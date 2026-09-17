@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# local secrets must never be committed
+.env.local
+.env.local.*
 
 # vercel
 .vercel
