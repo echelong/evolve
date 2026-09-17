@@ -531,6 +531,7 @@ npm run shadow          # run the Live Shadow League against the active market f
 npm run champions       # print the champion archive and the Hall of Fame
 npm run smoke:arena     # tiny, fully offline, deterministic funnel smoke run
 npm run validate:arena  # Phase 4 validation suite (26 offline cases)
+npm run validate:phase41  # Phase 4.1 correctness-pass regression suite (26 offline cases)
 ```
 
 ### Statistical honesty
@@ -541,6 +542,279 @@ mandatory Phase 3 baselines (no-trade, random, fixed momentum, buy-and-hold-like
 observations and friction — including when the evolved candidates lose to them. Nothing in the Champion
 Arena or the Live Shadow League is a claim that a candidate is profitable, safe, proven, predictive, or
 statistically significant.
+
+## Phase 4.1 — correctness pass
+
+Still **PAPER TRADING ONLY**, with no new capability of any kind. Phase 4.1 fixes six correctness issues
+found by inspecting the first genuine 1-hour Solana Arena run (`.evolve/arenas/arena-20260917T134825Z`)
+in detail, then reran the exact same historical dataset with the same seeds/config to compare before vs
+after. Every fix narrows behavior toward "more honest," never toward "more likely to produce a survivor."
+
+- **Concentration (`topMintShare`) is now measured by pooled executed notional.** It used to be
+  `maxMintPnl / positiveTotal` from a single run — share of *profit*, not trading size, denominated
+  against only the profitable mints — which saturated to `1.0` any time a candidate had exactly one
+  mint with positive P&L, regardless of how many mints or trades it actually ran. It is now
+  `max(notional by mint) / total notional`, pooled across every OOS and stress run in a candidate's full
+  evidence set (not the max of independent per-run shares, which had the same saturation problem one
+  level up). Paper trades now carry their executed notional so this is computable at all.
+- **The regime classifier is now actually wired into the arena.** `buildRegimeMap` existed and was
+  covered by its own validation cases, but the arena CLI never called it — every dataset's
+  `regimesByWindow` was an empty object, so every OOS window fell into `unknown` by construction, not by
+  evidence. A second, independent bug meant that even with `regimesByWindow` supplied, the tournament
+  runner flattened every dataset's runs into one array per candidate before scoring, discarding the tag
+  needed to look its window back up — regime is now stamped on each individual run rather than on the
+  wrapping per-dataset object, so it survives that flattening. `buildRegimeMap` itself was also rewritten
+  to classify each window strictly from that window's own TEST-interval snapshots (queried directly by
+  timestamp range) instead of a single forward-only cumulative buffer, which had been silently bleeding
+  earlier windows' training data into later windows whenever walk-forward windows overlap.
+- **Live evolutionary selection is evidence-aware and less aggressive by default.** Reproduction used to
+  be "top ~10% (elites) survive, everyone else dies," which meant ~90% replacement per generation at the
+  default 10% elite fraction, and raw fitness (no evidence gate) meant a one-trade lucky result could
+  win a large reproductive share. There is now a wider, evidence-ranked **survivor tier**
+  (`EVOLVE_LIVE_SURVIVOR_FRACTION`, default 35% of the population) that lives on unculled beyond the
+  elites, and agents are ranked for elite/breeder selection with evidence-sufficiency
+  (`EVOLVE_LIVE_MIN_TRADES_FOR_SELECTION`, `EVOLVE_LIVE_MIN_OBSERVATIONS_FOR_SELECTION`) checked *before*
+  fitness — an under-evidenced agent can still survive, it just cannot out-rank a properly evidenced one
+  on a lucky result. `EVOLVE_LIVE_ELITE_FRACTION` and `EVOLVE_LIVE_MIN_GENERATION_TICKS` (a floor under
+  `generationTicks`, a no-op at every default/test config) round out the knobs. This governs live/replay
+  reproduction only — Arena deployment gates are untouched.
+- **Gene bounds are species-specific and sane.** Every species used to mutate `minPoolAgeHours` /
+  `maxPoolAgeHours` against one *global* bound box spanning roughly 114 years (wide enough to hold
+  `MAX_POOL_AGE_UNBOUNDED` as a reachable "no age gate" sentinel some presets used outright). Mutation
+  jitter is proportional to that span, so a Genesis Hunter genome — whose preset starts at a sane 48h —
+  could drift to something like 844,533h within a handful of generations: the step size was scaled for a
+  different species' range entirely. Each species now mutates against its own finite, niche-appropriate
+  box (`SPECIES_AGE_BOUNDS` in `scripts/engine/genome.mjs`): Genesis Hunter stays within hours-to-days,
+  Momentum/Reversal/Wallet Flow get progressively broader multi-week ranges, Liquidity explicitly allows
+  older seasoned pools, and Experimental stays broad but finite. No preset relies on the unbounded
+  sentinel anymore, so every species is now genuinely age-aware.
+- **Compact leaderboard elimination context.** `leaderboard.json` rows now carry a `failedGates` array
+  (gate labels only, e.g. `["reasonable concentration"]`) alongside score/status, so a candidate's
+  elimination reason is visible without cross-referencing `candidates.json`.
+- **STRESS funnel semantics are documented, not just implemented.** STRESS genuinely culls
+  (`stressSurvived >= 1` across the configured profiles) — the funnel now carries a `rule` string per
+  stage explaining exactly what "survivors" means there, since a candidate that failed every stress
+  profile is still recorded in `candidates.json` with full detail even though it never reaches this
+  stage's survivor count.
+
+None of these fixes weaken a deployment gate, and the corrected rerun can still — and does — produce
+zero Deployment Candidates. See `npm run validate:phase41` (26 offline cases) for the regression suite,
+and the Phase 4.1 correctness-pass report for the full before/after Arena comparison.
+
+## Phase 5A — Controlled Research Swarm
+
+Still **PAPER ONLY**, with no wallet, no signing, and no execution path of any kind. Phase 5A adds a
+bounded research layer whose job is to make EVOLVE better at *searching* the existing strategy space —
+discovering hypotheses, combining existing signal families, criticizing apparent edge, preserving
+strategic diversity, specializing by regime, remembering failed research, and abstaining when the
+market is unsuitable. Research agents **propose**; the existing deterministic engine (selection, the
+watchdog, the Champion Arena) **decides**. Nothing in this phase can place a live trade, alter an Arena
+gate, or promote its own output.
+
+### Configurable population
+
+`EVOLVE_POPULATION_SIZE` (default `96`; the older `EVOLVE_POPULATION` name still works, and the new
+name wins if both are set) replaces the previous hard-coded population. 48, 96, 192, and arbitrary
+sensible sizes all work: the population is exact after every generation (births restore precisely
+`populationSize - survivors`), accounting stays internally consistent
+(`bornTotal - terminatedTotal == population` at all times), and the same seed/config always initializes
+the same population byte-for-byte. Invalid values (negative, non-numeric, absurdly large) clamp to a
+safe range rather than crashing. No internal code assumes exactly 96 agents.
+
+### Strategy islands
+
+The population is split into semi-isolated **islands** — one per existing species (Genesis Hunter,
+Momentum, Reversal, Wallet Flow, Liquidity, Experimental) — that breed primarily from their own members
+(`scripts/engine/islands.mjs`, wired into `breedGeneration` in `scripts/engine/simulation.mjs`). At 192
+agents this starts at 32/32/32/32/32/32. Islands are not just a display grouping: each generation,
+births are allocated per island in proportion to how far under its target it currently sits (deficit
+proportional, largest-remainder apportionment, so the total is always exact), and breeding draws from a
+fixed, pre-generation snapshot of each island's own top performers — never from siblings born earlier in
+the same generation. On top of that:
+
+- **Migration** (`EVOLVE_ISLAND_MIGRATION_RATE`, `EVOLVE_ISLAND_MAX_MIGRATIONS`): a bounded fraction of
+  survivors relabel to a different island each generation (genome carried over, breeding boundary
+  changed).
+- **Cross-species crossover** (`EVOLVE_CROSS_SPECIES_CROSSOVER_RATE`): a bounded fraction of births pick
+  their second parent from a different island's breeder pool.
+- **Random immigration** (`EVOLVE_RANDOM_IMMIGRANT_RATE`): on top of the pre-existing global
+  `EVOLVE_IMMIGRANT_RATE` floor, a bounded fraction of each island's own births are fresh random genomes.
+- **Revival** (`EVOLVE_ISLAND_REVIVE_EXTINCT`): an island with zero survivors is re-seeded with fresh
+  random genomes rather than left permanently at zero — it still has to earn its way back through
+  ordinary evidence-ranked selection from there. A poor island is never protected from selection; only
+  total extinction is prevented from being permanent.
+
+Per-island population, target, births, deaths, migrations in/out, revivals, extinction events, avg
+return/fitness, trade count, and evidence-sufficient-agent count are all visible in `state.json` under
+`islands` and rendered on the dashboard's Strategy Islands panel.
+
+### Research swarm roles
+
+Six structured researcher roles read a bounded, plain-data **evidence packet** (regime, island/species
+stats, cost summary, prior conclusions — never source code, credentials, or raw provider payloads) and
+propose hypotheses as structured proposals:
+
+- **Signal Researcher** — combinations of existing approved signals.
+- **Regime Researcher** — regime-specific specialization and transitions.
+- **Execution Researcher** — friction, slippage, turnover, holding time, churn.
+- **Risk Researcher** — drawdown, concentration, stop/take-profit, sizing.
+- **Diversity Researcher** — island collapse, lineage dominance, unexplored genome regions.
+- **Adversarial Critic** — reserved as a non-proposing role; its purpose is to falsify others' hypotheses
+  rather than add its own.
+
+The default (and, for now, only) provider is `mock` — a **deterministic, offline, no-LLM** heuristic
+provider (`scripts/research/provider.mjs`). The whole validation suite, and Phase 5A itself, work with
+no network access and no LLM API key. An external provider can be added later behind the same interface
+(`resolveResearchProvider`); it would read its own credential from the environment
+(`EVOLVE_RESEARCH_API_KEY` / `EVOLVE_LLM_API_KEY`, non-enumerable, never persisted to proposals, memory,
+state, or logs) and an unrecognized provider name always falls back to the offline mock rather than
+attempting a network call.
+
+### Structured research proposals
+
+A proposal (`scripts/research/proposal-schema.mjs`) is declarative data, never code:
+
+```json
+{
+  "schemaVersion": 1,
+  "proposalId": "P-...",
+  "authorRole": "regime-researcher",
+  "hypothesis": "Momentum improves during liquidity expansion when buyer flow persists.",
+  "targetRegimes": ["liquidity-expansion"],
+  "abstainRegimes": ["broad-selloff"],
+  "parentFamilies": ["Momentum x Wallet Flow"],
+  "changes": { "momentumWeight": [0.45, 0.75], "flowWeight": [0.3, 0.65], "maxHold": [35, 90] },
+  "rationale": "...",
+  "risks": ["cost drag", "regime dependence"]
+}
+```
+
+Validation is a strict allowlist, not a denylist: unknown top-level fields are rejected outright; only
+whitelisted genome keys may appear in `changes`, as a finite number or a finite `[min, max]` range inside
+`GENE_BOUNDS`; `targetRegimes`/`abstainRegimes` must be real `REGIMES` members (never the classifier's own
+`"unknown"` sentinel); and a static sandbox scan rejects `eval`, `require`/`import`, `child_process`,
+`fetch`, raw URLs, shell metacharacters, assignment/statement chains, and template-literal execution
+anywhere in any string field. After validation, a proposal is a tree of plain strings, booleans, numbers,
+and enum references — nothing that can execute.
+
+### Deterministic proposal compiler
+
+`scripts/research/compiler.mjs` turns validated proposals into candidate genome families. The compiler —
+never the proposal, never the provider — owns which genes exist, their ranges, species-aware bounds
+(the same `clampToBounds`/`SPECIES_AGE_BOUNDS` every other genome goes through), and its own tighter
+safety ceilings (`COMPILER_LIMITS`: max 25% risk fraction, min 2% stop-loss, min 4% take-profit, capped
+pool-age ranges) — proposals may narrow inside these, never widen past them. Compilation is a pure
+function: the same proposals compile to byte-identical genomes every time, with no `eval`, no dynamic
+import, no shell, and no I/O.
+
+### Research memory
+
+`.evolve/research/` persists, as sanitized JSON (no secrets, no code, no non-finite numbers):
+
+```text
+.evolve/research/
+  proposals/<proposalId>.json   one validated proposal per file
+  compiled/<familyId>.json      the exact compiled genome (for later Arena digest matching)
+  memory/index.json             bounded structured evaluation records
+  conclusions.json              one aggregated line per proposal outcome
+```
+
+Statuses are `PROPOSED → TESTING → REJECTED`, or (Arena-gated only, see below) `PROMISING`,
+`ARENA_SURVIVOR`, `SHADOW_ELIGIBLE`. Each research cycle reloads prior conclusions first, so researchers
+do not endlessly re-propose the same rejected region — the mock provider's rationale explicitly
+references prior `REJECTED` proposal ids it is avoiding.
+
+### The recursive research cycle
+
+`scripts/research/cycle.mjs` runs the bounded pipeline (market evidence → researchers propose →
+schema validation → deterministic compilation → candidate genomes → injection → watchdog evaluation →
+research memory → next cycle), driven from the live engine's tick loop every
+`EVOLVE_RESEARCH_CYCLE_EVERY_GENERATIONS` generations (`scripts/evolve-engine.mjs`,
+`createResearchController`). A compiled candidate is injected by replacing the population's current
+lowest-fitness agent (population size is invariant — a replace, never an append) and from that instant
+on is an ordinary genome subject to the exact same fitness/selection/death rules as every other agent.
+Its accumulated evidence (trades, distinct mints, per-mint notional, cost drag, drawdown — bounded by
+mint count, never by trade count, so long-lived candidates cannot grow this without limit) is captured
+the moment it is culled or replaced, and evaluated by the watchdog on the *next* research cycle. A research
+cycle can only ever leave a memory record at `PROPOSED`, `TESTING`, or `REJECTED` — see Promotion below
+for the only path to anything further.
+
+### Reward-hacking watchdog and quarantine
+
+`scripts/research/watchdog.mjs` is a deterministic, inspection-only screen (`NORMAL` / `WATCH` /
+`QUARANTINED`) over: single-mint dominance, single-window/regime/seed dependence, very-low trade count,
+single-trade-return dominance, high cost drag, replay-vs-live discrepancy, missing-data dependence,
+parameter-boundary saturation, train→OOS collapse, and stress collapse. A flag does not kill a candidate;
+enough flags move it to `WATCH` (labelled, continues) or `QUARANTINED`. **A `QUARANTINED` candidate can
+never become a Deployment Candidate, cannot hold `PROMISING`/`ARENA_SURVIVOR`/`SHADOW_ELIGIBLE` status,
+and cannot self-clear** — clearance requires a later, independent evaluation whose verdict is `NORMAL` or
+`WATCH` (`clearQuarantine`). The watchdog is advisory to the research layer only: it never touches an
+Arena gate.
+
+### Meta-evolution: approved family combinations
+
+`scripts/engine/families.mjs` defines the only combinations Phase 5A may target — deterministic blends of
+two existing species presets (`Momentum x Wallet Flow`, `Genesis x Flow`, `Reversal x Liquidity`,
+`Momentum x Liquidity`, `Reversal x Flow`) with fixed blending rules (weights average, binary gates AND,
+risk genes take the most conservative parent). A family still resolves to plain existing genome fields —
+Phase 5A introduces no new signal and no executable artifact. Arbitrary feature/indicator-source
+generation is explicitly out of scope for this phase.
+
+### Regime specialization and ACTIVE / REDUCED_RISK / ABSTAIN
+
+A research candidate may declare `targetRegimes` (where it specializes) and `abstainRegimes` (where it
+should stand down). Deterministic posture rules (`abstentionDecision` in `families.mjs`) resolve to
+`ACTIVE`, `REDUCED_RISK` (half position size), or `ABSTAIN` (skip the tick entirely) from the *same*
+regime classifier the Arena uses on historical windows (`classifyWindowRegime`), applied live over a
+small rolling buffer of already-observed ticks — so replaying the same data reproduces the same
+activation-state sequence. This is scoped to research-declared candidates only: an agent with no declared
+`targetRegimes`/`abstainRegimes` (every pre-5A species agent) is completely unaffected — the mechanism is
+a byte-for-byte no-op for the rest of the population. Abstention is not a failure; a specialist is never
+presented as globally robust (see `topAgents[].research.posture` in `state.json`).
+
+### Arena-gated promotion — researchers cannot self-promote
+
+`scripts/research/promote.mjs` is the **only** place a memory record can reach `PROMISING`,
+`ARENA_SURVIVOR`, or `SHADOW_ELIGIBLE`, and it only ever runs against a real, already-finished
+`npm run arena` result. Matching is by genome digest (`digestOf`, the same value the Arena already uses
+for its own leaderboard rows) — the compiled candidate genome persisted under
+`.evolve/research/compiled/` is looked up against the Arena leaderboard, and its research memory record
+is upgraded accordingly. A `QUARANTINED` family is blocked from promotion even if its genome happens to
+match a leaderboard entry. Run `npm run arena -- --research` (or `EVOLVE_ARENA_INCLUDE_RESEARCH=1`) to
+add persisted research candidates as additional Arena entrants; promotion itself runs on every
+`npm run arena` invocation regardless of that flag, so a research candidate added in an earlier run can
+still be promoted from a later one.
+
+### Shared market feed
+
+Population scaling does not multiply market traffic: `feed.markets(at)` / `feed.health(at)` are each
+called exactly once per tick regardless of population size, and every agent in the tick loop reads the
+same already-fetched snapshot. 48, 96, and 192 agents issue the identical number of feed calls per tick —
+population scaling increases local strategy evaluation only, never external request volume (verified by
+`npm run validate:phase5a`, case 50).
+
+### The upcoming 192-agent live experiment
+
+```bash
+EVOLVE_MARKET_MODE=live \
+EVOLVE_POPULATION_SIZE=192 \
+EVOLVE_LIVE_SURVIVOR_FRACTION=0.35 \
+EVOLVE_LIVE_MIN_TRADES_FOR_SELECTION=3 \
+EVOLVE_LIVE_MIN_OBSERVATIONS_FOR_SELECTION=30 \
+npm run engine
+```
+
+This is a configuration, not an instruction to run it — start it deliberately, and record a market feed
+in parallel (`npm run record:market`) so the same window can be replayed later. Zero Deployment
+Candidates remains a completely acceptable outcome of the eventual Arena run over whatever this produces.
+
+### Commands
+
+```bash
+npm run validate:phase5a         # Phase 5A validation suite (63 offline cases)
+npm run arena -- --research      # include persisted research candidates as Arena entrants,
+                                  # and promote research memory from the result
+```
 
 ## Validation
 
@@ -619,6 +893,62 @@ Phase 4 adds `npm run validate:arena` (26 offline cases):
 - **No execution path** — the arena/shadow code is scanned for wallet, signing, and transaction-execution
   patterns exactly like Phase 2 and Phase 3
 
+Phase 4.1 adds `npm run validate:phase41` (26 offline cases):
+
+- **Concentration** — notional-based `topMintShare` bounded [0, 1]; equal/skewed/single-mint/no-trade
+  cases; pools correctly across seeds and windows without max-of-per-run saturation
+- **Regime wiring** — real-shaped fixture snapshots classify non-`unknown` labels; a window is classified
+  only from its own TEST-interval snapshots; deterministic; the arena entrypoint actually threads
+  `regimesByWindow` through to `regimePerformance` end to end
+- **Live selection** — a one-trade lucky winner cannot outrank an evidenced moderate performer; evidence
+  gate requires both trades and observations; default replacement stays in the configured 40–75% band;
+  population size and birth/death bookkeeping stay exact across generations
+- **Gene bounds** — Genesis Hunter's age bounds stay young-pool sane under 500 generations of mutation
+  and under crossover with a wide-bounded species; every species keeps a distinct, finite pool-age
+  niche; non-age gene bounds still hold
+- **Output schema** — leaderboard rows carry compact `failedGates`, never the full candidate object;
+  every funnel stage carries a `rule` string
+- **No non-finite state** — a full arena run and a multi-generation live snapshot contain no
+  `NaN`/`Infinity`
+
+Phase 5A adds `npm run validate:phase5a` (63 offline cases):
+
+- **Configurable population** — 48/96/192/arbitrary sizes stay exact across generations; invalid values
+  clamp safely; `EVOLVE_POPULATION_SIZE` takes priority over the legacy `EVOLVE_POPULATION`; births
+  restore the population exactly; deterministic initialization
+- **Strategy islands** — target-count apportionment always sums exactly to the population (even split and
+  explicit weights); birth allocation never gives an over-target island new births; island populations
+  stay near target over many generations at 192; migration respects its per-generation cap; islands can
+  be disabled without breaking population accounting
+- **Proposal schema** — valid proposals accepted; unknown fields, unsupported genes, out-of-bounds
+  ranges, and non-degenerate binary-gene ranges rejected; nine distinct executable-content payloads
+  (`eval`, `require`, `process`, `fetch`, `javascript:`, dynamic `import`, shell, `new Function`, template
+  execution) rejected; every researcher role produces an acceptable proposal
+- **Deterministic compiler** — identical proposals compile to byte-identical genomes; compiled genomes
+  never escape `GENE_BOUNDS`; compiler limits are tighter than or equal to the raw gene bounds; an
+  unresolvable family is rejected; `maxCompilations` is enforced; every family name resolves via `x`/`×`/`*`
+- **Research memory** — proposals/records/conclusions persist and reload; nothing non-finite or
+  secret-shaped ever reaches disk; researchers demonstrably consult prior `REJECTED` conclusions; an
+  unknown provider name always falls back to the offline mock, never a network call
+- **Watchdog + quarantine** — single-mint dominance, very-low trade count, train→OOS collapse, and stress
+  collapse are each independently flagged; enough flags escalate `NORMAL → WATCH → QUARANTINED`;
+  `QUARANTINED` can never self-clear
+- **Recursive cycle + promotion** — a full offline cycle proposes/validates/compiles/persists; a research
+  cycle can never itself write `PROMISING`/`ARENA_SURVIVOR`/`SHADOW_ELIGIBLE`; promotion only happens
+  from a genome-digest match against a real Arena leaderboard and is blocked for any quarantined family;
+  an unmatched candidate is skipped, never promoted
+- **Arena/paper-only protections untouched** — `DEFAULT_DEPLOYMENT_GATES` and `ARENA_SCORE_VERSION` stay
+  exactly as Phase 4/4.1 left them; `PAPER_ONLY` stays `true`; every research module is scanned for
+  wallet/signing/execution patterns exactly like Phase 2–4
+- **ACTIVE/REDUCED_RISK/ABSTAIN** — deterministic and regime-driven; a research candidate's posture
+  sequence replays identically for the same seed; an ordinary (non-research) agent's behavior is a
+  byte-for-byte no-op
+- **Shared feed** — `feed.markets()` is called exactly once per tick regardless of population size (48 vs
+  192 issue the identical call count)
+- **No non-finite state, no look-ahead** — a live run with islands and an injected research candidate
+  stays fully finite; `"unknown"` (the classifier's no-data sentinel) is never offered as a proposable
+  regime; culled research-candidate evidence survives until explicitly cleared
+
 ## Roadmap
 
 ### Phase 1 — evolutionary lab
@@ -661,6 +991,29 @@ Phase 4 adds `npm run validate:arena` (26 offline cases):
 - [ ] WebSocket / streaming market ingestion (still polling-based)
 - [ ] Strategy quarantine and promotion gates beyond the Shadow League's own milestones
 - [ ] Kill switches and loss budgets (paper-only; there is nothing real to halt yet)
+
+### Phase 5A — Controlled Research Swarm
+- [x] Configurable population (`EVOLVE_POPULATION_SIZE`: 48/96/192/arbitrary, exact and deterministic)
+- [x] Strategy islands: species-as-breeding-boundary, bounded migration, cross-species crossover, random
+      immigration, and extinction revival — tracked per island, actually driving breeding
+- [x] Six structured researcher roles over a bounded, plain-data evidence packet; deterministic offline
+      `mock` provider (no LLM key/network required); pluggable provider interface for later
+- [x] Strict-allowlist proposal schema with a static executable-content sandbox scan
+- [x] Deterministic proposal compiler with its own tighter-than-`GENE_BOUNDS` safety ceilings
+- [x] Persistent research memory (proposals, compiled candidates, structured evaluation records,
+      conclusions) that later cycles actually read back
+- [x] Controlled recursive research cycle wired into the live engine loop (propose → validate → compile →
+      inject → watchdog → memory → next cycle)
+- [x] Deterministic reward-hacking watchdog with `NORMAL`/`WATCH`/`QUARANTINED` and non-self-clearing
+      quarantine
+- [x] Meta-evolution over five approved existing-family combinations (no new signals, no code generation)
+- [x] Deterministic regime specialization and `ACTIVE`/`REDUCED_RISK`/`ABSTAIN`, scoped to research
+      candidates, replay-reproducible
+- [x] Arena-gated promotion by genome digest — researchers cannot self-promote
+- [x] Dashboard: Strategy Islands panel and Research Swarm panel, both labelled `PAPER RESEARCH`
+- [ ] A non-mock research provider (still just an interface; only the offline mock is implemented)
+- [ ] Automatic Arena re-entry of every compiled candidate on a fixed cadence (currently manual via
+      `npm run arena -- --research`)
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

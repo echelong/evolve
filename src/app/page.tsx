@@ -10,10 +10,13 @@ import {
   Dna,
   FlaskConical,
   Gauge,
+  Map,
+  Microscope,
   Radio,
   RadioTower,
   ScanSearch,
   ShieldCheck,
+  ShieldAlert,
   Signal,
   Sparkles,
   TrendingUp,
@@ -56,6 +59,15 @@ type Agent = {
     markPrice: number;
     heldTicks: number;
   };
+  // Phase 5A: present only for research-compiled candidates.
+  research?: {
+    familyId: string;
+    proposalId: string | null;
+    authorRole: string | null;
+    targetRegimes: string[];
+    abstainRegimes: string[];
+    posture: string;
+  } | null;
 };
 
 type MarketFeed = {
@@ -223,6 +235,7 @@ type EvolveState = {
     netPnl: number;
     bestFitness: number;
     bestReturn: number;
+    populationTarget?: number;
   };
   topAgents: Agent[];
   positions: Position[];
@@ -240,6 +253,24 @@ type EvolveState = {
     extinctionEvents?: number;
     extinct?: boolean;
   }[];
+  // --- Phase 5A: strategy islands ---------------------------------------
+  islands?: {
+    name: string;
+    target: number;
+    population: number;
+    births: number;
+    deaths: number;
+    migrationsIn: number;
+    migrationsOut: number;
+    revivals: number;
+    extinctionEvents: number;
+    avgReturn: number;
+    avgFitness: number;
+    trades: number;
+    evidenceSufficientCount: number;
+    extinct: boolean;
+  }[];
+  researchRegime?: string | null;
   markets: MarketRow[];
   marketSummary: { observed: number; tradeable: number; shown: number; source: string };
   history: { t: number; generation: number; tick: number; avgReturn: number }[];
@@ -276,6 +307,12 @@ type EvolveState = {
     replay: { exists: boolean; updatedAt: string | null };
   };
   research?: Research | null;
+  // Phase 5A: the controlled research swarm's cycle summary. Named distinctly
+  // from `research` above (Phase 3 read-only reference data: experiment /
+  // champions / arena / hall-of-fame / shadow) to avoid confusion between the
+  // two — this is the propose -> validate -> compile -> watchdog -> memory
+  // loop specifically.
+  researchSwarm?: ResearchSwarm | null;
   genealogy?: { nodes: number; lineages: number; prunedNodes: number; activeLineages: number; extinctLineages: number; maxGeneration: number };
   evolution?: {
     enabled: boolean;
@@ -450,7 +487,7 @@ type ChampionArchive = {
   }[];
 };
 
-type ArenaFunnelRow = { stage: string; entered: number; survivors: number };
+type ArenaFunnelRow = { stage: string; entered: number; survivors: number; rule: string | null };
 
 type ArenaLeaderboardRow = {
   digest: string | null;
@@ -458,6 +495,7 @@ type ArenaLeaderboardRow = {
   origin: string | null;
   score: number | null;
   status: string | null;
+  failedGates: string[];
 };
 
 type ArenaSummary = {
@@ -522,6 +560,31 @@ type ShadowLeague = {
   available: boolean;
   count: number;
   rows: ShadowCandidate[];
+};
+
+// --- Phase 5A: controlled research swarm ------------------------------------
+type ResearchSwarmLogEntry = {
+  cycle: number;
+  at: string;
+  proposed: number;
+  compiled: number;
+  rejected: number;
+  watchdogEvaluated: number;
+};
+
+type ResearchSwarm = {
+  enabled: boolean;
+  provider: string;
+  cycle: number;
+  proposalsGenerated: number;
+  proposalsRejected: number;
+  compiledCandidates: number;
+  watchCount: number;
+  quarantinedCount: number;
+  memoryRecords: number;
+  lastRunAt: string | null;
+  lastError: string | null;
+  log: ResearchSwarmLogEntry[];
 };
 
 type Research = {
@@ -1138,6 +1201,206 @@ function EvolutionResearchPanel({ state, research }: { state: EvolveState; resea
   );
 }
 
+/**
+ * Strategy Islands panel (Phase 5A). An island is a species label used as a
+ * breeding boundary — this shows whether island targets are actually being
+ * held, not just a re-labelled species breakdown.
+ */
+function IslandsPanel({ state }: { state: EvolveState }) {
+  const islands = state.islands ?? [];
+  const totalPopulation = islands.reduce((sum, island) => sum + island.population, 0);
+  const totalTarget = islands.reduce((sum, island) => sum + island.target, 0);
+  const totalMigrations = islands.reduce((sum, island) => sum + island.migrationsIn, 0);
+  const totalRevivals = islands.reduce((sum, island) => sum + island.revivals, 0);
+
+  return (
+    <div className="panel islands-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">STRATEGY ISLANDS</p>
+          <h2>Semi-isolated breeding populations</h2>
+        </div>
+        <Map size={20} />
+      </div>
+
+      <div className="health-grid">
+        <div className="health-item">
+          <span>Current / target population</span>
+          <strong>
+            {totalPopulation} / {totalTarget || state.stats.populationTarget || state.stats.population}
+          </strong>
+        </div>
+        <div className="health-item">
+          <span>Islands</span>
+          <strong>{islands.length}</strong>
+        </div>
+        <div className="health-item">
+          <span>Migrations this generation</span>
+          <strong>{totalMigrations}</strong>
+        </div>
+        <div className="health-item">
+          <span>Revivals (extinct islands re-seeded)</span>
+          <strong className={totalRevivals > 0 ? "tone-warn" : undefined}>{totalRevivals}</strong>
+        </div>
+      </div>
+
+      <div className="survival-list">
+        {islands.map((island) => (
+          <div className="survival-row" key={island.name}>
+            <div className="survival-meta">
+              <strong>
+                {island.name}
+                {island.extinct ? " (extinct — reviving)" : ""}
+              </strong>
+              <span>
+                pop {island.population}/{island.target} · births {island.births} · deaths {island.deaths} · migrations{" "}
+                {island.migrationsIn}in/{island.migrationsOut}out · revivals {island.revivals} · evidence-sufficient{" "}
+                {island.evidenceSufficientCount}
+              </span>
+            </div>
+            <div className="survival-track">
+              <div
+                className={`survival-alive${island.extinct ? " tone-bad" : ""}`}
+                style={{ width: `${Math.min(100, (island.population / Math.max(1, island.target)) * 100)}%` }}
+              />
+            </div>
+            <small className="species-role">
+              avg return {pct(island.avgReturn * 100)} · trades {island.trades}
+            </small>
+          </div>
+        ))}
+      </div>
+
+      <p className="health-note">
+        Islands breed primarily within themselves, with bounded migration, cross-species crossover, and random
+        immigration (see EVOLVE_ISLAND_MIGRATION_RATE / EVOLVE_CROSS_SPECIES_CROSSOVER_RATE /
+        EVOLVE_RANDOM_IMMIGRANT_RATE). Revival re-seeds an extinct island; it does not protect a poor one from
+        ordinary selection.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Research Swarm panel (Phase 5A): researchers propose, a deterministic
+ * compiler turns valid proposals into candidate genomes, and the same
+ * evidence-ranked selection every other agent goes through decides whether
+ * they survive. PAPER RESEARCH — never a profitability claim.
+ */
+function ResearchSwarmPanel({ state }: { state: EvolveState }) {
+  const swarm = state.researchSwarm ?? null;
+  const researchAgents = state.topAgents.filter((agent) => agent.research);
+
+  if (!swarm) {
+    return (
+      <div className="panel research-swarm-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">PAPER RESEARCH</p>
+            <h2>Research swarm not reporting yet</h2>
+          </div>
+          <Microscope size={20} />
+        </div>
+        <p className="health-note">The research swarm reports here once the live engine has run its first cycle.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="panel research-swarm-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">PAPER RESEARCH</p>
+          <h2>Controlled research swarm</h2>
+        </div>
+        <Microscope size={20} />
+      </div>
+
+      <div className="health-grid">
+        <div className="health-item">
+          <span>Research cycle</span>
+          <strong>{swarm.cycle}</strong>
+        </div>
+        <div className="health-item">
+          <span>Provider</span>
+          <strong>{swarm.provider}</strong>
+        </div>
+        <div className="health-item">
+          <span>Proposals generated</span>
+          <strong>{swarm.proposalsGenerated}</strong>
+        </div>
+        <div className="health-item">
+          <span>Proposals rejected</span>
+          <strong>{swarm.proposalsRejected}</strong>
+        </div>
+        <div className="health-item">
+          <span>Compiled candidates</span>
+          <strong>{swarm.compiledCandidates}</strong>
+        </div>
+        <div className="health-item">
+          <span>WATCH</span>
+          <strong className={swarm.watchCount > 0 ? "tone-warn" : undefined}>{swarm.watchCount}</strong>
+        </div>
+        <div className="health-item">
+          <span>QUARANTINED</span>
+          <strong className={swarm.quarantinedCount > 0 ? "tone-bad" : undefined}>{swarm.quarantinedCount}</strong>
+        </div>
+        <div className="health-item">
+          <span>Research memory records</span>
+          <strong>{swarm.memoryRecords}</strong>
+        </div>
+        <div className="health-item">
+          <span>Active in population now</span>
+          <strong>{researchAgents.length}</strong>
+        </div>
+      </div>
+
+      {swarm.lastError ? (
+        <p className="health-note tone-bad">
+          <ShieldAlert size={14} /> last cycle error: {swarm.lastError}
+        </p>
+      ) : null}
+
+      <div className="survival-list">
+        {swarm.log.map((entry) => (
+          <div className="survival-row" key={entry.cycle}>
+            <div className="survival-meta">
+              <strong>Cycle {entry.cycle}</strong>
+              <span>
+                proposed {entry.proposed} · compiled {entry.compiled} · rejected {entry.rejected} · watchdog-evaluated{" "}
+                {entry.watchdogEvaluated}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {researchAgents.length > 0 ? (
+        <div className="survival-list">
+          {researchAgents.slice(0, 6).map((agent) => (
+            <div className="survival-row" key={agent.id}>
+              <div className="survival-meta">
+                <strong>{agent.research?.authorRole ?? "researcher"}</strong>
+                <span>
+                  {agent.id} · {agent.species} · posture {agent.research?.posture ?? "ACTIVE"} · fitness{" "}
+                  {agent.fitness.toFixed(2)} · trades {agent.trades}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <p className="health-note">
+        PAPER RESEARCH. Research agents propose candidate genomes; deterministic EVOLVE machinery (selection, the
+        watchdog, and the Champion Arena) decides everything else. Nothing here is a profitability claim, and no
+        research candidate can promote itself — promotion to a Deployment Candidate only ever happens from a real
+        Arena result.
+      </p>
+    </div>
+  );
+}
+
 /** Species that suffered at least one extinction event during the run. */
 function championLineages(experiment: ExperimentReport | null) {
   if (!experiment) return 0;
@@ -1194,7 +1457,7 @@ function ArenaPanel({ arena }: { arena: ArenaSummary | null }) {
 
       <div className="survival-list">
         {arena.funnel.map((row) => (
-          <div className="survival-row" key={row.stage}>
+          <div className="survival-row" key={row.stage} title={row.rule ?? undefined}>
             <div className="survival-meta">
               <strong>{row.stage}</strong>
               <span>
@@ -1260,6 +1523,11 @@ function ArenaPanel({ arena }: { arena: ArenaSummary | null }) {
             <div className="survival-track">
               <div className="survival-alive" style={{ width: `${Math.max(0, Math.min(100, row.score ?? 0))}%` }} />
             </div>
+            {row.failedGates.length > 0 ? (
+              <p className="health-note" style={{ marginTop: 2 }}>
+                Failed: {row.failedGates.join(", ")}
+              </p>
+            ) : null}
           </div>
         ))}
       </div>
@@ -1858,6 +2126,13 @@ function Dashboard({
         <section className="dashboard-grid research-grid">
           <OutOfSamplePanel experiment={research.experiment ?? null} />
           <EvolutionResearchPanel state={state} research={research} />
+        </section>
+      ) : null}
+
+      {state.islands || state.researchSwarm ? (
+        <section className="dashboard-grid research-grid">
+          <IslandsPanel state={state} />
+          <ResearchSwarmPanel state={state} />
         </section>
       ) : null}
 

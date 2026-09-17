@@ -343,6 +343,7 @@ async function loadLatestArena(root: string) {
     stage,
     entered: isRecord(row) ? num(row.entered) ?? 0 : 0,
     survivors: isRecord(row) ? num(row.survivors) ?? 0 : 0,
+    rule: isRecord(row) && typeof row.rule === "string" ? row.rule : null,
   }));
 
   const shortDigest = (value: unknown) => (typeof value === "string" ? value.slice(0, 12) : null);
@@ -368,6 +369,7 @@ async function loadLatestArena(root: string) {
               origin: row.origin ?? null,
               score: num(row.score),
               status: row.status ?? null,
+              failedGates: asArray(row.failedGates).filter((g): g is string => typeof g === "string"),
             }
           : null,
       )

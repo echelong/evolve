@@ -25,6 +25,9 @@ import {
 import { generateAgentId } from "../lib/ids.mjs";
 import { ORIGIN, createGenealogy } from "./genealogy.mjs";
 import { PAPER_ONLY, paperGuards, simulateEntry, simulateExit } from "./paper.mjs";
+import { islandTargetCounts, allocateBirths, pickOtherIsland } from "./islands.mjs";
+import { ABSTAIN_STATE, abstentionDecision, riskMultiplierFor } from "./families.mjs";
+import { classifyWindowRegime } from "../arena/orchestrator.mjs";
 
 const STATUS = Object.freeze({
   SCANNING: "SCANNING",
@@ -66,6 +69,36 @@ export function computeFitness(agent, startingCash) {
     netReturn * 100 - finite(agent.maxDrawdown, 0) * 45 + winRate * 8 + activity * 2 - costDrag * 15;
 
   return Number.isFinite(value) ? value : -100;
+}
+
+/**
+ * Selection-privilege evidence gate: has this agent traded/observed enough
+ * *this generation* to trust its fitness number at all? Deliberately separate
+ * from the death gate in breedGeneration — an agent short on evidence can
+ * still survive, it just cannot rank into the elite/breeder tiers on a lucky
+ * result.
+ */
+export function hasSufficientEvidence(agent, { minTradesForSelection = 0, minObservationsForSelection = 0 } = {}) {
+  return (
+    finite(agent?.trades, 0) >= minTradesForSelection &&
+    finite(agent?.observations, 0) >= minObservationsForSelection
+  );
+}
+
+/**
+ * Evidence-aware selection ranking (pure, exported for direct testing).
+ * Agents with sufficient evidence always rank ahead of those without,
+ * fitness breaking ties within each tier — so a one-trade lucky winner
+ * cannot outrank a properly evidenced agent no matter how large its raw
+ * fitness number is; it can only compete with other unproven agents.
+ */
+export function rankForSelection(agents, evidenceOptions = {}) {
+  return [...agents].sort((a, b) => {
+    const aOk = hasSufficientEvidence(a, evidenceOptions);
+    const bOk = hasSufficientEvidence(b, evidenceOptions);
+    if (aOk !== bOk) return aOk ? -1 : 1;
+    return finite(b?.fitness, -Infinity) - finite(a?.fitness, -Infinity);
+  });
 }
 
 /** 0..1 composites that all agents share, so genomes stay comparable. */
@@ -175,8 +208,19 @@ export const DEFAULT_EVOLUTION = Object.freeze({
   immigrantRate: 0.1,
   eliteFraction: 0.1,
   breederFraction: 0.28,
-  speciesInheritanceRate: 0.72,
   speciesPull: true,
+  // Live selection pressure (see EVOLVE_LIVE_* in market/config.mjs). These
+  // are deliberately separate from the Arena's deployment gates: they govern
+  // who reproduces in the live/replay swarm, not who becomes a Deployment
+  // Candidate.
+  survivorFraction: 0.35,
+  minTradesForSelection: 3,
+  minObservationsForSelection: 30,
+  // A no-op floor by default (below every generationTicks value used anywhere
+  // in this codebase, including fast test/smoke configs) — it only bites when
+  // an operator explicitly raises EVOLVE_LIVE_MIN_GENERATION_TICKS above
+  // whatever config.engine.generationTicks is set to.
+  minGenerationTicks: 10,
 });
 
 function clampNumber(value, min, max, fallback) {
@@ -225,10 +269,45 @@ export function createSimulation({
   const immigrantRate = clampNumber(evolutionOptions.immigrantRate, 0, 0.5, 0.1);
   const eliteFraction = clampNumber(evolutionOptions.eliteFraction, 0.01, 0.5, 0.1);
   const breederFraction = clampNumber(evolutionOptions.breederFraction, 0.05, 1, 0.28);
-  const speciesInheritanceRate = clampNumber(evolutionOptions.speciesInheritanceRate, 0, 1, 0.72);
+  const survivorFraction = Math.max(
+    eliteFraction,
+    clampNumber(evolutionOptions.survivorFraction, 0.05, 0.9, 0.35),
+  );
+  const minTradesForSelection = clampNumber(evolutionOptions.minTradesForSelection, 0, 10_000, 3);
+  const minObservationsForSelection = clampNumber(
+    evolutionOptions.minObservationsForSelection,
+    0,
+    10_000_000,
+    30,
+  );
+  const minGenerationTicks = clampNumber(evolutionOptions.minGenerationTicks, 10, 100_000, 120);
   const scanLimit = Math.max(0, Math.round(marketScanLimit));
 
-  const { population: populationSize, generationTicks } = config.engine;
+  // --- Phase 5A: strategy islands -------------------------------------------
+  // An island is the species label used as a breeding boundary (see
+  // engine/islands.mjs) rather than a new taxonomy. Disabled falls back to
+  // the pre-5A behavior: every island's target is 0, so the island-aware
+  // birth path below always takes the "no positive deficit" even-split
+  // fallback, which reduces to the old global breeder pool in practice.
+  const islandsConfig = config.islands ?? {};
+  const islandsEnabled = islandsConfig.enabled !== false;
+  const islandNames = [...SPECIES];
+  const islandMigrationRate = clampNumber(islandsConfig.migrationRate, 0, 0.25, 0.04);
+  const islandMaxMigrations = clampNumber(islandsConfig.maxMigrationsPerGeneration, 0, 10_000, 12);
+  const crossSpeciesCrossoverRate = clampNumber(islandsConfig.crossSpeciesCrossoverRate, 0, 1, 0.05);
+  const islandRandomImmigrantRate = clampNumber(islandsConfig.randomImmigrantRate, 0, 0.25, 0.03);
+  const islandReviveExtinct = islandsConfig.reviveExtinct !== false;
+
+  function islandTargets() {
+    return islandsEnabled
+      ? islandTargetCounts(populationSize, islandNames, islandsConfig.targetCounts ?? {})
+      : Object.fromEntries(islandNames.map((name) => [name, 0]));
+  }
+
+  const { population: populationSize, generationTicks: configuredGenerationTicks } = config.engine;
+  // A generation cannot end before agents have had a chance to accumulate
+  // evidence, regardless of how short config.engine.generationTicks is set.
+  const generationTicks = Math.max(configuredGenerationTicks, minGenerationTicks);
   const startingCash = config.paper.startingCash;
   const minOrderUsd = Math.max(0.5, startingCash * 0.02);
   const maxHistory = 150;
@@ -248,24 +327,71 @@ export function createSimulation({
   let lastGenerationSummary = null;
   let totalTrades = 0;
   const startedAt = now();
+
+  // Phase 5A: research-injected candidates carry a lightweight evidence
+  // ledger (bounded by distinct-mint count, never by trade count) so the
+  // research cycle can watchdog-evaluate them without a full per-trade
+  // history. `researchLedger` retains a FINAL snapshot for any research
+  // candidate that was culled or replaced, so evidence is not lost the
+  // moment an agent leaves the live population.
+  let researchLedger = new Map(); // familyId -> evidence record
+  let tickSnapshotBuffer = [];
+  let currentRegimeLabel = null;
+  const REGIME_BUFFER_SIZE = 24;
   const speciesStats = new Map(
     SPECIES.map((name) => [
       name,
-      { births: 0, deaths: 0, peakCount: 0, extinctionEvents: 0, wasPresent: false },
+      {
+        births: 0,
+        deaths: 0,
+        peakCount: 0,
+        extinctionEvents: 0,
+        wasPresent: false,
+        // Phase 5A: island bookkeeping, tracked on the same per-species entry
+        // since an island *is* a species label used as a breeding boundary.
+        migrationsIn: 0,
+        migrationsOut: 0,
+        revivals: 0,
+      },
     ]),
   );
 
-  function trackBirth(species) {
-    if (!speciesStats.has(species)) {
-      speciesStats.set(species, { births: 0, deaths: 0, peakCount: 0, extinctionEvents: 0, wasPresent: false });
+  function islandEntry(name) {
+    if (!speciesStats.has(name)) {
+      speciesStats.set(name, {
+        births: 0,
+        deaths: 0,
+        peakCount: 0,
+        extinctionEvents: 0,
+        wasPresent: false,
+        migrationsIn: 0,
+        migrationsOut: 0,
+        revivals: 0,
+      });
     }
-    speciesStats.get(species).births += 1;
+    return speciesStats.get(name);
+  }
+
+  function trackBirth(species) {
+    islandEntry(species).births += 1;
+  }
+
+  function trackMigration(from, to) {
+    islandEntry(from).migrationsOut += 1;
+    islandEntry(to).migrationsIn += 1;
+  }
+
+  function trackRevival(island) {
+    islandEntry(island).revivals += 1;
   }
 
   function trackDeaths(agents) {
     for (const agent of agents) {
       const entry = speciesStats.get(agent.species);
       if (entry) entry.deaths += 1;
+      // A research candidate's evidence must not vanish just because it lost
+      // the generation's selection — freeze what it did before it is gone.
+      if (agent.researchMeta) captureResearchEvidence(agent);
     }
   }
 
@@ -440,6 +566,10 @@ export function createSimulation({
       net,
       gross: fill.grossPnl,
       cost: tradeCost,
+      // Entry notional (cash committed, including fee) — the executed size of
+      // this trade. Used to measure mint concentration by actual exposure
+      // rather than by which trades happened to be profitable.
+      notional: position.cost,
       heldTicks: position.held,
       openedAt: position.entryAt,
       closedAt: ctx.at,
@@ -450,6 +580,15 @@ export function createSimulation({
     // Cumulative view: never reset by selection, so a candidate can be judged
     // on everything it did rather than on its final partial generation.
     if (Array.isArray(agent.stageLedger)) agent.stageLedger.push(row);
+    if (agent.researchMeta) {
+      // Bounded by distinct-mint count (not trade count) so a long-lived
+      // research candidate cannot grow this without limit — no full ledger
+      // is kept, only the aggregates the watchdog actually needs.
+      agent.researchMintNotional = agent.researchMintNotional ?? {};
+      agent.researchMintNotional[row.mint] = (agent.researchMintNotional[row.mint] ?? 0) + Math.max(0, row.notional);
+      agent.researchMaxSingleTradeReturn = Math.max(agent.researchMaxSingleTradeReturn ?? 0, net);
+      agent.researchTotalPositiveReturn = (agent.researchTotalPositiveReturn ?? 0) + Math.max(0, net);
+    }
     agent.stageTrades = (agent.stageTrades ?? 0) + 1;
     agent.stageCosts = (agent.stageCosts ?? 0) + Math.max(0, fill.frictionUsd);
     agent.stagePnl = (agent.stagePnl ?? 0) + net;
@@ -485,8 +624,13 @@ export function createSimulation({
 
   function openPosition(agent, market, ctx) {
     const genome = agent.genome;
+    // Phase 5A: a research candidate's declared REDUCED_RISK posture scales
+    // its position size down (ABSTAIN never reaches here — stepAgent returns
+    // before scanning for entries). Every other agent's multiplier is 1, so
+    // this is a no-op for the entire pre-5A population.
+    const riskMultiplier = Number.isFinite(agent.researchRiskMultiplier) ? agent.researchRiskMultiplier : 1;
     const notional = Math.min(
-      agent.cash * genome.riskFraction,
+      agent.cash * genome.riskFraction * riskMultiplier,
       agent.cash * config.paper.maxPositionFraction,
       market.liquidity * config.paper.maxLiquidityFraction,
     );
@@ -576,6 +720,32 @@ export function createSimulation({
       return;
     }
 
+    // Phase 5A: ACTIVE / REDUCED_RISK / ABSTAIN. Deterministic and regime-
+    // driven, scoped to research-injected candidates only (agents that
+    // declare abstainRegimes/targetRegimes) — every pre-5A agent has neither
+    // array set, so this block is a complete no-op for them and behavior is
+    // byte-for-byte unchanged. No external research model makes this call at
+    // runtime: it is the same rule table every replay of the same data
+    // reproduces (see engine/families.mjs).
+    agent.researchRiskMultiplier = 1;
+    if (Array.isArray(agent.abstainRegimes) && agent.abstainRegimes.length > 0) {
+      const posture = abstentionDecision({
+        regime: ctx.regime ?? currentRegimeLabel,
+        allowNewEntries: ctx.allowNewEntries,
+        hasPosition: false,
+        eligibleCount: ctx.tradeable.length,
+        abstainRegimes: agent.abstainRegimes,
+      });
+      agent.researchPosture = posture.state;
+      agent.researchRiskMultiplier = riskMultiplierFor(posture.state);
+      if (posture.state === ABSTAIN_STATE.ABSTAIN) {
+        agent.status = STATUS.SCANNING;
+        agent.lastAction = `Abstaining — ${posture.reason}`;
+        markToMarket(agent, ctx);
+        return;
+      }
+    }
+
     let best = null;
     let bestScore = -Infinity;
 
@@ -610,6 +780,8 @@ export function createSimulation({
     return computeFitness(agent, startingCash);
   }
 
+  const evidenceOptions = { minTradesForSelection, minObservationsForSelection };
+
   function resetSurvivor(agent) {
     return {
       ...agent,
@@ -632,6 +804,100 @@ export function createSimulation({
       lastAction: "Elite survived",
       lastActionAt: now(),
     };
+  }
+
+  /**
+   * Compact watchdog-ready evidence for one research candidate, derived from
+   * its cumulative stage accounting (never reset by survivor rollover). Null
+   * for any agent that is not a research candidate.
+   */
+  function evidenceFromAgent(agent) {
+    const meta = agent?.researchMeta;
+    if (!meta) return null;
+    const mintNotional = { ...(agent.researchMintNotional ?? {}) };
+    return {
+      familyId: meta.familyId,
+      proposalId: meta.proposalId,
+      authorRole: meta.authorRole ?? null,
+      species: agent.species,
+      agentId: agent.id,
+      alive: true,
+      generation,
+      trades: agent.stageTrades ?? 0,
+      distinctMints: Object.keys(mintNotional).length,
+      mintNotional,
+      costDrag: startingCash > 0 ? (agent.stageCosts ?? 0) / startingCash : 0,
+      maxSingleTradeReturn: agent.researchMaxSingleTradeReturn ?? 0,
+      totalPositiveReturn: agent.researchTotalPositiveReturn ?? 0,
+      maxDrawdown: agent.stageMaxDrawdown ?? 0,
+      observations: agent.stageObservations ?? 0,
+      netReturn: startingCash > 0 ? (agent.stagePnl ?? 0) / startingCash : 0,
+    };
+  }
+
+  /** Freeze a research candidate's evidence before it leaves the population. */
+  function captureResearchEvidence(agent) {
+    const evidence = evidenceFromAgent(agent);
+    if (!evidence) return;
+    researchLedger.set(evidence.familyId, { ...evidence, alive: false });
+  }
+
+  /** Current evidence for every tracked research candidate, alive or culled. */
+  function getResearchEvidence() {
+    const merged = new Map(researchLedger);
+    for (const agent of population) {
+      const evidence = evidenceFromAgent(agent);
+      if (evidence) merged.set(evidence.familyId, evidence);
+    }
+    return [...merged.values()];
+  }
+
+  /** Drop finalized evidence records once the research cycle has consumed them. */
+  function clearResearchEvidence(familyIds) {
+    for (const id of familyIds ?? []) researchLedger.delete(id);
+  }
+
+  /**
+   * Inject one deterministically-compiled research candidate into the live
+   * population, replacing the current lowest-fitness agent. Population size
+   * is invariant by construction (a replace, never an append). The injected
+   * agent is an ordinary genome from the moment it exists — it competes,
+   * survives, or dies under the exact same rules as any other agent; nothing
+   * here grants it special selection privilege.
+   */
+  function injectResearchCandidate({
+    genome,
+    species = null,
+    familyId,
+    proposalId,
+    authorRole = null,
+    targetRegimes = [],
+    abstainRegimes = [],
+  } = {}) {
+    if (!genome || population.length === 0 || !familyId) return null;
+
+    for (const agent of population) agent.fitness = fitness(agent);
+    let worstIdx = 0;
+    for (let i = 1; i < population.length; i += 1) {
+      if (population[i].fitness < population[worstIdx].fitness) worstIdx = i;
+    }
+    const victim = population[worstIdx];
+    if (victim.researchMeta) captureResearchEvidence(victim);
+
+    const resolvedSpecies = SPECIES.includes(species) ? species : SPECIES[Math.floor(random() * SPECIES.length)];
+    const agent = makeAgent({
+      genome,
+      species: resolvedSpecies,
+      parents: [],
+      origin: ORIGIN.RESEARCH,
+      born: generation,
+      label: familyId,
+    });
+    agent.researchMeta = { familyId, proposalId: proposalId ?? null, authorRole };
+    agent.targetRegimes = Array.isArray(targetRegimes) ? [...targetRegimes] : [];
+    agent.abstainRegimes = Array.isArray(abstainRegimes) ? [...abstainRegimes] : [];
+    population[worstIdx] = agent;
+    return agent.id;
   }
 
   function breedGeneration(explicitCtx = null) {
@@ -678,7 +944,12 @@ export function createSimulation({
       agent.fitness = fitness(agent);
     }
 
-    population.sort((a, b) => b.fitness - a.fitness);
+    // Evidence-sufficient agents are always ranked ahead of everything else,
+    // fitness breaking ties within each tier. This is what stops a one-trade
+    // lucky winner from dominating selection: no matter how large its raw
+    // fitness number is, it cannot outrank a properly evidenced agent — it
+    // can only compete with other unproven agents. See rankForSelection.
+    population = rankForSelection(population, evidenceOptions);
     const best = population[0];
     const averageReturn =
       population.reduce((sum, agent) => sum + (agent.equity - startingCash) / startingCash, 0) /
@@ -695,12 +966,21 @@ export function createSimulation({
     };
 
     const eliteCount = Math.max(1, Math.floor(populationSize * eliteFraction));
-    const breederCount = Math.max(2, Math.floor(populationSize * breederFraction));
+    // Survivors: a wider, evidence-ranked tier that lives on unculled beyond
+    // just the elites, so replacement per generation stays well below the
+    // ~90% a pure elites-only-survive policy produces at the default 10%
+    // elite fraction. Insufficient-evidence agents may still occupy a
+    // survivor slot (they are not killed for lack of evidence) — they are
+    // just never able to out-rank evidenced agents to get there.
+    const survivorCount = Math.max(
+      eliteCount,
+      Math.min(populationSize, Math.round(populationSize * survivorFraction)),
+    );
     const immigrantCount = Math.max(0, Math.floor(populationSize * immigrantRate));
     const elites = population.slice(0, eliteCount);
-    const breeders = population.slice(0, breederCount);
-    const deaths = populationSize - eliteCount;
-    const culled = population.slice(eliteCount);
+    const survivorPool = population.slice(0, survivorCount);
+    const deaths = populationSize - survivorCount;
+    const culled = population.slice(survivorCount);
     trackDeaths(culled);
 
     addEvent(
@@ -709,60 +989,155 @@ export function createSimulation({
     );
     addEvent("DEATH", `${deaths} weak agents terminated by selection.`);
 
-    const next = elites.map(resetSurvivor);
+    const next = survivorPool.map(resetSurvivor);
 
-    while (next.length < populationSize - immigrantCount) {
-      const a = breeders[Math.floor(random() * breeders.length)];
-      const b = breeders[Math.floor(random() * breeders.length)];
-      const childSpecies = random() < speciesInheritanceRate ? a.species : b.species;
-      const useCrossover = random() < crossoverRate;
-      const genome = useCrossover
-        ? crossoverGenomes(a.genome, b.genome, {
-            random,
-            species: evolutionOptions.speciesPull ? childSpecies : null,
-          })
-        : mutateGenome(a.genome, {
-            scale: mutationScale,
-            random,
-            species: evolutionOptions.speciesPull ? childSpecies : null,
-          });
+    // --- Phase 5A: island migration -----------------------------------------
+    // A bounded fraction of this generation's survivors emigrate to a
+    // different island (their genome carries over unchanged; only the label
+    // that governs future breeding changes). Bounded by both a rate and an
+    // absolute per-generation cap so migration informs without homogenizing.
+    if (islandsEnabled && islandMigrationRate > 0 && islandMaxMigrations > 0) {
+      let migrations = 0;
+      for (const agent of next) {
+        if (migrations >= islandMaxMigrations) break;
+        if (random() >= islandMigrationRate) continue;
+        const destination = pickOtherIsland(islandNames, agent.species, random);
+        if (!destination) continue;
+        trackMigration(agent.species, destination);
+        agent.species = destination;
+        agent.origin = ORIGIN.SURVIVOR;
+        migrations += 1;
+      }
+    }
 
+    // --- Phase 5A: island-scoped births --------------------------------------
+    // First, the long-standing global exploration floor: a fixed fraction of
+    // every generation's births are pure random immigrants, species picked
+    // uniformly (unchanged from pre-5A behavior — EVOLVE_IMMIGRANT_RATE).
+    for (let i = 0; i < immigrantCount && next.length < populationSize; i += 1) {
+      const species = SPECIES[Math.floor(random() * SPECIES.length)];
       next.push(
-        makeAgent({
-          genome,
-          species: childSpecies,
-          parents: a.id === b.id ? [a.id] : [a.id, b.id],
-          origin: useCrossover ? ORIGIN.CROSSOVER : ORIGIN.MUTATION,
-          lineageId: a.lineageId,
-          born: generation + 1,
-        }),
+        makeAgent({ genome: randomGenome(species, random), species, parents: [], origin: ORIGIN.IMMIGRANT, born: generation + 1 }),
       );
     }
 
+    // Remaining births are allocated per island, proportional to how far
+    // under its target each island currently sits (after migration + the
+    // random-immigrant floor above), so breeding pulls every island back
+    // toward its target share instead of drifting wherever fitness happens
+    // to concentrate this generation.
+    const targets = islandTargets();
+    function currentIslandCounts() {
+      const counts = Object.fromEntries(islandNames.map((name) => [name, 0]));
+      for (const agent of next) counts[agent.species] = (counts[agent.species] ?? 0) + 1;
+      return counts;
+    }
+
+    // Breeder pools are a fixed snapshot taken once, before any of this
+    // generation's births are added — never recomputed mid-loop. Otherwise a
+    // just-born (fitness-0) sibling could become eligible to breed later in
+    // the same generation's island loop, diluting "breed from proven
+    // survivors" into "breed from whatever was added first."
+    const breederPools = new Map(
+      islandNames.map((name) => {
+        const local = next
+          .filter((agent) => agent.species === name)
+          .sort((a, b) => (b.fitness ?? -Infinity) - (a.fitness ?? -Infinity));
+        const count = local.length === 0 ? 0 : Math.max(1, Math.round(local.length * breederFraction));
+        return [name, local.slice(0, count)];
+      }),
+    );
+    function breedersForIsland(name) {
+      return breederPools.get(name) ?? [];
+    }
+
+    const remainingBirths = Math.max(0, populationSize - next.length);
+    const deficits = {};
+    const counts = currentIslandCounts();
+    for (const name of islandNames) deficits[name] = targets[name] - counts[name];
+    const allocation = islandsEnabled
+      ? allocateBirths(deficits, remainingBirths)
+      : { [islandNames[0]]: remainingBirths };
+
+    for (const name of islandNames) {
+      const slots = allocation[name] ?? 0;
+      if (slots <= 0) continue;
+      const wasExtinctBeforeThisGeneration = counts[name] === 0;
+      for (let i = 0; i < slots; i += 1) {
+        if (islandRandomImmigrantRate > 0 && random() < islandRandomImmigrantRate) {
+          next.push(
+            makeAgent({ genome: randomGenome(name, random), species: name, parents: [], origin: ORIGIN.IMMIGRANT, born: generation + 1 }),
+          );
+          continue;
+        }
+
+        const localBreeders = breedersForIsland(name);
+        if (localBreeders.length === 0) {
+          // Extinct island: revive with a fresh random genome rather than
+          // leaving the target permanently unfilled. Not the same as
+          // protecting a poor island — a revived island still has to earn
+          // its way back through ordinary fitness selection from here.
+          if (islandReviveExtinct) {
+            next.push(
+              makeAgent({ genome: randomGenome(name, random), species: name, parents: [], origin: ORIGIN.IMMIGRANT, born: generation + 1 }),
+            );
+            if (wasExtinctBeforeThisGeneration) trackRevival(name);
+          }
+          continue;
+        }
+
+        const useCrossIsland = islandsEnabled && random() < crossSpeciesCrossoverRate;
+        const otherIsland = useCrossIsland ? pickOtherIsland(islandNames, name, random) : null;
+        const otherBreeders = otherIsland ? breedersForIsland(otherIsland) : [];
+
+        const a = localBreeders[Math.floor(random() * localBreeders.length)];
+        const b = otherBreeders.length > 0 ? otherBreeders[Math.floor(random() * otherBreeders.length)] : localBreeders[Math.floor(random() * localBreeders.length)];
+
+        const useCrossover = random() < crossoverRate;
+        const genome = useCrossover
+          ? crossoverGenomes(a.genome, b.genome, { random, species: evolutionOptions.speciesPull ? name : null })
+          : mutateGenome(a.genome, { scale: mutationScale, random, species: evolutionOptions.speciesPull ? name : null });
+
+        next.push(
+          makeAgent({
+            genome,
+            species: name,
+            parents: a.id === b.id ? [a.id] : [a.id, b.id],
+            origin: useCrossover ? ORIGIN.CROSSOVER : ORIGIN.MUTATION,
+            lineageId: a.lineageId,
+            born: generation + 1,
+          }),
+        );
+      }
+    }
+
+    // Deterministic backstop: rounding inside allocateBirths/migration can
+    // leave the population a handful of agents short in edge configurations
+    // (e.g. every island simultaneously extinct with revival disabled) —
+    // fill any remainder with plain random immigrants so populationSize is
+    // always exact, never a best-effort approximation.
     while (next.length < populationSize) {
       const species = SPECIES[Math.floor(random() * SPECIES.length)];
       next.push(
-        makeAgent({
-          genome: randomGenome(species, random),
-          species,
-          parents: [],
-          origin: ORIGIN.IMMIGRANT,
-          born: generation + 1,
-        }),
+        makeAgent({ genome: randomGenome(species, random), species, parents: [], origin: ORIGIN.IMMIGRANT, born: generation + 1 }),
       );
     }
+    if (next.length > populationSize) next.length = populationSize;
 
     for (const agent of next.slice(0, elites.length)) {
       agent.origin = ORIGIN.ELITE;
     }
+    for (const agent of next.slice(elites.length, survivorPool.length)) {
+      agent.origin = ORIGIN.SURVIVOR;
+    }
 
     terminatedTotal += deaths;
-    bornTotal += next.length - eliteCount;
+    bornTotal += next.length - survivorCount;
     generation += 1;
     generationTick = 0;
     population = next;
     trackCensus();
-    addEvent("BIRTH", `${populationSize - eliteCount} new agents entered generation ${generation}.`);
+    addEvent("BIRTH", `${populationSize - survivorCount} new agents entered generation ${generation}.`);
   }
 
   function averageReturnSafe(value) {
@@ -824,6 +1199,23 @@ export function createSimulation({
             .slice(0, scanLimit)
         : tradeable;
 
+    // Phase 5A: live regime classification. The same deterministic classifier
+    // the Arena uses on historical windows (arena/orchestrator.mjs
+    // classifyWindowRegime) over a small bounded rolling buffer of
+    // already-observed ticks (REGIME_BUFFER_SIZE), so replaying the same data
+    // reproduces the same regime sequence and therefore the same activation
+    // states. Computed every tick regardless of whether any agent currently
+    // uses it: cost is bounded by the buffer size, not by population, and the
+    // research evidence packet needs a regime label even in the very first
+    // cycle, before any research candidate exists to read it back.
+    tickSnapshotBuffer.push({ t: at, markets });
+    if (tickSnapshotBuffer.length > REGIME_BUFFER_SIZE) tickSnapshotBuffer.shift();
+    try {
+      currentRegimeLabel = classifyWindowRegime(tickSnapshotBuffer)?.regime ?? null;
+    } catch {
+      currentRegimeLabel = null;
+    }
+
     const ctx = {
       at,
       markets,
@@ -833,6 +1225,7 @@ export function createSimulation({
       minLiquidityUsd: config.minLiquidityUsd,
       friction: config.paper,
       bestScore: null,
+      regime: currentRegimeLabel,
     };
 
     for (const agent of population) {
@@ -965,6 +1358,49 @@ export function createSimulation({
       };
     }).sort((a, b) => b.count - a.count || b.avgReturn - a.avgReturn);
 
+    // Phase 5A: strategy islands. An island IS a species label used as a
+    // breeding boundary (see engine/islands.mjs) — this reuses the same
+    // per-species membership as `species` above but reports the numbers that
+    // actually describe island *behavior* (target, migration, revival,
+    // evidence sufficiency) rather than just a dashboard grouping.
+    const currentIslandTargets = islandTargets();
+    const islands = islandNames
+      .map((name) => {
+        const members = population.filter((agent) => agent.species === name);
+        const stats = speciesStats.get(name) ?? {
+          births: 0,
+          deaths: 0,
+          migrationsIn: 0,
+          migrationsOut: 0,
+          revivals: 0,
+          extinctionEvents: 0,
+        };
+        const avgReturn =
+          members.length === 0
+            ? 0
+            : members.reduce((sum, agent) => sum + (agent.equity - startingCash) / startingCash, 0) /
+              members.length;
+        const avgFitness =
+          members.length === 0 ? 0 : members.reduce((sum, agent) => sum + agent.fitness, 0) / members.length;
+        return {
+          name,
+          target: currentIslandTargets[name] ?? 0,
+          population: members.length,
+          births: stats.births,
+          deaths: stats.deaths,
+          migrationsIn: stats.migrationsIn,
+          migrationsOut: stats.migrationsOut,
+          revivals: stats.revivals,
+          extinctionEvents: stats.extinctionEvents,
+          avgReturn: averageReturnSafe(avgReturn),
+          avgFitness: averageReturnSafe(avgFitness),
+          trades: members.reduce((sum, agent) => sum + agent.trades, 0),
+          evidenceSufficientCount: members.filter((agent) => hasSufficientEvidence(agent, evidenceOptions)).length,
+          extinct: members.length === 0,
+        };
+      })
+      .sort((a, b) => b.population - a.population || a.name.localeCompare(b.name));
+
     history.push({
       t: at,
       generation,
@@ -1032,6 +1468,13 @@ export function createSimulation({
       tick: generationTick,
       generationTicks,
       marketRegime: regime(markets),
+      // Phase 5A: the Arena-vocabulary regime label (REGIMES in
+      // arena/orchestrator.mjs — "broad-selloff", "liquidity-expansion", etc.),
+      // distinct from the coarse `marketRegime` label above. This is what the
+      // research evidence packet and any research candidate's abstention
+      // decision actually key off; `null` until enough ticks have
+      // accumulated to classify anything.
+      researchRegime: currentRegimeLabel,
       marketBreadth: round(upShare * 100, 2),
       stats: {
         population: populationSize,
@@ -1051,6 +1494,9 @@ export function createSimulation({
         bestReturn: ranked[0]
           ? averageReturnSafe((ranked[0].equity - startingCash) / startingCash)
           : 0,
+        // Alias of `population` above, named for the dashboard's "current vs
+        // target" population readout (Phase 5A: EVOLVE_POPULATION_SIZE).
+        populationTarget: populationSize,
       },
       evolution: {
         enabled: evolutionEnabled,
@@ -1061,6 +1507,9 @@ export function createSimulation({
         immigrantRate,
         eliteFraction,
         breederFraction,
+        survivorFraction,
+        minTradesForSelection,
+        minObservationsForSelection,
         marketScanLimit: scanLimit,
         trackTrades: recordTrades,
       },
@@ -1107,9 +1556,21 @@ export function createSimulation({
             }
           : null,
         genome: genomeSummary(agent.genome),
+        // Phase 5A: present only for research-compiled candidates.
+        research: agent.researchMeta
+          ? {
+              familyId: agent.researchMeta.familyId,
+              proposalId: agent.researchMeta.proposalId,
+              authorRole: agent.researchMeta.authorRole,
+              targetRegimes: [...(agent.targetRegimes ?? [])],
+              abstainRegimes: [...(agent.abstainRegimes ?? [])],
+              posture: agent.researchPosture ?? ABSTAIN_STATE.ACTIVE,
+            }
+          : null,
       })),
       positions,
       species,
+      islands,
       markets: markets.slice(0, maxStateMarkets).map(compactMarket),
       marketSummary: {
         observed: markets.length,
@@ -1159,5 +1620,13 @@ export function createSimulation({
     addEventPublic: addEvent,
     stats: () => ({ totalTrades }),
     speciesRoles: SPECIES_ROLES,
+    // Phase 5A: research-swarm integration surface. Islands need no new
+    // methods — they are visible through snapshot().islands — but injection
+    // and evidence collection are driven from outside this module (the async
+    // research cycle in evolve-engine.mjs), so they are exposed here.
+    injectResearchCandidate,
+    getResearchEvidence,
+    clearResearchEvidence,
+    islandNames: Object.freeze([...islandNames]),
   };
 }

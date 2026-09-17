@@ -25,12 +25,16 @@ import {
   loadChampionCandidates,
   mergeHallOfFameRecord,
   ensureDir,
+  buildRegimeMap,
   DEFAULT_ARENA_DIR,
   DEFAULT_HOF_DIR,
   ARENA_STAGE,
 } from "./arena/orchestrator.mjs";
 import { buildEntrantPool, runArenaTournament } from "./arena/tournament.mjs";
+import { planDatasetWindows } from "./arena/evaluator.mjs";
 import { digestOf } from "./lib/hash.mjs";
+import { listCompiledCandidates, readMemoryIndex } from "./research/memory.mjs";
+import { promoteFromArenaLeaderboard } from "./research/promote.mjs";
 
 const PAPER_NOTICE =
   "PAPER ONLY. Every number is simulated paper accounting over historical observations. Arena results do NOT predict future profitability.";
@@ -115,9 +119,25 @@ async function main() {
   const champions = await loadChampionCandidates(config.championsDir ?? ".evolve/champions");
   console.log(`[arena] population=${population} seeds=${seeds.length} champions re-entering=${champions.length} workers=${workers || "auto"} generations=${generations}`);
 
-  const datasetRefs = datasets.map((d) => ({ dir: d.dir, id: d.datasetId, fingerprint: d.fingerprint, sourceType: d.sourceType }));
   const cacheDir = path.join(".evolve", "arena-cache");
   const useCache = args["no-cache"] !== true;
+  const maxWindows = args["max-windows"] ? Number(args["max-windows"]) : null;
+
+  // Precompute each window's market regime from its own TEST-interval
+  // snapshots (deterministic, no look-ahead) so the tournament can group OOS
+  // performance by regime instead of every window reporting "unknown".
+  const datasetRefs = [];
+  for (const d of datasets) {
+    const ref = { dir: d.dir, id: d.datasetId, fingerprint: d.fingerprint, sourceType: d.sourceType, regimesByWindow: {} };
+    try {
+      const { windows } = await planDatasetWindows(d.dir, config, { maxWindows, allowShort: true });
+      const regimeRows = await buildRegimeMap(d.dir, windows);
+      ref.regimesByWindow = Object.fromEntries(regimeRows.map((row) => [row.window, row]));
+    } catch (error) {
+      console.error(`[arena] regime classification failed for ${d.datasetId}: ${error?.message ?? error}`);
+    }
+    datasetRefs.push(ref);
+  }
 
   let entrants = buildEntrantPool({
     champions,
@@ -162,7 +182,24 @@ async function main() {
       immigrantShare: 0.15,
     });
   }
-  console.log(`[arena] entrants: ${entrants.length} (champions ${entrants.filter((e) => e.origin === "champion").length}, evolved ${entrants.filter((e) => e.origin === "evolved").length}, immigrants ${entrants.filter((e) => e.origin === "immigrant").length})`);
+  // ---- Phase 5A: optional research candidates -----------------------------
+  // Off by default: a real arena run's population is a fixed, requested size,
+  // and research candidates are additive on top of it, never a silent
+  // substitute for the existing champion/evolved/immigrant mix. Matching back
+  // to research memory afterward is by genome digest (promote.mjs) — no
+  // special-case identity needs to flow through the tournament itself.
+  const includeResearch = args.research === true || process.env.EVOLVE_ARENA_INCLUDE_RESEARCH === "1";
+  const researchRoot = config.research?.root ?? ".evolve/research";
+  if (includeResearch) {
+    const compiledCandidates = await listCompiledCandidates(researchRoot);
+    for (const candidate of compiledCandidates) {
+      if (!candidate?.genome) continue;
+      entrants.push({ genome: candidate.genome, species: candidate.species ?? "Experimental", origin: "research", digest: digestOf(candidate.genome) });
+    }
+    console.log(`[arena] research candidates added: ${compiledCandidates.length} (from ${researchRoot})`);
+  }
+
+  console.log(`[arena] entrants: ${entrants.length} (champions ${entrants.filter((e) => e.origin === "champion").length}, evolved ${entrants.filter((e) => e.origin === "evolved").length}, immigrants ${entrants.filter((e) => e.origin === "immigrant").length}, research ${entrants.filter((e) => e.origin === "research").length})`);
 
   const arenaId = `arena-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}`;
   const stressProfiles = ["mild", "moderate"];
@@ -173,7 +210,7 @@ async function main() {
     entrants,
     seeds,
     stressProfiles,
-    maxWindows: args["max-windows"] ? Number(args["max-windows"]) : null,
+    maxWindows,
     workers,
     cacheDir,
     useCache,
@@ -183,6 +220,27 @@ async function main() {
       if (message) console.log(`[arena] ${message}`);
     },
   });
+
+  // ---- Phase 5A: promote research memory from this Arena's real result ----
+  // The ONLY place a research proposal can reach PROMISING/ARENA_SURVIVOR/
+  // SHADOW_ELIGIBLE — never the research cycle itself. Runs unconditionally
+  // (cheap no-op when no compiled candidates exist), independent of whether
+  // this run's entrants were told to include research candidates, so an
+  // operator can promote against an arena run from research candidates added
+  // in a previous invocation too.
+  try {
+    const memoryRecords = await readMemoryIndex(researchRoot, { limit: 2000 });
+    const promotion = await promoteFromArenaLeaderboard({
+      root: researchRoot,
+      leaderboardRows: result.summary.leaderboard,
+      memoryRecords,
+    });
+    if (promotion.promoted.length > 0) {
+      console.log(`[arena] research memory promoted: ${promotion.promoted.map((p) => `${p.familyId}->${p.to}`).join(", ")}`);
+    }
+  } catch (error) {
+    console.error(`[arena] research promotion skipped: ${error?.message ?? error}`);
+  }
 
   // ---- Hall of Fame merge -------------------------------------------------
   const hofDir = config.hallOfFameDir ?? DEFAULT_HOF_DIR;

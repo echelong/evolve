@@ -101,16 +101,24 @@ export function summarizeAgent(agent, { startingCash = 100, ledger = null } = {}
       : 0;
 
   const mintPnl = new Map();
+  // Concentration is measured by executed notional, not by which mint
+  // happened to be profitable — a genome that puts most of its size through
+  // one mint is concentrated even if that mint's P&L nets out near zero.
+  const mintNotional = new Map();
+  let totalNotional = 0;
   for (const row of ledgerRows) {
     const mint = typeof row.mint === "string" && row.mint.length > 0 ? row.mint : "unknown";
     mintPnl.set(mint, (mintPnl.get(mint) ?? 0) + finite(row.net, 0));
+    const notional = Math.max(0, finite(row.notional, 0));
+    mintNotional.set(mint, (mintNotional.get(mint) ?? 0) + notional);
+    totalNotional += notional;
   }
 
-  const positiveTotal = [...mintPnl.values()]
-    .filter((value) => value > 0)
-    .reduce((sum, value) => sum + value, 0);
-  const maxMintPnl = [...mintPnl.values()].reduce((max, value) => Math.max(max, value), 0);
-  const maxTradePnl = perTrade.reduce((max, value) => Math.max(max, value), 0);
+  const maxNotionalByTrade = ledgerRows.reduce(
+    (max, row) => Math.max(max, Math.max(0, finite(row.notional, 0))),
+    0,
+  );
+  const maxMintNotional = [...mintNotional.values()].reduce((max, value) => Math.max(max, value), 0);
 
   const wins = ledgerRows.filter((row) => finite(row.net, 0) > 0).length;
 
@@ -148,8 +156,15 @@ export function summarizeAgent(agent, { startingCash = 100, ledger = null } = {}
     meanTradePnl: round(meanTrade, 4),
     tradeVolatility: round(stdDevTrade, 4),
     downsideDeviation: round(downsideDeviation, 4),
-    topMintShare: round(positiveTotal > 0 ? maxMintPnl / positiveTotal : 0, 4),
-    topTradeShare: round(positiveTotal > 0 ? maxTradePnl / positiveTotal : 0, 4),
+    // Concentration, by executed notional: share of all trading size that
+    // went through the single most-traded mint / single largest trade. 0 when
+    // there is no notional (no trades); 1 only when every dollar traded went
+    // through one mint / one trade. See aggregateCandidateEvaluation in
+    // arena/orchestrator.mjs for how these pool across seeds/windows/stress.
+    topMintShare: round(totalNotional > 0 ? maxMintNotional / totalNotional : 0, 4),
+    topTradeShare: round(totalNotional > 0 ? maxNotionalByTrade / totalNotional : 0, 4),
+    totalNotional: round(totalNotional, 2),
+    mintNotional: Object.fromEntries(mintNotional),
     consistency: round(consistency, 4),
     holding: Boolean(agent?.position),
   };

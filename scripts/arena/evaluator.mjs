@@ -171,6 +171,12 @@ export async function evaluateCandidateOnDataset({
       } else {
         run = { ...run, fromCache: true };
       }
+      // Tagged per-run (not just on the wrapping evaluation object): the
+      // caller flattens oosRuns/stressRuns from every dataset into one array
+      // per candidate, so the regime lookup in aggregateCandidateEvaluation
+      // needs each run to know which dataset — and therefore which window's
+      // regime map — it belongs to.
+      run.datasetDir = datasetDir;
 
       oosRuns.push(run);
       if (onProgress) onProgress({ stage: "OOS", seed, window: window.label, ticks: run.ticks });
@@ -218,6 +224,7 @@ export async function evaluateCandidateOnDataset({
       } else {
         run = { ...run, fromCache: true };
       }
+      run.datasetDir = datasetDir;
 
       stressRuns.push(run);
       if (onProgress) onProgress({ stage: "STRESS", seed, profile: profileName, ticks: run.ticks });

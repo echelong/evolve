@@ -21,7 +21,16 @@ import { digestOf, shortDigest } from "../lib/hash.mjs";
 import { createSeededRandom } from "../lib/random.mjs";
 import { randomGenome, mutateGenome, crossoverGenomes, SPECIES } from "../engine/genome.mjs";
 import { runBaselines } from "../engine/baselines.mjs";
-import { adaptMutationScale, ARENA_CACHE_VERSION, computeGenomeMetrics, diversityVerdict } from "./orchestrator.mjs";
+import {
+  adaptMutationScale,
+  ARENA_CACHE_VERSION,
+  ARENA_SCORE_VERSION,
+  computeGenomeMetrics,
+  diversityVerdict,
+  DEFAULT_DEPLOYMENT_GATES,
+  STRESS_PROFILES,
+} from "./orchestrator.mjs";
+import { EVALUATOR_VERSION } from "./evaluator.mjs";
 
 export const ARENA_RUNNER_VERSION = 1;
 
@@ -278,13 +287,25 @@ export async function runArenaTournament({
     .map(([entrant, row]) => ({ entrant, ...row }))
     .sort((a, b) => b.arenaScore - a.arenaScore);
 
+  // Every stage's `rule` documents exactly what "survivors" means there.
+  // STRESS genuinely culls (candidates.json still carries full stress detail
+  // for every entrant, survivor or not, so a candidate that failed stress can
+  // always be found and inspected even though it never reached this count).
   const funnel = {
-    QUALIFICATION: { entered: qualification.entered, survivors: qualification.survivors.length },
-    GROUP: { entered: group.entered, survivors: group.survivors.length },
-    STRESS: { entered: stress.entered, survivors: stress.survivors.length },
-    "OUT-OF-SAMPLE": { entered: championLeague.entered, survivors: championLeague.survivors.length },
-    "CHAMPION LEAGUE": { entered: championLeague.entered, survivors: championLeague.survivors.length },
-    DEPLOYMENT: { entered: entrants.length, survivors: deploymentCandidates.length },
+    QUALIFICATION: { entered: qualification.entered, survivors: qualification.survivors.length, rule: qualification.rule },
+    GROUP: { entered: group.entered, survivors: group.survivors.length, rule: group.rule },
+    STRESS: { entered: stress.entered, survivors: stress.survivors.length, rule: stress.rule },
+    "OUT-OF-SAMPLE": {
+      entered: championLeague.entered,
+      survivors: championLeague.survivors.length,
+      rule: "carried forward from STRESS survivors; out-of-sample windows were already evaluated for every entrant in phase A",
+    },
+    "CHAMPION LEAGUE": { entered: championLeague.entered, survivors: championLeague.survivors.length, rule: championLeague.rule },
+    DEPLOYMENT: {
+      entered: entrants.length,
+      survivors: deploymentCandidates.length,
+      rule: "passed every configured deployment gate (evaluateSurvivalGates) — see candidates[].gates for per-candidate detail",
+    },
   };
 
   // ---------------- Diversity + adaptive mutation ---------------------------
@@ -334,6 +355,12 @@ export async function runArenaTournament({
         origin: entrant.origin,
         score: round2(score),
         status: statuses.get(entrant)?.status,
+        // Compact elimination context: which named gates this candidate
+        // failed, not the whole candidate/gate-detail object (see
+        // candidates.json for full per-gate pass/fail + numbers).
+        failedGates: (statuses.get(entrant)?.gates ?? [])
+          .filter((gate) => !gate.pass)
+          .map((gate) => gate.label),
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 50),
@@ -351,7 +378,19 @@ export async function runArenaTournament({
   };
 
   if (arenasDir && arenaId) {
-    await writeArenaOutputs({ arenasDir, arenaId, summary, details, statuses, entrants, scored });
+    await writeArenaOutputs({
+      arenasDir,
+      arenaId,
+      summary,
+      details,
+      statuses,
+      entrants,
+      scored,
+      config,
+      evidence,
+      stressProfiles,
+      gatesConfig: config.arena?.gates ?? {},
+    });
   }
 
   return { summary, details, statuses, scored, evaluations };
@@ -525,7 +564,19 @@ function round2(value) {
 /* Output writing                                                             */
 /* -------------------------------------------------------------------------- */
 
-async function writeArenaOutputs({ arenasDir, arenaId, summary, details, statuses, entrants, scored }) {
+async function writeArenaOutputs({
+  arenasDir,
+  arenaId,
+  summary,
+  details,
+  statuses,
+  entrants,
+  scored,
+  config = {},
+  evidence = null,
+  stressProfiles = [],
+  gatesConfig = {},
+}) {
   const dir = path.join(arenasDir, arenaId);
   await mkdir(dir, { recursive: true });
 
@@ -558,15 +609,31 @@ async function writeArenaOutputs({ arenasDir, arenaId, summary, details, statuse
     await writeFile(path.join(dir, name), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   }
 
+  // Reproducibility record: everything needed to re-run this exact arena and
+  // get the same result — scoring/evaluator code versions, the walk-forward
+  // and evidence config actually used, the deployment gates actually applied,
+  // and the exact stress-profile overlay parameters (not just their names, in
+  // case defaults change later). Datasets/fingerprints/seeds already live in
+  // summary.json, so they are not duplicated here.
   await writeFile(
     path.join(dir, "manifest.json"),
     `${JSON.stringify(
       {
         arenaId,
-        schemaVersion: 1,
+        schemaVersion: 2,
         arenaRunnerVersion: ARENA_RUNNER_VERSION,
         arenaCacheVersion: ARENA_CACHE_VERSION,
+        arenaScoreVersion: ARENA_SCORE_VERSION,
+        evaluatorVersion: EVALUATOR_VERSION,
         createdAt: new Date().toISOString(),
+        walkForward: config.walkForward ?? null,
+        evidenceThresholds: evidence ?? config.evidence ?? null,
+        deploymentGates: { ...DEFAULT_DEPLOYMENT_GATES, ...gatesConfig },
+        stressProfileDefinitions: Object.fromEntries(
+          (stressProfiles.length > 0 ? stressProfiles : Object.keys(STRESS_PROFILES))
+            .filter((name) => STRESS_PROFILES[name])
+            .map((name) => [name, STRESS_PROFILES[name]]),
+        ),
         paperOnly: true,
         note: "Paper research output. No real-money execution exists in this repository.",
       },

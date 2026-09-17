@@ -13,10 +13,18 @@
 export const ORIGIN = Object.freeze({
   FOUNDER: "founder",
   ELITE: "elite",
+  // Carried forward unculled (evidence-checked survivor tier) but not one of
+  // the top elites. See DEFAULT_EVOLUTION.survivorFraction in simulation.mjs.
+  SURVIVOR: "survivor",
   CROSSOVER: "crossover",
   MUTATION: "mutation",
   IMMIGRANT: "immigrant",
   FROZEN: "frozen-candidate",
+  // Phase 5A: compiled from a validated research proposal (see
+  // scripts/research/). Still an ordinary genome from the moment it is born —
+  // no special privilege, subject to the exact same fitness/selection/death
+  // rules as any other agent.
+  RESEARCH: "research",
 });
 
 export function createGenealogy({ maxNodes = 20_000 } = {}) {

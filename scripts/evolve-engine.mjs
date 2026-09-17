@@ -21,6 +21,8 @@ import { serializeForPublic } from "./lib/sanitize.mjs";
 import { createMarketConfig, publicConfig } from "./market/config.mjs";
 import { createMarketFeed } from "./market/feed.mjs";
 import { REPLAY_BANNER } from "./market/replay.mjs";
+import { buildEvidencePacket, runResearchCycle } from "./research/cycle.mjs";
+import { loadPriorConclusions, readMemoryIndex } from "./research/memory.mjs";
 
 export const STATE_DIR = ".evolve";
 export const STATE_FILE = "state.json";
@@ -55,7 +57,13 @@ export function createEngine({ config = createMarketConfig(), now, random } = {}
     onEvent: ({ type, message }) => simulation?.addEvent(type, message),
   });
 
-  simulation = createSimulation({ config, feed, now, random });
+  simulation = createSimulation({
+    config,
+    feed,
+    now,
+    random,
+    evolution: { enabled: true, ...config.evolution },
+  });
 
   return { config, feed, simulation };
 }
@@ -94,6 +102,119 @@ export function startupLines({ config }) {
   return lines;
 }
 
+/**
+ * Phase 5A: drives the controlled recursive research cycle from the live
+ * engine loop. The heavy lifting (propose / validate / compile / watchdog /
+ * memory) lives in research/cycle.mjs and is simulation-agnostic; this
+ * controller is the thin, engine-specific glue: when to run a cycle, how to
+ * turn a live snapshot into an evidence packet, and how to inject whatever
+ * the cycle compiles back into the running population.
+ *
+ * Failures here are always caught and logged — a research cycle can delay
+ * research, never the paper engine itself.
+ */
+export function createResearchController({ config, simulation }) {
+  const researchConfig = config.research ?? {};
+  const enabled = researchConfig.enabled !== false;
+  const root = researchConfig.root ?? ".evolve/research";
+  const cycleEveryGenerations = Math.max(0, Math.round(researchConfig.cycleEveryGenerations ?? 2));
+
+  let cycle = 0;
+  let lastGenerationRun = -1;
+  const summary = {
+    enabled,
+    provider: researchConfig.provider ?? "mock",
+    cycle: 0,
+    proposalsGenerated: 0,
+    proposalsRejected: 0,
+    compiledCandidates: 0,
+    watchCount: 0,
+    quarantinedCount: 0,
+    memoryRecords: 0,
+    lastRunAt: null,
+    lastError: null,
+    log: [], // bounded, most-recent-first, for the dashboard activity feed
+  };
+
+  function dueThisGeneration() {
+    if (!enabled) return false;
+    const generation = simulation.generation;
+    if (generation === lastGenerationRun) return false;
+    if (cycleEveryGenerations === 0) return true;
+    return generation - Math.max(0, lastGenerationRun) >= cycleEveryGenerations;
+  }
+
+  async function runIfDue() {
+    if (!dueThisGeneration()) return summary;
+    lastGenerationRun = simulation.generation;
+    cycle += 1;
+
+    try {
+      const snapshot = simulation.snapshot();
+      const priorConclusions = await loadPriorConclusions(root);
+      const evidence = buildEvidencePacket({
+        snapshot,
+        islands: snapshot.islands ?? [],
+        priorConclusions,
+        cycle,
+      });
+      const pendingEvidence = simulation.getResearchEvidence();
+
+      const report = await runResearchCycle({
+        root,
+        evidence,
+        cycle,
+        seed: `${config.seed ?? "evolve"}:${config.engine.population}`,
+        provider: researchConfig.provider,
+        proposalsPerCycle: researchConfig.proposalsPerCycle,
+        maxCompilations: researchConfig.maxCompilationsPerCycle,
+        watchThresholds: config.researchWatch ?? {},
+        pendingEvidence,
+      });
+
+      for (const entry of report.compiled) {
+        simulation.injectResearchCandidate({
+          genome: entry.genome,
+          species: entry.species,
+          familyId: entry.familyId,
+          proposalId: entry.proposalId,
+          authorRole: entry.authorRole,
+          targetRegimes: entry.targetRegimes,
+          abstainRegimes: entry.abstainRegimes,
+        });
+      }
+      simulation.clearResearchEvidence(report.clearedFamilyIds);
+
+      const memoryIndex = await readMemoryIndex(root, { limit: 500 });
+
+      summary.cycle = cycle;
+      summary.proposalsGenerated += report.proposed;
+      summary.proposalsRejected += report.rejectedSchema.length + report.rejectedCompile.length;
+      summary.compiledCandidates += report.compiled.length;
+      summary.watchCount = report.watchdog.filter((w) => w.verdict === "WATCH").length;
+      summary.quarantinedCount = memoryIndex.filter((r) => r.watchdogVerdict === "QUARANTINED").length;
+      summary.memoryRecords = memoryIndex.length;
+      summary.lastRunAt = new Date().toISOString();
+      summary.lastError = null;
+      summary.log.unshift({
+        cycle,
+        at: summary.lastRunAt,
+        proposed: report.proposed,
+        compiled: report.compiled.length,
+        rejected: report.rejectedSchema.length + report.rejectedCompile.length,
+        watchdogEvaluated: report.watchdog.length,
+      });
+      summary.log = summary.log.slice(0, 10);
+    } catch (error) {
+      summary.lastError = error?.message ?? String(error);
+    }
+
+    return summary;
+  }
+
+  return { runIfDue, summary: () => summary };
+}
+
 /** Persist the snapshot atomically so the dashboard never reads a partial file. */
 export async function persist(state, { dir = STATE_DIR } = {}) {
   const paths = statePaths(dir);
@@ -114,9 +235,16 @@ export async function startEngine({ config = createMarketConfig(), dir = STATE_D
     "Paper mode enforced. No wallet keys are loaded and no on-chain execution path exists.",
   );
 
+  const research = createResearchController({ config, simulation });
+
   const snapshotWithConfig = () => ({
     ...simulation.snapshot(),
     config: publicConfig(config),
+    // Named distinctly from the API route's pre-existing `research` bucket
+    // (experiment/champions/arena/hall-of-fame/shadow reference data) so the
+    // two are never confused: this is the Phase 5A research-swarm cycle
+    // summary specifically.
+    researchSwarm: research.summary(),
   });
 
   await persist(snapshotWithConfig(), { dir });
@@ -130,6 +258,11 @@ export async function startEngine({ config = createMarketConfig(), dir = STATE_D
     ticking = true;
     try {
       simulation.advanceTick();
+      // Best-effort and bounded: a research cycle can only run once per
+      // newly-reached generation boundary (see dueThisGeneration), and any
+      // failure inside it is caught and logged without ever throwing here —
+      // research can lag, the paper engine tick loop must not.
+      await research.runIfDue();
       await persist(snapshotWithConfig(), { dir });
     } catch (error) {
       console.error("[EVOLVE] tick failed:", error?.message ?? error);

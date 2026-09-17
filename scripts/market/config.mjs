@@ -105,6 +105,23 @@ function parseSeedList(value) {
     .map((part) => (/^-?\d+$/.test(part) ? Number(part) : part));
 }
 
+/**
+ * "Genesis Hunter:6,Momentum:5" -> { "Genesis Hunter": 6, Momentum: 5 }.
+ * Unknown island names are dropped (validated against ISLAND_NAMES upstream);
+ * counts below 2 collapse to 2 so an island can always select + breed.
+ */
+function parseIslandCounts(value) {
+  const out = {};
+  if (!value) return out;
+  for (const part of String(value).split(",")) {
+    const [name, rawCount] = part.split(":").map((piece) => piece.trim());
+    if (!name) continue;
+    const count = Math.max(2, Math.round(Number(rawCount)));
+    if (Number.isFinite(count)) out[name] = count;
+  }
+  return out;
+}
+
 function normalizeDashboardSource(value) {
   const allowed = ["auto", "live", "replay"];
   const normalized = String(value ?? "").trim().toLowerCase();
@@ -283,13 +300,113 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
       minExposureTicks: clampNumber(readInt(env, ["EVOLVE_MIN_EXPOSURE_TICKS"], 40), 0, 10_000_000),
     }),
 
+    // --- Phase 5A: strategy islands ------------------------------------------
+    // The live population is split into semi-isolated islands that evolve
+    // predominantly from their own successful genomes, with bounded migration.
+    // The point is to stop one short-lived market regime from immediately
+    // destroying all strategic diversity.
+    islands: Object.freeze({
+      enabled: readBool(env, ["EVOLVE_ISLANDS_ENABLED"], true),
+      // Explicit per-island targets ("Name:count,Name:count"). Unset = split
+      // the population approximately evenly across the enabled islands.
+      targetCounts: parseIslandCounts(readFirst(env, ["EVOLVE_ISLAND_TARGETS"]).value),
+      // Fraction of each island that emigrates to other islands per generation
+      // (bounded: migration informs, it must not homogenize).
+      migrationRate: clampNumber(readNumber(env, ["EVOLVE_ISLAND_MIGRATION_RATE"], 0.04), 0, 0.25),
+      maxMigrationsPerGeneration: clampNumber(
+        readInt(env, ["EVOLVE_ISLAND_MAX_MIGRATIONS"], 12),
+        0,
+        10_000,
+      ),
+      // Probability a bred child is a CROSS-SPECIES crossover (parents drawn
+      // from two different islands). Deliberately conservative: cross-pollination
+      // without homogenization.
+      crossSpeciesCrossoverRate: clampNumber(
+        readNumber(env, ["EVOLVE_CROSS_SPECIES_CROSSOVER_RATE"], 0.05),
+        0,
+        1,
+      ),
+      // Extra random immigrants per generation as a fraction of the population,
+      // on top of the long-standing EVOLVE_IMMIGRANT_RATE (kept for
+      // compatibility; both contribute to the bounded exploration floor).
+      randomImmigrantRate: clampNumber(readNumber(env, ["EVOLVE_RANDOM_IMMIGRANT_RATE"], 0.03), 0, 0.25),
+      // An island whose members all died may be re-seeded with fresh random
+      // genomes (bounded revival); an island that persists but keeps failing is
+      // NOT protected — selection still culls it normally.
+      reviveExtinct: readBool(env, ["EVOLVE_ISLAND_REVIVE_EXTINCT"], true),
+    }),
+
+    // --- Phase 5A: offline research swarm -------------------------------------
+    // Researchers PROPOSE strategy hypotheses; a deterministic compiler turns
+    // valid proposals into candidate genome families; only the existing Arena
+    // decides anything. The swarm can never execute code, touch the Arena
+    // gates, or promote itself. `mock` is a deterministic no-LLM provider, so
+    // the whole validation suite works offline and Phase 5A is usable without
+    // any LLM API key.
+    research: Object.freeze({
+      enabled: readBool(env, ["EVOLVE_RESEARCH_ENABLED"], true),
+      provider: (readFirst(env, ["EVOLVE_RESEARCH_PROVIDER"]).value ?? "mock").toLowerCase(),
+      root: readFirst(env, ["EVOLVE_RESEARCH_ROOT"]).value ?? path.join(".evolve", "research"),
+      // Bounded cadence: a research cycle every N generations (0 = every tick
+      // batch the engine decides; the engine treats 0 as "every generation").
+      cycleEveryGenerations: clampNumber(readInt(env, ["EVOLVE_RESEARCH_CYCLE_EVERY_GENERATIONS"], 2), 0, 10_000),
+      proposalsPerCycle: clampNumber(readInt(env, ["EVOLVE_RESEARCH_PROPOSALS_PER_CYCLE"], 6), 1, 64),
+      maxCompilationsPerCycle: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_COMPILATIONS_PER_CYCLE"], 3), 0, 64),
+      maxProposalsKept: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_PROPOSALS_KEPT"], 200), 10, 10_000),
+      maxMemoryKept: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_MEMORY_KEPT"], 500), 10, 100_000),
+      proposalSchemaVersion: clampNumber(readInt(env, ["EVOLVE_RESEARCH_PROPOSAL_SCHEMA_VERSION"], 1), 1, 99),
+    }),
+
+    researchWatch: Object.freeze({
+      // Reward-hacking watchdog thresholds (deterministic, inspection-only).
+      topMintNotionalShare: clampNumber(readNumber(env, ["EVOLVE_WATCH_TOP_MINT_SHARE"], 0.5), 0.01, 1),
+      topWindowReturnShare: clampNumber(readNumber(env, ["EVOLVE_WATCH_TOP_WINDOW_SHARE"], 0.6), 0.01, 1),
+      topRegimeReturnShare: clampNumber(readNumber(env, ["EVOLVE_WATCH_TOP_REGIME_SHARE"], 0.75), 0.01, 1),
+      minTrades: clampNumber(readInt(env, ["EVOLVE_WATCH_MIN_TRADES"], 8), 1, 1_000_000),
+      maxSingleTradeReturnShare: clampNumber(readNumber(env, ["EVOLVE_WATCH_MAX_SINGLE_TRADE_SHARE"], 0.8), 0.01, 1),
+      maxCostDrag: clampNumber(readNumber(env, ["EVOLVE_WATCH_MAX_COST_DRAG"], 0.15), 0, 10),
+      maxTrainOosCollapse: clampNumber(readNumber(env, ["EVOLVE_WATCH_MAX_TRAIN_OOS_COLLAPSE"], 0.7), 0, 1),
+      quarantineFlags: clampNumber(readInt(env, ["EVOLVE_WATCH_QUARANTINE_FLAGS"], 4), 1, 64),
+      watchFlags: clampNumber(readInt(env, ["EVOLVE_WATCH_WATCH_FLAGS"], 2), 1, 64),
+      minOosWindows: clampNumber(readInt(env, ["EVOLVE_WATCH_MIN_OOS_WINDOWS"], 3), 1, 10_000),
+    }),
+
     evolution: Object.freeze({
       enabled: readBool(env, ["EVOLVE_EVOLUTION_ENABLED"], true),
       mutationScale: clampNumber(readNumber(env, ["EVOLVE_MUTATION_SCALE"], 0.07), 0.001, 2),
       crossoverRate: clampNumber(readNumber(env, ["EVOLVE_CROSSOVER_RATE"], 0.48), 0, 1),
       immigrantRate: clampNumber(readNumber(env, ["EVOLVE_IMMIGRANT_RATE"], 0.1), 0, 0.5),
-      eliteFraction: clampNumber(readNumber(env, ["EVOLVE_ELITE_FRACTION"], 0.1), 0.01, 0.5),
+      eliteFraction: clampNumber(readNumber(env, ["EVOLVE_LIVE_ELITE_FRACTION", "EVOLVE_ELITE_FRACTION"], 0.1), 0.01, 0.5),
       breederFraction: clampNumber(readNumber(env, ["EVOLVE_BREEDER_FRACTION"], 0.28), 0.05, 1),
+      // Total fraction of the population that survives a generation unculled
+      // (elites plus a wider, evidence-checked survivor tier). Keeps live
+      // replacement well below the ~90% churn a pure elites-only-survive
+      // policy produces at the default 10% elite fraction.
+      survivorFraction: clampNumber(readNumber(env, ["EVOLVE_LIVE_SURVIVOR_FRACTION"], 0.35), 0.05, 0.9),
+      // Evidence gate for *selection privilege* (ranking into the elite/
+      // breeder tiers), not for staying alive — an agent short on trades or
+      // observations can still occupy a survivor slot, it just cannot out-
+      // rank evidenced agents on one lucky result.
+      minTradesForSelection: clampNumber(
+        readInt(env, ["EVOLVE_LIVE_MIN_TRADES_FOR_SELECTION"], 3),
+        0,
+        10_000,
+      ),
+      minObservationsForSelection: clampNumber(
+        readInt(env, ["EVOLVE_LIVE_MIN_OBSERVATIONS_FOR_SELECTION"], 30),
+        0,
+        10_000_000,
+      ),
+      // Floor under config.engine.generationTicks: a generation cannot end
+      // (and cull/breed) before agents have had at least this many ticks to
+      // accumulate evidence. Defaults to a no-op (10, below any
+      // generationTicks value used anywhere in this codebase) — raise it
+      // explicitly if a very short generationTicks is otherwise configured.
+      minGenerationTicks: clampNumber(
+        readInt(env, ["EVOLVE_LIVE_MIN_GENERATION_TICKS"], 10),
+        10,
+        100_000,
+      ),
     }),
 
     baselines: Object.freeze({
@@ -310,7 +427,16 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
     }),
 
     engine: Object.freeze({
-      population: clampNumber(readInt(env, ["EVOLVE_POPULATION"], 96), 12, 512),
+      // Phase 5A: EVOLVE_POPULATION_SIZE is the documented primary knob
+      // (default 96, matching the long-standing EVOLVE_POPULATION). Both names
+      // resolve to the same value; the first set one wins. The population is
+      // constant within one run — births restore exactly this target after
+      // every selection, and nothing may grow it.
+      population: clampNumber(
+        readInt(env, ["EVOLVE_POPULATION_SIZE", "EVOLVE_POPULATION"], 96),
+        12,
+        512,
+      ),
       generationTicks: clampNumber(readInt(env, ["EVOLVE_GENERATION_TICKS"], 180), 10, 100_000),
       tickMs: clampNumber(readInt(env, ["EVOLVE_TICK_MS"], 900), 50, 60_000),
     }),
@@ -351,7 +477,26 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
     }),
   };
 
-  const secretValues = [apiKey].filter(Boolean);
+  const researchApiKeyEntry = readFirst(env, ["EVOLVE_RESEARCH_API_KEY", "EVOLVE_LLM_API_KEY"]);
+  const researchApiKey = researchApiKeyEntry.value;
+
+  const secretValues = [apiKey, researchApiKey].filter(Boolean);
+
+  // Phase 5A: an external researcher provider's credential is environment-only,
+  // never enumerable, and can never reach state, logs, or the dashboard.
+  Object.defineProperty(config, "researchApiKey", {
+    value: researchApiKey ?? null,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+
+  Object.defineProperty(config, "researchApiKeyConfigured", {
+    value: Boolean(researchApiKey),
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
 
   Object.defineProperty(config, "apiKey", {
     value: apiKey ?? null,
@@ -378,12 +523,15 @@ export function publicConfig(config) {
     provider: config.provider,
     seed: config.seed,
     evalSeeds: [...config.evalSeeds],
+    researchApiKeyConfigured: config.researchApiKeyConfigured,
     historyRoot: config.historyRoot,
     recordCaptureMs: config.recordCaptureMs,
     replay: { ...config.replay },
     walkForward: { ...config.walkForward },
     evidence: { ...config.evidence },
     evolution: { ...config.evolution },
+    islands: { ...config.islands },
+    research: { ...config.research },
     baselines: { ...config.baselines },
     apiKeyConfigured: config.apiKeyConfigured,
     keylessAllowed: config.keylessAllowed,

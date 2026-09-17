@@ -419,21 +419,27 @@ export function classifyWindowRegime(snapshots) {
 
 /**
  * Precompute regimes for every dataset window from its snapshots.
- * Windows are evaluated in stream order using only data up to each window's
- * end, so classifications carry no future information.
+ *
+ * Each window is classified independently from the snapshots inside its own
+ * TEST interval (the same interval an OOS run is scored on) — never data from
+ * outside that window, and never data past the window's end, so
+ * classifications carry no future information. Windows are queried directly
+ * by timestamp range rather than accumulated from a single forward-only
+ * stream cursor: walk-forward windows overlap by design (train periods
+ * re-cover earlier test periods), and a cursor that only ever advances would
+ * silently drop the overlapping portion of a later window's own range.
  */
 export async function buildRegimeMap(datasetDir, windows) {
   const { openDataset } = await import("../history/dataset.mjs");
   const dataset = await openDataset(datasetDir, { requireManifest: false });
   const out = [];
-  let index = 0;
 
-  const stream = dataset.snapshots()[Symbol.asyncIterator]();
-  let buffer = [];
-
-  const classifyBuffer = async () => {
-    if (buffer.length === 0) return;
+  for (let index = 0; index < windows.length; index += 1) {
     const window = windows[index];
+    const buffer = [];
+    for await (const snapshot of dataset.snapshots({ from: window.test.start, until: window.test.end })) {
+      buffer.push({ ...snapshot, markets: snapshot.markets ?? [] });
+    }
     const result = classifyWindowRegime(buffer);
     out.push({
       window: window?.label ?? `W${index + 1}`,
@@ -443,28 +449,7 @@ export async function buildRegimeMap(datasetDir, windows) {
       ...result,
       snapshotCount: buffer.length,
     });
-    index += 1;
-    buffer = [];
-  };
-
-  for await (const snapshot of stream) {
-    const t = Number(snapshot.t);
-    if (!Number.isFinite(t)) continue;
-
-    const window = windows[index];
-    if (!window) break;
-
-    const windowEnd = window.test.end;
-    if (t > windowEnd) {
-      await classifyBuffer();
-      // Skip windows that this snapshot is already past.
-      while (index < windows.length && t > windows[index].test.end) index += 1;
-      if (index >= windows.length) break;
-    }
-
-    buffer.push({ ...snapshot, markets: snapshot.markets ?? [] });
   }
-  await classifyBuffer();
 
   return out;
 }
@@ -901,7 +886,6 @@ export function aggregateCandidateEvaluation({
   let maxDrawdown = 0;
   let catastrophicEvents = 0;
   let distinctMintsCount = 0;
-  let worstTopMintShare = 0;
 
   for (const run of usableOos) {
     const metrics = run.metrics;
@@ -909,7 +893,6 @@ export function aggregateCandidateEvaluation({
     costs += metrics.costs ?? 0;
     observations += metrics.observations ?? 0;
     maxDrawdown = Math.max(maxDrawdown, metrics.maxDrawdown ?? 0);
-    worstTopMintShare = Math.max(worstTopMintShare, metrics.topMintShare ?? 0);
     distinctMintsCount = Math.max(distinctMintsCount, metrics.distinctMints ?? 0);
     if (metrics.robustnessDetail?.catastrophic === true) catastrophicEvents += 1;
   }
@@ -956,10 +939,15 @@ export function aggregateCandidateEvaluation({
   const stressTotal = stressProfilesEvaluated.length;
 
   // Regime mapping: OOS run -> window -> regime label for that dataset window.
+  // Looked up per RUN (not per wrapping evaluation object): the tournament
+  // runner flattens every dataset's runs into one array per candidate before
+  // this function ever sees them, so `evaluation.datasetDir` alone is not
+  // reliable — each run carries its own `datasetDir` (set in evaluator.mjs)
+  // precisely so this lookup still works after flattening.
   const regimeMap = {};
   for (const evaluation of rows) {
-    const regimes = regimesByDataset[evaluation?.datasetDir] ?? {};
     for (const run of evaluation?.oosRuns ?? []) {
+      const regimes = regimesByDataset[run.datasetDir ?? evaluation?.datasetDir] ?? {};
       const regime = regimes[run.window]?.regime ?? "unknown";
       if (!regimeMap[regime]) regimeMap[regime] = { regime, runs: 0, netReturns: [] };
       regimeMap[regime].runs += 1;
@@ -995,21 +983,29 @@ export function aggregateCandidateEvaluation({
     (runs) => runs.reduce((a, b) => a + b, 0) / runs.length,
   );
 
-  // Concentration: the worse of (a) worst single-mint share of positive P&L
-  // in any window (from the paper ledger) and (b) one-window share of total
-  // positive return — one-token AND one-period dependence both penalised.
-  const windowPnl = new Map();
-  for (const run of usableOos) {
-    if (Number.isFinite(run.metrics?.netReturn) && run.metrics.netReturn > 0) {
-      windowPnl.set(run.window, (windowPnl.get(run.window) ?? 0) + run.metrics.netReturn);
+  // Concentration: aggregate share of total executed paper notional
+  // attributable to the single most-traded mint, pooled by mint across every
+  // OOS and stress run in this candidate's full evaluated evidence set (not
+  // the max of independent per-run shares, which saturates to 1.0 the moment
+  // any single run happens to trade only one mint). Bounded 0..1; 0 when
+  // there is no notional evidence at all; 1 only when every dollar of
+  // evidence traded through one mint.
+  const evidenceRuns = [...usableOos, ...stressRuns.filter((run) => run?.metrics)];
+  const pooledMintNotional = new Map();
+  let pooledTotalNotional = 0;
+  for (const run of evidenceRuns) {
+    const byMint = run.metrics?.mintNotional;
+    if (!byMint || typeof byMint !== "object") continue;
+    for (const [mint, notional] of Object.entries(byMint)) {
+      const value = Number.isFinite(notional) ? Math.max(0, notional) : 0;
+      pooledMintNotional.set(mint, (pooledMintNotional.get(mint) ?? 0) + value);
+      pooledTotalNotional += value;
     }
   }
-  const positiveTotal = [...windowPnl.values()].reduce((sum, v) => sum + Math.max(0, v), 0);
-  const topWindowShare =
-    positiveTotal > 0 && windowPnl.size > 0
-      ? Math.max(...windowPnl.values()) / positiveTotal
-      : 0;
-  const topMintShare = Math.max(worstTopMintShare, topWindowShare);
+  const maxPooledMintNotional =
+    pooledMintNotional.size > 0 ? Math.max(...pooledMintNotional.values()) : 0;
+  const topMintShare =
+    pooledTotalNotional > 0 ? clamp01(maxPooledMintNotional / pooledTotalNotional) : 0;
 
   const components = {
     medianOOSReturn: round6(medianOOSReturn),
@@ -1475,7 +1471,10 @@ export async function persistShadowState(state, dir = DEFAULT_SHADOW_DIR) {
  * 11. Arena cache
  * ==========================================================================*/
 
-export const ARENA_CACHE_VERSION = 1;
+// Bumped for Phase 4.1: cached run payloads now carry `datasetDir` (regime
+// wiring fix) and metrics carry `notional`/`mintNotional` (concentration
+// fix) — old cache entries lack both and must not be reused.
+export const ARENA_CACHE_VERSION = 2;
 
 /**
  * Cache key for an arena evaluation slice. Includes dataset fingerprints,
