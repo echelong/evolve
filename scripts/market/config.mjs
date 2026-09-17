@@ -17,10 +17,11 @@ import { fileURLToPath } from "node:url";
 
 import { loadEnvFiles } from "../lib/env.mjs";
 
-export const MARKET_MODES = ["auto", "live", "synthetic"];
+export const MARKET_MODES = ["auto", "live", "synthetic", "replay"];
 
 export const PROVIDER_JUPITER = "Jupiter Developer Platform";
 export const PROVIDER_SYNTHETIC = "Internal synthetic simulator";
+export const PROVIDER_REPLAY = "Historical dataset replay";
 
 /** Tokens V2 observation endpoints. Observation only, never execution. */
 export const DEFAULT_ENDPOINTS = [
@@ -92,6 +93,22 @@ function readBool(env, names, fallback) {
 function clampNumber(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, value));
+}
+
+/** "11,22,33" -> [11, 22, 33]; empty/unusable input -> empty list. */
+function parseSeedList(value) {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part !== "")
+    .map((part) => (/^-?\d+$/.test(part) ? Number(part) : part));
+}
+
+function normalizeDashboardSource(value) {
+  const allowed = ["auto", "live", "replay"];
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : "auto";
 }
 
 function resolveEndpoints(env, limit) {
@@ -206,6 +223,83 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
     ),
     syntheticUniverseSize: clampNumber(readInt(env, ["EVOLVE_SYNTHETIC_UNIVERSE"], 24), 4, 400),
     minLiquidityUsd: clampNumber(readNumber(env, ["EVOLVE_MIN_LIQUIDITY_USD"], 2500), 0, 1e12),
+
+    // --- Phase 3: historical capture, deterministic replay, walk-forward ----
+    seed: readFirst(env, ["EVOLVE_SEED"]).value ?? "evolve",
+    evalSeeds: parseSeedList(readFirst(env, ["EVOLVE_EVAL_SEEDS"]).value),
+
+    historyRoot: readFirst(env, ["EVOLVE_HISTORY_ROOT"]).value ?? path.join(".evolve", "history"),
+    recordCaptureMs: clampNumber(
+      readInt(env, ["EVOLVE_RECORD_INTERVAL_MS"], 5000),
+      250,
+      3_600_000,
+    ),
+    recordManifestEvery: clampNumber(readInt(env, ["EVOLVE_RECORD_MANIFEST_EVERY"], 12), 1, 10_000),
+    championsDir: readFirst(env, ["EVOLVE_CHAMPIONS_DIR"]).value ?? path.join(".evolve", "champions"),
+    experimentsDir:
+      readFirst(env, ["EVOLVE_EXPERIMENTS_DIR"]).value ?? path.join(".evolve", "experiments"),
+
+    replay: Object.freeze({
+      dataset:
+        readFirst(env, ["EVOLVE_REPLAY_DATASET", "EVOLVE_HISTORY_DATASET"]).value ?? null,
+      speed: readFirst(env, ["EVOLVE_REPLAY_SPEED"]).value ?? "1",
+      limit: clampNumber(readInt(env, ["EVOLVE_REPLAY_LIMIT"], 0), 0, 10_000_000),
+      pacing: readBool(env, ["EVOLVE_REPLAY_PACING"], true),
+      verifyFingerprint: readBool(env, ["EVOLVE_REPLAY_VERIFY_FINGERPRINT"], true),
+      marketScanLimit: clampNumber(readInt(env, ["EVOLVE_REPLAY_SCAN_LIMIT"], 60), 0, 5000),
+      writeStateEveryTicks: clampNumber(readInt(env, ["EVOLVE_REPLAY_STATE_EVERY"], 20), 1, 100_000),
+      stateFile: readFirst(env, ["EVOLVE_REPLAY_STATE_FILE"]).value ?? "replay-state.json",
+    }),
+
+    dashboard: Object.freeze({
+      source: normalizeDashboardSource(readFirst(env, ["EVOLVE_DASHBOARD_SOURCE"]).value),
+      liveWindowMs: clampNumber(
+        readInt(env, ["EVOLVE_DASHBOARD_LIVE_WINDOW_MS"], 45_000),
+        1000,
+      3_600_000,
+      ),
+    }),
+
+    walkForward: Object.freeze({
+      trainMinutes: clampNumber(readNumber(env, ["EVOLVE_WF_TRAIN_MINUTES"], 360), 0.001, 1_000_000),
+      validateMinutes: clampNumber(
+        readNumber(env, ["EVOLVE_WF_VALIDATE_MINUTES"], 120),
+        0.001,
+        1_000_000,
+      ),
+      testMinutes: clampNumber(readNumber(env, ["EVOLVE_WF_TEST_MINUTES"], 120), 0.001, 1_000_000),
+      stepMinutes: clampNumber(readNumber(env, ["EVOLVE_WF_STEP_MINUTES"], 120), 0.001, 1_000_000),
+      minWindows: clampNumber(readInt(env, ["EVOLVE_WF_MIN_WINDOWS"], 1), 1, 10_000),
+      maxCandidates: clampNumber(readInt(env, ["EVOLVE_WF_MAX_CANDIDATES"], 8), 1, 512),
+      minValidationRobustness: readNumber(env, ["EVOLVE_WF_MIN_VALIDATION_ROBUSTNESS"], 0),
+      overfitMargin: clampNumber(readNumber(env, ["EVOLVE_WF_OVERFIT_MARGIN"], 0.25), 0, 10),
+      allowShortDataset: readBool(env, ["EVOLVE_WF_ALLOW_SHORT_DATASET"], false),
+    }),
+
+    evidence: Object.freeze({
+      minTrades: clampNumber(readInt(env, ["EVOLVE_MIN_TRADES"], 20), 1, 1_000_000),
+      minDistinctMints: clampNumber(readInt(env, ["EVOLVE_MIN_DISTINCT_MINTS"], 4), 1, 10_000),
+      minObservations: clampNumber(readInt(env, ["EVOLVE_MIN_OBSERVATIONS"], 200), 1, 10_000_000),
+      minExposureTicks: clampNumber(readInt(env, ["EVOLVE_MIN_EXPOSURE_TICKS"], 40), 0, 10_000_000),
+    }),
+
+    evolution: Object.freeze({
+      enabled: readBool(env, ["EVOLVE_EVOLUTION_ENABLED"], true),
+      mutationScale: clampNumber(readNumber(env, ["EVOLVE_MUTATION_SCALE"], 0.07), 0.001, 2),
+      crossoverRate: clampNumber(readNumber(env, ["EVOLVE_CROSSOVER_RATE"], 0.48), 0, 1),
+      immigrantRate: clampNumber(readNumber(env, ["EVOLVE_IMMIGRANT_RATE"], 0.1), 0, 0.5),
+      eliteFraction: clampNumber(readNumber(env, ["EVOLVE_ELITE_FRACTION"], 0.1), 0.01, 0.5),
+      breederFraction: clampNumber(readNumber(env, ["EVOLVE_BREEDER_FRACTION"], 0.28), 0.05, 1),
+    }),
+
+    baselines: Object.freeze({
+      enabled: readBool(env, ["EVOLVE_BASELINES_ENABLED"], true),
+      randomEntryProbability: clampNumber(
+        readNumber(env, ["EVOLVE_BASELINE_RANDOM_ENTRY_PROBABILITY"], 0.02),
+        0.0001,
+        1,
+      ),
+    }),
     momentumReference: Object.freeze({
       live: clampNumber(readNumber(env, ["EVOLVE_LIVE_MOMENTUM_REFERENCE"], 0.1), 0.0001, 5),
       synthetic: clampNumber(
@@ -282,6 +376,15 @@ export function publicConfig(config) {
   return {
     requestedMode: config.requestedMode,
     provider: config.provider,
+    seed: config.seed,
+    evalSeeds: [...config.evalSeeds],
+    historyRoot: config.historyRoot,
+    recordCaptureMs: config.recordCaptureMs,
+    replay: { ...config.replay },
+    walkForward: { ...config.walkForward },
+    evidence: { ...config.evidence },
+    evolution: { ...config.evolution },
+    baselines: { ...config.baselines },
     apiKeyConfigured: config.apiKeyConfigured,
     keylessAllowed: config.keylessAllowed,
     endpoints: config.endpoints.map((endpoint) => endpoint.label),

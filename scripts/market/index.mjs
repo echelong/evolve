@@ -26,3 +26,10 @@ export {
 export { MarketUniverse, mergeToken } from "./universe.mjs";
 export { SyntheticMarketProvider, syntheticMint } from "./synthetic.mjs";
 export { createMarketFeed, MODE, BANNER, bannerFor, SOURCE_LABEL } from "./feed.mjs";
+export {
+  openReplayFeed,
+  parseReplaySpeed,
+  REPLAY_BANNER,
+  REPLAY_SOURCE,
+  REPLAY_SPEED_MAX,
+} from "./replay.mjs";

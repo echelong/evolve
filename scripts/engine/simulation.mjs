@@ -23,6 +23,7 @@ import {
   randomGenome,
 } from "./genome.mjs";
 import { generateAgentId } from "../lib/ids.mjs";
+import { ORIGIN, createGenealogy } from "./genealogy.mjs";
 import { PAPER_ONLY, paperGuards, simulateEntry, simulateExit } from "./paper.mjs";
 
 const STATUS = Object.freeze({
@@ -167,11 +168,66 @@ export function passesGates(genome, market, { minLiquidityUsd = 0 } = {}) {
   return true;
 }
 
+export const DEFAULT_EVOLUTION = Object.freeze({
+  enabled: true,
+  mutationScale: 0.07,
+  crossoverRate: 0.48,
+  immigrantRate: 0.1,
+  eliteFraction: 0.1,
+  breederFraction: 0.28,
+  speciesInheritanceRate: 0.72,
+  speciesPull: true,
+});
+
+function clampNumber(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
 /**
  * Create the runnable simulation.
- * @param {{ config: object, feed: object, now?: () => number, random?: () => number }} options
+ *
+ * @param {{
+ *   config: object,
+ *   feed: object,
+ *   now?: () => number,
+ *   random?: () => number,
+ *   ids?: ((kind: string) => string) | null,
+ *   evolution?: object | null,
+ *   fixedPopulation?: Array<{ genome: object, species?: string, lineageId?: string, label?: string }> | null,
+ *   marketScanLimit?: number,
+ *   recordTrades?: boolean,
+ *   genealogy?: object | null,
+ * }} options
  */
-export function createSimulation({ config, feed, now = () => Date.now(), random = Math.random } = {}) {
+export function createSimulation({
+  config,
+  feed,
+  now = () => Date.now(),
+  random = Math.random,
+  ids = null,
+  evolution = null,
+  fixedPopulation = null,
+  marketScanLimit = 0,
+  recordTrades = false,
+  genealogy = null,
+} = {}) {
+  const nextId = typeof ids === "function" ? ids : (kind) => generateAgentId(kind);
+  const ancestry = genealogy ?? createGenealogy({});
+  const evolutionOptions = {
+    ...DEFAULT_EVOLUTION,
+    ...(evolution ?? {}),
+  };
+  const evolutionEnabled = evolutionOptions.enabled !== false;
+  const mutationScale = clampNumber(evolutionOptions.mutationScale, 0.001, 2, 0.07);
+  const crossoverRate = clampNumber(evolutionOptions.crossoverRate, 0, 1, 0.48);
+  const immigrantRate = clampNumber(evolutionOptions.immigrantRate, 0, 0.5, 0.1);
+  const eliteFraction = clampNumber(evolutionOptions.eliteFraction, 0.01, 0.5, 0.1);
+  const breederFraction = clampNumber(evolutionOptions.breederFraction, 0.05, 1, 0.28);
+  const speciesInheritanceRate = clampNumber(evolutionOptions.speciesInheritanceRate, 0, 1, 0.72);
+  const scanLimit = Math.max(0, Math.round(marketScanLimit));
+
   const { population: populationSize, generationTicks } = config.engine;
   const startingCash = config.paper.startingCash;
   const minOrderUsd = Math.max(0.5, startingCash * 0.02);
@@ -192,20 +248,89 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
   let lastGenerationSummary = null;
   let totalTrades = 0;
   const startedAt = now();
+  const speciesStats = new Map(
+    SPECIES.map((name) => [
+      name,
+      { births: 0, deaths: 0, peakCount: 0, extinctionEvents: 0, wasPresent: false },
+    ]),
+  );
+
+  function trackBirth(species) {
+    if (!speciesStats.has(species)) {
+      speciesStats.set(species, { births: 0, deaths: 0, peakCount: 0, extinctionEvents: 0, wasPresent: false });
+    }
+    speciesStats.get(species).births += 1;
+  }
+
+  function trackDeaths(agents) {
+    for (const agent of agents) {
+      const entry = speciesStats.get(agent.species);
+      if (entry) entry.deaths += 1;
+    }
+  }
+
+  function trackCensus() {
+    for (const [name, entry] of speciesStats) {
+      const count = population.filter((agent) => agent.species === name).length;
+      entry.peakCount = Math.max(entry.peakCount, count);
+      if (count === 0 && entry.wasPresent) entry.extinctionEvents += 1;
+      entry.wasPresent = count > 0;
+    }
+  }
 
   function addEvent(type, message) {
-    events.unshift({ id: generateAgentId("E"), at: new Date(now()).toISOString(), type, message });
+    // `nextId` is the seeded factory during replay/experiments, so events are
+    // reproducible run to run; live runs keep the random-but-readable ids.
+    events.unshift({ id: nextId("E"), at: new Date(now()).toISOString(), type, message });
     events = events.slice(0, maxEvents);
   }
 
-  function makeAgent({ genome, species, parents = [], born = generation } = {}) {
+  function makeAgent({
+    genome,
+    species,
+    parents = [],
+    born = generation,
+    origin = ORIGIN.FOUNDER,
+    lineageId = null,
+    label = null,
+  } = {}) {
     const resolvedSpecies = species ?? SPECIES[Math.floor(random() * SPECIES.length)];
+    const id = nextId("A");
+    const lineage = ancestry.record({
+      id,
+      generation: born,
+      species: resolvedSpecies,
+      parents,
+      origin,
+      lineageId,
+    });
+    trackBirth(resolvedSpecies);
+
     return {
-      id: generateAgentId("A"),
+      id,
+      label,
       species: resolvedSpecies,
       parents,
       born,
+      origin,
+      lineageId: lineage,
       age: generation - born,
+      // Per-generation accounting (what selection acts on).
+      ledger: recordTrades ? [] : null,
+      periodCosts: 0,
+      exposureTicks: 0,
+      observations: 0,
+      // Cumulative stage accounting: survives generation resets so evidence
+      // (trades, mints, costs) is not erased every time a bankroll resets.
+      stageLedger: recordTrades ? [] : null,
+      stageTrades: 0,
+      stageWins: 0,
+      stageLosses: 0,
+      stageCosts: 0,
+      stagePnl: 0,
+      stageExposureTicks: 0,
+      stageObservations: 0,
+      stageMaxDrawdown: 0,
       genome: genome ?? randomGenome(resolvedSpecies, random),
       cash: startingCash,
       equity: startingCash,
@@ -226,11 +351,29 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
   }
 
   function seedPopulation() {
+    if (Array.isArray(fixedPopulation) && fixedPopulation.length > 0) {
+      // Frozen evaluation: one paper portfolio per supplied candidate genome.
+      population = fixedPopulation.map((candidate) =>
+        makeAgent({
+          genome: candidate.genome,
+          species: candidate.species ?? SPECIES[0],
+          parents: candidate.parents ?? [],
+          origin: candidate.origin ?? ORIGIN.FROZEN,
+          lineageId: candidate.lineageId ?? null,
+          label: candidate.label ?? null,
+          born: generation,
+        }),
+      );
+      trackCensus();
+      return;
+    }
+
     population = Array.from({ length: populationSize }, () => makeAgent({}));
     population.forEach((agent, index) => {
       agent.species = SPECIES[index % SPECIES.length];
       agent.genome = randomGenome(agent.species, random);
     });
+    trackCensus();
   }
 
   function markToMarket(agent, ctx) {
@@ -283,10 +426,37 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
     agent.costs += Math.max(0, fill.frictionUsd);
     agent.trades += 1;
     totalTrades += 1;
-    if (fill.netProceeds - position.cost >= 0) agent.wins += 1;
-    else agent.losses += 1;
 
     const net = fill.netProceeds - position.cost;
+    const tradeCost = position.costFriction + fill.frictionUsd;
+
+    if (net >= 0) agent.wins += 1;
+    else agent.losses += 1;
+
+    const row = {
+      mint: position.mint,
+      symbol: position.symbol,
+      reason,
+      net,
+      gross: fill.grossPnl,
+      cost: tradeCost,
+      heldTicks: position.held,
+      openedAt: position.entryAt,
+      closedAt: ctx.at,
+    };
+
+    if (Array.isArray(agent.ledger)) agent.ledger.push(row);
+
+    // Cumulative view: never reset by selection, so a candidate can be judged
+    // on everything it did rather than on its final partial generation.
+    if (Array.isArray(agent.stageLedger)) agent.stageLedger.push(row);
+    agent.stageTrades = (agent.stageTrades ?? 0) + 1;
+    agent.stageCosts = (agent.stageCosts ?? 0) + Math.max(0, fill.frictionUsd);
+    agent.stagePnl = (agent.stagePnl ?? 0) + net;
+    agent.stageMaxDrawdown = Math.max(agent.stageMaxDrawdown ?? 0, agent.maxDrawdown ?? 0);
+    if (net >= 0) agent.stageWins = (agent.stageWins ?? 0) + 1;
+    else agent.stageLosses = (agent.stageLosses ?? 0) + 1;
+
     agent.lastAction = `${reason} ${position.symbol} ${net >= 0 ? "+" : "-"}$${Math.abs(net).toFixed(2)}`;
     agent.lastActionAt = ctx.at;
     // Flat agents are only 'scanning' when the feed currently allows entries.
@@ -294,7 +464,7 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
     agent.position = null;
 
     recentTrades.unshift({
-      id: generateAgentId("T"),
+      id: nextId("T"),
       at: new Date(ctx.at).toISOString(),
       agentId: agent.id,
       species: agent.species,
@@ -340,6 +510,7 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
 
     agent.cash -= fill.cashSpent;
     agent.costs += fill.frictionUsd;
+    agent.periodCosts = (agent.periodCosts ?? 0) + fill.frictionUsd;
     agent.position = {
       mint: market.mint,
       symbol: market.symbol,
@@ -370,6 +541,9 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
       const market = ctx.byMint.get(position.mint) ?? null;
 
       position.held += 1;
+      agent.exposureTicks += 1;
+      agent.stageExposureTicks = (agent.stageExposureTicks ?? 0) + 1;
+      agent.stageMaxDrawdown = Math.max(agent.stageMaxDrawdown ?? 0, agent.maxDrawdown ?? 0);
       if (market && market.price > 0) {
         position.lastMarkPrice = market.price;
         position.lastMarkAt = ctx.at;
@@ -447,6 +621,7 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
       realizedPnl: 0,
       grossPnl: 0,
       costs: 0,
+      periodCosts: 0,
       unrealizedPnl: 0,
       trades: 0,
       wins: 0,
@@ -460,6 +635,31 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
   }
 
   function breedGeneration(explicitCtx = null) {
+    if (!evolutionEnabled) {
+      // Frozen mode (validation / test): rank for reporting only. Genomes must
+      // not change, so nothing is bred, culled, or reset.
+      for (const agent of population) {
+        agent.fitness = fitness(agent);
+      }
+      const rankedFrozen = [...population].sort((a, b) => b.fitness - a.fitness);
+      lastGenerationSummary = {
+        generation,
+        bestId: rankedFrozen[0]?.id ?? null,
+        bestSpecies: rankedFrozen[0]?.species ?? null,
+        bestReturn: rankedFrozen[0]
+          ? averageReturnSafe((rankedFrozen[0].equity - startingCash) / startingCash)
+          : 0,
+        averageReturn: averageReturnSafe(
+          population.reduce((sum, agent) => sum + (agent.equity - startingCash) / startingCash, 0) /
+            Math.max(1, population.length),
+        ),
+        bestFitness: round(rankedFrozen[0]?.fitness ?? 0, 3),
+        trades: population.reduce((sum, agent) => sum + agent.trades, 0),
+        frozen: true,
+      };
+      return;
+    }
+
     const at = now();
     const markets = feed.markets(at);
     const ctx =
@@ -494,12 +694,14 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
       trades: population.reduce((sum, agent) => sum + agent.trades, 0),
     };
 
-    const eliteCount = Math.max(6, Math.floor(populationSize * 0.1));
-    const breederCount = Math.max(18, Math.floor(populationSize * 0.28));
-    const immigrantCount = Math.max(8, Math.floor(populationSize * 0.1));
+    const eliteCount = Math.max(1, Math.floor(populationSize * eliteFraction));
+    const breederCount = Math.max(2, Math.floor(populationSize * breederFraction));
+    const immigrantCount = Math.max(0, Math.floor(populationSize * immigrantRate));
     const elites = population.slice(0, eliteCount);
     const breeders = population.slice(0, breederCount);
     const deaths = populationSize - eliteCount;
+    const culled = population.slice(eliteCount);
+    trackDeaths(culled);
 
     addEvent(
       "GENERATION",
@@ -512,17 +714,26 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
     while (next.length < populationSize - immigrantCount) {
       const a = breeders[Math.floor(random() * breeders.length)];
       const b = breeders[Math.floor(random() * breeders.length)];
-      const childSpecies = random() < 0.72 ? a.species : b.species;
-      const genome =
-        random() < 0.48
-          ? crossoverGenomes(a.genome, b.genome, { random, species: childSpecies })
-          : mutateGenome(a.genome, { scale: 0.07, random, species: childSpecies });
+      const childSpecies = random() < speciesInheritanceRate ? a.species : b.species;
+      const useCrossover = random() < crossoverRate;
+      const genome = useCrossover
+        ? crossoverGenomes(a.genome, b.genome, {
+            random,
+            species: evolutionOptions.speciesPull ? childSpecies : null,
+          })
+        : mutateGenome(a.genome, {
+            scale: mutationScale,
+            random,
+            species: evolutionOptions.speciesPull ? childSpecies : null,
+          });
 
       next.push(
         makeAgent({
           genome,
           species: childSpecies,
           parents: a.id === b.id ? [a.id] : [a.id, b.id],
+          origin: useCrossover ? ORIGIN.CROSSOVER : ORIGIN.MUTATION,
+          lineageId: a.lineageId,
           born: generation + 1,
         }),
       );
@@ -535,21 +746,58 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
           genome: randomGenome(species, random),
           species,
           parents: [],
+          origin: ORIGIN.IMMIGRANT,
           born: generation + 1,
         }),
       );
     }
 
+    for (const agent of next.slice(0, elites.length)) {
+      agent.origin = ORIGIN.ELITE;
+    }
+
     terminatedTotal += deaths;
-    bornTotal += populationSize - eliteCount;
+    bornTotal += next.length - eliteCount;
     generation += 1;
     generationTick = 0;
     population = next;
+    trackCensus();
     addEvent("BIRTH", `${populationSize - eliteCount} new agents entered generation ${generation}.`);
   }
 
   function averageReturnSafe(value) {
     return Number.isFinite(value) ? value : 0;
+  }
+
+  /**
+   * Settle every open paper position at the last observed price.
+   *
+   * Used at the end of a replay stage so the measured period is realized rather
+   * than left floating: no price is invented, an agent whose token vanished
+   * settles at its own last mark, and every resulting fill flows through the
+   * same friction model as any other exit.
+   */
+  function settle({ reason = "STAGE-END" } = {}) {
+    const at = now();
+    const markets = feed.markets(at);
+    const ctx = {
+      at,
+      markets,
+      byMint: new Map(markets.map((market) => [market.mint, market])),
+      tradeable: [],
+      allowNewEntries: false,
+      minLiquidityUsd: config.minLiquidityUsd,
+      friction: config.paper,
+      bestScore: null,
+    };
+
+    let closed = 0;
+    for (const agent of population) {
+      if (!agent.position) continue;
+      if (closePosition(agent, reason, ctx)) closed += 1;
+      markToMarket(agent, ctx);
+    }
+    return closed;
   }
 
   /** One simulation step. Reads the feed, never advances it. */
@@ -567,12 +815,21 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
       tradeable.push(market);
     }
 
+    // Optional scan cap: agents consider the most liquid N markets per tick.
+    // Never enabled for live mode by default; used to keep long replays tractable.
+    const scanned =
+      scanLimit > 0 && tradeable.length > scanLimit
+        ? [...tradeable]
+            .sort((a, b) => b.liquidity - a.liquidity || (a.mint < b.mint ? -1 : 1))
+            .slice(0, scanLimit)
+        : tradeable;
+
     const ctx = {
       at,
       markets,
+      tradeable: scanned,
       byMint,
-      tradeable,
-      allowNewEntries: health.allowNewEntries === true && tradeable.length > 0,
+      allowNewEntries: health.allowNewEntries === true && scanned.length > 0,
       minLiquidityUsd: config.minLiquidityUsd,
       friction: config.paper,
       bestScore: null,
@@ -580,13 +837,21 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
 
     for (const agent of population) {
       ctx.bestScore = null;
+      agent.observations += 1;
+      agent.stageObservations = (agent.stageObservations ?? 0) + 1;
       stepAgent(agent, ctx);
     }
 
     generationTick += 1;
-    if (generationTick >= generationTicks) breedGeneration(ctx);
 
-    return { at, health, marketCount: markets.length, tradeable: tradeable.length };
+    if (evolutionEnabled) {
+      if (generationTick >= generationTicks) breedGeneration(ctx);
+    } else {
+      // Frozen evaluation: keep ranking for reporting, never mutate anything.
+      for (const agent of population) agent.fitness = fitness(agent);
+    }
+
+    return { at, health, marketCount: markets.length, tradeable: scanned.length };
   }
 
   function regime(markets) {
@@ -674,13 +939,29 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
         members.length === 0
           ? 0
           : members.reduce((sum, agent) => sum + agent.fitness, 0) / members.length;
+      const stats = speciesStats.get(name) ?? {
+        births: 0,
+        deaths: 0,
+        peakCount: 0,
+        extinctionEvents: 0,
+      };
+      const returns = members
+        .map((agent) => (agent.equity - startingCash) / startingCash)
+        .sort((a, b) => a - b);
+
       return {
         name,
         role: SPECIES_ROLES[name] ?? "",
         count: members.length,
         avgReturn: averageReturnSafe(avg),
+        medianReturn: returns.length > 0 ? averageReturnSafe(returns[Math.floor(returns.length / 2)]) : 0,
         avgFitness: averageReturnSafe(avgFitness),
         trades: members.reduce((sum, agent) => sum + agent.trades, 0),
+        births: stats.births,
+        deaths: stats.deaths,
+        peakCount: stats.peakCount,
+        extinctionEvents: stats.extinctionEvents,
+        extinct: members.length === 0,
       };
     }).sort((a, b) => b.count - a.count || b.avgReturn - a.avgReturn);
 
@@ -771,10 +1052,27 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
           ? averageReturnSafe((ranked[0].equity - startingCash) / startingCash)
           : 0,
       },
+      evolution: {
+        enabled: evolutionEnabled,
+        frozen: !evolutionEnabled,
+        generationTicks,
+        mutationScale,
+        crossoverRate,
+        immigrantRate,
+        eliteFraction,
+        breederFraction,
+        marketScanLimit: scanLimit,
+        trackTrades: recordTrades,
+      },
+      genealogy: ancestry.stats({ alive: population.map((agent) => agent.id) }),
       topAgents: ranked.slice(0, 18).map((agent) => ({
         id: agent.id,
+        label: agent.label ?? null,
         species: agent.species,
         parents: agent.parents,
+        origin: agent.origin ?? null,
+        lineageId: agent.lineageId ?? null,
+        ancestryDepth: ancestry.ancestryDepth(agent.id),
         born: agent.born,
         age: generation - agent.born,
         equity: round(agent.equity, 2),
@@ -785,6 +1083,16 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
         fitness: round(agent.fitness, 3),
         trades: agent.trades,
         winRate: agent.trades ? agent.wins / agent.trades : 0,
+        // Cumulative stage evidence: what the agent did across every generation
+        // it lived through, not just its final partial one.
+        stage: {
+          trades: agent.stageTrades ?? 0,
+          wins: agent.stageWins ?? 0,
+          costs: round(agent.stageCosts ?? 0, 2),
+          netPnl: round(agent.stagePnl ?? 0, 2),
+          exposureTicks: agent.stageExposureTicks ?? 0,
+          observations: agent.stageObservations ?? 0,
+        },
         maxDrawdown: agent.maxDrawdown,
         status: agent.status,
         lastAction: agent.lastAction,
@@ -822,6 +1130,7 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
         paperStartingCash: startingCash,
         speciesCount: SPECIES.length,
         totalTrades,
+        frozen: !evolutionEnabled,
       },
     };
   }
@@ -831,8 +1140,13 @@ export function createSimulation({ config, feed, now = () => Date.now(), random 
   return {
     advanceTick,
     snapshot,
+    settle,
     breedGeneration,
     addEvent,
+    genealogy: ancestry,
+    evolutionOptions: Object.freeze({ ...evolutionOptions, enabled: evolutionEnabled }),
+    frozen: !evolutionEnabled,
+    config,
     get population() {
       return population;
     },

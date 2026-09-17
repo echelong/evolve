@@ -16,12 +16,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createSimulation } from "./engine/simulation.mjs";
+import { DEFAULT_REPLAY_STATE_FILE, runReplay } from "./engine/replay-runner.mjs";
 import { serializeForPublic } from "./lib/sanitize.mjs";
 import { createMarketConfig, publicConfig } from "./market/config.mjs";
 import { createMarketFeed } from "./market/feed.mjs";
+import { REPLAY_BANNER } from "./market/replay.mjs";
 
 export const STATE_DIR = ".evolve";
 export const STATE_FILE = "state.json";
+
+/**
+ * State isolation: a live/synthetic run writes `state.json`, a historical
+ * replay writes `replay-state.json`, and experiment reports live under
+ * `.evolve/experiments/<id>/`. A replay can therefore never overwrite the live
+ * dashboard snapshot, and the dashboard picks whichever one it asked for.
+ */
+export const REPLAY_STATE_FILE = DEFAULT_REPLAY_STATE_FILE;
 
 export function statePaths(dir = STATE_DIR) {
   return {
@@ -144,12 +154,43 @@ export async function startEngine({ config = createMarketConfig(), dir = STATE_D
   return { feed, simulation, timer };
 }
 
+/**
+ * Replay mode through the standard entry point:
+ *
+ *   EVOLVE_MARKET_MODE=replay EVOLVE_REPLAY_DATASET=<dir> npm run engine
+ *
+ * Identical simulation, dataset-driven clock, state written to the replay state
+ * file so the live dashboard snapshot is untouched.
+ */
+export async function startReplayEngine({ config = createMarketConfig(), dir = STATE_DIR } = {}) {
+  console.log(`[EVOLVE] ${REPLAY_BANNER}`);
+  console.log("[EVOLVE] PAPER ONLY — no wallet, no keys, no signing, no on-chain execution.");
+  console.log(`[EVOLVE] dataset ${config.replay.dataset ?? "(unset)"} · speed ${config.replay.speed} · seed ${config.seed}`);
+
+  let stopping = false;
+  const onSignal = (signal) => {
+    stopping = true;
+    console.log(`[EVOLVE] ${signal} received — finalizing replay state.`);
+  };
+  process.once("SIGINT", () => onSignal("SIGINT"));
+  process.once("SIGTERM", () => onSignal("SIGTERM"));
+
+  const result = await runReplay({ config, dir, shouldStop: () => stopping });
+
+  console.log(
+    `[EVOLVE] replay complete: ${result.ticks} ticks · generations ${result.state.generation} · state -> ${result.statePath}`,
+  );
+  return result;
+}
+
 const invokedDirectly =
   process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (invokedDirectly) {
-  startEngine().catch((error) => {
-    console.error("[EVOLVE] fatal bootstrap error:", error);
+  const config = createMarketConfig();
+  const run = config.requestedMode === "replay" ? startReplayEngine({ config }) : startEngine({ config });
+  run.catch((error) => {
+    console.error("[EVOLVE] fatal bootstrap error:", error?.message ?? error);
     process.exitCode = 1;
   });
 }

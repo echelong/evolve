@@ -226,7 +226,20 @@ type EvolveState = {
   };
   topAgents: Agent[];
   positions: Position[];
-  species: { name: string; role: string; count: number; avgReturn: number; avgFitness: number; trades: number }[];
+  species: {
+    name: string;
+    role: string;
+    count: number;
+    avgReturn: number;
+    medianReturn?: number;
+    avgFitness: number;
+    trades: number;
+    births?: number;
+    deaths?: number;
+    peakCount?: number;
+    extinctionEvents?: number;
+    extinct?: boolean;
+  }[];
   markets: MarketRow[];
   marketSummary: { observed: number; tradeable: number; shown: number; source: string };
   history: { t: number; generation: number; tick: number; avgReturn: number }[];
@@ -253,6 +266,226 @@ type EvolveState = {
     paper: Record<string, number>;
     execution: string;
   };
+  // --- Phase 3: state isolation + historical research -----------------------
+  stateSource?: "live" | "replay";
+  stateUpdatedAt?: string;
+  sources?: {
+    requested: string;
+    available: string[];
+    live: { exists: boolean; updatedAt: string | null };
+    replay: { exists: boolean; updatedAt: string | null };
+  };
+  research?: Research | null;
+  genealogy?: { nodes: number; lineages: number; prunedNodes: number; activeLineages: number; extinctLineages: number; maxGeneration: number };
+  evolution?: {
+    enabled: boolean;
+    frozen: boolean;
+    generationTicks: number;
+    mutationScale: number;
+    crossoverRate: number;
+    immigrantRate: number;
+    eliteFraction: number;
+    breederFraction: number;
+    marketScanLimit: number;
+    trackTrades: boolean;
+  };
+  universe?: { tracked: number; max: number; usable: number; fresh: number; evicted: number };
+  runtime?: { uptimeMs: number; startedAt: string; paperStartingCash: number; speciesCount: number; totalTrades: number; frozen: boolean };
+};
+
+type Range = { start: number; end: number };
+
+type DatasetInfo = {
+  id: string | null;
+  dir: string | null;
+  dataClass: string | null;
+  containsSynthetic: boolean | null;
+  usableForRealMarketReplay: boolean | null;
+  snapshotCount: number | null;
+  uniqueMints: number | null;
+  firstObservedAt: number | null;
+  lastObservedAt: number | null;
+  durationMinutes: number | null;
+  fingerprint: string | null;
+  integrityVerified: boolean | null;
+};
+
+type WindowPlanDetail = {
+  label: string;
+  index: number;
+  seed?: string;
+  train: Range;
+  validate: Range;
+  test: Range;
+};
+
+type EvidenceCheck = { label: string; actual: number; required: number };
+
+type StageMetrics = {
+  netReturn: number | null;
+  robustness: number | null;
+  maxDrawdown: number | null;
+  trades: number | null;
+  distinctMints: number | null;
+  costs: number | null;
+  classification: string | null;
+  evidence: { sufficient: boolean; label: string | null; missing: EvidenceCheck[] } | null;
+} | null;
+
+type WindowCandidate = {
+  candidateId: string | null;
+  species: string | null;
+  lineageId: string | null;
+  seeds: (string | number)[];
+  classification: string | null;
+  reason: string | null;
+  overfitWarning: boolean;
+  train: { netReturn: number | null; robustness: number | null; trades: number | null } | null;
+  validation: StageMetrics;
+  test: StageMetrics;
+};
+
+type WindowRow = {
+  label: string;
+  index: number | null;
+  note?: string | null;
+  window: { train: Range | null; validate: Range | null; test: Range | null } | null;
+  trainRuns: {
+    seed: string | number;
+    ticks: number | null;
+    generations: number | null;
+    candidates: number | null;
+    eligible: number | null;
+    considered: number | null;
+    excludedForEvidence: number | null;
+    freezeAudit: { immutable?: boolean; genomesMutated?: number; frozen?: boolean } | null;
+  }[];
+  candidates: WindowCandidate[];
+  candidateCount: number;
+  survivors: unknown[];
+  baselines: { id: string; metrics: { netReturn?: number; trades?: number } | null; usesFutureData: boolean }[];
+};
+
+type ExperimentReport = {
+  id: string;
+  dir: string;
+  createdAt: string | null;
+  endedAt?: string | null;
+  durationMs?: number | null;
+  dataset: {
+    datasetId?: string;
+    dataClass?: string | null;
+    containsSynthetic?: boolean | null;
+    fingerprint?: string | null;
+    snapshotCount?: number | null;
+    durationMinutes?: number | null;
+  } | null;
+  seeds: (string | number)[];
+  windows: number | null;
+  windowsWithCandidates: number | null;
+  champions: number | null;
+  resultCounts: Record<string, number> | null;
+  outOfSample: {
+    validationMedianNetReturn?: number | null;
+    validationCount?: number | null;
+    validationMedianRobustness?: number | null;
+    testMedianNetReturn?: number | null;
+    testCount?: number | null;
+    testWorstNetReturn?: number | null;
+    testBestNetReturn?: number | null;
+  } | null;
+  classifications: Record<string, number> | null;
+  species: {
+    name: string;
+    role?: string;
+    births?: number;
+    deaths?: number;
+    extinctionEvents?: number;
+    medianTrainReturn?: number | null;
+    medianValidationReturn?: number | null;
+    medianTestReturn?: number | null;
+    championCount?: number;
+  }[];
+  baselineRows: { id: string; window: string; netReturn: number | null; robustness: number | null; trades: number | null; maxDrawdown: number | null; classification: string }[];
+  baselineMedianNetReturn: number | null;
+  windowPlanScaled: boolean;
+  windowsRun: number;
+  windowRows: WindowRow[];
+  championRows: {
+    id: string | null;
+    species: string | null;
+    lineageId: string | null;
+    window: string | null;
+    seeds: (string | number)[];
+    classification: string | null;
+    reason: string | null;
+    overfitWarning: boolean;
+    netReturn: number | null;
+    maxDrawdown: number | null;
+    tradeCount: number | null;
+    distinctMints: number | null;
+    costs: number | null;
+    robustness: number | null;
+    genomeDigest: string | null;
+    datasetFingerprint: string | null;
+    createdAt: string | null;
+    lineageChain: { agentId: string; generation: number | null; species: string | null; origin: string | null; lineageId: string | null }[];
+  }[];
+};
+
+type ChampionArchive = {
+  available: boolean;
+  count: number | null;
+  updatedAt?: string | null;
+  species: { species: string; count: number }[];
+  rows: {
+    id: string | null;
+    species: string | null;
+    window: string | null;
+    classification: string | null;
+    overfitWarning: boolean;
+    validationRobustness: number | null;
+    testNetReturn: number | null;
+    createdAt: string | null;
+  }[];
+};
+
+type Research = {
+  mode?: string;
+  banner?: string;
+  stage?: string;
+  stageForced?: boolean;
+  evolutionFrozen?: boolean;
+  seed?: string;
+  seeds?: (string | number)[];
+  dataset?: DatasetInfo;
+  windows?: {
+    planned: number;
+    scaled: boolean;
+    note: string | null;
+    current: number | null;
+    currentLabel: string | null;
+    stage: string | null;
+    total: number;
+    detail: WindowPlanDetail[];
+  };
+  replay?: {
+    timestamp: number | null;
+    speed: number | string;
+    snapshotsRead: number;
+    totalSnapshots: number | null;
+    progressPct: number | null;
+    firstTimestamp: number | null;
+    lastTimestamp: number | null;
+    wallPacedMs: number;
+    ticks: number;
+    finished: boolean;
+  };
+  experiment?: ExperimentReport | null;
+  champions?: ChampionArchive | null;
+  note?: string;
+  disclaimer?: string;
+  paperOnly?: boolean;
 };
 
 const money = new Intl.NumberFormat("en-US", {
@@ -314,10 +547,41 @@ function relativeTime(iso: string, nowMs: number) {
   return `${duration(ms)} ago`;
 }
 
-function bannerTone(feed: MarketFeed) {
+function bannerTone(feed: MarketFeed, stateSource?: string) {
+  if (stateSource === "replay") return "replay";
   if (feed.effectiveMode === "live" && feed.degraded) return "degraded";
   if (feed.effectiveMode === "live") return "live";
   return "synthetic";
+}
+
+/** Phase 3 result vocabulary. Positive return alone is never a verdict. */
+const CLASSIFICATION_LABEL: Record<string, string> = {
+  "insufficient-sample": "INSUFFICIENT SAMPLE",
+  "failed-validation": "FAILED VALIDATION",
+  "passed-validation": "PASSED VALIDATION",
+  "test-completed": "TEST COMPLETED",
+};
+
+function classificationLabel(value: string | null | undefined) {
+  if (!value) return "—";
+  return CLASSIFICATION_LABEL[value] ?? value.toUpperCase();
+}
+
+function classificationTone(value: string | null | undefined) {
+  if (value === "test-completed") return "good";
+  if (value === "passed-validation") return "good";
+  if (value === "failed-validation") return "bad";
+  return "warn";
+}
+
+function stamp(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return new Date(value).toISOString().replace("T", " ").slice(0, 19);
+}
+
+function stageLabel(stage: string | null | undefined) {
+  if (!stage) return "—";
+  return stage.toUpperCase();
 }
 
 function StatCard({
@@ -349,33 +613,458 @@ function StatCard({
   );
 }
 
-function MarketBanner({ feed }: { feed: MarketFeed }) {
-  const tone = bannerTone(feed);
+function MarketBanner({
+  feed,
+  stateSource,
+  research,
+}: {
+  feed: MarketFeed;
+  stateSource?: string;
+  research?: Research | null;
+}) {
+  const tone = bannerTone(feed, stateSource);
+  const replayDataset = research?.dataset?.id ?? null;
 
   const detail =
-    tone === "degraded"
-      ? (feed.degradedReason ?? "live market data is unavailable")
-      : tone === "live"
-        ? `Jupiter Tokens V2 · last observation ${duration(feed.ageMs)} ago · stale after ${duration(feed.staleMs)}`
-        : feed.fallbackActive
-          ? `live data unavailable (${feed.fallbackReason ?? "unknown reason"})`
-          : "Phase 1 simulator · no live Solana data in use";
+    tone === "replay"
+      ? `Recorded dataset ${replayDataset ?? "unknown"} (${research?.dataset?.dataClass ?? "unclassified"}) · replay speed ${research?.replay?.speed ?? "1"} · simulated paper accounting`
+      : tone === "degraded"
+        ? (feed.degradedReason ?? "live market data is unavailable")
+        : tone === "live"
+          ? `Jupiter Tokens V2 · last observation ${duration(feed.ageMs)} ago · stale after ${duration(feed.staleMs)}`
+          : feed.fallbackActive
+            ? `live data unavailable (${feed.fallbackReason ?? "unknown reason"})`
+            : "Phase 1 simulator · no live Solana data in use";
+
+  const headline =
+    tone === "replay" ? (research?.banner ?? "HISTORICAL REPLAY • PAPER MONEY") : feed.banner;
 
   return (
     <section className={`market-banner ${tone}`}>
       <div className="market-banner-main">
         <span className="banner-dot" />
-        <strong>{feed.banner}</strong>
+        <strong>{headline}</strong>
         <span className="paper-tag solid">PAPER ONLY</span>
       </div>
       <div className="market-banner-sub">
         <span>{detail}</span>
         <span>
-          {feed.provider} · request={feed.requestedMode} · effective={feed.effectiveMode}
+          {tone === "replay"
+            ? `provider ${feed.provider} · state source ${stateSource ?? "replay"} · request=${feed.requestedMode} · effective=${feed.effectiveMode}`
+            : `${feed.provider} · request=${feed.requestedMode} · effective=${feed.effectiveMode}`}
         </span>
       </div>
     </section>
   );
+}
+
+/**
+ * Research / Replay panel: where in the historical timeline this run is, which
+ * walk-forward stage is active, and which dataset bytes produced it.
+ */
+function ResearchPanel({ research, stateSource }: { research: Research; stateSource?: string }) {
+  const dataset = research.dataset;
+  const replay = research.replay;
+  const windows = research.windows;
+
+  const items: { label: string; value: string; tone?: string }[] = [
+    { label: "State source", value: stateSource === "replay" ? "replay (isolated file)" : "live engine" },
+    { label: "Dataset ID", value: dataset?.id ?? "—" },
+    { label: "Dataset type", value: dataset?.dataClass ?? "—", tone: dataset?.containsSynthetic ? "warn" : "good" },
+    {
+      label: "Real-market usable",
+      value: dataset?.usableForRealMarketReplay === true ? "yes" : "no (synthetic/mixed)",
+      tone: dataset?.usableForRealMarketReplay === true ? "good" : "warn",
+    },
+    { label: "Replay timestamp", value: stamp(replay?.timestamp) },
+    {
+      label: "Replay progress",
+      value:
+        replay?.progressPct === null || replay?.progressPct === undefined
+          ? "—"
+          : `${replay.progressPct.toFixed(1)}% (${replay.snapshotsRead}/${replay.totalSnapshots ?? "?"})`,
+    },
+    { label: "Replay speed", value: `${replay?.speed ?? 1}×` },
+    {
+      label: "Current stage",
+      value: stageLabel(research.stage),
+      tone: research.evolutionFrozen ? "warn" : undefined,
+    },
+    { label: "Evolution", value: research.evolutionFrozen ? "FROZEN (no breeding)" : "ACTIVE (train)", tone: research.evolutionFrozen ? "warn" : "good" },
+    {
+      label: "Window",
+      value: windows?.current ? `${windows.current} / ${windows.total}` : `— / ${windows?.total ?? 0}`,
+    },
+    { label: "Seed", value: String(research.seed ?? "—") },
+    { label: "Seeds evaluated", value: (research.seeds ?? []).join(", ") || "—" },
+    { label: "Dataset span", value: `${(dataset?.durationMinutes ?? 0).toFixed(1)} min · ${count(dataset?.snapshotCount ?? null)} snapshots` },
+    { label: "First observation", value: stamp(dataset?.firstObservedAt) },
+    { label: "Final observation", value: stamp(dataset?.lastObservedAt) },
+    {
+      label: "Integrity",
+      value:
+        dataset?.integrityVerified === true
+          ? "verified"
+          : dataset?.integrityVerified === false
+            ? "MISMATCH"
+            : "unknown",
+      tone: dataset?.integrityVerified === false ? "bad" : undefined,
+    },
+    { label: "Fingerprint", value: dataset?.fingerprint ? `${dataset.fingerprint.slice(0, 16)}…` : "—" },
+  ];
+
+  const currentWindow = windows?.detail?.find((entry) => entry.label === windows?.currentLabel) ?? null;
+
+  return (
+    <div className="panel research-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">
+            RESEARCH / REPLAY <span className="paper-tag">PAPER</span>
+          </p>
+          <h2>Historical capture</h2>
+        </div>
+        <Database size={20} />
+      </div>
+
+      <div className="health-grid">
+        {items.map((item) => (
+          <div className="health-item" key={item.label}>
+            <span>{item.label}</span>
+            <strong className={item.tone ? `tone-${item.tone}` : undefined}>{item.value}</strong>
+          </div>
+        ))}
+      </div>
+
+      {windows && windows.detail.length > 0 ? (
+        <div className="window-strip">
+          <div className="window-strip-head">
+            <span>Walk-forward windows planned: {windows.planned}</span>
+            {windows.scaled ? <span className="tone-warn">scaled to dataset length</span> : null}
+          </div>
+          <div className="window-track">
+            {windows.detail.map((entry) => (
+              <div
+                className={`window-block ${entry.label === windows.currentLabel ? "current" : ""}`}
+                key={entry.label}
+                title={`${entry.label} · train ${stamp(entry.train.start)} → ${stamp(entry.train.end)} · validate → ${stamp(entry.validate.end)} · test → ${stamp(entry.test.end)}`}
+              >
+                <span className="window-train" />
+                <span className="window-validate" />
+                <span className="window-test" />
+                <small>{entry.label}</small>
+              </div>
+            ))}
+          </div>
+          {currentWindow ? (
+            <div className="window-periods">
+              <div>
+                <span className="tone-good">TRAIN</span>
+                <small>
+                  {stamp(currentWindow.train.start)} → {stamp(currentWindow.train.end)}
+                </small>
+              </div>
+              <div>
+                <span className="tone-warn">VALIDATE</span>
+                <small>
+                  {stamp(currentWindow.validate.start)} → {stamp(currentWindow.validate.end)}
+                </small>
+              </div>
+              <div>
+                <span className="tone-bad">TEST</span>
+                <small>
+                  {stamp(currentWindow.test.start)} → {stamp(currentWindow.test.end)}
+                </small>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : windows && windows.note ? (
+        <p className="health-note">Window plan unavailable for this dataset: {windows.note.split("\n")[0]}</p>
+      ) : null}
+
+      <p className="health-note">
+        {research.note ??
+          "Historical replay runs the paper engine over recorded observations. Recorded data is never re-fetched, and replay speed changes only wall-clock pacing — never a decision."}
+      </p>
+    </div>
+  );
+}
+
+/** Out-of-sample panel: the honest scoreboard, including the losing outcomes. */
+function OutOfSamplePanel({ experiment }: { experiment: ExperimentReport | null }) {
+  if (!experiment) {
+    return (
+      <div className="panel oos-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">OUT OF SAMPLE</p>
+            <h2>Walk-forward results</h2>
+          </div>
+          <FlaskConical size={20} />
+        </div>
+        <p className="muted">
+          No experiment report yet. Run <code>npm run experiment -- &lt;dataset&gt;</code> to train on one period,
+          validate on the next, and test on data neither stage influenced.
+        </p>
+      </div>
+    );
+  }
+
+  const oos = experiment.outOfSample;
+  const counts = experiment.resultCounts ?? {};
+  const champions = experiment.championRows ?? [];
+  const best = [...champions].sort((a, b) => (b.netReturn ?? -Infinity) - (a.netReturn ?? -Infinity))[0] ?? null;
+
+  const items: { label: string; value: string; tone?: string }[] = [
+    { label: "Experiment", value: experiment.id },
+    { label: "Dataset class", value: experiment.dataset?.dataClass ?? "—" },
+    { label: "Seeds", value: experiment.seeds.join(", ") || "—" },
+    { label: "Windows run", value: `${experiment.windowsRun} / ${experiment.windows ?? "?"}` },
+    { label: "Validation median", value: pct((oos?.validationMedianNetReturn ?? NaN) * 100), tone: (oos?.validationMedianNetReturn ?? 0) >= 0 ? "good" : "bad" },
+    { label: "Test median", value: pct((oos?.testMedianNetReturn ?? NaN) * 100), tone: (oos?.testMedianNetReturn ?? 0) >= 0 ? "good" : "bad" },
+    { label: "Test worst seed", value: pct((oos?.testWorstNetReturn ?? NaN) * 100) },
+    { label: "Validation n", value: count(oos?.validationCount ?? null) },
+    { label: "Test n", value: count(oos?.testCount ?? null) },
+    { label: "Validation robustness (median)", value: oos?.validationMedianRobustness === null || oos?.validationMedianRobustness === undefined ? "—" : oos.validationMedianRobustness.toFixed(2) },
+    { label: "Insufficient sample", value: String(counts.insufficientSample ?? 0), tone: (counts.insufficientSample ?? 0) > 0 ? "warn" : undefined },
+    { label: "Failed validation", value: String(counts.failedValidation ?? 0), tone: (counts.failedValidation ?? 0) > 0 ? "bad" : undefined },
+    { label: "Passed validation", value: String(counts.passedValidation ?? 0) },
+    { label: "Test completed", value: String(counts.testCompleted ?? 0) },
+    { label: "Overfit warnings", value: String(counts.overfitWarnings ?? 0), tone: (counts.overfitWarnings ?? 0) > 0 ? "bad" : undefined },
+    { label: "Champions archived", value: String(experiment.champions ?? 0) },
+    { label: "Baseline median", value: pct((experiment.baselineMedianNetReturn ?? NaN) * 100) },
+  ];
+
+  return (
+    <div className="panel oos-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">
+            OUT OF SAMPLE <span className="paper-tag">PAPER</span>
+          </p>
+          <h2>Walk-forward scoreboard</h2>
+        </div>
+        <FlaskConical size={20} />
+      </div>
+
+      <div className="health-grid">
+        {items.map((item) => (
+          <div className="health-item" key={item.label}>
+            <span>{item.label}</span>
+            <strong className={item.tone ? `tone-${item.tone}` : undefined}>{item.value}</strong>
+          </div>
+        ))}
+      </div>
+
+      <div className="table-scroll oos-table-wrap">
+        <table className="oos-table">
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Candidate</th>
+              <th>Species</th>
+              <th>Train</th>
+              <th>Validation</th>
+              <th>Test</th>
+              <th>Test DD</th>
+              <th>Trades</th>
+              <th>Tokens</th>
+              <th>Costs</th>
+              <th>Robustness</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {experiment.windowRows.flatMap((row, rowIndex) =>
+              row.candidates.map((candidate, candidateIndex) => (
+                <tr key={`${row.label}-${rowIndex}-${candidateIndex}`}>
+                  <td>{row.label}</td>
+                  <td>
+                    <strong>{candidate.candidateId ?? candidate.species ?? "—"}</strong>
+                    <small>
+                      {candidate.lineageId ?? "no lineage"} · seeds {(candidate.seeds ?? []).join(", ")}
+                    </small>
+                  </td>
+                  <td>{candidate.species ?? "—"}</td>
+                  <td>{pct((candidate.train?.netReturn ?? NaN) * 100)}</td>
+                  <td>{pct((candidate.validation?.netReturn ?? NaN) * 100)}</td>
+                  <td className={(candidate.test?.netReturn ?? 0) >= 0 ? "positive" : "negative"}>
+                    {candidate.test ? pct((candidate.test.netReturn ?? NaN) * 100) : "not run"}
+                  </td>
+                  <td>{candidate.test?.maxDrawdown === null || candidate.test?.maxDrawdown === undefined ? "—" : `-${(candidate.test.maxDrawdown * 100).toFixed(1)}%`}</td>
+                  <td>{candidate.test?.trades ?? candidate.validation?.trades ?? "—"}</td>
+                  <td>{candidate.test?.distinctMints ?? candidate.validation?.distinctMints ?? "—"}</td>
+                  <td>{candidate.test?.costs === null || candidate.test?.costs === undefined ? "—" : money2.format(candidate.test.costs)}</td>
+                  <td>{candidate.validation?.robustness === null || candidate.validation?.robustness === undefined ? "—" : candidate.validation.robustness.toFixed(1)}</td>
+                  <td>
+                    <span className={`result-chip ${classificationTone(candidate.classification)}`}>
+                      {classificationLabel(candidate.classification)}
+                    </span>
+                    {candidate.overfitWarning ? <small className="tone-bad"> overfit warning</small> : null}
+                  </td>
+                </tr>
+              )),
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {best ? (
+        <p className="health-note">
+          Best archived test result: {best.id} ({best.species}) at {pct((best.netReturn ?? NaN) * 100)} paper return over {
+            best.tradeCount ?? "?"
+          }{" "}
+          trades across {best.distinctMints ?? "?"} token(s) · {classificationLabel(best.classification)}. A positive number is
+          not a promise: it is one simulated paper window on one dataset.
+        </p>
+      ) : (
+        <p className="health-note">
+          No genome cleared the minimum evidence gates yet, so there is nothing to report as validated. That is a valid
+          result: two lucky paper trades is not evidence.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Evolution research: lineage health, survival by species, and cheap genealogy SVG. */
+function EvolutionResearchPanel({ state, research }: { state: EvolveState; research?: Research | null }) {
+  const experiment = research?.experiment ?? null;
+  const champions = research?.champions ?? null;
+  const archiveCount = champions?.count ?? experiment?.champions ?? 0;
+  const best = state.topAgents[0] ?? null;
+
+  const speciesSurvival = useMemo(() => {
+    if (experiment && experiment.species.length > 0) return experiment.species;
+    return state.species.map((entry) => ({
+      name: entry.name,
+      role: entry.role,
+      births: entry.births ?? 0,
+      deaths: entry.deaths ?? 0,
+      extinctionEvents: entry.extinctionEvents ?? 0,
+      medianValidationReturn: null,
+      medianTestReturn: null,
+      championCount: 0,
+    }));
+  }, [experiment, state.species]);
+
+  const maxBirths = Math.max(...speciesSurvival.map((entry) => entry.births ?? 0), 1);
+
+  const evolution = state.evolution as
+    | { enabled?: boolean; frozen?: boolean; mutationScale?: number; crossoverRate?: number; immigrantRate?: number; eliteFraction?: number; breederFraction?: number; generationTicks?: number }
+    | undefined;
+
+  const lineageChain = experiment?.championRows?.find((row) => row.lineageChain.length > 0)?.lineageChain ?? [];
+
+  const extinctLineages = championLineages(experiment);
+
+  return (
+    <div className="panel evolution-research-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">EVOLUTION RESEARCH</p>
+          <h2>Lineages and survival</h2>
+        </div>
+        <BrainCircuit size={20} />
+      </div>
+
+      <div className="health-grid">
+        <div className="health-item">
+          <span>Best current lineage</span>
+          <strong>
+            {lineageChain[0]?.lineageId ?? best?.id ?? "—"}
+            {lineageChain.length > 0 ? ` (${lineageChain.length} steps)` : ""}
+          </strong>
+        </div>
+        <div className="health-item">
+          <span>Champion archive</span>
+          <strong>{archiveCount}</strong>
+        </div>
+        <div className="health-item">
+          <span>Lineages lost (est.)</span>
+          <strong className={extinctLineages > 0 ? "tone-warn" : undefined}>{extinctLineages}</strong>
+        </div>
+        <div className="health-item">
+          <span>Generation</span>
+          <strong>{state.generation}</strong>
+        </div>
+        <div className="health-item">
+          <span>Mutation scale</span>
+          <strong>{evolution?.mutationScale ?? "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Crossover rate</span>
+          <strong>{evolution?.crossoverRate ?? "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Immigrant rate</span>
+          <strong>{evolution?.immigrantRate ?? "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Genealogy nodes</span>
+          <strong>{state.genealogy?.nodes ?? "—"}</strong>
+        </div>
+      </div>
+
+      <div className="survival-list">
+        {speciesSurvival.map((entry) => (
+          <div className="survival-row" key={entry.name}>
+            <div className="survival-meta">
+              <strong>{entry.name}</strong>
+              <span>
+                births {entry.births ?? 0} · deaths {entry.deaths ?? 0} · extinct events {entry.extinctionEvents ?? 0} · champions{" "}
+                {entry.championCount ?? 0}
+              </span>
+            </div>
+            <div className="survival-track">
+              <div className="survival-alive" style={{ width: `${((entry.births ?? 0) / maxBirths) * 100}%` }} />
+            </div>
+            <small className="species-role">
+              {entry.role ?? ""}
+              {entry.medianValidationReturn !== null && entry.medianValidationReturn !== undefined
+                ? ` · val ${pct(entry.medianValidationReturn * 100)}`
+                : ""}
+              {entry.medianTestReturn !== null && entry.medianTestReturn !== undefined
+                ? ` · test ${pct(entry.medianTestReturn * 100)}`
+                : ""}
+            </small>
+          </div>
+        ))}
+      </div>
+
+      {lineageChain.length > 0 ? (
+        <div className="lineage-block">
+          <p className="eyebrow">CHAMPION LINEAGE</p>
+          <svg viewBox={`0 0 420 ${lineageChain.length * 34 + 10}`} className="lineage-svg" role="img" aria-label="Champion lineage chain">
+            {lineageChain.map((step, index) => (
+              <g key={step.agentId} transform={`translate(0 ${index * 34 + 6})`}>
+                <circle cx={14} cy={12} r={7} className={`lineage-node ${index === 0 ? "origin" : ""}`} />
+                {index < lineageChain.length - 1 ? <line x1={14} y1={19} x2={14} y2={34} className="lineage-edge" /> : null}
+                <text x={30} y={10} className="lineage-text">
+                  {step.agentId} · gen {step.generation ?? "?"} · {step.species ?? "unknown"}
+                </text>
+                <text x={30} y={24} className="lineage-sub">
+                  {step.origin ?? "unknown origin"} · lineage {step.lineageId ?? "—"}
+                </text>
+              </g>
+            ))}
+          </svg>
+        </div>
+      ) : null}
+
+      <p className="health-note">
+        Evolution is selection between paper portfolios, not a profit model. Species survival and lineage depth are
+        research statistics; they do not imply any edge in live markets.
+      </p>
+    </div>
+  );
+}
+
+/** Species that suffered at least one extinction event during the run. */
+function championLineages(experiment: ExperimentReport | null) {
+  if (!experiment) return 0;
+  return experiment.species.filter((entry) => (entry.extinctionEvents ?? 0) > 0).length;
 }
 
 function FeedHealth({ feed }: { feed: MarketFeed }) {
@@ -601,15 +1290,28 @@ function PositionsPanel({ state }: { state: EvolveState }) {
   );
 }
 
-function Dashboard({ state, nowMs }: { state: EvolveState; nowMs: number }) {
+function Dashboard({
+  state,
+  nowMs,
+  source,
+  onSource,
+}: {
+  state: EvolveState;
+  nowMs: number;
+  source: string;
+  onSource: (next: string) => void;
+}) {
   const progress = state.generationTicks > 0 ? (state.tick / state.generationTicks) * 100 : 0;
   const best = state.topAgents[0];
   const feed = state.marketFeed;
+  const research = state.research ?? null;
+  const isReplay = state.stateSource === "replay" || research?.mode === "replay";
 
   // The banner describes the feed as the engine saw it. If the snapshot itself
-  // has stopped updating, say so plainly rather than implying live data.
+  // has stopped updating, say so plainly rather than implying live data. A
+  // finished replay is not a stalled engine, so it is reported separately.
   const snapshotAgeMs = nowMs > 0 ? Math.max(0, nowMs - new Date(state.updatedAt).getTime()) : 0;
-  const engineStale = nowMs > 0 && snapshotAgeMs > 15_000;
+  const engineStale = nowMs > 0 && snapshotAgeMs > 15_000 && !isReplay;
 
   const speciesMax = Math.max(...state.species.map((s) => s.count), 1);
 
@@ -652,6 +1354,18 @@ function Dashboard({ state, nowMs }: { state: EvolveState; nowMs: number }) {
             <Signal size={14} />
             breadth {state.marketBreadth.toFixed(0)}%
           </span>
+          <div className="source-switch" role="group" aria-label="Dashboard state source">
+            {["auto", "live", "replay"].map((option) => (
+              <button
+                type="button"
+                key={option}
+                className={option === source ? "source-option active" : "source-option"}
+                onClick={() => onSource(option)}
+              >
+                {option.toUpperCase()}
+              </button>
+            ))}
+          </div>
         </div>
       </header>
 
@@ -662,7 +1376,15 @@ function Dashboard({ state, nowMs }: { state: EvolveState; nowMs: number }) {
         </div>
       ) : null}
 
-      <MarketBanner feed={feed} />
+      {isReplay ? (
+        <div className="replay-strip">
+          Historical replay state (written {duration(snapshotAgeMs)} ago). Showing <code>replay-state.json</code> — the
+          live engine state is isolated in <code>state.json</code> and is not affected.
+          {research?.replay?.finished ? " This replay has finished; the numbers below are the final recorded snapshot." : ""}
+        </div>
+      ) : null}
+
+      <MarketBanner feed={feed} stateSource={state.stateSource} research={research} />
 
       <section className="hero panel">
         <div>
@@ -737,6 +1459,17 @@ function Dashboard({ state, nowMs }: { state: EvolveState; nowMs: number }) {
           icon={Sparkles}
         />
       </section>
+
+      {research?.dataset || research?.replay ? (
+        <ResearchPanel research={research} stateSource={state.stateSource} />
+      ) : null}
+
+      {research ? (
+        <section className="dashboard-grid research-grid">
+          <OutOfSamplePanel experiment={research.experiment ?? null} />
+          <EvolutionResearchPanel state={state} research={research} />
+        </section>
+      ) : null}
 
       <FeedHealth feed={feed} />
 
@@ -999,13 +1732,28 @@ export default function Home() {
   const [state, setState] = useState<EvolveState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(0);
+  const [source, setSource] = useState("auto");
+
+  /**
+   * `?source=live|replay|auto` selects which isolated state file the dashboard
+   * reads, so a historical replay can be inspected without disturbing the live
+   * view. Clicking a switch keeps the URL in sync instead of fighting it.
+   */
+  const selectSource = (next: string) => {
+    setSource(next);
+    const url = new URL(window.location.href);
+    url.searchParams.set("source", next);
+    window.history.replaceState(null, "", url);
+  };
 
   useEffect(() => {
     let active = true;
 
     async function refresh() {
       try {
-        const response = await fetch("/api/state", { cache: "no-store" });
+        const fromUrl = new URLSearchParams(window.location.search).get("source");
+        const requested = fromUrl && ["auto", "live", "replay"].includes(fromUrl) ? fromUrl : source;
+        const response = await fetch(`/api/state?source=${requested}`, { cache: "no-store" });
         if (!response.ok) throw new Error("Waiting for evolutionary engine");
         const next = (await response.json()) as EvolveState;
         if (active) {
@@ -1026,7 +1774,7 @@ export default function Home() {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [source]);
 
   if (!state) {
     return (
@@ -1046,5 +1794,5 @@ export default function Home() {
     );
   }
 
-  return <Dashboard state={state} nowMs={nowMs} />;
+  return <Dashboard state={state} nowMs={nowMs} source={source} onSource={selectSource} />;
 }

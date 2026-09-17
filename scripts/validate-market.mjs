@@ -775,7 +775,9 @@ test("12. No real transaction-execution path exists in the codebase", async () =
         continue;
       }
       if (!extensions.has(path.extname(entry.name))) continue;
-      if (relative.replace(/\\/g, "/").endsWith("scripts/validate-market.mjs")) continue;
+      // Validation suites contain these patterns as detection rules, and as
+      // strings they must be able to describe what they forbid.
+      if (/^validate-.+\.mjs$/.test(entry.name)) continue;
 
       const text = await readFile(path.join(PROJECT_ROOT, relative), "utf8");
       for (const pattern of FORBIDDEN_PATTERNS) {
