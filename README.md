@@ -4,9 +4,10 @@
 
 EVOLVE is an experimental evolutionary trading-agent laboratory. A population of agents competes under identical market conditions, high-fitness genomes reproduce, weak agents are terminated, and mutations preserve exploration across generations.
 
-> **Current status:** Phase 3 — historical market capture, deterministic replay, and walk-forward
-> evolution. The repository contains no wallet keys, no signer, and no transaction path. It cannot
-> spend real SOL because that capability does not exist in it.
+> **Current status:** Phase 4 — Champion Arena, regime/stress testing, and the Live Shadow League, on
+> top of Phase 3's historical capture, deterministic replay, and walk-forward evolution. The repository
+> contains no wallet keys, no signer, and no transaction path. It cannot spend real SOL because that
+> capability does not exist in it.
 
 Every monetary number the system produces is **PAPER P&L**. Simulated returns are not real profits.
 Historical backtests and paper results **do not** guarantee future profitability.
@@ -31,7 +32,9 @@ Historical backtests and paper results **do not** guarantee future profitability
 - Baselines (no-trade, random, momentum, buy-and-hold-like) under identical friction
 - Multi-seed evaluation with median/mean/worst aggregation, species survival analysis, genealogy
 - Dashboard polling the engine once per second, with isolated live / replay state
-- Validation suites, syntax sweep, offline engine and replay smoke runs
+- Champion Arena: large-scale tournament with regime/stress testing and a transparent Arena Score
+- Live Shadow League: frozen Deployment Candidates paper-trading genuine current market data
+- Validation suites, syntax sweep, offline engine, replay, and arena smoke runs
 
 ## Run
 
@@ -393,6 +396,152 @@ experiment summary plus the champion index for the research and out-of-sample pa
 
 No badge says “successful strategy” merely because a return is positive.
 
+## Phase 4 — Champion Arena, regime/stress testing, Live Shadow League
+
+**Still PAPER TRADING ONLY.** There is no private key, seed phrase, keypair, wallet adapter, signer,
+transaction construction, transaction broadcast, RPC write path, or Jupiter swap/order execution
+anywhere in this repository. Phase 4 adds a large-scale tournament and a long-running paper shadow
+evaluation on top of the same replay engine and simulated fill machinery from Phase 3 — it does not add
+any new capability to spend real SOL.
+
+### Champion Arena
+
+```bash
+npm run arena                                       # registry sweep over .evolve/history
+npm run arena -- <dataset-dir> [<dataset-dir> ...]   # specific dataset(s)
+EVOLVE_ARENA_POPULATION=500 EVOLVE_ARENA_WORKERS=8 EVOLVE_ARENA_GENERATIONS=20 npm run arena
+```
+
+Entrants — newly evolved genomes, archived champions (re-entering, never protected), and random
+immigrants — compete across every supplied dataset, seed, regime, and stress profile through a fixed
+funnel:
+
+```text
+QUALIFICATION -> GROUP -> STRESS -> OUT-OF-SAMPLE -> CHAMPION LEAGUE -> DEPLOYMENT CANDIDATES
+```
+
+`EVOLVE_ARENA_GENERATIONS` (default 1) runs cheap, single-seed, no-stress pre-evolution rounds — each
+one breeds the next round's pool from the previous round's top scorers — before the final generation
+runs the full funnel with stress and out-of-sample evaluation and writes output. Every candidate sees
+identical observations and identical applicable friction; agents never alter simulated market prices.
+
+### Dataset registry and real-vs-synthetic evidence
+
+`buildDatasetRegistry()` (`scripts/arena/orchestrator.mjs`) walks `.evolve/history/` and classifies each
+dataset as `REAL`, `SYNTHETIC`, or `MIXED` using the same `usableForRealMarketReplay` flag the Phase 3
+recorder already writes — a synthetic or mixed dataset is *never* aggregated into real-market evidence.
+`registrySummary()` reports real and synthetic dataset counts and observed durations **separately**, and
+arena and dashboard output always print both, e.g.:
+
+```text
+Real datasets:       8   Real observation:    41h
+Synthetic datasets:  3   Synthetic duration:  12h
+```
+
+### Regime classifier
+
+Deterministic, rule-based, and strictly backward-looking: `computeRegimeMetrics()` derives median
+return, dispersion, positive-return ratio, liquidity/volume change, buy/sell and organic ratios, active
+token count, and launch-heavy ratio from only the snapshots inside one window, and
+`classifyRegimeFromMetrics()` matches an ordered rule list (first match wins, so the result is
+inspectable) into one of: `strong-risk-on`, `weak-risk-on`, `sideways-chop`, `high-volatility`,
+`liquidity-expansion`, `liquidity-contraction`, `broad-selloff`, `launch-heavy`, `low-activity`. Regime
+labels are a heuristic, not ground truth — the supporting metrics are always stored alongside the label.
+
+### Stress engine
+
+Stress profiles (`none`, `mild`, `moderate`, `severe`, `extreme`) scale **execution conditions only** —
+fee multiplier, slippage multiplier, an adverse-execution buffer, observation delay, missing-snapshot
+rate, stale-interval length, liquidity haircut, and position-cap pressure — never historical prices. A
+deterministic token-failure plan (`buildTokenFailurePlan`) simulates tokens disappearing mid-window: no
+new entries open on a disappeared mint, an existing position closes on its last defensible observed
+mark, and no future price is ever fabricated.
+
+### Arena Score
+
+`computeArenaScore()` is a transparent, multi-component heuristic — **not** raw return. It blends median
+and worst out-of-sample return, drawdown, stress survival, regime breadth, seed consistency, distinct-
+token breadth, concentration penalty, cost sensitivity under added friction, a catastrophic-loss
+penalty, and evidence strength, each as a named, inspectable component (see `arenaScore.components` in
+any arena output). The formula string ships in every arena's `summary.json` and here:
+
+> `ArenaScore = 100 * weighted mean of: medianOOS tanh(netReturn/scale), worstPeriod tanh(worst/scale),
+> drawdown (1-DD/scale), stressSurvival (survived/total), regimeBreadth (positive regimes/known),
+> seedConsistency (1-std/scale), tokenBreadth log-scaled distinct mints, concentration (1-topMintShare),
+> costSensitivity (1-loss-under-2x-friction), catastrophic (0 if any blow-up), evidence (trades+mints+
+> windows coverage)`
+
+**Arena Score does not predict future profitability.**
+
+### Survival gates, Deployment Candidates, and Hall of Fame
+
+Every candidate lands in one explicit state: `INSUFFICIENT EVIDENCE`, `ELIMINATED`, `ARENA SURVIVOR`, or
+`DEPLOYMENT CANDIDATE`. `evaluateSurvivalGates()` checks minimum trades, distinct mints, genuine
+real-market datasets, out-of-sample windows, seeds, stress profiles survived, maximum drawdown, mint
+concentration, mild-stress survival, and zero catastrophic events — **any single failed gate**
+eliminates the candidate regardless of score, and insufficient evidence can never qualify no matter how
+high the score reads. A specialist that clears every gate becomes an `ARENA SURVIVOR`, not automatically
+a `DEPLOYMENT CANDIDATE` — it still needs demonstrated regime breadth.
+
+The Hall of Fame (`.evolve/hall-of-fame/index.json`) is historical/research recognition only — membership
+never implies deployment eligibility, profitability, or safety. Previous champions re-enter every future
+arena unprotected, can lose their title, and their appearances, title defenses, and eliminations are all
+tracked side by side.
+
+### Diversity protection and adaptive mutation
+
+`computeGenomeMetrics()` reports deterministic, bounded genome diversity, species distribution, and
+lineage concentration (a Herfindahl index, correctly falling back to the genome digest — not a shared
+"unknown" bucket — for entrants without an explicit lineage id). `diversityVerdict()` flags a collapsing
+population, and `adaptMutationScale()` nudges the mutation scale up under sustained low diversity and
+back toward baseline once diversity recovers, always within `MUTATION_LIMITS` — performance still ranks
+above novelty; diversity only protects against total convergence.
+
+### Live Shadow League
+
+```bash
+npm run shadow                                # admits DEPLOYMENT CANDIDATE(s) only
+npm run shadow -- --dev <genome.json|digest>  # labelled UNQUALIFIED SHADOW TEST — clearly not qualified
+```
+
+`LIVE SHADOW LEAGUE • PAPER MONEY` observes genuine current market data while frozen candidate genomes
+paper trade — **no mutation, no crossover, no threshold adaptation, no learning from shadow results, and
+no genome parameter ever changes for the life of the run.** Each candidate tracks bankroll, gross/net
+P&L, drawdown, simulated costs, trades, distinct mints, current positions, and feed-health exposure;
+state is persisted under `.evolve/shadow/<candidateId>.json` with no secrets and no genome mutation.
+Duration milestones (1h / 6h / 24h / 3d / 7d / 30d) progress a status from `SHADOW TESTING` through
+`SHADOW PROVISIONAL` to `SHADOW VALIDATED` as paper evidence accumulates — even `SHADOW VALIDATED` is
+still paper-only and never enables real trading. A degraded live feed blocks *new* shadow entries
+(`shadowEntryGate`); existing positions keep their last defensible observed mark.
+
+### Caching and parallel evaluation
+
+Arena evaluation results are cached under `.evolve/arena-cache/`, keyed by `arenaCacheKey()` over the
+dataset fingerprint(s), genome digest, seed, stage, stress profile, and the arena/scoring code versions
+— any one of those changing invalidates the cache; everything else reuses it.
+`EVOLVE_ARENA_WORKERS=<n>` bounds evaluation across worker threads (default: inline, single-threaded).
+Each worker evaluates one candidate independently against seeded, deterministic replay stages, so the
+result is identical regardless of worker count — this is asserted by `validate:arena`.
+
+### Commands
+
+```bash
+npm run arena           # run the Champion Arena (see EVOLVE_ARENA_* env vars above)
+npm run shadow          # run the Live Shadow League against the active market feed
+npm run champions       # print the champion archive and the Hall of Fame
+npm run smoke:arena     # tiny, fully offline, deterministic funnel smoke run
+npm run validate:arena  # Phase 4 validation suite (26 offline cases)
+```
+
+### Statistical honesty
+
+Arena and shadow output report medians, worst-period figures, seed dispersion, and evidence strength
+rather than a single flattering number, and every evolved candidate is compared against the same
+mandatory Phase 3 baselines (no-trade, random, fixed momentum, buy-and-hold-like) under identical
+observations and friction — including when the evolved candidates lose to them. Nothing in the Champion
+Arena or the Live Shadow League is a claim that a candidate is profitable, safe, proven, predictive, or
+statistically significant.
+
 ## Validation
 
 ```bash
@@ -441,6 +590,35 @@ Phase 3 adds `npm run validate:history` (30 offline cases):
   fabricating observations
 - **Replay smoke** — record → replay → train/validate/test end to end, offline, in milliseconds
 
+Phase 4 adds `npm run validate:arena` (26 offline cases):
+
+- **Dataset registry** — real/synthetic/mixed classification, real evidence never counted from synthetic
+- **Regime classification** — no look-ahead (a window's classification is unaffected by later windows),
+  deterministic, ordered-rule and unknown-on-no-data
+- **Stress engine** — every profile changes execution friction only, never price data; deterministic
+  token-disappearance plan with a conservative close policy and no fabricated price
+- **Arena Score** — penalises one-trade, one-token, one-seed, and catastrophic-drawdown profiles; pure
+  and deterministic; bounded to [0, 100]
+- **Survival gates** — insufficient evidence can never qualify; every gate must pass for a Deployment
+  Candidate; mild-stress survival and zero-catastrophic-events are enforced when configured
+- **Specialist/generalist** — classification reflects regime breadth honestly, with no data defaulting
+  to generalist rather than a guessed label
+- **Diversity and mutation** — genome diversity and lineage concentration are deterministic and bounded;
+  adaptive mutation never leaves its configured bounds
+- **Hall of Fame** — membership never implies Deployment Candidate status; title defenses require
+  back-to-back qualifying arenas, not a first promotion
+- **Champion re-entry** — a previous champion enters the pool and can be eliminated at qualification or
+  keep winning at the group stage, exactly like any other entrant
+- **Shadow League** — genomes are frozen (a milestone advance never touches the genome); development
+  overrides are permanently labelled `UNQUALIFIED SHADOW TEST`; duration milestones only move forward; a
+  degraded feed blocks new entries without fabricating a price
+- **Cache** — keys change with dataset fingerprint, seed, stage, stress profile, and code version; reads
+  reproduce exact writes; no secret-shaped string ever lands in a cache file
+- **Tournament** — the full funnel runs end to end with no `NaN`/`Infinity`; ranking is deterministic;
+  worker count never changes the evaluated result
+- **No execution path** — the arena/shadow code is scanned for wallet, signing, and transaction-execution
+  patterns exactly like Phase 2 and Phase 3
+
 ## Roadmap
 
 ### Phase 1 — evolutionary lab
@@ -469,11 +647,20 @@ Phase 3 adds `npm run validate:history` (30 offline cases):
 - [x] Multi-seed aggregation, species survival analysis, machine-readable experiment reports
 - [x] Isolated live / replay / experiment state and Phase 3 dashboard panels
 
-### Phase 4 — shadow execution
-- [ ] WebSocket / streaming market ingestion
-- [ ] Strategy quarantine and promotion gates
-- [ ] Risk-adjusted fitness across multiple regimes
-- [ ] Kill switches and loss budgets
+### Phase 4 — Champion Arena, regime/stress testing, Live Shadow League
+- [x] Large-scale tournament (qualification → group → stress → OOS → champion league → deployment)
+- [x] Dataset registry with explicit real/synthetic/mixed evidence accounting
+- [x] Deterministic, no-look-ahead market regime classifier
+- [x] Deterministic execution-side stress engine and token-disappearance handling
+- [x] Transparent, multi-component Arena Score with the formula shipped in output and docs
+- [x] Survival gates, Deployment Candidates, and a Hall of Fame that never implies eligibility
+- [x] Champion re-entry: previous champions compete unprotected and can lose
+- [x] Genetic diversity protection and bounded adaptive mutation
+- [x] Live Shadow League: frozen genomes, paper-only, admission-gated, duration milestones
+- [x] Arena result caching and bounded parallel (worker-thread) evaluation
+- [ ] WebSocket / streaming market ingestion (still polling-based)
+- [ ] Strategy quarantine and promotion gates beyond the Shadow League's own milestones
+- [ ] Kill switches and loss budgets (paper-only; there is nothing real to halt yet)
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

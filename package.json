@@ -12,14 +12,19 @@
     "validate:market": "node scripts/validate-market.mjs",
     "validate:syntax": "node scripts/check-syntax.mjs",
     "smoke:engine": "node scripts/smoke-engine.mjs",
-    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run smoke:engine && npm run smoke:replay",
+    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena",
     "probe:market": "node scripts/probe-jupiter.mjs",
     "record:market": "node scripts/record-market.mjs",
     "fixture:market": "node scripts/make-fixture.mjs",
     "replay": "node scripts/replay.mjs",
     "experiment": "node scripts/experiment.mjs",
     "validate:history": "node scripts/validate-history.mjs",
-    "smoke:replay": "node scripts/smoke-replay.mjs"
+    "smoke:replay": "node scripts/smoke-replay.mjs",
+    "arena": "node scripts/arena.mjs",
+    "shadow": "node scripts/arena/shadow.mjs",
+    "champions": "node scripts/champions.mjs",
+    "smoke:arena": "node scripts/smoke-arena.mjs",
+    "validate:arena": "node scripts/validate-arena.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.46.0",

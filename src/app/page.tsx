@@ -450,6 +450,80 @@ type ChampionArchive = {
   }[];
 };
 
+type ArenaFunnelRow = { stage: string; entered: number; survivors: number };
+
+type ArenaLeaderboardRow = {
+  digest: string | null;
+  species: string | null;
+  origin: string | null;
+  score: number | null;
+  status: string | null;
+};
+
+type ArenaSummary = {
+  arenaId: string | null;
+  createdAt: string | null;
+  durationMs: number | null;
+  entrants: number | null;
+  datasets: { id: string | null; sourceType: string | null }[];
+  seeds: (string | number)[];
+  stressProfiles: string[];
+  funnel: ArenaFunnelRow[];
+  leaderboard: ArenaLeaderboardRow[];
+  deploymentCandidates: { digest: string | null; species: string | null; score: number | null }[];
+  diversity: {
+    populationSize: number | null;
+    uniqueGenomes: number | null;
+    genomeDiversity: number | null;
+    lineageConcentration: number | null;
+  } | null;
+  diversityVerdict: { healthy: boolean; action: string | null } | null;
+  adaptiveMutation: { scale: number | null; previousScale: number | null; reason: string | null } | null;
+  note: string | null;
+  paperOnly: boolean;
+};
+
+type HallOfFame = {
+  available: boolean;
+  count: number;
+  updatedAt?: string | null;
+  note?: string | null;
+  rows: {
+    digest: string | null;
+    species: string | null;
+    arenaAppearances: number | null;
+    titleDefenses: number | null;
+    eliminations: number | null;
+    bestArenaScore: number | null;
+    latestArenaScore: number | null;
+    bestStatus: string | null;
+  }[];
+};
+
+type ShadowCandidate = {
+  candidateId: string | null;
+  digest: string | null;
+  species: string | null;
+  status: string | null;
+  qualified: boolean;
+  startTimestamp: number | null;
+  runtimeMs: number | null;
+  bankroll: number | null;
+  netPnl: number | null;
+  drawdown: number | null;
+  trades: number | null;
+  distinctMints: number | null;
+  activePositions: number | null;
+  marketSource: string | null;
+  durationMilestones: Record<string, boolean> | null;
+};
+
+type ShadowLeague = {
+  available: boolean;
+  count: number;
+  rows: ShadowCandidate[];
+};
+
 type Research = {
   mode?: string;
   banner?: string;
@@ -483,6 +557,9 @@ type Research = {
   };
   experiment?: ExperimentReport | null;
   champions?: ChampionArchive | null;
+  arena?: ArenaSummary | null;
+  hallOfFame?: HallOfFame | null;
+  shadow?: ShadowLeague | null;
   note?: string;
   disclaimer?: string;
   paperOnly?: boolean;
@@ -1067,6 +1144,319 @@ function championLineages(experiment: ExperimentReport | null) {
   return experiment.species.filter((entry) => (entry.extinctionEvents ?? 0) > 0).length;
 }
 
+function statusTone(status: string | null) {
+  if (!status) return undefined;
+  if (status === "DEPLOYMENT CANDIDATE" || status.startsWith("SHADOW")) return "tone-good";
+  if (status === "ELIMINATED" || status === "INSUFFICIENT EVIDENCE") return "tone-bad";
+  return "tone-warn";
+}
+
+/**
+ * Champion Arena panel: the tournament funnel, leaderboard, real-vs-synthetic
+ * evidence, and diversity/mutation health for the most recently completed
+ * arena run. Everything here is a paper research result, never a profit
+ * claim — see the disclaimer on every arena output.
+ */
+function ArenaPanel({ arena }: { arena: ArenaSummary | null }) {
+  if (!arena) {
+    return (
+      <div className="panel arena-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">CHAMPION ARENA</p>
+            <h2>No arena run yet</h2>
+          </div>
+          <Crosshair size={20} />
+        </div>
+        <p className="health-note">
+          Run <code>npm run arena</code> to tournament evolved genomes, archived champions, and random immigrants
+          across datasets, seeds, regimes, and stress profiles. Results will appear here once a run completes.
+        </p>
+      </div>
+    );
+  }
+
+  const initialEntered = Math.max(arena.funnel[0]?.entered ?? 0, 1);
+  const real = arena.datasets.filter((d) => d.sourceType === "REAL").length;
+  const synthetic = arena.datasets.filter((d) => d.sourceType === "SYNTHETIC").length;
+  const mixed = arena.datasets.filter((d) => d.sourceType === "MIXED").length;
+
+  return (
+    <div className="panel arena-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">CHAMPION ARENA · PAPER ONLY</p>
+          <h2>Tournament funnel</h2>
+          <span className="heading-note">{arena.arenaId ?? "—"}</span>
+        </div>
+        <Crosshair size={20} />
+      </div>
+
+      <div className="survival-list">
+        {arena.funnel.map((row) => (
+          <div className="survival-row" key={row.stage}>
+            <div className="survival-meta">
+              <strong>{row.stage}</strong>
+              <span>
+                {row.entered} → {row.survivors}
+              </span>
+            </div>
+            <div className="survival-track">
+              <div className="survival-alive" style={{ width: `${(row.survivors / initialEntered) * 100}%` }} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="health-grid" style={{ marginTop: 14 }}>
+        <div className="health-item">
+          <span>Entrants</span>
+          <strong>{arena.entrants ?? "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Seeds</span>
+          <strong>{arena.seeds.length}</strong>
+        </div>
+        <div className="health-item">
+          <span>Stress profiles</span>
+          <strong>{arena.stressProfiles.join(", ") || "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Evidence datasets</span>
+          <strong>
+            real {real} · synthetic {synthetic}
+            {mixed > 0 ? ` · mixed ${mixed}` : ""}
+          </strong>
+        </div>
+        <div className="health-item">
+          <span>Diversity</span>
+          <strong className={arena.diversityVerdict?.healthy === false ? "tone-warn" : "tone-good"}>
+            {arena.diversity ? `${((arena.diversity.genomeDiversity ?? 0) * 100).toFixed(0)}%` : "—"} unique ·{" "}
+            {arena.diversityVerdict?.action ?? "—"}
+          </strong>
+        </div>
+        <div className="health-item">
+          <span>Adaptive mutation</span>
+          <strong>
+            {arena.adaptiveMutation?.previousScale ?? "—"} → {arena.adaptiveMutation?.scale ?? "—"}
+          </strong>
+        </div>
+      </div>
+
+      <p className="eyebrow" style={{ marginTop: 16 }}>
+        LEADERBOARD (PAPER SCORES, NOT PROFIT)
+      </p>
+      <div className="survival-list">
+        {arena.leaderboard.slice(0, 8).map((row, index) => (
+          <div className="survival-row" key={row.digest ?? `${row.species ?? "row"}-${index}`}>
+            <div className="survival-meta">
+              <strong>
+                {row.digest ?? "—"} · {row.species ?? "—"}
+              </strong>
+              <span className={statusTone(row.status)}>
+                {row.score?.toFixed(1) ?? "—"} · {row.status ?? "—"}
+              </span>
+            </div>
+            <div className="survival-track">
+              <div className="survival-alive" style={{ width: `${Math.max(0, Math.min(100, row.score ?? 0))}%` }} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <p className="health-note">
+        {real === 0
+          ? "This run used no genuine live-Solana datasets — Deployment Candidate status is unreachable until at least one real dataset is included. "
+          : ""}
+        Arena Score is a robustness heuristic over paper results. It does NOT predict future profitability.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Champion League panel: Deployment Candidates and the Hall of Fame.
+ * Hall of Fame membership is historical interest only — it never implies
+ * Deployment Candidate status, and previous champions can lose.
+ */
+function ChampionLeaguePanel({ arena, hallOfFame }: { arena: ArenaSummary | null; hallOfFame: HallOfFame | null }) {
+  const deploymentCandidates = arena?.deploymentCandidates ?? [];
+
+  return (
+    <div className="panel champion-league-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">CHAMPION LEAGUE</p>
+          <h2>Deployment candidates &amp; Hall of Fame</h2>
+        </div>
+        <ShieldCheck size={20} />
+      </div>
+
+      <div className="health-grid">
+        <div className="health-item">
+          <span>Deployment candidates (latest arena)</span>
+          <strong className={deploymentCandidates.length > 0 ? "tone-good" : undefined}>{deploymentCandidates.length}</strong>
+        </div>
+        <div className="health-item">
+          <span>Hall of Fame members</span>
+          <strong>{hallOfFame?.count ?? 0}</strong>
+        </div>
+      </div>
+
+      {deploymentCandidates.length > 0 ? (
+        <>
+          <p className="eyebrow" style={{ marginTop: 14 }}>
+            DEPLOYMENT CANDIDATES
+          </p>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Digest</th>
+                  <th>Species</th>
+                  <th>Arena Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deploymentCandidates.map((row) => (
+                  <tr key={row.digest ?? row.species}>
+                    <td>{row.digest ?? "—"}</td>
+                    <td>{row.species ?? "—"}</td>
+                    <td>{row.score?.toFixed(1) ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : null}
+
+      <p className="eyebrow" style={{ marginTop: 14 }}>
+        HALL OF FAME · HISTORICAL INTEREST ONLY
+      </p>
+      {hallOfFame && hallOfFame.rows.length > 0 ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Digest</th>
+                <th>Species</th>
+                <th>Appearances</th>
+                <th>Defenses</th>
+                <th>Eliminations</th>
+                <th>Best score</th>
+                <th>Latest score</th>
+                <th>Best status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hallOfFame.rows.map((row) => (
+                <tr key={row.digest ?? row.species}>
+                  <td>{row.digest ?? "—"}</td>
+                  <td>{row.species ?? "—"}</td>
+                  <td>{row.arenaAppearances ?? 0}</td>
+                  <td>{row.titleDefenses ?? 0}</td>
+                  <td>{row.eliminations ?? 0}</td>
+                  <td>{row.bestArenaScore?.toFixed(1) ?? "—"}</td>
+                  <td>{row.latestArenaScore?.toFixed(1) ?? "—"}</td>
+                  <td className={statusTone(row.bestStatus)}>{row.bestStatus ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="health-note">No Hall of Fame members yet. Run an arena to populate it.</p>
+      )}
+
+      <p className="health-note">
+        {hallOfFame?.note ??
+          "Hall of Fame membership is historical interest only. It does NOT imply deployment eligibility, profitability, or safety. Previous champions can re-enter a future arena and lose."}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Live Shadow League: frozen Deployment Candidate genomes paper-trading
+ * against genuine current market observations. No evolution happens here —
+ * no mutation, no crossover, no threshold adaptation, no learning from
+ * results. Always PAPER MONEY, never presented as money earned.
+ */
+function ShadowLeaguePanel({ shadow, nowMs }: { shadow: ShadowLeague | null; nowMs: number }) {
+  return (
+    <div className="panel shadow-panel">
+      <section className="market-banner shadow">
+        <div className="market-banner-main">
+          <span className="banner-dot" />
+          <strong>LIVE SHADOW LEAGUE • PAPER MONEY</strong>
+        </div>
+        <div className="market-banner-sub">
+          <span>Frozen genomes, simulated results — not money earned.</span>
+          <span>{shadow?.count ?? 0} candidate(s)</span>
+        </div>
+      </section>
+
+      {!shadow || shadow.rows.length === 0 ? (
+        <p className="health-note">
+          No shadow candidates yet. Only Deployment Candidates from a completed arena are admitted automatically —
+          run <code>npm run shadow</code> once an arena has produced one, or <code>npm run shadow -- --dev &lt;genome&gt;</code>{" "}
+          for a clearly labelled development test.
+        </p>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Candidate</th>
+                <th>Species</th>
+                <th>Status</th>
+                <th>Runtime</th>
+                <th>Bankroll</th>
+                <th>Net P&amp;L</th>
+                <th>Drawdown</th>
+                <th>Trades</th>
+                <th>Mints</th>
+                <th>Positions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shadow.rows.map((row) => {
+                const runtimeMs = row.runtimeMs ?? (row.startTimestamp && nowMs > 0 ? nowMs - row.startTimestamp : null);
+                return (
+                  <tr key={row.candidateId ?? row.digest}>
+                    <td>{row.candidateId ?? row.digest ?? "—"}</td>
+                    <td>{row.species ?? "—"}</td>
+                    <td className={statusTone(row.status)}>
+                      {row.status ?? "—"}
+                      {!row.qualified ? <small> (dev override)</small> : null}
+                    </td>
+                    <td>{runtimeMs !== null ? duration(runtimeMs) : "—"}</td>
+                    <td>{row.bankroll !== null ? money2.format(row.bankroll) : "—"}</td>
+                    <td className={(row.netPnl ?? 0) >= 0 ? "positive" : "negative"}>
+                      {row.netPnl !== null ? signedMoney(row.netPnl) : "—"}
+                    </td>
+                    <td>{row.drawdown !== null ? pct(row.drawdown * 100) : "—"}</td>
+                    <td>{row.trades ?? 0}</td>
+                    <td>{row.distinctMints ?? 0}</td>
+                    <td>{row.activePositions ?? 0}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <p className="health-note">
+        Shadow genomes are frozen for the life of the run: no mutation, no crossover, no threshold adaptation, and no
+        learning from these results feeds back into the genome. Paper P&amp;L shown here is simulated, not money
+        earned, even for a SHADOW VALIDATED candidate.
+      </p>
+    </div>
+  );
+}
+
 function FeedHealth({ feed }: { feed: MarketFeed }) {
   const items: { label: string; value: string; tone?: string }[] = [
     { label: "Provider", value: feed.provider },
@@ -1469,6 +1859,16 @@ function Dashboard({
           <OutOfSamplePanel experiment={research.experiment ?? null} />
           <EvolutionResearchPanel state={state} research={research} />
         </section>
+      ) : null}
+
+      {research?.arena || research?.hallOfFame || research?.shadow ? (
+        <>
+          <section className="dashboard-grid research-grid">
+            <ArenaPanel arena={research.arena ?? null} />
+            <ChampionLeaguePanel arena={research.arena ?? null} hallOfFame={research.hallOfFame ?? null} />
+          </section>
+          <ShadowLeaguePanel shadow={research.shadow ?? null} nowMs={nowMs} />
+        </>
       ) : null}
 
       <FeedHealth feed={feed} />

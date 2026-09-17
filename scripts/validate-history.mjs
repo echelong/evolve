@@ -1153,6 +1153,7 @@ test("24. No wallet, signing, or transaction-execution path exists (including in
       // The validation suites contain these patterns as detection rules only.
       if (normalized.endsWith("scripts/validate-market.mjs")) continue;
       if (normalized.endsWith("scripts/validate-history.mjs")) continue;
+      if (normalized.endsWith("scripts/validate-arena.mjs")) continue;
 
       const text = await readFile(path.join(PROJECT_ROOT, relative), "utf8");
       for (const pattern of FORBIDDEN_PATTERNS) {

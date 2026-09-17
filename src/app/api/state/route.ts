@@ -15,6 +15,9 @@ export const revalidate = 0;
  *   historical replay       -> .evolve/replay-state.json
  *   experiment reports      -> .evolve/experiments/<id>/ (read-only, summarized)
  *   champion archive        -> .evolve/champions/index.json (read-only, summarized)
+ *   champion arena          -> .evolve/arenas/<id>/summary.json (read-only, summarized)
+ *   hall of fame            -> .evolve/hall-of-fame/index.json (read-only, summarized)
+ *   live shadow league      -> .evolve/shadow/*.json (read-only, summarized, PAPER ONLY)
  *
  * The dashboard asks for a source (`?source=live|replay|auto`). A replay run can
  * therefore never overwrite what the live dashboard shows, and `auto` prefers a
@@ -46,6 +49,9 @@ const MAX_EXPERIMENT_WINDOWS = 12;
 const MAX_CANDIDATES_PER_WINDOW = 8;
 const MAX_CHAMPIONS = 24;
 const MAX_BASELINE_ROWS = 24;
+const MAX_ARENA_LEADERBOARD = 12;
+const MAX_HOF_ROWS = 16;
+const MAX_SHADOW_CANDIDATES = 16;
 
 async function readJsonFile(file: string): Promise<unknown | null> {
   try {
@@ -303,6 +309,165 @@ async function loadChampionArchive(dir: string) {
   };
 }
 
+/** The most recently completed arena run, summarized (no genomes). PAPER ONLY. */
+async function loadLatestArena(root: string) {
+  let entries: string[] = [];
+  try {
+    entries = (await readdir(root, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return null;
+  }
+  if (entries.length === 0) return null;
+
+  // Newest by directory timestamp name, with mtime as a tie-breaker.
+  let latest = entries[entries.length - 1];
+  let latestMtime = 0;
+  for (const name of entries.slice(-6)) {
+    const info = await fileInfo(path.join(root, name, "summary.json"));
+    if (info.exists && info.mtimeMs >= latestMtime) {
+      latestMtime = info.mtimeMs;
+      latest = name;
+    }
+  }
+
+  const dir = path.join(root, latest);
+  const manifest = await readJsonFile(path.join(dir, "manifest.json"));
+  const summary = await readJsonFile(path.join(dir, "summary.json"));
+  if (!isRecord(summary)) return null;
+
+  const funnel = isRecord(summary.funnel) ? summary.funnel : {};
+  const funnelRows = Object.entries(funnel).map(([stage, row]) => ({
+    stage,
+    entered: isRecord(row) ? num(row.entered) ?? 0 : 0,
+    survivors: isRecord(row) ? num(row.survivors) ?? 0 : 0,
+  }));
+
+  const shortDigest = (value: unknown) => (typeof value === "string" ? value.slice(0, 12) : null);
+
+  return {
+    arenaId: isRecord(manifest) ? manifest.arenaId ?? latest : latest,
+    createdAt: isRecord(manifest) ? manifest.createdAt ?? null : null,
+    durationMs: num(summary.durationMs),
+    entrants: num(summary.entrants),
+    datasets: asArray(summary.datasets).map((entry) =>
+      isRecord(entry) ? { id: entry.id ?? null, sourceType: entry.sourceType ?? null } : null,
+    ).filter(Boolean),
+    seeds: asArray(summary.seeds),
+    stressProfiles: asArray(summary.stressProfiles),
+    funnel: funnelRows,
+    leaderboard: asArray(summary.leaderboard)
+      .slice(0, MAX_ARENA_LEADERBOARD)
+      .map((row) =>
+        isRecord(row)
+          ? {
+              digest: shortDigest(row.digest),
+              species: row.species ?? null,
+              origin: row.origin ?? null,
+              score: num(row.score),
+              status: row.status ?? null,
+            }
+          : null,
+      )
+      .filter(Boolean),
+    deploymentCandidates: asArray(summary.deploymentCandidates)
+      .map((row) =>
+        isRecord(row) ? { digest: shortDigest(row.digest), species: row.species ?? null, score: num(row.score) } : null,
+      )
+      .filter(Boolean),
+    diversity: isRecord(summary.diversity)
+      ? {
+          populationSize: num(summary.diversity.populationSize),
+          uniqueGenomes: num(summary.diversity.uniqueGenomes),
+          genomeDiversity: num(summary.diversity.genomeDiversity),
+          lineageConcentration: num(summary.diversity.lineageConcentration),
+        }
+      : null,
+    diversityVerdict: isRecord(summary.diversityVerdict)
+      ? { healthy: summary.diversityVerdict.healthy === true, action: summary.diversityVerdict.action ?? null }
+      : null,
+    adaptiveMutation: isRecord(summary.adaptiveMutation)
+      ? {
+          scale: num(summary.adaptiveMutation.scale),
+          previousScale: num(summary.adaptiveMutation.previousScale),
+          reason: summary.adaptiveMutation.reason ?? null,
+        }
+      : null,
+    note: summary.note ?? null,
+    paperOnly: true,
+  };
+}
+
+/** Hall of Fame index, summarized. Membership never implies deployment eligibility. */
+async function loadHallOfFame(dir: string) {
+  const index = await readJsonFile(path.join(dir, "index.json"));
+  if (!isRecord(index)) {
+    return { available: false, count: 0, updatedAt: null, note: null, rows: [] };
+  }
+  const members = asArray(index.members);
+  return {
+    available: true,
+    count: members.length,
+    updatedAt: index.updated ?? null,
+    note: index.note ?? null,
+    rows: members
+      .slice(0, MAX_HOF_ROWS)
+      .map((entry) =>
+        isRecord(entry)
+          ? {
+              digest: typeof entry.digest === "string" ? entry.digest.slice(0, 12) : null,
+              species: entry.species ?? null,
+              arenaAppearances: num(entry.arenaAppearances),
+              titleDefenses: num(entry.titleDefenses),
+              eliminations: num(entry.eliminations),
+              bestArenaScore: num(entry.bestArenaScore),
+              latestArenaScore: num(entry.latestArenaScore),
+              bestStatus: entry.bestStatus ?? null,
+            }
+          : null,
+      )
+      .filter(Boolean),
+  };
+}
+
+/** Live Shadow League candidates, summarized. Always paper-only; genomes never included. */
+async function loadShadowLeague(dir: string) {
+  let files: string[] = [];
+  try {
+    files = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return { available: false, count: 0, rows: [] };
+  }
+
+  const rows = [];
+  for (const name of files.slice(0, MAX_SHADOW_CANDIDATES)) {
+    const record = await readJsonFile(path.join(dir, name));
+    if (!isRecord(record)) continue;
+    rows.push({
+      candidateId: record.candidateId ?? null,
+      digest: typeof record.digest === "string" ? record.digest.slice(0, 12) : null,
+      species: record.species ?? null,
+      status: record.status ?? null,
+      qualified: record.qualified === true,
+      startTimestamp: num(record.startTimestamp),
+      runtimeMs: num(record.runtimeMs),
+      bankroll: num(record.bankroll),
+      netPnl: num(record.netPnl),
+      drawdown: num(record.drawdown),
+      trades: num(record.trades),
+      distinctMints: num(record.distinctMints),
+      activePositions: num(record.activePositions),
+      marketSource: record.marketSource ?? null,
+      durationMilestones: isRecord(record.durationMilestones)
+        ? Object.fromEntries(Object.entries(record.durationMilestones).map(([k, v]) => [k, v === true]))
+        : null,
+    });
+  }
+  return { available: rows.length > 0, count: rows.length, rows };
+}
+
 export async function GET(request: Request) {
   const secrets = [process.env.JUPITER_API_KEY, process.env.HELIUS_API_KEY].filter(
     (value): value is string => typeof value === "string" && value.trim().length >= 4,
@@ -358,6 +523,9 @@ export async function GET(request: Request) {
 
     const experiment = await loadLatestExperiment(path.join(root, "experiments"));
     const champions = await loadChampionArchive(path.join(root, "champions"));
+    const arena = await loadLatestArena(path.join(root, "arenas"));
+    const hallOfFame = await loadHallOfFame(path.join(root, "hall-of-fame"));
+    const shadow = await loadShadowLeague(path.join(root, "shadow"));
 
     const merged = isRecord(parsed)
       ? {
@@ -374,6 +542,9 @@ export async function GET(request: Request) {
             ...(isRecord(parsed.research) ? parsed.research : {}),
             experiment,
             champions,
+            arena,
+            hallOfFame,
+            shadow,
             paperOnly: true,
             disclaimer:
               "Historical backtests and paper results do NOT guarantee future profitability. Every value shown is simulated paper accounting.",

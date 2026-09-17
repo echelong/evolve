@@ -60,13 +60,15 @@ export function createEngine({ config = createMarketConfig(), now, random } = {}
   return { config, feed, simulation };
 }
 
-function startupLines({ config }) {
+export function startupLines({ config }) {
   const lines = [];
   lines.push(`[EVOLVE] PAPER ONLY engine — ${config.engine.population} agents, no wallet, no keys, no on-chain execution.`);
   lines.push(
     `[EVOLVE] market mode request=${config.requestedMode} key=${config.apiKeyConfigured ? "configured" : "not configured"} provider=${config.provider}`,
   );
-  if (!config.apiKeyConfigured) {
+  if (!config.apiKeyConfigured && config.requestedMode !== "synthetic") {
+    // Explicit synthetic mode never touches Jupiter: mentioning the API key here
+    // would imply a live probe that does not happen.
     lines.push(
       `[EVOLVE] JUPITER_API_KEY is not set. ${
         config.requestedMode === "live"
@@ -76,6 +78,9 @@ function startupLines({ config }) {
             : "Falling back to the synthetic paper market."
       }`,
     );
+  }
+  if (config.requestedMode === "synthetic") {
+    lines.push("[EVOLVE] synthetic mode: no Jupiter requests will be made (offline paper market).");
   }
   if (config.loadedEnvFiles.length > 0) {
     lines.push(`[EVOLVE] env files loaded: ${config.loadedEnvFiles.join(", ")}`);
