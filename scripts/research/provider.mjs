@@ -42,11 +42,18 @@ import { PROPOSAL_SCHEMA_VERSION, RESEARCHER_ROLES } from "./proposal-schema.mjs
 import { CANDIDATE_FAMILIES, FAMILY_NAMES } from "../engine/families.mjs";
 import { SPECIES } from "../engine/genome.mjs";
 import { REGIMES } from "../arena/orchestrator.mjs";
+import { createDeepSeekClineProvider } from "./providers/deepseek-cline.mjs";
+import { UnknownResearchProviderError, requireProviderName, validateProviderName } from "./provider-config.mjs";
 
-export const RESEARCH_PROVIDER_VERSION = 2;
+export { UnknownResearchProviderError, unknownProviderMessage, requireProviderName } from "./provider-config.mjs";
+
+export const RESEARCH_PROVIDER_VERSION = 3;
 
 export const PROVIDERS = Object.freeze({
-  mock: "mock", // deterministic, offline, no LLM
+  mock: "mock", // deterministic, offline, no LLM — the default
+  // Phase 5B: DeepSeek V4.1 Flash through the locally installed Cline CLI.
+  // OPTIONAL and explicitly selected; never a fallback target.
+  "deepseek-cline": "deepseek-cline",
 });
 
 /**
@@ -382,18 +389,71 @@ function mockRisks({ role, regime }) {
  * ==========================================================================*/
 
 /**
- * Resolve a provider by name. Only the offline mock exists in Phase 5A; an
- * external provider would be registered here later, with credentials read
- * from the environment inside its own module (never passed through state).
+ * Resolve a provider by name.
  *
- * @returns {{ name: string, propose: (input: object) => object[], offline: boolean }}
+ * Phase 5B.1 — FAIL-CLOSED. There is no fallback branch:
+ *
+ *   no name / empty name   → `mock` (the deterministic default)
+ *   `mock`                 → `mock`
+ *   `deepseek-cline`       → DeepSeek via the local Cline CLI
+ *   anything else          → throws `UnknownResearchProviderError`
+ *
+ * A typo therefore can never execute the mock provider, and a recognized
+ * provider that fails at runtime still only ever produces failure statuses — it
+ * is never replaced by the mock. An injected `options.provider` object is
+ * honoured (tests use it to drive a specific cohort deterministically), but it
+ * is never reached by an unrecognized NAME.
+ *
+ * @param {string} name
+ * @param {{ provider?: object, root?: string|null, experimentId?: string|null, env?: object,
+ *           now?: () => number, spawnImpl?: Function|null, replayRunIds?: string[], roles?: string[]|null,
+ *           config?: object }} [options]
+ * @returns {{ name: string, propose: (input: object) => object[]|Promise<object[]>, offline: boolean, [key: string]: unknown }}
+ * @throws {UnknownResearchProviderError}
  */
-export function resolveResearchProvider(name = "mock") {
-  const normalized = String(name ?? "").toLowerCase();
-  if (normalized !== PROVIDERS.mock) {
-    // Deliberate: unknown providers fall back to the offline mock rather than
-    // attempting network calls, so tests and air-gapped runs never hang.
-    return { name: PROVIDERS.mock, propose: mockProviderPropose, offline: true, fallbackFrom: normalized || null };
+export function resolveResearchProvider(name = "", options = {}) {
+  if (options?.provider && typeof options.provider.propose === "function") {
+    // An injected provider still has to declare a REGISTERED name, so a
+    // mislabeled experiment artifact cannot be produced.
+    const requested = String(name ?? "").trim();
+    if (requested.length > 0 && !validateProviderName(requested).recognized) {
+      throw new UnknownResearchProviderError(requested);
+    }
+    return options.provider;
   }
-  return { name: PROVIDERS.mock, propose: mockProviderPropose, offline: true };
+
+  const resolution = requireProviderName(name);
+
+  if (resolution.provider === PROVIDERS["deepseek-cline"]) {
+    return createDeepSeekClineProvider({
+      config: options.config ?? undefined,
+      env: options.env ?? process.env,
+      root: options.root ?? null,
+      experimentId: options.experimentId ?? null,
+      now: options.now,
+      spawnImpl: options.spawnImpl ?? null,
+      replayRunIds: options.replayRunIds ?? [],
+      roles: options.roles ?? null,
+    });
+  }
+
+  return {
+    name: PROVIDERS.mock,
+    propose: mockProviderPropose,
+    offline: true,
+    model: null,
+    reasoning: null,
+    defaulted: resolution.defaulted,
+    describe() {
+      return {
+        provider: PROVIDERS.mock,
+        model: null,
+        reasoning: null,
+        offline: true,
+        external: false,
+        deterministic: true,
+        defaulted: resolution.defaulted,
+      };
+    },
+  };
 }

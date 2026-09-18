@@ -246,7 +246,10 @@ export async function runResearchCycle({
   // drive specific cohorts deterministically).
   const resolvedProvider =
     typeof provider?.propose === "function" ? provider : resolveResearchProvider(provider);
-  const rawProposals = resolvedProvider.propose({
+  // Phase 5B: a provider may be asynchronous (an external model call) or
+  // synchronous (the offline mock). `await` accepts both, so the cycle code has
+  // no idea which kind it is talking to — which is the point.
+  const rawProposals = await resolvedProvider.propose({
     evidence: { ...evidence, priorConclusions },
     count: proposalsPerCycle,
     seed,
@@ -377,6 +380,11 @@ export async function runResearchCycle({
     cycle,
     version: RESEARCH_CYCLE_VERSION,
     compilerVersion: PROPOSAL_COMPILER_VERSION,
+    // Which provider authored this cycle (provenance; never a credential).
+    provider: typeof resolvedProvider?.name === "string" ? resolvedProvider.name : null,
+    model: typeof resolvedProvider?.model === "string" ? resolvedProvider.model : null,
+    reasoning: typeof resolvedProvider?.reasoning === "string" ? resolvedProvider.reasoning : null,
+    providerOffline: resolvedProvider?.offline === true,
     proposed: rawList.length,
     accepted: validProposals.length,
     rejectedSchema,

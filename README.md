@@ -675,13 +675,15 @@ propose hypotheses as structured proposals:
 - **Adversarial Critic** — reserved as a non-proposing role; its purpose is to falsify others' hypotheses
   rather than add its own.
 
-The default (and, for now, only) provider is `mock` — a **deterministic, offline, no-LLM** heuristic
-provider (`scripts/research/provider.mjs`). The whole validation suite, and Phase 5A itself, work with
-no network access and no LLM API key. An external provider can be added later behind the same interface
-(`resolveResearchProvider`); it would read its own credential from the environment
-(`EVOLVE_RESEARCH_API_KEY` / `EVOLVE_LLM_API_KEY`, non-enumerable, never persisted to proposals, memory,
-state, or logs) and an unrecognized provider name always falls back to the offline mock rather than
-attempting a network call.
+The default provider is `mock` — a **deterministic, offline, no-LLM** heuristic provider
+(`scripts/research/provider.mjs`). The whole validation suite, and Phases 5A–5B, work with no network
+access and no LLM API key. Phase 5B adds exactly one more provider behind the same interface
+(`resolveResearchProvider`): **`deepseek-cline`**, which asks DeepSeek V4.1 Flash (via the locally
+installed Cline CLI) for bounded, schema-validated hypotheses. `mock` remains the default and the
+baseline; provider selection is **fail-closed** (Phase 5B.1) — leaving `EVOLVE_RESEARCH_PROVIDER`
+unset uses `mock`, an explicit name must be registered, and an explicit *invalid* name
+(e.g. `deepseek-clnie`) is a configuration error that refuses to run rather than being served by the
+mock. See `## Research providers`.
 
 ### Structured research proposals
 
@@ -1051,19 +1053,16 @@ paused ticks, trade count, distinct mints, and the top-mint notional share — a
 into a per-candidate `distinctMintDiagnostics` block with a plain-language `explanation`. The research
 system has to learn to produce broader-evidence candidates; the gate is not tuned to let it through.
 
-### 10. Deterministic mock provider (DeepSeek is NOT integrated)
+### 10. Deterministic mock provider (the baseline)
 
 Phase 5A.2 remains offline-testable, deterministic, and reproducible with **no provider key and no
-network**. `mock` is still the only implemented provider and remains the baseline any future provider
-must be compared against. **DeepSeek is explicitly not integrated.** The future intended experiment is
-documented only as:
-
-> **DeepSeek V4.1 Flash via Cline, xhigh**
-
-It is not implemented, there is no client, no key handling beyond the existing environment-only
-placeholder, and an unrecognized provider name still falls back to the offline mock instead of making a
-network call. Until that experiment runs, every research number in this repository comes from the
-deterministic mock.
+network**. `mock` is still the DEFAULT provider and remains the baseline any other provider must be
+compared against. Since Phase 5B there is exactly one additional provider — `deepseek-cline` — which is
+**optional, explicitly selected, and never automatic**: it is a hypothesis *source*, and everything
+after the hypothesis (schema, compiler, uniqueness, watchdog, Arena, gates, promotion) is the same
+deterministic EVOLVE machinery the mock already exercises. See `## Research providers` for the full
+contract, the evidence boundary, and the experiment commands. Until a real DeepSeek A/B run is executed
+and recorded, every research number in this repository still comes from the deterministic mock.
 
 ### 11. Research candidate lifecycle
 
@@ -1296,16 +1295,20 @@ Read the A/B report as an **observation**, not a finding:
 **No profitability claim is made anywhere.** A higher paper score in one cohort is not evidence of
 future profit, and zero Deployment Candidates remains a completely acceptable outcome.
 
-### A future provider experiment (documented, NOT implemented)
+### A provider experiment (implemented, not yet run)
 
-The A/B benchmark is the instrument built to evaluate a real research provider later:
+The A/B benchmark is the instrument built to evaluate a real research provider:
 
 > **DeepSeek V4.1 Flash via Cline, xhigh**
 
-It is **not implemented** in this phase. There is no client, no new key handling, and an unrecognized
-provider name still falls back to the offline deterministic mock rather than making a network call.
-DeepSeek is not part of Phase 5A.3. The framework is now ready to run that experiment when it is
-explicitly started — see `## Roadmap`.
+Since Phase 5B that provider exists as `deepseek-cline` behind the same provider interface as the
+deterministic mock — optional, explicitly selected, bounded, and with no fallback of any kind. Provider
+selection is **fail-closed**: an explicit unregistered name is a configuration error that exits
+non-zero, calls nothing, and creates no artifact (it is never served by the mock); leaving the variable
+unset uses the deterministic mock. The instrument (strict species-matched A/B, isolation, provenance,
+comparison tooling) is ready; the real 58-minute dataset run has **not** been executed here, and no
+result is implied. See `## Phase 5B — optional DeepSeek research provider (Cline CLI)` and
+`## Roadmap`.
 
 ### Commands
 
@@ -1319,6 +1322,191 @@ EVOLVE_ARENA_WORKERS=8 npm run arena -- --research-mode ab <dataset>
 npm run validate:phase5a3                                  # Phase 5A.3 suite (69 offline cases)
 npm run validate:phase5a31                                 # Phase 5A.3.1 strict species-match suite (24 offline cases)
 ```
+
+## Phase 5B — optional DeepSeek research provider (Cline CLI)
+
+Phase 5B adds **DeepSeek V4.1 Flash (via the locally installed Cline CLI) as an OPTIONAL Research Swarm
+intelligence provider**. It changes nothing about how EVOLVE trades, tests, scores, gates, or promotes.
+
+```
+DeepSeek V4.1 Flash xHigh
+  → structured research proposal
+  → schema validation
+  → deterministic compiler
+  → uniqueness / watchdog
+  → CPU evolutionary system
+  → Arena
+  → evidence decides
+```
+
+**LLMs think; EVOLVE trades/tests.** DeepSeek does not trade, place orders, touch wallets or keys, sign
+anything, build transactions, call Solana write RPCs, alter positions or genomes directly, change Arena
+gates or scores, promote itself, decide whether it won, or see future/test/OOS information. Everything
+remains **PAPER ONLY**, and **no profitability claim is made anywhere**.
+
+### Provider architecture
+
+| Piece | File | Responsibility |
+| --- | --- | --- |
+| Provider config + statuses | `scripts/research/provider-config.mjs` | names, model, reasoning, timeout/attempt/call/context budgets, status vocabulary |
+| Registry | `scripts/research/provider.mjs` | `mock` (default) and `deepseek-cline`; fail-closed resolution — an explicit unregistered name throws |
+| DeepSeek provider | `scripts/research/providers/deepseek-cline.mjs` | one bounded subprocess call per proposal slot, provenance, cache, replay, probe |
+| Runtime | `scripts/research/provider-runtime.mjs` | argv construction, spawn (no shell), strict JSON extraction, digests, cache/replay store, provider-state summary |
+| Prompt contract | `scripts/research/prompt.mjs` | versioned, role-aware, single-JSON-object contract |
+| Evidence packet | `scripts/research/evidence-packet.mjs` | versioned TRAIN-only packet, digesting, memory projection, context budget, leak audit |
+| Experiment identity | `scripts/research/experiment.mjs` | `experiment.json` counters + isolated root naming |
+| Cohort runner | `scripts/research/cohort-runner.mjs` | bounded generate → validate → compile → record pipeline |
+| CLI | `scripts/research.mjs` | bounded cohort generation / stats / listing |
+| CLI | `scripts/probe-research-provider.mjs` | cheap structured provider probe |
+| CLI | `scripts/research-compare.mjs` | within-run A/B delta comparison (mock vs DeepSeek) |
+
+### Research providers
+
+Mock (default, deterministic baseline):
+
+```bash
+EVOLVE_RESEARCH_PROVIDER=mock
+```
+
+DeepSeek (optional, explicit):
+
+```bash
+EVOLVE_RESEARCH_PROVIDER=deepseek-cline
+EVOLVE_RESEARCH_MODEL=deepseek/deepseek-v4.1-flash
+EVOLVE_RESEARCH_REASONING=xhigh
+```
+
+- **mock is the default** and stays deterministic, reproducible, offline, subprocess-free, and usable
+  when Cline is unavailable. It is the baseline every other provider is compared against.
+- **DeepSeek proposes hypotheses only.** It never trades and never touches a wallet, key, order, or RPC.
+- **The deterministic compiler controls genomes.** DeepSeek cannot add genome fields, change bounds, or
+  smuggle a non-whitelisted key; the existing schema and compiler remain authoritative.
+- **The CPU engine performs evolution** and **the Arena decides through evidence.** Gates, scores,
+  stress, walk-forward, and promotion are untouched.
+- **Selection is explicit and fail-closed.** Leaving `EVOLVE_RESEARCH_PROVIDER` unset (or empty)
+  uses the deterministic `mock`. An explicit name must be registered: `mock` or `deepseek-cline`.
+  **Any other explicit name is a configuration error** — the CLI exits non-zero, no provider is
+  called, no proposals are generated, and no experiment artifact is created, so a typo like
+  `deepseek-clnie` can never masquerade as a valid mock or DeepSeek experiment:
+  `Unknown research provider: deepseek-clnie`.
+- **There is no provider fallback during an experiment.** Not from an invalid name to the mock, and not
+  from a failing `deepseek-cline` to the mock: a provider failure is recorded as a provider-failure
+  status (`PROVIDER_TIMEOUT`, `PROVIDER_UNAVAILABLE`, `PROVIDER_PROCESS_ERROR`,
+  `PROVIDER_INVALID_OUTPUT`, `PROVIDER_SCHEMA_REJECTED`, `PROVIDER_BUDGET_EXCEEDED`) and the run
+  reports it. The live engine behaves the same way: an invalid provider disables research for that
+  process, reports `providerState.health = PROVIDER_CONFIG_ERROR` plus the requested name on the
+  dashboard, and never substitutes the mock.
+
+### Fail-closed provider selection (Phase 5B.1)
+
+| `EVOLVE_RESEARCH_PROVIDER` | Behaviour |
+| --- | --- |
+| unset / empty | deterministic **`mock`** (the default; no subprocess, no network) |
+| `mock` | deterministic **`mock`** |
+| `deepseek-cline` | **DeepSeek V4.1 Flash** via the local Cline CLI (`xhigh`) |
+| anything else (e.g. `deepseek-clnie`) | **configuration error**: `Unknown research provider: deepseek-clnie` — exit code 2, no provider call, no proposals, no experiment artifact |
+
+- No provider fallback exists anywhere during an experiment: an invalid name resolves to **no** provider
+  (never the mock), and a failing `deepseek-cline` produces provider-failure statuses (never mock
+  proposals).
+- The same rule applies to `npm run research`, `npm run probe:research-provider`, experiment
+  construction, and the live engine (which disables research and reports
+  `providerState.health = PROVIDER_CONFIG_ERROR` instead of silently using the mock while keeping the
+  paper trading loop running).
+- Provider experiment metadata always names the provider that was actually used.
+
+### Evidence boundary (no look-ahead)
+
+The provider receives exactly one **versioned evidence packet** (`packetVersion`), built from
+`TRAIN_EVIDENCE` only: TRAIN-window regime classifications, permitted family/species coverage counts,
+aggregate market feature distributions inside TRAIN intervals, and a filtered view of research memory.
+`VALIDATION` / `TEST` / `OOS` / `STRESS` / `DEPLOYMENT` classes are declared **excluded** inside the
+packet; the memory projection keeps only `{proposalId, authorRole, status, outcome, conclusion}` (so a
+score, rank, return, or mint name cannot travel through it); quarantined and provider-error records are
+dropped; and `auditEvidencePacket()` walks the packet for forbidden keys (`oosReturn`, `finalRank`,
+`deploymentStatus`, `futureSnapshots`, `hiddenLabel`, credential-shaped names, …). Context is bounded
+(`EVOLVE_RESEARCH_MAX_CONTEXT_CHARS`, `EVOLVE_RESEARCH_MAX_MEMORY_RECORDS`), truncation is
+deterministic and recorded, and the **evidence digest** (which excludes the clock) is what the cache is
+keyed on — so a cached proposal can never be reused across a different evidence packet.
+
+### Strict structured output, provenance, replay
+
+The prompt asks for **exactly one JSON object, no Markdown**. Extraction tries a direct parse, then a
+single fenced block, then exactly one balanced object in the surrounding text; zero objects, several
+objects, a top-level array, or a truncated payload are **rejected** — nothing is ever "repaired" by
+inventing strategy values. Every call (accepted or rejected) records provider, model, reasoning, prompt
+version, evidence-packet version, evidence digest, prompt digest, raw-output digest, provider run id,
+request start/completion timestamps, latency, author role, token usage, and status — never credentials,
+never the raw prompt, never the raw response body. Each accepted proposal is persisted under the
+experiment's `provider/outputs/` so it can be **replayed without calling the model at all**, which is
+how LLM variability is separated from EVOLVE evaluation variability. Caching is explicit and off by
+default (`EVOLVE_RESEARCH_PROVIDER_CACHE=1`), and the CLI call is bounded by
+`EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS`, `EVOLVE_RESEARCH_MAX_PROVIDER_CALLS`, and the response/stream
+size caps.
+
+### Security posture
+
+The CLI is spawned with `spawn(command, argv[])` — **never** through a shell, so the prompt (which
+carries evidence text) is one argv element and cannot become a command. `--auto-approve false` is
+passed so the model has no tools to act with, and the subprocess runs in a dedicated empty work
+directory. Model output is untrusted DATA: it is parsed as JSON, validated against the existing
+proposal schema, and compiled by the deterministic compiler. Nothing the model emits is executed,
+fetched, or treated as a path. A static scan in `npm run validate:phase5b` enforces that no Phase 5B
+module contains a wallet/signing/execution path.
+
+### Experiment isolation
+
+A provider experiment gets a fresh identity and its own root:
+
+```
+.evolve/research/experiments/<experiment-id>/
+  experiment.json      provider, model, reasoning, promptVersion, evidenceDigest, counters
+  proposals/ compiled/ memory/ conclusions.json      the usual research memory
+  provider/ runs/ outputs/ cache/ workdir/           provider artifacts
+```
+
+The canonical mock baseline (`.evolve/arenas/arena-20260918T081727Z`) and the existing
+`.evolve/research` memory are never touched, and the baseline is never reinterpreted retrospectively.
+The Arena reads an experiment by pointing `EVOLVE_RESEARCH_ROOT` at it.
+
+### Commands
+
+```bash
+npm run probe:research-provider                    # cheap structured provider probe (no Arena/champion mutation)
+npm run probe:research-provider -- --provider mock  # probe the offline baseline
+
+# generate a FRESH, bounded DeepSeek research cohort (never the existing mock genomes)
+EVOLVE_RESEARCH_PROVIDER=deepseek-cline npm run research -- \
+  --cycles 1 --roles signal-researcher,regime-researcher,execution-researcher,risk-researcher,diversity-researcher \
+  --max-calls 12 --dataset .evolve/history/2026-09-17/session-20260917T164922Z-live
+
+npm run research -- --stats --experiment <experiment-id>   # proposals / unique genomes / species / family / role stats
+npm run research -- --list-experiments
+
+# eventual strict species-matched A/B against the SAME dataset as the mock baseline
+EVOLVE_RESEARCH_ROOT=.evolve/research/experiments/<experiment-id> \
+EVOLVE_ARENA_AB_SPECIES_MATCHED=1 EVOLVE_ARENA_POPULATION=200 \
+npm run arena -- --research-mode ab .evolve/history/2026-09-17/session-20260917T164922Z-live
+
+# compare that arena with the canonical mock control, using WITHIN-RUN deltas
+npm run compare:research -- --mock arena-20260918T081727Z --deepseek <new-arena-id>
+
+npm run validate:phase5b                           # Phase 5B suite (67 offline cases, stub Cline, no network)
+```
+
+The comparison unit is `Research arm − its own matched Conventional arm` for each run, then the
+deltas are compared. Raw DeepSeek-Research against raw Mock-Research is deliberately NOT the headline:
+if the matched control populations differ, that would measure the controls. No verdict is manufactured,
+and a null or worse result remains a valid outcome.
+
+### Operational note
+
+`mock` is the default everywhere, so nothing in the normal engine loop ever waits on a model. If an
+external provider IS selected for the live engine, a research cycle awaits one bounded call per slot
+(`EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS`), which bounds — but can still delay — that tick; a provider
+failure is caught, recorded as a provider status, and the paper engine continues. For real provider
+experiments, prefer the bounded cohort command above (generate once, then point the Arena at the
+experiment root), which keeps the live loop on the deterministic mock.
 
 ## Validation
 
@@ -1432,8 +1620,9 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
   never escape `GENE_BOUNDS`; compiler limits are tighter than or equal to the raw gene bounds; an
   unresolvable family is rejected; `maxCompilations` is enforced; every family name resolves via `x`/`×`/`*`
 - **Research memory** — proposals/records/conclusions persist and reload; nothing non-finite or
-  secret-shaped ever reaches disk; researchers demonstrably consult prior `REJECTED` conclusions; an
-  unknown provider name always falls back to the offline mock, never a network call
+  secret-shaped ever reaches disk; researchers demonstrably consult prior `REJECTED` conclusions;
+  provider selection is fail-closed (unset → offline mock; an explicit unregistered name throws and
+  never reaches the mock or the network)
 - **Watchdog + quarantine** — single-mint dominance, very-low trade count, train→OOS collapse, and stress
   collapse are each independently flagged; enough flags escalate `NORMAL → WATCH → QUARANTINED`;
   `QUARANTINED` can never self-clear
@@ -1592,9 +1781,9 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
       League final eight; promotion reads stage/gate information
 - [x] CHALLENGER mode preserved as the default; FAIR COHORT mode with equal treatment and no cloning
 - [x] Distinct-mint diagnostics explaining thin mint counts, with the gate itself unchanged
-- [x] Mock provider remains the deterministic default; DeepSeek NOT integrated
+- [x] Mock provider remains the deterministic default; DeepSeek NOT integrated in this phase
 - [x] `npm run validate:phase5a2` — 60 offline cases
-- [ ] Non-mock provider experiment: **DeepSeek V4.1 Flash via Cline, xhigh** (documented, not implemented)
+- [x] Non-mock provider integrated in Phase 5B as an OPTIONAL provider (`deepseek-cline`), never automatic
 - [ ] Automatic Arena re-entry of every compiled candidate on a fixed cadence
 
 ### Phase 5A.3 — controlled research vs conventional A/B benchmarking
@@ -1617,8 +1806,28 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
 - [x] One-command A/B run with explicit startup accounting
 - [x] `npm run validate:phase5a3` — 69 offline cases
 - [x] Challenger, fair, and normal Arena modes unchanged
-- [ ] Real provider experiment: **DeepSeek V4.1 Flash via Cline, xhigh** (documented, NOT implemented —
-      DeepSeek is not part of Phase 5A.3)
+- [x] `deepseek-cline` available as an OPTIONAL provider since Phase 5B — the A/B instrument is ready for it, no run executed here
+- [ ] Real provider A/B result: **DeepSeek V4.1 Flash via Cline, xhigh** — implementation + instrument are ready; the 58-minute matched run has not been executed
+
+### Phase 5B — optional DeepSeek research provider (Cline CLI)
+- [x] `deepseek-cline` provider behind the existing provider abstraction; `mock` stays the default
+- [x] Explicit selection (`EVOLVE_RESEARCH_PROVIDER`), explicit model (`deepseek/deepseek-v4.1-flash`), explicit reasoning (`xhigh`)
+- [x] No automatic fallback: a recognized provider's failure is a provider failure status, never mock proposals
+- [x] Fail-closed provider selection (Phase 5B.1): unset → `mock`; explicit `mock`/`deepseek-cline` resolve; any other explicit name is a configuration error (`Unknown research provider: …`) that exits non-zero, calls no provider, creates no experiment, and is never served by the mock
+- [x] Fail-closed in every resolution path: `npm run research`, `npm run probe:research-provider`, the live engine (research disabled + `PROVIDER_CONFIG_ERROR` on the dashboard), and experiment construction
+- [x] Subprocess contract via `spawn` + argv array (no shell), tool auto-approval disabled, isolated workdir
+- [x] Versioned, role-aware prompt contract (`RESEARCH_PROMPT_VERSION`) reusing the existing proposal schema
+- [x] Versioned TRAIN-only evidence packet with digest, leak audit, memory projection, and deterministic bounded truncation
+- [x] Strict JSON extraction: one object or nothing (no repair, no invented values)
+- [x] Bounded timeout, conservative retries, per-run provider-call budget, cache keyed on the evidence digest
+- [x] Provider-output persistence + replay path (prove LLM variability separately from EVOLVE variability)
+- [x] Provider provenance on every run; no credentials, prompts, or raw responses persisted
+- [x] Provider probe (`npm run probe:research-provider`) that never touches the Arena or champions
+- [x] Bounded cohort generation (`npm run research`) with isolated `.evolve/research/experiments/<id>` roots
+- [x] Within-run A/B delta comparison tool (`npm run compare:research`) with no manufactured verdict
+- [x] Dashboard/provider state: provider, model, reasoning, health, experiment id, calls, failures, cache hits, rejects, watchdog counts
+- [x] `npm run validate:phase5b` — 67 offline cases (stub Cline, no network, no key)
+- [ ] First real DeepSeek cohort + strict species-matched A/B (commands documented in `## Phase 5B`)
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

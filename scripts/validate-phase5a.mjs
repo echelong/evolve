@@ -615,10 +615,25 @@ test("31. Researchers consult memory: prior REJECTED proposals are referenced in
   assert(proposals.some((p) => p.rationale.includes("P-old-1")), "at least one new proposal must reference the prior rejected proposal id");
 });
 
-test("32. resolveResearchProvider falls back to the offline mock for an unknown/unset provider name (no network, no API key)", () => {
-  const resolved = resolveResearchProvider("some-llm-vendor");
-  assertEqual(resolved.offline, true, "an unrecognized provider must resolve to the offline mock, never attempt a network call");
-  assertEqual(typeof resolved.propose, "function", "the resolved provider must be callable");
+test("32. Provider selection is FAIL-CLOSED: unset resolves to the offline mock, an explicit unknown name throws instead of falling back", () => {
+  const unset = resolveResearchProvider();
+  assertEqual(unset.name, "mock", "no provider name resolves to the offline mock default");
+  assertEqual(unset.offline, true, "the default provider is offline");
+  assertEqual(typeof unset.propose, "function", "the resolved mock provider is callable");
+  assertEqual(resolveResearchProvider("mock").name, "mock", "explicit `mock` resolves to the offline mock");
+  assertEqual(resolveResearchProvider("").name, "mock", "an empty name is treated as unspecified and defaults to mock");
+
+  let thrown = null;
+  try {
+    resolveResearchProvider("some-llm-vendor");
+  } catch (error) {
+    thrown = error;
+  }
+  assert(thrown, "an explicit unregistered provider name must throw, never fall back to the mock");
+  assertEqual(thrown.code, "UNKNOWN_RESEARCH_PROVIDER", "the error is the explicit fail-closed configuration error");
+  assert(String(thrown.message).includes("some-llm-vendor"), "the error names the requested provider");
+  const registered = [...thrown.registeredProviders].sort();
+  assertEqual(JSON.stringify(registered), JSON.stringify(["deepseek-cline", "mock"]), "the error lists the registered providers");
 });
 
 /* ============================================================================

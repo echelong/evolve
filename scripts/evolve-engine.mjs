@@ -23,6 +23,10 @@ import { createMarketFeed } from "./market/feed.mjs";
 import { REPLAY_BANNER } from "./market/replay.mjs";
 import { buildEvidencePacket, runResearchCycle } from "./research/cycle.mjs";
 import { loadPriorConclusions, readResearchMemorySummary } from "./research/memory.mjs";
+import { PROVIDER_STATUS, providerIdentity, resolveProviderConfig, unknownProviderMessage, validateProviderName } from "./research/provider-config.mjs";
+import { listProviderRuns, providerStateSummary } from "./research/provider-runtime.mjs";
+import { readResearchExperiment, researchExperimentSummary } from "./research/experiment.mjs";
+import { RESEARCH_PROMPT_VERSION } from "./research/prompt.mjs";
 
 export const STATE_DIR = ".evolve";
 export const STATE_FILE = "state.json";
@@ -115,7 +119,17 @@ export function startupLines({ config }) {
  */
 export function createResearchController({ config, simulation }) {
   const researchConfig = config.research ?? {};
-  const enabled = researchConfig.enabled !== false;
+  // Phase 5B.1 — FAIL-CLOSED provider selection. A typo in
+  // EVOLVE_RESEARCH_PROVIDER must never silently run the mock provider in the
+  // live engine either: research is disabled, the requested (invalid) name is
+  // reported on the dashboard, and no cycle/provider call happens. The paper
+  // trading engine itself keeps running.
+  const providerValidation = validateProviderName(researchConfig.provider ?? "");
+  const providerSpecified = typeof researchConfig.provider === "string" && researchConfig.provider.trim().length > 0;
+  const requestedProvider = providerSpecified ? String(researchConfig.provider).trim().toLowerCase() : "";
+  const providerConfigError =
+    providerSpecified && !providerValidation.recognized ? unknownProviderMessage(requestedProvider) : null;
+  const enabled = researchConfig.enabled !== false && providerConfigError === null;
   const root = researchConfig.root ?? ".evolve/research";
   const cycleEveryGenerations = Math.max(0, Math.round(researchConfig.cycleEveryGenerations ?? 2));
 
@@ -127,7 +141,29 @@ export function createResearchController({ config, simulation }) {
   // name cannot collide with the API's historical/replay research bucket.
   const summary = {
     enabled,
-    provider: researchConfig.provider ?? "mock",
+    provider: providerSpecified ? requestedProvider : "mock",
+    // Phase 5B.1: a provider configuration error is reported, never hidden.
+    providerError: providerConfigError,
+    providerConfigValid: providerConfigError === null,
+    // Phase 5B: the provider contract the dashboard exposes — provider, model,
+    // reasoning, prompt version, experiment id, health, calls, failures, cache
+    // hits, schema rejects, watchdog counts. Counts and identity ONLY: never a
+    // prompt, never a raw response, never a credential.
+    providerState: providerConfigError
+      ? {
+          provider: requestedProvider,
+          model: null,
+          reasoning: null,
+          external: false,
+          health: PROVIDER_STATUS.CONFIG_ERROR,
+          calls: 0,
+          failures: 0,
+          cacheHits: 0,
+          error: providerConfigError,
+          note: "provider configuration is invalid: research is disabled (no fallback exists)",
+        }
+      : null,
+    promptVersion: RESEARCH_PROMPT_VERSION,
     cycle: 0, // current research cycle
     regime: null, // current research regime (Arena classifier vocabulary)
     proposalsGenerated: 0,
@@ -166,6 +202,12 @@ export function createResearchController({ config, simulation }) {
   }
 
   async function runIfDue() {
+    // A provider configuration error means NO research runs: no provider call,
+    // no proposals, no silent mock substitution.
+    if (providerConfigError !== null) {
+      summary.lastError = providerConfigError;
+      return summary;
+    }
     if (!dueThisGeneration()) return summary;
     lastGenerationRun = simulation.generation;
     cycle += 1;
@@ -243,6 +285,35 @@ export function createResearchController({ config, simulation }) {
       };
       summary.lastRunAt = new Date().toISOString();
       summary.lastError = null;
+      // Phase 5B provider roll-up: identity + counts, derived from the persisted
+      // provider run records (which hold digests, not payloads). A provider
+      // failure is reported here and never disguised as research.
+      try {
+        const providerRoot = path.join(root, "provider");
+        const [runs, experiment] = await Promise.all([
+          listProviderRuns(providerRoot, { limit: 200 }),
+          readResearchExperiment(root),
+        ]);
+        const providerConfig = resolveProviderConfig();
+        const identity = providerIdentity({
+          provider: providerSpecified ? requestedProvider : providerConfig.provider,
+          model: providerConfig.model,
+          reasoning: providerConfig.reasoning,
+        });
+        summary.providerState = providerStateSummary({
+          identity,
+          experimentId: researchExperimentSummary(experiment)?.experimentId ?? null,
+          cacheEnabled: providerConfig.cacheEnabled,
+          runs,
+          experiment: experiment?.counters ?? null,
+        });
+      } catch (error) {
+        summary.providerState = {
+          provider: researchConfig.provider ?? null,
+          health: "UNKNOWN",
+          note: `provider state unavailable: ${error?.message ?? error}`,
+        };
+      }
       summary.log.unshift({
         cycle,
         at: summary.lastRunAt,

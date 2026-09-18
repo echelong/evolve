@@ -91,6 +91,7 @@ import {
   speciesMatchRequested,
 } from "./research/ab-cohort.mjs";
 import { ADVISORY_ROLES, PROPOSING_ROLES } from "./research/provider.mjs";
+import { readResearchExperiment, researchExperimentSummary } from "./research/experiment.mjs";
 
 const PAPER_NOTICE =
   "PAPER ONLY. Every number is simulated paper accounting over historical observations. Arena results do NOT predict future profitability.";
@@ -924,6 +925,32 @@ async function main() {
   }
 
   const researchSummary = result.summary.researchSummary;
+
+  // ---- Phase 5B: research-provider provenance for this run -----------------
+  // When the research cohort came from an isolated provider experiment
+  // (`EVOLVE_RESEARCH_ROOT=.evolve/research/experiments/<id>`), copy the
+  // experiment's compact metadata next to the Arena artifacts so the
+  // comparison tool can attribute the run to a provider/model WITHOUT reading
+  // the research memory itself. This never mutates the tournament output and
+  // never rewrites research state.
+  if (includeResearch) {
+    try {
+      const experiment = await readResearchExperiment(researchRoot);
+      if (experiment) {
+        const summary = researchExperimentSummary(experiment);
+        await writeFile(
+          path.join(DEFAULT_ARENA_DIR, arenaId, "research-experiment.json"),
+          `${JSON.stringify({ ...summary, researchRoot }, null, 2)}\n`,
+          "utf8",
+        );
+        console.log(
+          `[arena] research provider: ${summary.provider}${summary.model ? ` / ${summary.model}` : ""}${summary.reasoning ? ` (${summary.reasoning})` : ""} · experiment ${summary.experimentId}`,
+        );
+      }
+    } catch (error) {
+      console.warn(`[arena] could not record research-provider provenance: ${error?.message ?? error}`);
+    }
+  }
   console.log("");
   console.log("=".repeat(72));
   console.log(`CHAMPION ARENA COMPLETE — ${arenaId}`);
