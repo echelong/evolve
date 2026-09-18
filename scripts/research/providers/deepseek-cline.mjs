@@ -40,6 +40,7 @@ import {
   extractAssistantText,
   extractJsonObject,
   providerCacheKey,
+  proposalRequestIdFor,
   readProviderCache,
   readProviderOutput,
   resolveClineCommand,
@@ -98,6 +99,11 @@ async function callProviderOnce({
   const { config, root, now, spawnImpl } = route;
   const promptDigest = digestOf({ role, promptVersion, evidenceDigest, experimentId, cycle, slot });
   const runId = providerRunIdFor({ experimentId, role, cycle, slot, attempt: 1 });
+  // The identity of THIS logical proposal slot — deterministic, not wall-clock
+  // based. This is what the cache key is scoped to: it is what stops cycle 2's
+  // `regime-researcher` slot from silently reusing cycle 1's cached answer for
+  // a brand-new cohort (Phase 5B.2 bugfix).
+  const proposalRequestId = proposalRequestIdFor({ experimentId, cycle, slot, role, seed });
 
   const base = {
     providerRunId: runId,
@@ -122,6 +128,7 @@ async function callProviderOnce({
     evidencePacketVersion,
     evidenceDigest,
     schemaVersion: PROPOSAL_SCHEMA_VERSION,
+    proposalRequestId,
   });
 
   // ---- cache ---------------------------------------------------------------
@@ -134,7 +141,9 @@ async function callProviderOnce({
         const run = createProviderRunRecord({
           ...base,
           status: PROVIDER_STATUS.OK,
-          reason: "cache hit: reused a persisted proposal for the same evidence digest",
+          // Never claim a cache hit was a fresh model call: the reason names
+          // the exact logical slot being replayed from memoized state.
+          reason: `cache hit: reused a persisted proposal for the same logical proposal slot (${proposalRequestId})`,
           cacheHit: true,
           requestStartedAt: nowIso(now),
           requestCompletedAt: nowIso(now),
@@ -143,6 +152,15 @@ async function callProviderOnce({
           proposalId: revalidated.proposal.proposalId,
         });
         run.cacheKey = cacheKey;
+        run.proposalRequestId = proposalRequestId;
+        run.cycle = cycle;
+        run.slot = slot;
+        // Provenance of the ORIGINAL provider run this cache entry came from,
+        // distinct from the current request slot recorded above. For a real
+        // cache hit the two always describe the same logical slot (the cache
+        // key is scoped to it) — this field just makes that traceable rather
+        // than implicit.
+        run.originalProviderRunId = cached.providerRunId ?? null;
         return { run, proposal: revalidated.proposal };
       }
       // A cached payload that no longer validates is not repaired and not used.
@@ -251,17 +269,29 @@ let attempt = 0;
     oversized: last?.oversized === true,
   });
   run.cacheKey = cacheKey;
+  run.proposalRequestId = proposalRequestId;
+  run.cycle = cycle;
+  run.slot = slot;
   run.extractionMethod = last?.extractionMethod ?? null;
   if (last?.failureDetail) run.diagnostic = safeDiagnostic(last.failureDetail, secrets);
 
   if (root) {
     await writeProviderRun(root, run);
     if (proposal) {
-      await writeProviderOutput(root, { runId, proposal, role, experimentId, meta: { evidenceDigest } });
+      await writeProviderOutput(root, {
+        runId,
+        proposal,
+        role,
+        experimentId,
+        meta: { evidenceDigest, proposalRequestId, cycle, slot },
+      });
       if (cacheEnabled) {
         await writeProviderCache(root, cacheKey, {
           schemaVersion: 1,
           cacheKey,
+          proposalRequestId,
+          cycle,
+          slot,
           provider: DEEPSEEK_CLINE_PROVIDER,
           model: config.model,
           reasoning: config.reasoning,
@@ -432,6 +462,9 @@ export function createDeepSeekClineProvider(options = {}) {
           requestCompletedAt: nowIso(now),
           latencyMs: 0,
         });
+        run.proposalRequestId = proposalRequestIdFor({ experimentId, cycle, slot, role, seed });
+        run.cycle = cycle;
+        run.slot = slot;
         runs.push(run);
         if (effectiveRoot) await writeProviderRun(effectiveRoot, run);
         break;

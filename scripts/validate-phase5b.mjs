@@ -81,6 +81,7 @@ import {
   providerCacheKey,
   providerStateSummary,
   PROVIDER_STATE_FORBIDDEN_FIELDS,
+  proposalRequestIdFor,
   readProviderOutput,
   runClineProcess,
 } from "./research/provider-runtime.mjs";
@@ -92,6 +93,7 @@ import {
 import { createRunBudget, generateResearchCohort, inspectResearchCohort } from "./research/cohort-runner.mjs";
 import { createResearchController } from "./evolve-engine.mjs";
 import {
+  accumulateExperimentCounters,
   createResearchExperiment,
   experimentRootFor,
   isValidExperimentId,
@@ -2340,7 +2342,7 @@ test("76. createRunBudget: cache hits and replays never consume the real-call bu
   );
 });
 
-test("77. Integration: a cache hit through the real provider does not inflate the run budget's attempted calls", async () => {
+test("77. Integration: retrying the EXACT SAME logical slot can cache-hit, and that cache hit does not inflate the run budget's attempted calls", async () => {
   await stubExecutable();
   await withTempDir(async (dir) => {
     const counter = path.join(dir, "calls.log");
@@ -2360,12 +2362,17 @@ test("77. Integration: a cache hit through the real provider does not inflate th
     assertEqual(budget.attemptedCalls, 1, "the live call consumed one unit of the shared budget");
     assertEqual(budget.remainingCalls, 1, "one call of budget remains");
 
-    const second = await provider.propose({ evidence, count: 1, cycle: 2, cacheEnabled: true, maxCallsPerRun: budget.maxCalls });
+    // Retrying the SAME cycle/slot (1/1) with the same evidence is a genuine
+    // retry of the exact same logical request, so it is allowed to cache-hit.
+    const second = await provider.propose({ evidence, count: 1, cycle: 1, cacheEnabled: true, maxCallsPerRun: budget.maxCalls });
     budget.recordCycle(2, provider.runs.slice(-1));
     assertEqual(await readCounter(counter), 1, "the cache hit never reached the subprocess");
     assertEqual(second.length, 1, "the cache hit still returns the (reused) proposal");
+    assertEqual(second[0].proposalId, first[0].proposalId, "the exact same logical slot reuses the exact same proposal");
     assertEqual(budget.attemptedCalls, 1, "a cache hit does not consume any additional budget");
     assertEqual(budget.remainingCalls, 1, "the remaining budget is unchanged by the cache hit");
+    assertEqual(provider.runs.at(-1).cacheHit, true, "the run record confirms the cache hit");
+    assertEqual(provider.runs.at(-1).proposalRequestId, provider.runs.at(-2).proposalRequestId, "the retried slot carries the SAME logical request id as the original");
   });
 });
 
@@ -2415,6 +2422,247 @@ test("79. The mock provider is unaffected by the timeout/call-budget bugfix", as
     assertEqual(report.experiment.counters.attemptedProviderCalls, 0, "the offline mock makes no real provider calls to attempt");
     assertEqual(report.experiment.counters.budgetRemaining, 1, "the call-budget accounting stays well-formed (and untouched) for the mock");
     assert(report.experiment.counters.compilerAccepted > 0, "the mock still proposes and compiles genomes exactly as before");
+  });
+});
+
+/* ============================================================================
+ * O. Proposal-slot identity and request-scoped caching (Phase 5B.2 bugfix)
+ *
+ * A real cohort (`exp-20260918T110612Z-deepseek-cline-a7abe2`, kept untouched
+ * on disk) requested 2 cycles x 5 roles (10 logical slots) with caching
+ * enabled, but only made 6 real subprocess calls: cycle 2's `regime-
+ * researcher` slot (and three others) silently reused cycle 1's cached
+ * answer, because the old cache key was `provider+model+reasoning+role+
+ * promptVersion+evidencePacketVersion+evidenceDigest+schemaVersion` -- fields
+ * that are IDENTICAL for "cycle 1, regime-researcher" and "cycle 2,
+ * regime-researcher" when the evidence has not moved. These tests pin down
+ * the fix: a deterministic `proposalRequestId` scopes the cache to one
+ * logical proposal SLOT, not just a role/evidence pair.
+ * ==========================================================================*/
+
+test("80. proposalRequestIdFor is deterministic, and differentiates cycle, slot, and role", () => {
+  const base = { experimentId: "exp-slot-id", cycle: 1, slot: 1, role: "signal-researcher", seed: "evolve" };
+  const idA = proposalRequestIdFor(base);
+  const idB = proposalRequestIdFor({ ...base });
+  assertEqual(idA, idB, "the same inputs always produce the same id (deterministic, no wall-clock randomness)");
+  assertEqual(typeof idA, "string", "the id is a string");
+  assert(idA.startsWith("PR-"), "the id carries a recognizable prefix");
+
+  assert(proposalRequestIdFor({ ...base, cycle: 2 }) !== idA, "a different cycle produces a different id");
+  assert(proposalRequestIdFor({ ...base, slot: 4 }) !== idA, "a different slot produces a different id");
+  assert(proposalRequestIdFor({ ...base, role: "risk-researcher" }) !== idA, "a different role produces a different id");
+  assert(proposalRequestIdFor({ ...base, experimentId: "exp-other" }) !== idA, "a different experiment produces a different id");
+  assert(proposalRequestIdFor({ ...base, seed: "other-seed" }) !== idA, "a different request seed produces a different id");
+
+  for (let i = 0; i < 5; i += 1) assertEqual(proposalRequestIdFor(base), idA, "repeated calls stay stable across invocations");
+});
+
+test("81. The cache key is scoped to the logical proposal slot: same role/evidence in a different cycle or slot changes it; the exact same slot reproduces it", () => {
+  const base = {
+    provider: DEEPSEEK_CLINE_PROVIDER,
+    model: DEEPSEEK_CLINE_MODEL,
+    reasoning: DEEPSEEK_CLINE_REASONING,
+    role: "regime-researcher",
+    promptVersion: RESEARCH_PROMPT_VERSION,
+    evidencePacketVersion: EVIDENCE_PACKET_VERSION,
+    evidenceDigest: "digest-fixed",
+    proposalRequestId: proposalRequestIdFor({ experimentId: "exp-x", cycle: 1, slot: 3, role: "regime-researcher" }),
+  };
+  const keyCycle1 = providerCacheKey(base);
+  assertEqual(providerCacheKey({ ...base }), keyCycle1, "the exact same logical slot (role/evidence/proposalRequestId) reproduces the exact same cache key");
+
+  const keyCycle2 = providerCacheKey({
+    ...base,
+    proposalRequestId: proposalRequestIdFor({ experimentId: "exp-x", cycle: 2, slot: 3, role: "regime-researcher" }),
+  });
+  assert(
+    keyCycle2 !== keyCycle1,
+    "the SAME role and SAME evidence digest in a DIFFERENT cycle must miss the cache -- this is the exact original bug (cycle 2 reused cycle 1's answer)",
+  );
+
+  const keySlot4 = providerCacheKey({
+    ...base,
+    proposalRequestId: proposalRequestIdFor({ experimentId: "exp-x", cycle: 1, slot: 4, role: "regime-researcher" }),
+  });
+  assert(keySlot4 !== keyCycle1, "a different slot within the same cycle also changes the cache key");
+
+  assert(providerCacheKey({ ...base, evidenceDigest: "digest-other" }) !== keyCycle1, "changed evidence still changes the key");
+  assert(providerCacheKey({ ...base, model: "other/model" }) !== keyCycle1, "changed model still changes the key");
+  assert(providerCacheKey({ ...base, promptVersion: "other" }) !== keyCycle1, "changed prompt version still changes the key");
+  assert(providerCacheKey({ ...base, schemaVersion: 2 }) !== keyCycle1, "changed schema version still changes the key");
+});
+
+test("82. A fresh 2 cycles x 5 roles cohort (cache enabled, empty cache, no failures) makes exactly 10 real subprocess calls and zero cache hits -- cycle 2 does not reuse cycle 1", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      baseRoot: path.join(dir, "research"),
+      cycles: 2,
+      proposalsPerCycle: 5,
+      maxProviderCalls: 10,
+      roles: [...PROPOSING_ROLES],
+      cacheEnabled: true,
+      env: { ...process.env, ...stubEnv("ok", { EVOLVE_TEST_STUB_COUNTER: counter }) },
+      experimentId: "exp-20260918T000000Z-deepseek-cline-freshcache",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(
+      await readCounter(counter),
+      10,
+      "exactly 10 real subprocess calls were made -- this is the exact 2x5/max-10 shape of the original cache-collapse bug, now fixed",
+    );
+    const c = report.experiment.counters;
+    assertEqual(c.attemptedProviderCalls, 10, "10 attempted calls");
+    assertEqual(c.cacheHits, 0, "a brand-new experiment with an empty cache has zero cache hits");
+    assertDeepEqual(
+      c.callsByCycle,
+      { "1": 5, "2": 5 },
+      "cycle 2 makes its own 5 real calls -- it does not silently reuse cycle 1's cached answers",
+    );
+    assertEqual(c.successfulProviderCalls, 10, "all 10 calls succeeded");
+    const ids = report.providerRuns.map((run) => run.proposalRequestId);
+    assertEqual(new Set(ids).size, 10, "all 10 proposalRequestIds are distinct: no two logical slots collapsed into one identity");
+  });
+});
+
+test("83. A cache hit performs no subprocess call, and its provenance records both the ORIGINAL provider run and the CURRENT request slot", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const root = path.join(dir, "provider");
+    const evidence = buildResearchEvidencePacket({ experimentId: "exp-provenance", regimeDistribution: { "sideways-chop": 1 } });
+    const env = { EVOLVE_TEST_STUB_COUNTER: counter, EVOLVE_RESEARCH_PROVIDER_CACHE: "1" };
+    const provider = stubProvider("ok", { root, env });
+
+    await provider.propose({ evidence, count: 1, cycle: 3, cacheEnabled: true, roles: ["risk-researcher"] });
+    assertEqual(await readCounter(counter), 1, "the first call is live");
+    const originalRun = provider.runs.at(-1);
+    assertEqual(originalRun.cycle, 3, "the live run records its cycle");
+    assertEqual(originalRun.slot, 1, "the live run records its slot");
+    assertEqual(typeof originalRun.proposalRequestId, "string", "the live run records a proposalRequestId");
+
+    const second = await provider.propose({ evidence, count: 1, cycle: 3, cacheEnabled: true, roles: ["risk-researcher"] });
+    assertEqual(await readCounter(counter), 1, "the retry is a cache hit: no additional subprocess call");
+    const cachedRun = provider.runs.at(-1);
+    assertEqual(cachedRun.cacheHit, true, "the retry is flagged as a cache hit");
+    assertEqual(cachedRun.status, PROVIDER_STATUS.OK, "a cache hit is a successful outcome");
+    assertEqual(cachedRun.proposalRequestId, originalRun.proposalRequestId, "current request provenance: the SAME logical slot is recorded");
+    assertEqual(cachedRun.cycle, 3, "current request provenance: the cycle is recorded");
+    assertEqual(cachedRun.slot, 1, "current request provenance: the slot is recorded");
+    assertEqual(
+      cachedRun.originalProviderRunId,
+      originalRun.providerRunId,
+      "provenance of the ORIGINAL provider run is preserved on the cache hit",
+    );
+    assert(cachedRun.reason.includes("cache hit"), "the reason never falsely claims a cache hit was a fresh model call");
+    assertEqual(second[0].proposalId, originalRun.proposalId, "the cached proposal is the exact one the original call produced");
+  });
+});
+
+test("84. Explicit replay performs no subprocess call and stays a distinct mechanism from caching", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const root = path.join(dir, "provider");
+    const env = { EVOLVE_TEST_STUB_COUNTER: counter };
+    const live = stubProvider("ok", { root, env });
+    const evidence = buildResearchEvidencePacket({ experimentId: "exp-replay-distinct", regimeDistribution: { "sideways-chop": 1 } });
+    const [produced] = await live.propose({ evidence, count: 1, cycle: 1, cacheEnabled: false, roles: ["signal-researcher"] });
+    assertEqual(await readCounter(counter), 1, "one live call produced the proposal to be replayed");
+    const originalRunId = live.runs[0].providerRunId;
+
+    const replayer = stubProvider("ok", { root, env, replayRunIds: [originalRunId] });
+    const [replayed] = await replayer.propose({ evidence, count: 1, cycle: 1, cacheEnabled: true, roles: ["signal-researcher"] });
+    assertEqual(await readCounter(counter), 1, "replay makes NO subprocess call");
+    assertEqual(replayed.proposalId, produced.proposalId, "replay reproduces the exact saved proposal");
+    const replayRun = replayer.runs[0];
+    assertEqual(replayRun.replay, true, "the run is explicitly flagged as a replay");
+    assertEqual(replayRun.cacheHit, false, "a replay is never mislabelled as a cache hit -- the two mechanisms stay distinct");
+    assertEqual(replayRun.providerRunId, originalRunId, "replay is identified by the explicit saved run id, not a recomputed cache key");
+  });
+});
+
+test("85. `providerSlots` (and the legacy `providerCalls`) count every logical slot -- live, cache hit, or budget refusal alike -- while `cacheHits` explains the ones that never reached the subprocess", () => {
+  const fresh = createResearchExperiment({
+    experimentId: "exp-counter-demo",
+    provider: DEEPSEEK_CLINE_PROVIDER,
+    promptVersion: RESEARCH_PROMPT_VERSION,
+    evidencePacketVersion: EVIDENCE_PACKET_VERSION,
+  });
+  assertEqual(fresh.counters.providerSlots, 0, "providerSlots starts at zero, same as providerCalls");
+  assertEqual(fresh.counters.providerCalls, 0, "sanity: the legacy field also starts at zero");
+
+  const runs = [
+    { status: PROVIDER_STATUS.OK, cacheHit: false },
+    { status: PROVIDER_STATUS.OK, cacheHit: true },
+    { status: PROVIDER_STATUS.BUDGET_EXCEEDED, cacheHit: false },
+  ];
+  const next = accumulateExperimentCounters({ counters: fresh.counters, cycleResults: [], providerRuns: runs });
+  assertEqual(next.providerCalls, 3, "providerCalls counts every record (unchanged legacy behaviour)");
+  assertEqual(next.providerSlots, 3, "providerSlots -- the unambiguous name -- agrees with providerCalls");
+  assertEqual(next.cacheHits, 1, "cacheHits explains one of the three logical slots");
+  assertEqual(next.providerFailures, 1, "only the budget refusal is a non-OK record among these three");
+});
+
+test("86. Caching stays experiment-scoped: a different experiment never reuses another experiment's cached hypothesis, even with identical evidence/cycle/slot/role", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const root = path.join(dir, "provider"); // deliberately the SAME storage root for both experiments
+    const evidence = buildResearchEvidencePacket({ experimentId: "exp-shared-evidence", regimeDistribution: { "sideways-chop": 1 } });
+    const extraEnv = { EVOLVE_TEST_STUB_COUNTER: counter, EVOLVE_RESEARCH_PROVIDER_CACHE: "1" };
+
+    // `experimentId` is a per-CALL argument to `propose()` (this is how
+    // `cohort-runner.mjs`'s wrapper threads it on every call), not something
+    // captured once at provider construction -- both calls below use the
+    // SAME provider factory options and only differ in the `experimentId`
+    // passed to `propose()` itself.
+    const providerA = createDeepSeekClineProvider({
+      config: { ...resolveProviderConfig(stubEnv("ok", extraEnv)), maxCallsPerRun: 1 },
+      env: { ...process.env, ...stubEnv("ok", extraEnv) },
+      root,
+    });
+    await providerA.propose({
+      evidence,
+      count: 1,
+      cycle: 1,
+      cacheEnabled: true,
+      roles: ["signal-researcher"],
+      experimentId: "exp-A-20260918T000000Z",
+    });
+    assertEqual(await readCounter(counter), 1, "experiment A makes one real call");
+
+    const providerB = createDeepSeekClineProvider({
+      config: { ...resolveProviderConfig(stubEnv("ok", extraEnv)), maxCallsPerRun: 1 },
+      env: { ...process.env, ...stubEnv("ok", extraEnv) },
+      root, // SAME storage root as A -- proves the KEY itself, not just the path, protects isolation
+    });
+    await providerB.propose({
+      evidence,
+      count: 1,
+      cycle: 1,
+      cacheEnabled: true,
+      roles: ["signal-researcher"],
+      experimentId: "exp-B-20260918T000000Z",
+    });
+    assertEqual(
+      await readCounter(counter),
+      2,
+      "experiment B, with the SAME evidence/cycle/slot/role, still makes its OWN real call -- it never silently inherits experiment A's cached hypothesis",
+    );
+    assertEqual(providerB.runs[0].cacheHit, false, "no cache hit occurred across experiments");
+    assert(
+      providerA.runs[0].cacheKey !== providerB.runs[0].cacheKey,
+      "the two experiments produce different cache keys for the identical logical request shape, because proposalRequestId folds in the experiment id",
+    );
+
+    // In production the storage root is ALSO experiment-scoped -- a second,
+    // independent layer of isolation on top of the cache-key scoping above.
+    const rootA = path.join(experimentRootFor(path.join(dir, "research"), "exp-20260918T000000Z-deepseek-cline-scopea"), "provider");
+    const rootB = path.join(experimentRootFor(path.join(dir, "research"), "exp-20260918T000000Z-deepseek-cline-scopeb"), "provider");
+    assert(rootA !== rootB, "experimentRootFor gives each experiment its own provider/cache directory");
   });
 });
 

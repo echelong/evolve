@@ -112,13 +112,24 @@ export function createResearchExperiment({
       compilerRejections: 0,
       duplicateGenomes: 0,
       uniqueGenomes: 0,
+      // `providerCalls` (kept for backward compatibility) and its clearer
+      // synonym `providerSlots` both count every RUN RECORD — a live
+      // subprocess attempt, a cache hit, AND a BUDGET_EXCEEDED refusal each
+      // add one. `providerFailures` here likewise counts every non-OK
+      // record, refusals included. None of these three distinguish "the
+      // subprocess actually ran" from "a cache entry answered instead" —
+      // that is what `attemptedProviderCalls`/`successfulProviderCalls`/
+      // `failedProviderCalls` below are for (Phase 5B.1), and `cacheHits`
+      // is what explains any gap between `providerSlots` and
+      // `attemptedProviderCalls` (Phase 5B.2).
       providerCalls: 0,
+      providerSlots: 0,
       providerFailures: 0,
       cacheHits: 0,
       // Phase 5B.1: the precise, unambiguous run-level call accounting — set at
       // finalize by `generateResearchCohort` from the shared run budget.
-      // `providerCalls`/`providerFailures` above count every RECORD (including
-      // BUDGET_EXCEEDED refusals); these count only real subprocess attempts.
+      // These count ONLY real subprocess attempts: never a cache hit, a
+      // replay, or a BUDGET_EXCEEDED refusal.
       attemptedProviderCalls: 0,
       successfulProviderCalls: 0,
       failedProviderCalls: 0,
@@ -163,6 +174,12 @@ export function accumulateExperimentCounters({
 
   for (const run of Array.isArray(providerRuns) ? providerRuns : []) {
     next.providerCalls = (next.providerCalls ?? 0) + 1;
+    // `providerSlots` is the unambiguous name for the same count (Phase
+    // 5B.2): one entry per LOGICAL proposal slot attempted — live call,
+    // cache hit, or budget refusal alike. Kept alongside `providerCalls`
+    // (not instead of it) so nothing that already reads `providerCalls`
+    // breaks; new code should prefer `providerSlots` for clarity.
+    next.providerSlots = (next.providerSlots ?? 0) + 1;
     const status = typeof run?.status === "string" ? run.status : "UNKNOWN";
     bump(next.providerStatuses, status);
     if (status !== "PROVIDER_OK") next.providerFailures = (next.providerFailures ?? 0) + 1;

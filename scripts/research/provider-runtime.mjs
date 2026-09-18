@@ -544,12 +544,44 @@ async function readJson(target, fallback = null) {
 }
 
 /**
+ * Deterministic identity for one LOGICAL proposal slot — never wall-clock
+ * based, so it is fully reproducible offline, in tests, and across reruns.
+ * The same (experiment, cycle, slot, role, seed) combination always yields
+ * the same id; any one of them changing yields a different one.
+ *
+ * This is what makes the provider cache request MEMOIZATION rather than
+ * "same role + same evidence look interchangeable": cycle 2's
+ * `regime-researcher` slot is a DIFFERENT logical request from cycle 1's,
+ * even when the evidence digest is unchanged (Phase 5B.2 bugfix — see
+ * `providerCacheKey`).
+ */
+export function proposalRequestIdFor({ experimentId = null, cycle = 1, slot = 1, role = null, seed = null } = {}) {
+  const digest = digestOf({
+    experimentId: experimentId ?? null,
+    cycle: Number.isFinite(cycle) ? cycle : 1,
+    slot: Number.isFinite(slot) ? slot : 1,
+    role: role ?? null,
+    seed: seed ?? null,
+  }).slice(0, 16);
+  return `PR-${digest}`;
+}
+
+/**
  * Cache key: provider + model + reasoning + role + prompt version + evidence
- * packet version + EVIDENCE DIGEST + proposal schema version.
+ * packet version + EVIDENCE DIGEST + proposal schema version + the LOGICAL
+ * PROPOSAL SLOT identity (`proposalRequestId`).
  *
  * The evidence digest is what makes the cache safe: a different evidence packet
  * can never hit an entry produced for another one, so a cached proposal can
  * never be replayed into a context it was not written for.
+ *
+ * `proposalRequestId` is what makes the cache a memo of ONE logical request
+ * rather than a collapse of every request that happens to share a role and
+ * evidence digest: without it, cycle 2's `regime-researcher` slot silently
+ * reused cycle 1's cached answer for a brand-new cohort (Phase 5B.2 bugfix).
+ * A caller that omits it (e.g. an older/simpler cache key computation) gets
+ * `null`, which still participates in the digest — so the key is still
+ * internally consistent, just no longer slot-scoped.
  */
 export function providerCacheKey({
   provider,
@@ -560,6 +592,7 @@ export function providerCacheKey({
   evidencePacketVersion,
   evidenceDigest,
   schemaVersion = 1,
+  proposalRequestId = null,
 }) {
   return digestOf({
     provider: provider ?? null,
@@ -570,6 +603,7 @@ export function providerCacheKey({
     evidencePacketVersion: evidencePacketVersion ?? null,
     evidenceDigest: evidenceDigest ?? null,
     schemaVersion,
+    proposalRequestId: proposalRequestId ?? null,
   });
 }
 
