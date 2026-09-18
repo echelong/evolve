@@ -987,12 +987,34 @@ async function main() {
   if (researchSummary) {
     console.log("Research cohort (PAPER hypotheses, same funnel and gates as everyone else):");
     console.log(`  enabled ${researchSummary.enabled} · mode ${researchSummary.mode} · proposals ${researchSummary.proposalsAvailable} · compiled ${researchSummary.compiledArtifacts} · unique genomes ${researchSummary.uniqueCompiledGenomes} · duplicate genomes ${researchSummary.duplicateCompiledGenomes}`);
-    console.log(`  entrants ${researchSummary.researchEntrants} (unique ${researchSummary.uniqueResearchEntrants}, ratio ${researchSummary.uniqueRatio.toFixed(3)} vs min ${researchSummary.uniquenessThreshold.toFixed(2)})`);
-    console.log(`  species ${JSON.stringify(researchSummary.speciesDistribution)} · roles ${JSON.stringify(researchSummary.roleDistribution)}`);
-    console.log(`  best rank ${researchSummary.bestResearchRank ?? "n/a"} · median rank ${researchSummary.medianResearchRank ?? "n/a"} · best score ${researchSummary.bestResearchScore ?? "n/a"} · median score ${researchSummary.medianResearchScore ?? "n/a"}`);
-    console.log(`  Champion League ${researchSummary.researchChampionLeagueCount}/${result.summary.championLeague.length} · top50 ${researchSummary.researchTop50Count} · reached GROUP ${researchSummary.researchGroupCount}`);
+    if (researchSummary.researchExperimentId) {
+      console.log(
+        `  research experiment ${researchSummary.researchExperimentId} · provider ${researchSummary.researchProvider ?? "n/a"}${researchSummary.researchModel ? ` / ${researchSummary.researchModel}` : ""}${researchSummary.researchReasoning ? ` (${researchSummary.researchReasoning})` : ""}`,
+      );
+    }
+    // NOTE: everything below labelled "ancestry" answers "how many entrants
+    // still carry TRACEABLE RESEARCH-PROPOSAL ANCESTRY" (Phase 5A.2) — a
+    // DIFFERENT question from A/B ARM MEMBERSHIP (`armResearch` below, Phase
+    // 5A.3.2). In A/B mode these two numbers can legitimately differ: an arm
+    // entrant may have lost its ancestry to generations of selection and
+    // random immigration while still correctly belonging to that arm.
+    console.log(`  ancestry entrants ${researchSummary.researchEntrants} (unique ${researchSummary.uniqueResearchEntrants}, ratio ${researchSummary.uniqueRatio.toFixed(3)} vs min ${researchSummary.uniquenessThreshold.toFixed(2)})`);
+    console.log(`  ancestry species ${JSON.stringify(researchSummary.speciesDistribution)} · ancestry roles ${JSON.stringify(researchSummary.roleDistribution)}`);
+    console.log(`  ancestry best rank ${researchSummary.bestResearchRank ?? "n/a"} · median rank ${researchSummary.medianResearchRank ?? "n/a"} · best score ${researchSummary.bestResearchScore ?? "n/a"} · median score ${researchSummary.medianResearchScore ?? "n/a"}`);
+    console.log(`  ancestry Champion League ${researchSummary.researchChampionLeagueCount}/${result.summary.championLeague.length} · top50 ${researchSummary.researchTop50Count} · reached GROUP ${researchSummary.researchGroupCount}`);
     console.log(`  exact original survivors ${researchSummary.exactOriginalResearchSurvivors} · descendant survivors ${researchSummary.descendantResearchSurvivors} · deployments ${researchSummary.researchDeploymentCount}`);
     console.log(`  failed gates ${JSON.stringify(researchSummary.failedGateCounts)}`);
+    if (researchSummary.armResearch) {
+      console.log(
+        `  A/B ARM (research)      entrants ${researchSummary.armResearch.entrants} (${researchSummary.armResearch.withResearchAncestryCount} with ancestry, ${researchSummary.armResearch.withoutResearchAncestryCount} without) · Champion League ${researchSummary.armResearch.championLeagueCount} · top50 ${researchSummary.armResearch.top50Count} · best rank ${researchSummary.armResearch.bestRank ?? "n/a"}`,
+      );
+      console.log(`  A/B ARM (research)      species ${JSON.stringify(researchSummary.armResearch.speciesDistribution)}`);
+    }
+    if (researchSummary.armConventional) {
+      console.log(
+        `  A/B ARM (conventional)  entrants ${researchSummary.armConventional.entrants} · Champion League ${researchSummary.armConventional.championLeagueCount} · top50 ${researchSummary.armConventional.top50Count} · best rank ${researchSummary.armConventional.bestRank ?? "n/a"}`,
+      );
+    }
     if (researchSummary.uniquenessWarning) console.warn(`  WARNING: ${researchSummary.uniquenessWarning}`);
     if (researchSummary.concentration?.warning) console.warn(`  WARNING: ${researchSummary.concentration.warning}`);
     if (researchSummary.accounting?.researchShortage > 0) {

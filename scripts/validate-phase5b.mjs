@@ -103,7 +103,16 @@ import {
   researchExperimentSummary,
   writeResearchExperiment,
 } from "./research/experiment.mjs";
-import { readArenaRun, compareRuns, MOCK_CONTROL_ARENA } from "./research-compare.mjs";
+import {
+  DEEPSEEK_COMPARISON_ARENA,
+  METRIC_PATHS,
+  MOCK_CONTROL_ARENA,
+  buildProviderMetadata,
+  buildReport,
+  compareRuns,
+  directionNote,
+  readArenaRun,
+} from "./research-compare.mjs";
 
 const cases = [];
 function test(name, fn) {
@@ -2664,6 +2673,369 @@ test("86. Caching stays experiment-scoped: a different experiment never reuses a
     const rootB = path.join(experimentRootFor(path.join(dir, "research"), "exp-20260918T000000Z-deepseek-cline-scopeb"), "provider");
     assert(rootA !== rootB, "experimentRootFor gives each experiment its own provider/cache directory");
   });
+});
+
+/* ============================================================================
+ * I. Research-comparison audit (Phase 5B.2)
+ *
+ * `npm run compare:research` is the tool the final Phase 5B write-up rests on,
+ * so its inputs, arithmetic, and language are pinned here. Every A/B number must
+ * come from `ab-comparison.json`'s COHORT MEMBERSHIP (cohort === research vs
+ * cohort === conventional); the ancestry predicate `isResearch` and the
+ * ancestry-only `summary.json.researchSummary` counts must never be substituted.
+ * ==========================================================================*/
+
+const MOCK_ARENA_DIR = path.join(".evolve", "arenas", MOCK_CONTROL_ARENA);
+const DEEPSEEK_ARENA_DIR = path.join(".evolve", "arenas", DEEPSEEK_COMPARISON_ARENA);
+const CANONICAL_COMPARE_ARGS = ["--mock", MOCK_CONTROL_ARENA, "--deepseek", DEEPSEEK_COMPARISON_ARENA];
+
+async function canonicalReport() {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  return buildReport({ mock, deepseek, mockId: MOCK_CONTROL_ARENA, deepseekId: DEEPSEEK_COMPARISON_ARENA });
+}
+
+/** Every key path in a JSON tree, for forbidden-field scanning. */
+function collectKeyPaths(node, at = "", out = []) {
+  if (Array.isArray(node)) {
+    node.forEach((child, index) => collectKeyPaths(child, `${at}[${index}]`, out));
+  } else if (node && typeof node === "object") {
+    for (const [key, value] of Object.entries(node)) {
+      const next = at ? `${at}.${key}` : key;
+      out.push(next);
+      collectKeyPaths(value, next, out);
+    }
+  }
+  return out;
+}
+
+test("87. compare:research reads BOTH canonical A/B arenas from ab-comparison.json and leaves them byte-identical", async () => {
+  const mockFile = path.join(MOCK_ARENA_DIR, "ab-comparison.json");
+  const deepseekFile = path.join(DEEPSEEK_ARENA_DIR, "ab-comparison.json");
+  const mockHashBefore = digestOf(await readFile(mockFile, "utf8"));
+  const deepseekHashBefore = digestOf(await readFile(deepseekFile, "utf8"));
+
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  assertEqual(mock.available, true, "the canonical mock Arena is readable");
+  assertEqual(deepseek.available, true, "the canonical DeepSeek Arena is readable");
+  assertEqual(mock.arenaId, MOCK_CONTROL_ARENA, "the mock side is the canonical control");
+  assertEqual(deepseek.arenaId, DEEPSEEK_COMPARISON_ARENA, "the DeepSeek side is the canonical provider arena");
+  assertEqual(mock.source, "ab-comparison.json", "the canonical A/B artifact is the source of arm metrics");
+  assertEqual(deepseek.source, "ab-comparison.json", "the canonical A/B artifact is the source of arm metrics");
+  assertEqual(mock.researchMode, "ab", "the mock control is a matched A/B run");
+  assertEqual(deepseek.researchMode, "ab", "the DeepSeek run is a matched A/B run");
+
+  const report = await canonicalReport();
+  assertEqual(report.controlArenaId, MOCK_CONTROL_ARENA, "the report names the canonical mock Arena");
+  assertEqual(report.comparisonArenaId, DEEPSEEK_COMPARISON_ARENA, "the report names the canonical DeepSeek Arena");
+  assertEqual(report.mock.arenaId, MOCK_CONTROL_ARENA, "the report carries the mock artifact");
+  assertEqual(report.deepseek.arenaId, DEEPSEEK_COMPARISON_ARENA, "the report carries the DeepSeek artifact");
+
+  assertEqual(digestOf(await readFile(mockFile, "utf8")), mockHashBefore, "reading the canonical mock artifact did not modify it");
+  assertEqual(
+    digestOf(await readFile(deepseekFile, "utf8")),
+    deepseekHashBefore,
+    "reading the canonical DeepSeek artifact did not modify it",
+  );
+  const missing = await readArenaRun("arena-does-not-exist");
+  assertEqual(missing.available, false, "a missing arena is reported as unavailable, never invented");
+});
+
+test("88. A/B arm sizes are cohort membership (13/13 and 12/12), never ancestry counts", async () => {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  assertEqual(mock.cohort.armResearch, 13, "mock Research ARM size is 13");
+  assertEqual(mock.cohort.armConventional, 13, "mock Conventional ARM size is 13");
+  assertEqual(deepseek.cohort.armResearch, 12, "DeepSeek Research ARM size is 12");
+  assertEqual(deepseek.cohort.armConventional, 12, "DeepSeek Conventional ARM size is 12");
+
+  // The ancestry-only counts are DIFFERENT numbers and must never be substituted.
+  const mockSummary = JSON.parse(await readFile(path.join(MOCK_ARENA_DIR, "summary.json"), "utf8"));
+  const deepseekSummary = JSON.parse(await readFile(path.join(DEEPSEEK_ARENA_DIR, "summary.json"), "utf8"));
+  assertEqual(mockSummary.researchSummary.researchEntrants, 12, "the mock ancestry count is 12, unlike its arm size of 13");
+  assertEqual(deepseekSummary.researchSummary.researchEntrants, 6, "the DeepSeek ancestry count is 6, unlike its arm size of 12");
+  assertEqual(
+    mock.cohort.armResearch === mockSummary.researchSummary.researchEntrants,
+    false,
+    "the mock arm size is NOT the ancestry count",
+  );
+  assertEqual(
+    deepseek.cohort.armResearch === deepseekSummary.researchSummary.researchEntrants,
+    false,
+    "the DeepSeek arm size is NOT the ancestry count",
+  );
+
+  const report = await canonicalReport();
+  assert(report.armPredicate.includes("cohort === research"), "the report states the cohort-membership predicate");
+  assert(report.armPredicate.includes("cohort === conventional"), "the report states both arms");
+  assert(report.armPredicate.includes("isResearch"), "the report names the ancestry flag it does NOT use");
+
+  const source = await readFile("scripts/research-compare.mjs", "utf8");
+  assert(!/\.isResearch\b/.test(source), "the tool never reads the isResearch ancestry flag as a predicate");
+  assert(!/researchChampionLeagueCount/.test(source), "the tool never reads the ancestry-only Champion-League field");
+  assert(!/\bresearchEntrants\b/.test(source), "the tool never reads the ancestry-only researchEntrants field");
+});
+
+test("89. Champion League accounting uses A/B arm membership (DeepSeek 4/4), never the ancestry-only 2/8", async () => {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  assertEqual(deepseek.accounting.championLeague.research, 4, "DeepSeek Research-arm Champion League count is 4");
+  assertEqual(deepseek.accounting.championLeague.conventional, 4, "DeepSeek Conventional-arm Champion League count is 4");
+  assertEqual(mock.accounting.championLeague.research, 3, "mock Research-arm Champion League count is 3");
+  assertEqual(mock.accounting.championLeague.conventional, 5, "mock Conventional-arm Champion League count is 5");
+
+  const deepseekSummary = JSON.parse(await readFile(path.join(DEEPSEEK_ARENA_DIR, "summary.json"), "utf8"));
+  assertEqual(
+    deepseekSummary.researchSummary.researchChampionLeagueCount,
+    2,
+    "the ancestry-only Research CL figure really is 2 (documented, deliberately NOT used)",
+  );
+  assertEqual(
+    deepseek.accounting.championLeague.research === deepseekSummary.researchSummary.researchChampionLeagueCount,
+    false,
+    "the tool does not reuse the ancestry-only 2",
+  );
+
+  const report = await canonicalReport();
+  assertEqual(report.withinRunDeltas.deepseek.championLeagueCount, 0, "DeepSeek arm CL delta is 0 (4 − 4)");
+  assertEqual(report.withinRunDeltas.mock.championLeagueCount, -2, "mock arm CL delta is −2 (3 − 5)");
+  assertEqual(report.deltaOfDeltas.championLeagueCount, 2, "CL delta-of-deltas is +2 (0 − (−2)), raw");
+  assertEqual(report.deepseek.accounting.championLeague.research, 4, "the report's CL accounting is arm-based");
+});
+
+test("90. Within-run deltas reproduce the documented canonical numbers exactly", async () => {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  const report = await canonicalReport();
+
+  // Mock baseline — arena-20260918T081727Z
+  assertClose(mock.deltas.medianArenaScore, 0.47, 1e-6, "mock Arena-score delta is +0.470");
+  assertClose(mock.deltas.medianNetPaperReturn, -0.002087, 1e-9, "mock net paper-return delta is −0.002087");
+  assertClose(mock.deltas.medianCostDrag, -0.002825, 1e-9, "mock cost-drag delta is −0.002825");
+  assertClose(mock.deltas.medianDrawdown, -0.00549, 1e-9, "mock drawdown delta is −0.005490");
+
+  // DeepSeek — arena-20260918T120841Z
+  assertClose(deepseek.deltas.medianArenaScore, 0.035, 1e-6, "DeepSeek Arena-score delta is +0.035");
+  assertClose(deepseek.deltas.medianNetPaperReturn, -0.002172, 1e-9, "DeepSeek net paper-return delta is −0.002172");
+  assertClose(deepseek.deltas.medianCostDrag, 0.003222, 1e-9, "DeepSeek cost-drag delta is +0.003222");
+  assertClose(deepseek.deltas.medianDrawdown, 0.004667, 1e-9, "DeepSeek drawdown delta is +0.004667");
+
+  // Expected delta-of-deltas
+  assertClose(report.deltaOfDeltas.medianArenaScore, -0.435, 1e-6, "Arena delta-of-deltas is −0.435");
+  assertClose(report.deltaOfDeltas.medianNetPaperReturn, -0.000085, 1e-9, "net delta-of-deltas is −0.000085");
+  assertClose(report.deltaOfDeltas.medianCostDrag, 0.006047, 1e-9, "cost-drag delta-of-deltas is +0.006047");
+  assertClose(report.deltaOfDeltas.medianDrawdown, 0.010157, 1e-9, "drawdown delta-of-deltas is +0.010157");
+
+  // Each within-run delta equals the artifact's own precomputed `difference.median`.
+  const pairs = [
+    ["medianArenaScore", "arenaScore"],
+    ["medianNetPaperReturn", "medianNetPaperReturn"],
+    ["medianCostDrag", "medianCostDrag"],
+    ["medianDrawdown", "medianDrawdown"],
+  ];
+  for (const [key, field] of pairs) {
+    for (const run of [mock, deepseek]) {
+      assertClose(
+        run.deltas[key],
+        run.artifactDifferences[field].difference.median,
+        1e-9,
+        `${run.arenaId} ${key} matches the artifact's own precomputed difference`,
+      );
+    }
+  }
+});
+
+test("91. Lower-is-better metrics keep their raw sign; direction is metadata only", async () => {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  const report = await canonicalReport();
+
+  // Cost drag: raw research − conventional. Negative for mock (research cheaper),
+  // positive for DeepSeek (research costlier). Neither is sign-flipped.
+  assertClose(
+    mock.deltas.medianCostDrag,
+    mock.absolute.medianCostDrag.research - mock.absolute.medianCostDrag.conventional,
+    1e-9,
+    "cost-drag delta is the raw research − conventional difference",
+  );
+  assert(mock.deltas.medianCostDrag < 0, "mock cost-drag delta stays negative; it is not flipped to look favourable");
+  assert(deepseek.deltas.medianCostDrag > 0, "DeepSeek cost-drag delta stays positive; it is not flipped");
+  assertClose(
+    report.deltaOfDeltas.medianCostDrag,
+    deepseek.deltas.medianCostDrag - mock.deltas.medianCostDrag,
+    1e-9,
+    "cost-drag delta-of-deltas is the raw difference of raw deltas",
+  );
+  assert(mock.deltas.medianDrawdown < 0, "mock drawdown delta stays negative");
+  assert(deepseek.deltas.medianDrawdown > 0, "DeepSeek drawdown delta stays positive");
+
+  // Direction travels as metadata, never folded into the number.
+  assertEqual(report.deltaOfDeltasProperties.metricDirections.medianCostDrag, "lower-better", "cost drag is lower-better metadata");
+  assertEqual(report.deltaOfDeltasProperties.metricDirections.medianDrawdown, "lower-better", "drawdown is lower-better metadata");
+  assertEqual(report.deltaOfDeltasProperties.metricDirections.medianArenaScore, "higher-better", "Arena score is higher-better metadata");
+  assertEqual(report.deltaOfDeltasProperties.metricDirections.medianRank, "lower-better", "final rank is lower-better metadata");
+  assertEqual(directionNote("lower-better"), "lower is generally favourable", "the direction label is human-readable");
+  assertEqual(directionNote("higher-better"), "higher is generally favourable", "the direction label is human-readable");
+  assertEqual(directionNote("neutral"), "direction not ranked", "a neutral metric is not ranked");
+
+  const source = await readFile("scripts/research-compare.mjs", "utf8");
+  assert(!/Math\.abs\([^)]*[Dd]elta/.test(source), "the tool never absolute-values a delta");
+  assert(!/-1\s*\*/.test(source), "no unconditional −1 sign flip exists for lower-is-better metrics");
+  assert(!/(favorab|favourab)\w*Delta/i.test(source), "direction wording never produces a separate flipped delta field");
+});
+
+test("92. top-N, gate, and funnel accounting use A/B arm membership", async () => {
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  assertDeepEqual(deepseek.accounting.topN.research, { top10: 5, top25: 12, top50: 12 }, "DeepSeek Research-arm top-N counts");
+  assertDeepEqual(
+    deepseek.accounting.topN.conventional,
+    { top10: 5, top25: 12, top50: 12 },
+    "DeepSeek Conventional-arm top-N counts",
+  );
+  assertEqual(deepseek.accounting.funnel.research.group, 5, "DeepSeek Research-arm GROUP count");
+  assertEqual(deepseek.accounting.funnel.research.stress, 5, "DeepSeek Research-arm STRESS count");
+  assertEqual(deepseek.accounting.funnel.research.championLeague, 4, "DeepSeek Research-arm CHAMPION LEAGUE count");
+  assertEqual(deepseek.accounting.funnel.research.gatePassed, 6, "DeepSeek Research-arm gate-passed count");
+  assertEqual(deepseek.accounting.funnel.conventional.gatePassed, 4, "DeepSeek Conventional-arm gate-passed count");
+  assertEqual(deepseek.accounting.funnel.research.deployment, 0, "DeepSeek Research-arm deployment count");
+  assertDeepEqual(
+    deepseek.accounting.gates.research,
+    { "minimum distinct mints": 5, "reasonable concentration": 3, "minimum total trades": 2 },
+    "DeepSeek Research-arm failed-gate counts",
+  );
+  assertDeepEqual(
+    deepseek.accounting.gates.conventional,
+    { "minimum distinct mints": 8, "minimum total trades": 3, "reasonable concentration": 2 },
+    "DeepSeek Conventional-arm failed-gate counts",
+  );
+  assertEqual(deepseek.accounting.oos.research.totalOosRuns, 144, "DeepSeek OOS run total is reported per arm");
+  assertEqual(deepseek.accounting.oos.perArmSurvivorCountAvailable, false, "no per-arm OOS survivor count is invented");
+
+  const report = await canonicalReport();
+  assertEqual(report.withinRunDeltas.deepseek.top10Count, 0, "DeepSeek top-10 delta is 0 (5 − 5)");
+  assertEqual(report.withinRunDeltas.mock.top10Count, -2, "mock top-10 delta is −2 (4 − 6)");
+  assertEqual(report.withinRunDeltas.mock.gatePassedCount, -2, "mock gate-passed delta is −2 (7 − 9)");
+  assertEqual(report.withinRunDeltas.mock.groupCount, -1, "mock GROUP delta is −1 (5 − 6)");
+  assertEqual(report.deltaOfDeltas.top10Count, 2, "top-10 delta-of-deltas is +2");
+  assertEqual(report.deltaOfDeltas.gatePassedCount, 4, "gate-passed delta-of-deltas is +4");
+});
+
+test("93. Species matching holds WITHIN each experiment and differs ACROSS them", async () => {
+  const mock = await readArenaRun(MOCK_CONTROL_ARENA);
+  const deepseek = await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  const report = await canonicalReport();
+  assertEqual(mock.cohort.speciesMatched, true, "the mock run is internally species-matched");
+  assertEqual(deepseek.cohort.speciesMatched, true, "the DeepSeek run is internally species-matched");
+  assertDeepEqual(mock.cohort.speciesCountsResearch, { Momentum: 13 }, "mock Research-arm species");
+  assertDeepEqual(mock.cohort.speciesCountsConventional, { Momentum: 13 }, "mock Conventional-arm species");
+  assertDeepEqual(deepseek.cohort.speciesCountsResearch, { Reversal: 5, Liquidity: 7 }, "DeepSeek Research-arm species");
+  assertDeepEqual(deepseek.cohort.speciesCountsConventional, { Reversal: 5, Liquidity: 7 }, "DeepSeek Conventional-arm species");
+
+  const comparability = report.cohortMetadata.comparability;
+  assertEqual(comparability.speciesMatchedWithinBothRuns, true, "both experiments are internally species-matched");
+  assertEqual(comparability.speciesCompositionDiffersAcrossRuns, true, "species composition differs BETWEEN experiments");
+  assertEqual(comparability.sameSpeciesCompositionAcrossRuns, false, "the two experiments do NOT share a species mix");
+  assert(comparability.note.includes("not controlled for species mix"), "the note explains the raw cross-run comparison limitation");
+  assertEqual(comparability.mock.armResearch, 13, "comparability reports the mock Research-arm size");
+  assertEqual(comparability.deepseek.armResearch, 12, "comparability reports the DeepSeek Research-arm size");
+});
+
+test("94. Provider provenance is exact and never silently inferred", async () => {
+  const report = await canonicalReport();
+  const mockProvider = report.providerMetadata.mock;
+  const deepseekProvider = report.providerMetadata.deepseek;
+
+  assertEqual(mockProvider.provider, "mock", "the control is labelled the deterministic mock");
+  assertEqual(mockProvider.deterministic, true, "the control is marked deterministic");
+  assertEqual(mockProvider.recordedProvider, null, "the control has NO recorded provider field");
+  assertEqual(mockProvider.providerSource, null, "and no provider artifact source");
+  assert(mockProvider.note.includes("--mock role"), "the mock label is explained, not silently inferred");
+
+  assertEqual(deepseekProvider.provider, "deepseek-cline", "the DeepSeek provider is deepseek-cline");
+  assertEqual(deepseekProvider.model, "deepseek/deepseek-v4.1-flash", "the model is deepseek/deepseek-v4.1-flash");
+  assertEqual(deepseekProvider.reasoning, "xhigh", "the reasoning level is xhigh");
+  assertEqual(deepseekProvider.promptVersion, "5b.3", "the prompt version is 5b.3");
+  assertEqual(
+    deepseekProvider.experimentId,
+    "exp-20260918T115857Z-deepseek-cline-a7abe2",
+    "the research experiment id is exact",
+  );
+  assertEqual(deepseekProvider.providerSource, "research-experiment.json", "the provenance source is named");
+  assertEqual(deepseekProvider.deterministic, false, "the DeepSeek run is not the deterministic baseline");
+
+  // A comparison arena with no provenance must report unknown, never mock.
+  const invented = buildProviderMetadata(
+    { arenaId: "arena-unknown", provider: { provider: null, source: null } },
+    { role: "comparison" },
+  );
+  assertEqual(invented.provider, null, "a comparison arena with no provenance reports null");
+  assert(invented.note.includes("unknown"), "and explains that the values are unknown, not assumed");
+});
+
+test("95. No verdict, no significance claim, and JSON and text outputs agree", async () => {
+  const jsonRun = cliCommand("scripts/research-compare.mjs", [...CANONICAL_COMPARE_ARGS, "--json"]);
+  const textRun = cliCommand("scripts/research-compare.mjs", [...CANONICAL_COMPARE_ARGS]);
+  assertEqual(jsonRun.status, 0, "the JSON comparison exits 0");
+  assertEqual(textRun.status, 0, "the text comparison exits 0");
+  const report = JSON.parse(jsonRun.stdout);
+  assertEqual(report.verdict, null, "verdict remains null");
+  assertEqual(report.significance, null, "no significance value is produced");
+  assert(report.verdictNote.includes("No verdict"), "the report states that no verdict is produced");
+  assert(/descriptive|not as a result|observation/i.test(report.verdictNote), "statistical language stays descriptive");
+
+  const forbidden = /(^|\.)(winner|pValue|p_value|pvalue|significant|isSignificant|deepseekWins|mockWins)$/i;
+  const paths = collectKeyPaths(report);
+  assert(paths.every((pathKey) => !forbidden.test(pathKey)), "no winner or p-value field exists anywhere in the report");
+  assert(!/"(DeepSeek|Mock) (wins|won)"/i.test(jsonRun.stdout), "no 'wins' field is emitted");
+  assert(
+    !/p-?value\s*[:=]\s*[0-9]/.test(jsonRun.stdout),
+    "no numeric p-value is emitted",
+  );
+
+  const text = textRun.stdout;
+  assert(text.includes("PAPER ONLY"), "the text output states the paper-only guarantee");
+  const section4 = text.split("4. DELTA-OF-DELTAS")[1]?.split("5. RESEARCH-GENERATION")[0] ?? "";
+  assert(section4.length > 0, "the text output has an explicit delta-of-deltas section");
+  for (const metric of METRIC_PATHS) {
+    const value = report.deltaOfDeltas[metric.key];
+    if (value === null) continue;
+    const match = new RegExp(`^\\s*${metric.key}\\s+(\\S+)`, "m").exec(section4);
+    assert(match, `the text output lists ${metric.key} in the delta-of-deltas section`);
+    assertClose(Number(match[1]), value, 1e-9, `text and JSON agree for ${metric.key}`);
+  }
+});
+
+test("96. compare:research reads only canonical JSON artifacts and has no real execution path", async () => {
+  const source = await readFile("scripts/research-compare.mjs", "utf8");
+  for (const pattern of [
+    /\bchild_process\b/,
+    /\bspawnSync\b/,
+    /\bspawn\s*\(/,
+    /\bexecSync\b/,
+    /\bexec\s*\(/,
+    /\bwriteFile\b/,
+    /\bunlink\b/,
+    /\brm\s*\(/,
+  ]) {
+    assert(!pattern.test(source), `scripts/research-compare.mjs must not contain ${pattern}`);
+  }
+  for (const artifact of ["ab-comparison.json", "summary.json", "research-experiment.json"]) {
+    assert(source.includes(artifact), `the tool reads ${artifact}`);
+  }
+  assert(/PAPER ONLY|paper-only/i.test(source), "the tool states the paper-only guarantee");
+
+  const files = [
+    path.join(MOCK_ARENA_DIR, "ab-comparison.json"),
+    path.join(DEEPSEEK_ARENA_DIR, "ab-comparison.json"),
+    path.join(DEEPSEEK_ARENA_DIR, "research-experiment.json"),
+  ];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8").then(digestOf)));
+  await readArenaRun(MOCK_CONTROL_ARENA);
+  await readArenaRun(DEEPSEEK_COMPARISON_ARENA);
+  await canonicalReport();
+  const after = await Promise.all(files.map((file) => readFile(file, "utf8").then(digestOf)));
+  assertDeepEqual(after, before, "reading through the comparison tool leaves the canonical artifacts byte-identical");
 });
 
 /* ============================================================================

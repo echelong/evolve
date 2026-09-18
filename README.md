@@ -1491,13 +1491,21 @@ npm run arena -- --research-mode ab .evolve/history/2026-09-17/session-20260917T
 # compare that arena with the canonical mock control, using WITHIN-RUN deltas
 npm run compare:research -- --mock arena-20260918T081727Z --deepseek <new-arena-id>
 
-npm run validate:phase5b                           # Phase 5B suite (67 offline cases, stub Cline, no network)
+npm run validate:phase5b                           # Phase 5B suite (96 offline cases, stub Cline, no network)
 ```
 
 The comparison unit is `Research arm − its own matched Conventional arm` for each run, then the
 deltas are compared. Raw DeepSeek-Research against raw Mock-Research is deliberately NOT the headline:
 if the matched control populations differ, that would measure the controls. No verdict is manufactured,
 and a null or worse result remains a valid outcome.
+
+Every A/B number comes from `ab-comparison.json`'s **cohort membership** (`cohort === research` vs
+`cohort === conventional`) — never from the ancestry flag `isResearch`, and never from the ancestry-only
+`researchSummary` counts (an arm entrant can legitimately carry zero research ancestry). The report
+separates seven blocks: experiment metadata, the mock within-run A/B, the DeepSeek within-run A/B, the
+delta-of-deltas, research-generation characteristics, cohort comparability, and limitations. Lower-is-
+better metrics (cost drag, drawdown, final rank) keep their raw sign; direction travels as separate
+metadata, and `verdict`/`significance` stay `null`.
 
 ### Operational note
 
@@ -1826,7 +1834,7 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
 - [x] Bounded cohort generation (`npm run research`) with isolated `.evolve/research/experiments/<id>` roots
 - [x] Within-run A/B delta comparison tool (`npm run compare:research`) with no manufactured verdict
 - [x] Dashboard/provider state: provider, model, reasoning, health, experiment id, calls, failures, cache hits, rejects, watchdog counts
-- [x] `npm run validate:phase5b` — 67 offline cases (stub Cline, no network, no key)
+- [x] `npm run validate:phase5b` — 96 offline cases (stub Cline, no network, no key)
 - [ ] First real DeepSeek cohort + strict species-matched A/B (commands documented in `## Phase 5B`)
 
 ### Phase 5 — capped mainnet pilot

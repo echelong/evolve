@@ -55,8 +55,15 @@ import {
 } from "./arena/ab-comparison.mjs";
 import {
   RESEARCH_ARENA_MODE,
+  RESEARCH_IDENTITY,
+  buildResearchCohort,
   composeFairCohort,
+  descendantResearchMeta,
+  exactResearchMeta,
+  mergeResearchAncestry,
   researchEntrantsFromCohort,
+  researchProvenance,
+  summarizeResearchCohort,
 } from "./arena/research-cohort.mjs";
 import { compileProposals } from "./research/compiler.mjs";
 import { validateProposal } from "./research/proposal-schema.mjs";
@@ -72,6 +79,7 @@ import {
   normalizeLineage,
   seedLineageId,
   speciesMatchedConventionalSeeds,
+  tagSeedLineage,
 } from "./research/ab-cohort.mjs";
 import { ADVISORY_ROLES, PROPOSING_ROLES, mockProviderPropose } from "./research/provider.mjs";
 import {
@@ -1503,6 +1511,325 @@ test("69. A/B mode is PAPER ONLY: the artifact never claims profit or safety", a
   }
   assert(artifact.note.toLowerCase().includes("paper"), "the note must state paper-only");
   assert(artifact.note.toLowerCase().includes("does not predict"), "the note must disclaim prediction");
+});
+
+/* ============================================================================
+ * Phase 5A.3.2: arm membership vs research ancestry (provenance/reporting fix)
+ *
+ * `arena-20260918T120841Z` (kept untouched on disk as regression evidence)
+ * exposed a real contradiction: the formal A/B accounting reported 12 Research
+ * entrants, but the generic Research-cohort summary reported only 6. Both
+ * numbers were individually correct for the question each was answering —
+ * `cohort === "research"` (which A/B arm a genome lives in) is a DIFFERENT
+ * question from `isResearch` (whether a genome still carries traceable
+ * research-proposal ancestry after generations of selection and random
+ * immigration). The bug was that the generic summary answered the wrong one
+ * of the two questions under an ambiguous label. These tests pin down both
+ * concepts staying correctly distinct AND correctly labeled.
+ * ==========================================================================*/
+
+test("70. A Research seed carries abCohort=research through tagSeedLineage", () => {
+  const [seed] = syntheticResearchSeeds(1);
+  const tagged = tagSeedLineage(seed, { cohort: AB_COHORT.RESEARCH });
+  assertEqual(tagged.cohort, AB_COHORT.RESEARCH, "the seed is tagged with the research arm");
+  assertEqual(tagged.lineage.cohort, AB_COHORT.RESEARCH, "the lineage object agrees");
+  assertEqual(researchProvenance(tagged).cohort, AB_COHORT.RESEARCH, "researchProvenance reports the same arm");
+});
+
+test("71. A Conventional seed carries abCohort=conventional through tagSeedLineage", () => {
+  const [seed] = syntheticConventionalSeeds(1);
+  const tagged = tagSeedLineage(seed, { cohort: AB_COHORT.CONVENTIONAL });
+  assertEqual(tagged.cohort, AB_COHORT.CONVENTIONAL, "the seed is tagged with the conventional arm");
+  assertEqual(tagged.lineage.cohort, AB_COHORT.CONVENTIONAL, "the lineage object agrees");
+  assertEqual(researchProvenance(tagged).cohort, AB_COHORT.CONVENTIONAL, "researchProvenance reports the same arm");
+});
+
+test("72. Research CHAMPION CARRYOVER preserves Research ancestry (cohort, exact identity, familyId/proposalId) verbatim", () => {
+  const seeds = syntheticResearchSeeds(2, "carryover").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.RESEARCH }));
+  // championShare 1 / immigrantShare 0 forces both slots to be verbatim
+  // champion re-entries, exercising the exact carryover path the real Arena
+  // uses when an unchanged genome re-enters (`buildEntrantPool`'s `carriedMeta`).
+  const pool = buildEntrantPool({ champions: seeds, population: 2, seed: "carryover-pool", championShare: 1, immigrantShare: 0 });
+  assertEqual(pool.length, 2, "both champions re-enter");
+  for (const [index, entrant] of pool.entries()) {
+    assertEqual(entrant.cohort, AB_COHORT.RESEARCH, "carryover preserves the arm tag");
+    assertEqual(entrant.research.identity, RESEARCH_IDENTITY.EXACT, "an unchanged re-entering seed is still an EXACT original");
+    assertEqual(entrant.research.familyId, seeds[index].research.familyId, "the exact familyId survives carryover");
+    assertEqual(entrant.research.proposalId, seeds[index].research.proposalId, "the exact proposalId survives carryover");
+    assertEqual(entrant.lineageId, seeds[index].lineageId, "the lineageId survives carryover");
+  }
+});
+
+test("73. Research MUTATION (single champion) preserves Research ancestry but demotes identity to descendant", () => {
+  const [seed] = syntheticResearchSeeds(1, "mutate-only").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.RESEARCH }));
+  // championShare 0 / immigrantShare 0 forces the remaining slots to be
+  // MUTATED children of the single champion (the `champions.length === 1` path).
+  const pool = buildEntrantPool({ champions: [seed], population: 3, seed: "mutate-pool", championShare: 0, immigrantShare: 0 });
+  const evolved = pool.filter((e) => e.origin === "evolved");
+  assert(evolved.length > 0, "mutation actually produced evolved children");
+  for (const child of evolved) {
+    assertEqual(child.cohort, AB_COHORT.RESEARCH, "a mutated child of a research seed stays in the research arm");
+    assertEqual(child.research.identity, RESEARCH_IDENTITY.DESCENDANT, "a bred child is a descendant, never re-labelled exact");
+    assertEqual(child.research.familyId, null, "a descendant carries no exact familyId of its own");
+    assert(child.research.researchAncestorFamilyIds.includes(seed.research.familyId), "the parent's familyId survives as ANCESTRY");
+    assert(child.research.researchAncestorRoles.includes(seed.research.authorRole), "the parent's author role survives as ancestry");
+    assertEqual(researchProvenance(child).isResearch, true, "the descendant still carries traceable research ancestry");
+  }
+});
+
+test("74. Research CROSSOVER (two champions) preserves ancestry, cohort, and a valid lineageId across children", () => {
+  const seeds = syntheticResearchSeeds(2, "cross-only").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.RESEARCH }));
+  const familyIds = new Set(seeds.map((s) => s.research.familyId));
+  const pool = buildEntrantPool({ champions: seeds, population: 5, seed: "cross-pool", championShare: 0, immigrantShare: 0 });
+  const evolved = pool.filter((e) => e.origin === "evolved");
+  assert(evolved.length > 0, "crossover actually produced evolved children");
+  for (const child of evolved) {
+    assertEqual(child.cohort, AB_COHORT.RESEARCH, "a crossed child of two research parents stays in the research arm");
+    assertEqual(child.research.identity, RESEARCH_IDENTITY.DESCENDANT, "a bred child is a descendant");
+    for (const fid of child.research.researchAncestorFamilyIds) {
+      assert(familyIds.has(fid), "every ancestor familyId traces back to one of the two real parents, never fabricated");
+    }
+    assert(typeof child.lineageId === "string" && child.lineageId.length > 0, "the child carries a valid, non-empty lineageId");
+    assertEqual(child.lineage.crossCohort, false, "crossing two RESEARCH parents is not a cross-COHORT cross");
+  }
+});
+
+test("75. Conventional MUTATION and CROSSOVER stay Conventional and never acquire Research provenance", () => {
+  const seeds = syntheticConventionalSeeds(3, "conv-check").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.CONVENTIONAL }));
+  const pool = buildEntrantPool({ champions: seeds, population: 6, seed: "conv-pool", championShare: 0.2, immigrantShare: 0.15 });
+  const evolved = pool.filter((e) => e.origin === "evolved");
+  assert(evolved.length > 0, "conventional breeding actually produced evolved children");
+  for (const child of evolved) {
+    assertEqual(child.cohort, AB_COHORT.CONVENTIONAL, "a conventional descendant stays in the conventional arm");
+    assertEqual(child.research, undefined, "a conventional descendant never gains a `.research` object");
+    assertEqual(child.researchAncestry, undefined, "a conventional descendant never gains a `.researchAncestry` object");
+    assertEqual(researchProvenance(child).isResearch, false, "researchProvenance never mislabels it as research");
+  }
+});
+
+test("76. Cross-cohort crossover is flagged (never silently allowed) if ever attempted directly, and strict A/B produces zero of them end to end", async () => {
+  // Direct unit check of the DETECTION mechanism: `childLineage` must flag a
+  // cross-cohort merge if it is ever handed parents from two different arms.
+  const [researchParent] = syntheticResearchSeeds(1, "xcohort-r").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.RESEARCH }));
+  const [conventionalParent] = syntheticConventionalSeeds(1, "xcohort-c").map((e) => tagSeedLineage(e, { cohort: AB_COHORT.CONVENTIONAL }));
+  const mixedLineage = childLineage(researchParent, conventionalParent);
+  assertEqual(mixedLineage.crossCohort, true, "childLineage flags a research+conventional merge as cross-cohort");
+
+  // End-to-end: the real A/B pipeline never actually produces one, because
+  // each cohort is pre-evolved in complete isolation (`preEvolveCohort`).
+  const { built, entrants } = abEntrants({ requested: 12, researchCount: 6, conventionalCount: 12 });
+  const result = await runAbTournament({ entrants, built });
+  const artifact = buildAbComparison({
+    candidateRows: result.candidateRows,
+    entrants,
+    accounting: built.accounting,
+    config: {},
+    datasets: result.summary.datasets,
+    seeds: result.summary.seeds,
+    stressProfiles: result.summary.stressProfiles,
+  });
+  assertEqual(artifact.lineage.research.crossCohortCrossovers, 0, "the real pipeline never mixes cohorts for research");
+  assertEqual(artifact.lineage.conventional.crossCohortCrossovers, 0, "the real pipeline never mixes cohorts for conventional");
+});
+
+test("77. A multi-parent crossover descendant reports MULTI-ROLE ancestry honestly, never a fabricated single role", () => {
+  const parentA = tagSeedLineage(
+    {
+      genome: { riskFraction: 0.05 },
+      species: "Momentum",
+      origin: "research",
+      digest: "digest-parent-a",
+      research: exactResearchMeta({
+        familyId: "F-multi-a",
+        proposalId: "P-multi-a",
+        authorRole: "signal-researcher",
+        species: "Momentum",
+        family: "Momentum blend",
+      }),
+    },
+    { cohort: AB_COHORT.RESEARCH },
+  );
+  const parentB = tagSeedLineage(
+    {
+      genome: { riskFraction: 0.06 },
+      species: "Momentum",
+      origin: "research",
+      digest: "digest-parent-b",
+      research: exactResearchMeta({
+        familyId: "F-multi-b",
+        proposalId: "P-multi-b",
+        authorRole: "risk-researcher",
+        species: "Momentum",
+        family: "Momentum blend",
+      }),
+    },
+    { cohort: AB_COHORT.RESEARCH },
+  );
+
+  const ancestry = mergeResearchAncestry(parentA, parentB);
+  const descendant = descendantResearchMeta(ancestry);
+  const lineage = childLineage(parentA, parentB);
+  const child = { research: descendant, researchAncestry: ancestry, cohort: lineage.cohort, lineage, lineageId: lineage.lineageId };
+
+  const prov = researchProvenance(child);
+  assertEqual(prov.isResearch, true, "the merged descendant still carries traceable research ancestry");
+  assertEqual(prov.identity, RESEARCH_IDENTITY.DESCENDANT, "it is a descendant, not an exact original");
+  assertEqual(
+    JSON.stringify([...prov.researchRoles].sort()),
+    JSON.stringify(["risk-researcher", "signal-researcher"]),
+    "BOTH contributing roles are reported — neither is dropped",
+  );
+  assertEqual(prov.multiRoleAncestry, true, "multi-role ancestry is explicitly flagged");
+  assert(
+    prov.researchAncestorFamilyIds.includes("F-multi-a") && prov.researchAncestorFamilyIds.includes("F-multi-b"),
+    "family ancestry from BOTH parents survives the merge",
+  );
+  // The legacy single-value field is documented as non-exhaustive: it picks
+  // one role for backward-compatible display, never claiming sole authorship.
+  assert(
+    prov.authorRole === "risk-researcher" || prov.authorRole === "signal-researcher",
+    "the legacy singular field still resolves to ONE of the real contributing roles, never a fabricated third value",
+  );
+});
+
+test("78. researchExperimentId/provider/model/reasoning survive equally for every Research descendant (cohort-level, not per-genome)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "evolve-5a32-"));
+  try {
+    const proposals = validatedProposals({ count: 6, seed: "5a32-exp" });
+    const { compiled } = compileProposals({ proposals, maxCompilations: 12 });
+    for (const entry of compiled) await saveCompiledCandidate(dir, entry);
+    const { createResearchExperiment, writeResearchExperiment } = await import("./research/experiment.mjs");
+    const experiment = createResearchExperiment({
+      experimentId: "exp-20260918T000000Z-deepseek-cline-5a32test",
+      provider: "deepseek-cline",
+      model: "deepseek/deepseek-v4.1-flash",
+      reasoning: "xhigh",
+      promptVersion: "5b.3",
+      evidencePacketVersion: 1,
+    });
+    await writeResearchExperiment(dir, experiment);
+
+    const cohort = await buildResearchCohort(dir);
+    assertEqual(cohort.experimentId, "exp-20260918T000000Z-deepseek-cline-5a32test", "buildResearchCohort reads the experiment id");
+    assertEqual(cohort.provider, "deepseek-cline", "buildResearchCohort reads the provider");
+    assertEqual(cohort.model, "deepseek/deepseek-v4.1-flash", "buildResearchCohort reads the model");
+    assertEqual(cohort.reasoning, "xhigh", "buildResearchCohort reads the reasoning level");
+
+    const summary = summarizeResearchCohort({ enabled: true, mode: "challenger", cohort, candidates: [] });
+    assertEqual(summary.researchExperimentId, "exp-20260918T000000Z-deepseek-cline-5a32test", "the summary carries the experiment id");
+    assertEqual(summary.researchProvider, "deepseek-cline", "the summary carries the provider");
+    assertEqual(summary.researchModel, "deepseek/deepseek-v4.1-flash", "the summary carries the model");
+    assertEqual(summary.researchReasoning, "xhigh", "the summary carries the reasoning level");
+
+    // A cohort with no experiment.json (the canonical offline mock cohort
+    // shape) reports null, never a fabricated identity.
+    const dirNoExperiment = await mkdtemp(path.join(tmpdir(), "evolve-5a32-noexp-"));
+    try {
+      const noExpCohort = await buildResearchCohort(dirNoExperiment);
+      assertEqual(noExpCohort.experimentId, null, "no experiment.json means no fabricated experiment id");
+      assertEqual(noExpCohort.provider, null, "no experiment.json means no fabricated provider");
+    } finally {
+      await rm(dirNoExperiment, { recursive: true, force: true }).catch(() => {});
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("79. Artifact regression: the REAL arena-20260918T120841Z 12-vs-6 contradiction is resolved under the fixed reporting", async () => {
+  const arenaDir = path.join(".evolve", "arenas", "arena-20260918T120841Z");
+  const candidates = JSON.parse(await readFile(path.join(arenaDir, "candidates.json"), "utf8"));
+  const abComparison = JSON.parse(await readFile(path.join(arenaDir, "ab-comparison.json"), "utf8"));
+  const championLeague = JSON.parse(await readFile(path.join(arenaDir, "champion-league.json"), "utf8"));
+
+  const summary = summarizeResearchCohort({
+    enabled: true,
+    mode: "ab",
+    candidates,
+    championLeagueDigests: championLeague.map((row) => row.digest),
+    deploymentDigests: [],
+  });
+
+  // The historically observed (and individually correct, for its OWN
+  // narrower question) ancestry-based count.
+  assertEqual(summary.researchEntrants, 6, "the ancestry-based count reproduces the historically observed 6 -- still correct for its own question");
+
+  // THE FIX: the arm-based count now agrees with the formal A/B accounting
+  // for the exact same candidate set — the contradiction this task started
+  // from can no longer occur silently under one ambiguous label.
+  assert(summary.armResearch, "armResearch is populated because these candidates carry cohort tags");
+  assertEqual(summary.armResearch.entrants, abComparison.cohorts.research.arena.entrants, "armResearch.entrants now agrees with the formal A/B research-arm count");
+  assertEqual(summary.armResearch.entrants, 12, "matches the known-good value recorded in this artifact");
+  assertEqual(summary.armConventional.entrants, abComparison.cohorts.conventional.arena.entrants, "armConventional.entrants agrees with the formal A/B conventional-arm count");
+  assertEqual(summary.armConventional.entrants, 12, "matches the known-good value recorded in this artifact");
+
+  // Species totals agree (J.18).
+  assertEqual(
+    JSON.stringify(summary.armResearch.speciesDistribution),
+    JSON.stringify(abComparison.species.research),
+    "armResearch species distribution matches the formal A/B species block",
+  );
+
+  // Champion League counts agree (J.19).
+  assertEqual(summary.armResearch.championLeagueCount, abComparison.cohorts.research.arena.championLeagueCount, "armResearch Champion League count matches the formal A/B count (4), not the ancestry-based 2");
+
+  // Top-50/rank counts agree (J.20).
+  assertEqual(summary.armResearch.top50Count, abComparison.cohorts.research.arena.top50Count, "armResearch top50 count matches the formal A/B count");
+  assertEqual(summary.armResearch.bestRank, abComparison.cohorts.research.arena.bestRank, "armResearch bestRank matches the formal A/B count (rank 2), not silently excluding the #2 Reversal entrant");
+
+  // Every candidate can still answer "cohort" and "research ancestry yes/no"
+  // separately and honestly for this exact artifact.
+  const armMembers = candidates.filter((row) => row.cohort === "research");
+  assertEqual(armMembers.length, 12, "sanity: 12 raw candidate rows actually carry cohort=research");
+  const armWithoutAncestry = armMembers.filter((row) => !researchProvenance(row).isResearch);
+  assertEqual(armWithoutAncestry.length, 6, "6 of those 12 honestly have no traceable research ancestry (2 Reversal immigrants, 3 Reversal descendants whose lineage went extinct, 1 Liquidity immigrant)");
+});
+
+test("80. armResearch/armConventional are null outside A/B mode; ancestry-based `research*` fields keep their prior meaning unchanged", () => {
+  const research = researchSeedsFor(4, "5a32-outside-ab");
+  const challengerSummary = summarizeResearchCohort({
+    enabled: true,
+    mode: RESEARCH_ARENA_MODE.CHALLENGER,
+    candidates: research.map((entrant) => ({ ...entrant, digest: entrant.digest, gateStatus: "GATES_PASSED", score: 50, finalRank: 1 })),
+  });
+  assertEqual(challengerSummary.armResearch, null, "CHALLENGER mode carries no cohort tags, so armResearch is null, never a fabricated zero");
+  assertEqual(challengerSummary.armConventional, null, "same for armConventional");
+  assertEqual(challengerSummary.researchEntrants, research.length, "the ancestry-based count is unaffected by this fix outside A/B mode");
+});
+
+test("81. `armResearch`/`armConventional` role and family distributions are explicitly separate from the ancestry-based ones, and use count attribution", () => {
+  const arenaDir = path.join(".evolve", "arenas", "arena-20260918T120841Z");
+  return (async () => {
+    const candidates = JSON.parse(await readFile(path.join(arenaDir, "candidates.json"), "utf8"));
+    const summary = summarizeResearchCohort({ enabled: true, mode: "ab", candidates });
+    // The ancestry-based roleDistribution (still execution-researcher-only,
+    // because only the ancestry-carrying Liquidity descendants are counted).
+    assertEqual(
+      JSON.stringify(Object.keys(summary.roleDistribution)),
+      JSON.stringify(["execution-researcher"]),
+      "the ancestry-based role distribution is unchanged: only ancestry-carrying entrants contribute",
+    );
+    // The arm-based roleDistribution additionally reports how many arm
+    // members are attributable at all (still just execution-researcher here,
+    // since none of this artifact's Reversal ancestry survived) — but it is
+    // computed over the FULL 12-entrant arm, not the 6-entrant ancestry
+    // subset, so its total is bounded by 12, not 6.
+    const totalArmRoleAttributions = Object.values(summary.armResearch.roleDistribution).reduce((a, b) => a + b, 0);
+    assert(totalArmRoleAttributions <= summary.armResearch.entrants, "arm role attributions never exceed the arm's own entrant count");
+    assert(summary.armResearch.roleDistribution !== summary.roleDistribution, "the arm and ancestry role distributions are distinct objects, not aliases");
+  })();
+});
+
+test("82. Strict species-matched mode is unaffected by the arm-vs-ancestry reporting fix", async () => {
+  const speciesPlan = { research: syntheticResearchSeeds(6, "strict-fix"), counts: { Momentum: 6 } };
+  void speciesPlan; // strict-mode wiring is covered end to end by validate-phase5a31.mjs; this file only needs to confirm the reporting fix does not change its inputs.
+  const built = buildMatchedAbCohort({
+    requestedPopulation: 12,
+    researchSeeds: syntheticResearchSeeds(6, "strict-fix-r"),
+    conventionalSeeds: syntheticConventionalSeeds(6, "strict-fix-c"),
+  });
+  assert(built.ok, "matched cohort still builds under strict inputs");
+  assertEqual(built.research.length, built.conventional.length, "cohorts remain symmetric — the reporting fix touches summaries only, never cohort construction");
 });
 
 /* ============================================================================
