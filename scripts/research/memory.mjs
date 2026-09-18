@@ -27,6 +27,7 @@ import { digestOf } from "../lib/hash.mjs";
 import { sanitizeForPublic } from "../lib/sanitize.mjs";
 
 export const RESEARCH_MEMORY_VERSION = 1;
+export const WATCHDOG_MEMORY_VERSION = 1;
 
 export const RESEARCH_ROOT = path.join(".evolve", "research");
 export const PROPOSALS_DIR = "proposals";
@@ -178,8 +179,60 @@ export async function listCompiledCandidates(root, { limit = 200 } = {}) {
  * ==========================================================================*/
 
 /**
+ * Normalize a watchdog verdict into structured, queryable evidence.
+ *
+ * Watchdog results used to exist only as a human-readable sentence inside
+ * `conclusion` ("watchdog quarantined after 5 trades"), which meant answering
+ * "which candidates are quarantined, and why?" required parsing prose. This
+ * produces the machine-readable form every memory record and conclusion now
+ * carries: machine status + flag labels + reasons + the trade count the verdict
+ * was based on + when it was evaluated.
+ *
+ * @param {object|null} watchdog  raw watchdog output ({ verdict/status, flags })
+ * @returns {null | { version: number, status: string, flags: string[], reasons: string[], tradeCount: number, evaluatedAt: string }}
+ */
+export function normalizeWatchdogEvidence(watchdog, { evaluatedAt = null } = {}) {
+  if (!watchdog || typeof watchdog !== "object") return null;
+  const status = typeof watchdog.status === "string" ? watchdog.status : watchdog.verdict;
+  if (typeof status !== "string" || status === "") return null;
+
+  const rawFlags = Array.isArray(watchdog.flags) ? watchdog.flags : [];
+  const flags = rawFlags
+    .map((entry) => (typeof entry === "string" ? entry : entry?.flag))
+    .filter((entry) => typeof entry === "string" && entry.length > 0);
+  const reasons = rawFlags
+    .map((entry) =>
+      typeof entry === "string"
+        ? entry
+        : [entry?.flag, entry?.detail].filter((part) => typeof part === "string" && part.length > 0).join(": "),
+    )
+    .filter((entry) => entry.length > 0);
+
+  return {
+    version: finiteInt(watchdog.version, WATCHDOG_MEMORY_VERSION),
+    status,
+    flags: [...new Set(flags)].slice(0, 24),
+    reasons: reasons.slice(0, 24),
+    tradeCount: finiteInt(watchdog.tradeCount ?? watchdog.trades, 0),
+    evaluatedAt:
+      typeof watchdog.evaluatedAt === "string"
+        ? watchdog.evaluatedAt
+        : typeof evaluatedAt === "string"
+          ? evaluatedAt
+          : new Date().toISOString(),
+  };
+}
+
+/**
  * A research-memory record: the structured result of testing one hypothesis.
  * Every number passes through `finite`; nothing non-finite can be stored.
+ *
+ * Memory stays append-only: a record's `status` only ever moves through
+ * PROPOSED -> TESTING -> REJECTED here, and promotion (PROMISING /
+ * ARENA_SURVIVOR / SHADOW_ELIGIBLE) is written by promote.mjs from a real
+ * Arena result as a *new* record. Watchdog evidence is attached in place (a
+ * watchdog verdict genuinely describes the same evaluation), never by mutating
+ * a promoted status.
  */
 export function createMemoryRecord({
   proposalId,
@@ -199,7 +252,10 @@ export function createMemoryRecord({
   failedGates = [],
   conclusion = "",
   status = MEMORY_STATUS.PROPOSED,
+  watchdog = null,
+  evaluatedAt = null,
 }) {
+  const watchdogEvidence = normalizeWatchdogEvidence(watchdog, { evaluatedAt });
   return {
     schemaVersion: RESEARCH_MEMORY_VERSION,
     recordedAt: new Date().toISOString(),
@@ -220,6 +276,14 @@ export function createMemoryRecord({
     failedGates: [...failedGates],
     conclusion: String(conclusion ?? "").slice(0, 400),
     status,
+    // Structured watchdog evidence (null until the candidate has been screened).
+    // `watchdogVerdict` / `watchdogStatus` are flat aliases so an existing
+    // reader (promote.mjs' quarantine check, older memory rows) keeps working.
+    watchdog: watchdogEvidence,
+    watchdogStatus: watchdogEvidence?.status ?? null,
+    watchdogVerdict: watchdogEvidence?.status ?? null,
+    watchdogFlags: watchdogEvidence?.flags ?? [],
+    watchdogEvaluatedAt: watchdogEvidence?.evaluatedAt ?? null,
   };
 }
 
@@ -260,18 +324,25 @@ export async function readMemoryIndex(root, { limit = 100 } = {}) {
 
 /**
  * Write one aggregated conclusion per proposal outcome (append, bounded).
- * Researchers read these back as prior knowledge for the next cycle.
+ * Researchers read these back as prior knowledge for the next cycle, and the
+ * structured `watchdog` field rides along so watchdog evidence is queryable
+ * here too, without parsing `conclusion`.
  */
-export async function appendConclusion(root, { proposalId, authorRole, status, conclusion, at = null }) {
+export async function appendConclusion(
+  root,
+  { proposalId, authorRole, status, conclusion, at = null, watchdog = null },
+) {
   const file = path.join(root, CONCLUSIONS_FILE);
   const current = await readJson(file, { schemaVersion: RESEARCH_MEMORY_VERSION, entries: [] });
   const entries = Array.isArray(current.entries) ? current.entries : [];
+  const watchdogEvidence = normalizeWatchdogEvidence(watchdog, { evaluatedAt: at });
   entries.push({
     proposalId,
     authorRole,
     status,
     conclusion: String(conclusion ?? "").slice(0, 400),
     at: at ?? new Date().toISOString(),
+    ...(watchdogEvidence ? { watchdog: watchdogEvidence } : {}),
   });
   await writeJsonAtomic(file, {
     schemaVersion: RESEARCH_MEMORY_VERSION,
@@ -302,6 +373,104 @@ export function memoryStats({ proposals, memoryRecords, conclusions }) {
     byRole,
     note: "Research statuses describe the evaluation journey. PROMISING is not profitability.",
   };
+}
+
+/**
+ * Machine-readable watchdog roll-up over research memory. Counts are derived
+ * from each record's structured `watchdog.status` (falling back to the flat
+ * `watchdogVerdict` alias on rows written before structured evidence existed)
+ * — never by parsing a conclusion sentence.
+ *
+ * The memory index is the canonical store; `conclusions` is only used as a
+ * fallback when there are no memory records at all, so a record and its
+ * mirrored conclusion line are never double-counted.
+ *
+ * @param {{ memoryRecords?: object[], conclusions?: object[] }} options
+ * @returns {{ evaluated: number, NORMAL: number, WATCH: number, QUARANTINED: number, byStatus: Record<string, number>, lastEvaluatedAt: string|null }}
+ */
+export function watchdogStats({ memoryRecords = [], conclusions = [] } = {}) {
+  const byStatus = { NORMAL: 0, WATCH: 0, QUARANTINED: 0 };
+  let evaluated = 0;
+  let lastEvaluatedAt = null;
+
+  const consider = (entry) => {
+    const status = entry?.watchdog?.status ?? entry?.watchdogStatus ?? entry?.watchdogVerdict;
+    if (typeof status !== "string" || status === "") return;
+    evaluated += 1;
+    byStatus[status] = (byStatus[status] ?? 0) + 1;
+    const at = entry?.watchdog?.evaluatedAt ?? null;
+    if (typeof at === "string" && (lastEvaluatedAt === null || at > lastEvaluatedAt)) lastEvaluatedAt = at;
+  };
+
+  const source = (memoryRecords ?? []).length > 0 ? memoryRecords : conclusions ?? [];
+  for (const entry of source) consider(entry);
+
+  return { evaluated, ...byStatus, byStatus, lastEvaluatedAt };
+}
+
+/**
+ * Full research-memory summary for the engine's state summary and the
+ * dashboard: how many records exist, by status and by researcher role, how
+ * many conclusions/evaluations have been written, and the watchdog roll-up.
+ */
+export function summarizeResearchMemory({
+  proposals = [],
+  compiled = [],
+  memoryRecords = [],
+  conclusions = [],
+} = {}) {
+  const byStatus = {};
+  for (const status of Object.values(MEMORY_STATUS)) byStatus[status] = 0;
+  const byRole = {};
+  for (const record of memoryRecords ?? []) {
+    if (record?.status && byStatus[record.status] !== undefined) byStatus[record.status] += 1;
+    const role = record?.authorRole ?? "unknown";
+    byRole[role] = (byRole[role] ?? 0) + 1;
+  }
+
+  return {
+    version: RESEARCH_MEMORY_VERSION,
+    proposalsStored: (proposals ?? []).length,
+    compiledFamilies: (compiled ?? []).length,
+    memoryRecords: (memoryRecords ?? []).length,
+    conclusions: (conclusions ?? []).length,
+    byStatus,
+    byRole,
+    watchdog: watchdogStats({ memoryRecords, conclusions }),
+    note: "Research statuses describe the evaluation journey. PROMISING is not profitability.",
+  };
+}
+
+/** Read the memory index + conclusions and summarize them (bounded reads). */
+export async function readResearchMemorySummary(root, { limit = 1000 } = {}) {
+  const memoryRecords = await readMemoryIndex(root, { limit });
+  const conclusionsDoc = await readJson(path.join(root, CONCLUSIONS_FILE), { entries: [] });
+  const conclusions = Array.isArray(conclusionsDoc?.entries) ? conclusionsDoc.entries.slice(-limit) : [];
+  const proposals = await listProposals(root, { limit });
+  const compiled = await listCompiledCandidates(root, { limit });
+  return summarizeResearchMemory({ proposals, compiled, memoryRecords, conclusions });
+}
+
+/**
+ * Queryable watchdog evidence: the structured evaluations recorded in research
+ * memory (optionally filtered by status), plus the conclusions that carry one.
+ */
+export async function readWatchdogEvaluations(root, { limit = 500, status = null } = {}) {
+  const records = await readMemoryIndex(root, { limit });
+  const evaluations = [];
+  for (const record of records) {
+    const evidence = record?.watchdog ?? null;
+    if (!evidence?.status) continue;
+    if (status && evidence.status !== status) continue;
+    evaluations.push({
+      proposalId: record.proposalId ?? null,
+      candidateFamily: record.candidateFamily ?? null,
+      authorRole: record.authorRole ?? null,
+      memoryStatus: record.status ?? null,
+      watchdog: evidence,
+    });
+  }
+  return evaluations;
 }
 
 /** Deterministic digest of a proposal for cross-referencing in memory. */

@@ -253,11 +253,18 @@ type EvolveState = {
     extinctionEvents?: number;
     extinct?: boolean;
   }[];
-  // --- Phase 5A: strategy islands ---------------------------------------
+  // --- Phase 5A / 5A.1: strategy islands --------------------------------
   islands?: {
     name: string;
+    /** Initialization/base split — a weight, never a hard per-generation quota. */
     target: number;
+    /** This generation's evidence-adjusted, inertia-bounded aim in [floor, cap]. */
+    softTarget: number;
+    reproductiveWeight: number;
+    floor: number;
+    cap: number;
     population: number;
+    share: number;
     births: number;
     deaths: number;
     migrationsIn: number;
@@ -265,9 +272,14 @@ type EvolveState = {
     revivals: number;
     extinctionEvents: number;
     avgReturn: number;
+    paperReturn: number;
     avgFitness: number;
+    meanFitness: number;
+    medianFitness: number;
     trades: number;
     evidenceSufficientCount: number;
+    evidenceShare: number;
+    overCap: boolean;
     extinct: boolean;
   }[];
   researchRegime?: string | null;
@@ -306,13 +318,16 @@ type EvolveState = {
     live: { exists: boolean; updatedAt: string | null };
     replay: { exists: boolean; updatedAt: string | null };
   };
-  research?: Research | null;
-  // Phase 5A: the controlled research swarm's cycle summary. Named distinctly
-  // from `research` above (Phase 3 read-only reference data: experiment /
-  // champions / arena / hall-of-fame / shadow) to avoid confusion between the
-  // two — this is the propose -> validate -> compile -> watchdog -> memory
-  // loop specifically.
+  // Phase 3/4 reference data (replay metadata, experiment, champions, arena,
+  // hall of fame, shadow league), explicitly labelled historical. Phase 5A.1
+  // split this out of the old ambiguous `research` field so it can never be
+  // mistaken for — or overwrite — the current Phase 5A research swarm.
+  historicalResearch?: HistoricalResearch | null;
+  // Phase 5A: the CURRENT controlled research swarm's cycle summary — the
+  // propose -> validate -> compile -> watchdog -> memory loop.
   researchSwarm?: ResearchSwarm | null;
+  stateContractVersion?: number;
+  stateStale?: boolean;
   genealogy?: { nodes: number; lineages: number; prunedNodes: number; activeLineages: number; extinctLineages: number; maxGeneration: number };
   evolution?: {
     enabled: boolean;
@@ -567,27 +582,46 @@ type ResearchSwarmLogEntry = {
   cycle: number;
   at: string;
   proposed: number;
+  accepted?: number;
   compiled: number;
   rejected: number;
   watchdogEvaluated: number;
+  watchdogVerdicts?: Record<string, number>;
 };
 
 type ResearchSwarm = {
   enabled: boolean;
   provider: string;
   cycle: number;
+  regime: string | null;
   proposalsGenerated: number;
+  proposalsAccepted: number;
   proposalsRejected: number;
   compiledCandidates: number;
-  watchCount: number;
-  quarantinedCount: number;
+  compiledFamilies: number;
+  injectedCandidates: number;
   memoryRecords: number;
+  conclusions: number;
+  evaluations: number;
+  researcherRoles: Record<string, number>;
+  watchdog: {
+    normal: number;
+    watch: number;
+    quarantined: number;
+    evaluated: number;
+    lastEvaluatedAt: string | null;
+  };
   lastRunAt: string | null;
   lastError: string | null;
   log: ResearchSwarmLogEntry[];
+  // Provenance: which state document this swarm summary came from.
+  source?: string | null;
+  sourceUpdatedAt?: string | null;
+  paperOnly?: boolean;
+  disclaimer?: string;
 };
 
-type Research = {
+type HistoricalResearch = {
   mode?: string;
   banner?: string;
   stage?: string;
@@ -760,7 +794,7 @@ function MarketBanner({
 }: {
   feed: MarketFeed;
   stateSource?: string;
-  research?: Research | null;
+  research?: HistoricalResearch | null;
 }) {
   const tone = bannerTone(feed, stateSource);
   const replayDataset = research?.dataset?.id ?? null;
@@ -802,7 +836,7 @@ function MarketBanner({
  * Research / Replay panel: where in the historical timeline this run is, which
  * walk-forward stage is active, and which dataset bytes produced it.
  */
-function ResearchPanel({ research, stateSource }: { research: Research; stateSource?: string }) {
+function ResearchPanel({ research, stateSource }: { research: HistoricalResearch; stateSource?: string }) {
   const dataset = research.dataset;
   const replay = research.replay;
   const windows = research.windows;
@@ -1069,7 +1103,7 @@ function OutOfSamplePanel({ experiment }: { experiment: ExperimentReport | null 
 }
 
 /** Evolution research: lineage health, survival by species, and cheap genealogy SVG. */
-function EvolutionResearchPanel({ state, research }: { state: EvolveState; research?: Research | null }) {
+function EvolutionResearchPanel({ state, research }: { state: EvolveState; research?: HistoricalResearch | null }) {
   const experiment = research?.experiment ?? null;
   const champions = research?.champions ?? null;
   const archiveCount = champions?.count ?? experiment?.champions ?? 0;
@@ -1209,25 +1243,28 @@ function EvolutionResearchPanel({ state, research }: { state: EvolveState; resea
 function IslandsPanel({ state }: { state: EvolveState }) {
   const islands = state.islands ?? [];
   const totalPopulation = islands.reduce((sum, island) => sum + island.population, 0);
-  const totalTarget = islands.reduce((sum, island) => sum + island.target, 0);
   const totalMigrations = islands.reduce((sum, island) => sum + island.migrationsIn, 0);
   const totalRevivals = islands.reduce((sum, island) => sum + island.revivals, 0);
+  const floor = islands.reduce((min, island) => Math.min(min, island.floor ?? 0), Infinity);
+  const cap = islands.reduce((max, island) => Math.max(max, island.cap ?? 0), 0);
+  const hasPolicy = islands.some((island) => typeof island.floor === "number" && island.floor > 0);
+  const maxPopulation = Math.max(...islands.map((island) => island.population), 1);
 
   return (
     <div className="panel islands-panel">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">STRATEGY ISLANDS</p>
-          <h2>Semi-isolated breeding populations</h2>
+          <h2>Soft diversity-protected populations</h2>
         </div>
         <Map size={20} />
       </div>
 
       <div className="health-grid">
         <div className="health-item">
-          <span>Current / target population</span>
+          <span>Total population</span>
           <strong>
-            {totalPopulation} / {totalTarget || state.stats.populationTarget || state.stats.population}
+            {totalPopulation} / {state.stats.populationTarget || state.stats.population}
           </strong>
         </div>
         <div className="health-item">
@@ -1235,7 +1272,11 @@ function IslandsPanel({ state }: { state: EvolveState }) {
           <strong>{islands.length}</strong>
         </div>
         <div className="health-item">
-          <span>Migrations this generation</span>
+          <span>Diversity floor / cap</span>
+          <strong>{hasPolicy && Number.isFinite(floor) ? `${floor} / ${cap}` : "—"}</strong>
+        </div>
+        <div className="health-item">
+          <span>Migrations (lifetime in)</span>
           <strong>{totalMigrations}</strong>
         </div>
         <div className="health-item">
@@ -1253,29 +1294,38 @@ function IslandsPanel({ state }: { state: EvolveState }) {
                 {island.extinct ? " (extinct — reviving)" : ""}
               </strong>
               <span>
-                pop {island.population}/{island.target} · births {island.births} · deaths {island.deaths} · migrations{" "}
-                {island.migrationsIn}in/{island.migrationsOut}out · revivals {island.revivals} · evidence-sufficient{" "}
-                {island.evidenceSufficientCount}
+                pop {island.population} ({((island.share ?? 0) * 100).toFixed(0)}% of population) · soft target{" "}
+                {island.softTarget ?? island.target} · weight {(island.reproductiveWeight ?? 1).toFixed(2)} · floor{" "}
+                {island.floor ?? "—"} · cap {island.cap ?? "—"}
+              </span>
+              <span>
+                births {island.births} · deaths {island.deaths} · migrations {island.migrationsIn}in/
+                {island.migrationsOut}out · revivals {island.revivals} · evidence-sufficient{" "}
+                {island.evidenceSufficientCount} ({((island.evidenceShare ?? 0) * 100).toFixed(0)}%)
               </span>
             </div>
             <div className="survival-track">
               <div
-                className={`survival-alive${island.extinct ? " tone-bad" : ""}`}
-                style={{ width: `${Math.min(100, (island.population / Math.max(1, island.target)) * 100)}%` }}
+                className={`survival-alive${island.extinct ? " tone-bad" : island.overCap ? " tone-warn" : ""}`}
+                style={{ width: `${Math.min(100, (island.population / maxPopulation) * 100)}%` }}
               />
             </div>
             <small className="species-role">
-              avg return {pct(island.avgReturn * 100)} · trades {island.trades}
+              paper return {pct((island.paperReturn ?? island.avgReturn ?? 0) * 100)} · mean fitness{" "}
+              {(island.meanFitness ?? island.avgFitness ?? 0).toFixed(2)} · median fitness{" "}
+              {(island.medianFitness ?? 0).toFixed(2)} · trades {island.trades}
             </small>
           </div>
         ))}
       </div>
 
       <p className="health-note">
-        Islands breed primarily within themselves, with bounded migration, cross-species crossover, and random
-        immigration (see EVOLVE_ISLAND_MIGRATION_RATE / EVOLVE_CROSS_SPECIES_CROSSOVER_RATE /
-        EVOLVE_RANDOM_IMMIGRANT_RATE). Revival re-seeds an extinct island; it does not protect a poor one from
-        ordinary selection.
+        Islands are diversity-protected, not equal-by-quota: births follow each island&apos;s evidence-adjusted
+        reproductive weight, movement is bounded per generation (EVOLVE_ISLAND_MAX_SHARE_DELTA), and each island is
+        clamped into an explicit floor/cap (EVOLVE_ISLAND_MIN_SHARE / EVOLVE_ISLAND_MAX_SHARE). The total always
+        equals the configured population size. A stronger, better-evidenced island earns share; a weak one shrinks
+        substantially without being wiped out, and bounded migration / cross-species crossover / random immigration
+        still apply (EVOLVE_ISLAND_MIGRATION_RATE / EVOLVE_CROSS_SPECIES_CROSSOVER_RATE / EVOLVE_RANDOM_IMMIGRANT_RATE).
       </p>
     </div>
   );
@@ -1290,6 +1340,9 @@ function IslandsPanel({ state }: { state: EvolveState }) {
 function ResearchSwarmPanel({ state }: { state: EvolveState }) {
   const swarm = state.researchSwarm ?? null;
   const researchAgents = state.topAgents.filter((agent) => agent.research);
+  // A snapshot written by an older engine may predate some of these fields;
+  // render zeros rather than crashing the whole dashboard on a stale file.
+  const watchdog = swarm?.watchdog ?? { normal: 0, watch: 0, quarantined: 0, evaluated: 0, lastEvaluatedAt: null };
 
   if (!swarm) {
     return (
@@ -1318,6 +1371,10 @@ function ResearchSwarmPanel({ state }: { state: EvolveState }) {
 
       <div className="health-grid">
         <div className="health-item">
+          <span>Enabled</span>
+          <strong>{swarm.enabled ? "yes" : "no"}</strong>
+        </div>
+        <div className="health-item">
           <span>Research cycle</span>
           <strong>{swarm.cycle}</strong>
         </div>
@@ -1326,33 +1383,70 @@ function ResearchSwarmPanel({ state }: { state: EvolveState }) {
           <strong>{swarm.provider}</strong>
         </div>
         <div className="health-item">
+          <span>Current research regime</span>
+          <strong>{swarm.regime ?? "—"}</strong>
+        </div>
+        <div className="health-item">
           <span>Proposals generated</span>
           <strong>{swarm.proposalsGenerated}</strong>
+        </div>
+        <div className="health-item">
+          <span>Proposals accepted</span>
+          <strong>{swarm.proposalsAccepted ?? "—"}</strong>
         </div>
         <div className="health-item">
           <span>Proposals rejected</span>
           <strong>{swarm.proposalsRejected}</strong>
         </div>
         <div className="health-item">
-          <span>Compiled candidates</span>
-          <strong>{swarm.compiledCandidates}</strong>
+          <span>Compiled families</span>
+          <strong>{swarm.compiledFamilies ?? swarm.compiledCandidates}</strong>
         </div>
         <div className="health-item">
-          <span>WATCH</span>
-          <strong className={swarm.watchCount > 0 ? "tone-warn" : undefined}>{swarm.watchCount}</strong>
-        </div>
-        <div className="health-item">
-          <span>QUARANTINED</span>
-          <strong className={swarm.quarantinedCount > 0 ? "tone-bad" : undefined}>{swarm.quarantinedCount}</strong>
+          <span>Injected candidates (live now)</span>
+          <strong>{swarm.injectedCandidates ?? "—"}</strong>
         </div>
         <div className="health-item">
           <span>Research memory records</span>
           <strong>{swarm.memoryRecords}</strong>
         </div>
         <div className="health-item">
+          <span>Conclusions / evaluations</span>
+          <strong>
+            {swarm.conclusions ?? "—"} / {swarm.evaluations ?? "—"}
+          </strong>
+        </div>
+        <div className="health-item">
+          <span>Watchdog NORMAL</span>
+          <strong>{watchdog.normal}</strong>
+        </div>
+        <div className="health-item">
+          <span>WATCH</span>
+          <strong className={watchdog.watch > 0 ? "tone-warn" : undefined}>{watchdog.watch}</strong>
+        </div>
+        <div className="health-item">
+          <span>QUARANTINED</span>
+          <strong className={watchdog.quarantined > 0 ? "tone-bad" : undefined}>
+            {watchdog.quarantined}
+          </strong>
+        </div>
+        <div className="health-item">
           <span>Active in population now</span>
           <strong>{researchAgents.length}</strong>
         </div>
+      </div>
+
+      <div className="survival-list">
+        {Object.entries(swarm.researcherRoles ?? {})
+          .sort((a, b) => b[1] - a[1])
+          .map(([role, count]) => (
+            <div className="survival-row" key={role}>
+              <div className="survival-meta">
+                <strong>{role}</strong>
+                <span>{count} memory records authored</span>
+              </div>
+            </div>
+          ))}
       </div>
 
       {swarm.lastError ? (
@@ -1367,8 +1461,8 @@ function ResearchSwarmPanel({ state }: { state: EvolveState }) {
             <div className="survival-meta">
               <strong>Cycle {entry.cycle}</strong>
               <span>
-                proposed {entry.proposed} · compiled {entry.compiled} · rejected {entry.rejected} · watchdog-evaluated{" "}
-                {entry.watchdogEvaluated}
+                proposed {entry.proposed} · accepted {entry.accepted ?? "—"} · compiled {entry.compiled} · rejected{" "}
+                {entry.rejected} · watchdog-evaluated {entry.watchdogEvaluated}
               </span>
             </div>
           </div>
@@ -1396,6 +1490,14 @@ function ResearchSwarmPanel({ state }: { state: EvolveState }) {
         watchdog, and the Champion Arena) decides everything else. Nothing here is a profitability claim, and no
         research candidate can promote itself — promotion to a Deployment Candidate only ever happens from a real
         Arena result.
+        {swarm.source ? (
+          <>
+            {" "}
+            Swarm state source: <code>{swarm.source}</code>
+            {swarm.sourceUpdatedAt ? ` (written ${swarm.sourceUpdatedAt})` : ""}. Historical Phase 3/4 reference data
+            lives separately under <code>historicalResearch</code>.
+          </>
+        ) : null}
       </p>
     </div>
   );
@@ -1962,8 +2064,11 @@ function Dashboard({
   const progress = state.generationTicks > 0 ? (state.tick / state.generationTicks) * 100 : 0;
   const best = state.topAgents[0];
   const feed = state.marketFeed;
-  const research = state.research ?? null;
-  const isReplay = state.stateSource === "replay" || research?.mode === "replay";
+  // Phase 5A.1: `historicalResearch` is Phase 3/4 reference data only. The
+  // current research swarm is a separate field (`state.researchSwarm`) and is
+  // never sourced from here.
+  const historicalResearch = state.historicalResearch ?? null;
+  const isReplay = state.stateSource === "replay" || historicalResearch?.mode === "replay";
 
   // The banner describes the feed as the engine saw it. If the snapshot itself
   // has stopped updating, say so plainly rather than implying live data. A
@@ -2038,11 +2143,11 @@ function Dashboard({
         <div className="replay-strip">
           Historical replay state (written {duration(snapshotAgeMs)} ago). Showing <code>replay-state.json</code> — the
           live engine state is isolated in <code>state.json</code> and is not affected.
-          {research?.replay?.finished ? " This replay has finished; the numbers below are the final recorded snapshot." : ""}
+          {historicalResearch?.replay?.finished ? " This replay has finished; the numbers below are the final recorded snapshot." : ""}
         </div>
       ) : null}
 
-      <MarketBanner feed={feed} stateSource={state.stateSource} research={research} />
+      <MarketBanner feed={feed} stateSource={state.stateSource} research={historicalResearch} />
 
       <section className="hero panel">
         <div>
@@ -2118,14 +2223,14 @@ function Dashboard({
         />
       </section>
 
-      {research?.dataset || research?.replay ? (
-        <ResearchPanel research={research} stateSource={state.stateSource} />
+      {historicalResearch?.dataset || historicalResearch?.replay ? (
+        <ResearchPanel research={historicalResearch} stateSource={state.stateSource} />
       ) : null}
 
-      {research ? (
+      {historicalResearch ? (
         <section className="dashboard-grid research-grid">
-          <OutOfSamplePanel experiment={research.experiment ?? null} />
-          <EvolutionResearchPanel state={state} research={research} />
+          <OutOfSamplePanel experiment={historicalResearch.experiment ?? null} />
+          <EvolutionResearchPanel state={state} research={historicalResearch} />
         </section>
       ) : null}
 
@@ -2136,13 +2241,16 @@ function Dashboard({
         </section>
       ) : null}
 
-      {research?.arena || research?.hallOfFame || research?.shadow ? (
+      {historicalResearch?.arena || historicalResearch?.hallOfFame || historicalResearch?.shadow ? (
         <>
           <section className="dashboard-grid research-grid">
-            <ArenaPanel arena={research.arena ?? null} />
-            <ChampionLeaguePanel arena={research.arena ?? null} hallOfFame={research.hallOfFame ?? null} />
+            <ArenaPanel arena={historicalResearch.arena ?? null} />
+            <ChampionLeaguePanel
+              arena={historicalResearch.arena ?? null}
+              hallOfFame={historicalResearch.hallOfFame ?? null}
+            />
           </section>
-          <ShadowLeaguePanel shadow={research.shadow ?? null} nowMs={nowMs} />
+          <ShadowLeaguePanel shadow={historicalResearch.shadow ?? null} nowMs={nowMs} />
         </>
       ) : null}
 

@@ -16,7 +16,7 @@
  * Run with: npm run validate:phase5a
  */
 
-import { mkdtemp, rm, readdir, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,18 @@ import { digestOf } from "./lib/hash.mjs";
 import { PAPER_ONLY } from "./engine/paper.mjs";
 import { createSimulation } from "./engine/simulation.mjs";
 import { SPECIES, GENOME_KEYS, GENE_BOUNDS, randomGenome } from "./engine/genome.mjs";
-import { islandTargetCounts, allocateBirths, largestRemainderAllocation, pickOtherIsland } from "./engine/islands.mjs";
+import {
+  islandTargetCounts,
+  allocateBirths,
+  allocateIslandBirths,
+  islandDiversityPolicy,
+  islandEvidenceWeight,
+  islandReproductiveWeights,
+  islandSoftTargets,
+  largestRemainderAllocation,
+  pickOtherIsland,
+  ISLAND_DIVERSITY_DEFAULTS,
+} from "./engine/islands.mjs";
 import { ABSTAIN_STATE, abstentionDecision, riskMultiplierFor, FAMILY_NAMES, resolveFamily } from "./engine/families.mjs";
 import { REGIMES, DEFAULT_DEPLOYMENT_GATES, ARENA_SCORE_VERSION } from "./arena/orchestrator.mjs";
 import {
@@ -50,7 +61,17 @@ import {
   loadPriorConclusions,
   saveCompiledCandidate,
   listCompiledCandidates,
+  normalizeWatchdogEvidence,
+  readWatchdogEvaluations,
+  summarizeResearchMemory,
+  watchdogStats,
 } from "./research/memory.mjs";
+import {
+  DASHBOARD_STATE_CONTRACT_VERSION,
+  buildResearchState,
+  readDashboardState,
+  selectStateSource,
+} from "./lib/dashboard-state.mjs";
 import { mockProviderPropose, resolveResearchProvider } from "./research/provider.mjs";
 import { runResearchCycle, buildEvidencePacket } from "./research/cycle.mjs";
 import { promoteFromArenaLeaderboard, isQuarantined } from "./research/promote.mjs";
@@ -136,6 +157,126 @@ async function runLiveSimulationGenerations({
     simulation.advanceTick();
   }
   return { simulation, snapshot: simulation.snapshot() };
+}
+
+/**
+ * Build an offline synthetic simulation directly (no ticks elapsed), for tests
+ * that need the untouched initialization state or precise generation control.
+ */
+async function offlineSimulation({
+  populationSize = 48,
+  generationTicks = 10,
+  envOverrides = {},
+  seedLabel = "phase5a-offline",
+} = {}) {
+  const config = createMarketConfig(
+    {
+      EVOLVE_MARKET_MODE: "synthetic",
+      EVOLVE_POPULATION_SIZE: String(populationSize),
+      EVOLVE_GENERATION_TICKS: String(generationTicks),
+      EVOLVE_SYNTHETIC_UNIVERSE: "16",
+      ...envOverrides,
+    },
+    { loadEnv: false },
+  );
+  const random = createSeededRandom(seedLabel);
+  let clock = 1_760_000_000_000;
+  const now = () => clock;
+  const feed = createMarketFeed({
+    config,
+    fetchImpl: async () => {
+      throw new Error("offline fixture only");
+    },
+    now,
+    random,
+  });
+  const simulation = createSimulation({ config, feed, now, random, evolution: { enabled: true, ...config.evolution } });
+  const advance = async (ticks) => {
+    for (let i = 0; i < ticks; i += 1) {
+      await feed.advance(clock);
+      clock += config.engine.tickMs;
+      simulation.advanceTick();
+    }
+  };
+  return { config, feed, simulation, advance, random };
+}
+
+async function writeJsonFixture(file, payload) {
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+/**
+ * A `.evolve/` directory exactly like the one the first 192-agent live run
+ * left behind: a live Phase 5A state.json carrying `researchSwarm`, plus a much
+ * older Phase 3 synthetic `session-demo` replay document and experiment report.
+ */
+async function writeLivePlusStalePhase3Fixture(root, { swarm } = {}) {
+  const staleExperimentId = "exp-session-demo-20260917T085106Z-S-a7km";
+
+  await writeJsonFixture(path.join(root, "state.json"), {
+    updatedAt: "2026-09-17T17:45:35.472Z",
+    mode: "PAPER",
+    paperOnly: true,
+    stats: { population: 192, alive: 192, bornTotal: 4000, terminatedTotal: 3808 },
+    researchRegime: "weak-risk-on",
+    islands: [{ name: "Momentum", population: 41, softTarget: 38, floor: 15, cap: 58 }],
+    researchSwarm: swarm,
+  });
+
+  await writeJsonFixture(path.join(root, "replay-state.json"), {
+    updatedAt: "2026-09-17T11:54:00.000Z",
+    mode: "PAPER",
+    paperOnly: true,
+    research: {
+      mode: "replay",
+      banner: "HISTORICAL REPLAY • PAPER MONEY",
+      stage: "TEST",
+      dataset: { id: "session-demo", dataClass: "synthetic-only", usableForRealMarketReplay: false },
+      replay: { finished: true, snapshotsRead: 263, speed: 1 },
+    },
+  });
+
+  await writeJsonFixture(path.join(root, "experiments", staleExperimentId, "manifest.json"), {
+    experimentId: staleExperimentId,
+    createdAt: "2026-09-17T08:51:06.000Z",
+    dataset: { id: "session-demo", dataClass: "synthetic-only" },
+    paperOnly: true,
+  });
+  await writeJsonFixture(path.join(root, "experiments", staleExperimentId, "summary.json"), {
+    experimentId: staleExperimentId,
+    dataset: { id: "session-demo", dataClass: "synthetic-only" },
+    seeds: ["evolve"],
+    windows: 1,
+    champions: 0,
+    paperOnly: true,
+  });
+
+  return { staleExperimentId };
+}
+
+function liveSwarmFixture(overrides = {}) {
+  return {
+    enabled: true,
+    provider: "mock",
+    cycle: 11,
+    regime: "weak-risk-on",
+    proposalsGenerated: 66,
+    proposalsAccepted: 66,
+    proposalsRejected: 0,
+    compiledCandidates: 33,
+    compiledFamilies: 33,
+    injectedCandidates: 3,
+    memoryRecords: 46,
+    conclusions: 13,
+    evaluations: 13,
+    researcherRoles: { "signal-researcher": 16, "execution-researcher": 22 },
+    watchdog: { normal: 6, watch: 7, quarantined: 0, evaluated: 13, lastEvaluatedAt: "2026-09-17T17:45:35.472Z" },
+    lastRunAt: "2026-09-17T17:45:35.472Z",
+    lastError: null,
+    log: [],
+    ...overrides,
+  };
 }
 
 function validProposal(overrides = {}) {
@@ -851,6 +992,520 @@ test("53. getResearchEvidence / clearResearchEvidence round-trip: culled researc
   // a subsequent read must still find the alive ones (they re-derive live).
   const after = simulation.getResearchEvidence();
   assertNoNonFinite(after, "researchEvidenceAfterClear");
+});
+
+/* ============================================================================
+ * 12. Phase 5A.1 — soft diversity-protected islands
+ *    (no hard equal quotas; evidence-weighted, inertia-bounded, floored/capped)
+ * ==========================================================================*/
+
+test("54. Islands initialize approximately evenly at 192 (about 32 each) with explicit soft floor and cap", async () => {
+  const { simulation } = await offlineSimulation({ populationSize: 192, seedLabel: "init-islands-192" });
+  const snapshot = simulation.snapshot();
+  const policy = islandDiversityPolicy(192, SPECIES, {});
+
+  assertEqual(snapshot.islands.length, SPECIES.length, "there must be one island per species");
+  assertEqual(snapshot.islands.reduce((sum, island) => sum + island.population, 0), 192, "islands must sum to the population");
+  for (const island of snapshot.islands) {
+    assert(
+      Math.abs(island.population - 32) <= 1,
+      `initialization must be approximately 32 per island, got ${island.name} ${island.population}`,
+    );
+    assertEqual(island.floor, policy.floor, `island ${island.name} must report the diversity floor`);
+    assertEqual(island.cap, policy.cap, `island ${island.name} must report the monoculture cap`);
+    assert(island.floor > 0 && island.cap > island.floor, "the floor and cap must be real, distinct bounds");
+    assert(island.cap < 192, "the cap must be a genuine ceiling, not the whole population");
+  }
+  assertEqual(policy.floor, 15, "the default floor at 192 is 8% of the population");
+  assertEqual(policy.cap, 58, "the default cap at 192 is 30% of the population");
+});
+
+test("55. Population stays exactly 192 for many generations while islands diverge from 32 each", async () => {
+  const { simulation, advance } = await offlineSimulation({ populationSize: 192, generationTicks: 10, seedLabel: "diverge-192" });
+  const policy = islandDiversityPolicy(192, SPECIES, {});
+  await advance(10 * 30);
+
+  const snapshot = simulation.snapshot();
+  assertEqual(snapshot.islands.reduce((sum, island) => sum + island.population, 0), 192, "island populations must sum to exactly 192");
+  assertEqual(snapshot.stats.alive, 192, "alive must stay exactly 192");
+  assertEqual(snapshot.stats.bornTotal - snapshot.stats.terminatedTotal, 192, "born - terminated must equal the population");
+
+  const distinct = new Set(snapshot.islands.map((island) => island.population));
+  assert(distinct.size > 1, "island populations must be able to differ from one another after evolution");
+  assert(
+    snapshot.islands.some((island) => island.population !== 32),
+    "soft islands must not snap back to a hard 32/32/32/32/32/32 quota",
+  );
+
+  for (const island of snapshot.islands) {
+    assert(island.population >= policy.floor, `${island.name} (${island.population}) fell below the diversity floor ${policy.floor}`);
+    assert(island.population <= policy.cap, `${island.name} (${island.population}) exceeded the cap ${policy.cap}`);
+    assertFinite(island.share, `${island.name} share`);
+    assertFinite(island.medianFitness, `${island.name} median fitness`);
+    assertFinite(island.meanFitness, `${island.name} mean fitness`);
+    assertFinite(island.paperReturn, `${island.name} paper return`);
+    assert(Number.isInteger(island.trades), `${island.name} trades must be an integer`);
+    assert(Number.isInteger(island.births) && Number.isInteger(island.deaths), `${island.name} births/deaths must be integers`);
+    assertFinite(island.softTarget, `${island.name} soft target`);
+    assertFinite(island.reproductiveWeight, `${island.name} reproductive weight`);
+  }
+  const shareSum = snapshot.islands.reduce((sum, island) => sum + island.share, 0);
+  assert(Math.abs(shareSum - 1) < 1e-6, `island shares must sum to 1, got ${shareSum}`);
+});
+
+test("56. A stronger, better-evidenced island earns more weight, a larger soft target, and more births than a weak one", () => {
+  const [strong, ...weakNames] = SPECIES;
+  const policy = islandDiversityPolicy(192, SPECIES, {});
+  const stats = { [strong]: { population: 32, evidenceSufficientCount: 32, medianFitness: 9 } };
+  for (const name of weakNames) stats[name] = { population: 32, evidenceSufficientCount: 32, medianFitness: -9 };
+  const weights = islandReproductiveWeights(stats, {});
+
+  for (const name of weakNames) {
+    assert(weights[strong] > weights[name], `the evidence-backed island must outweigh ${name}`);
+  }
+
+  const startCounts = Object.fromEntries(SPECIES.map((name) => [name, 32]));
+  const targets = islandSoftTargets({ startCounts, weights, total: 192, floor: policy.floor, cap: policy.cap, maxShareDelta: policy.maxShareDelta });
+  assert(targets[strong] > 32, "the evidence-backed island must be aimed above its starting share");
+  for (const name of weakNames) {
+    assert(targets[strong] > targets[name], `the evidence-backed island must out-target ${name}`);
+    assert(targets[name] < 32, `${name} must be aimed below its starting share`);
+  }
+
+  const counts = Object.fromEntries(SPECIES.map((name) => [name, 14]));
+  const births = allocateIslandBirths({ counts, targets, weights, birthsNeeded: 120, floor: policy.floor, cap: policy.cap });
+  for (const name of weakNames) {
+    assert(births[strong] > births[name], `the stronger island must receive more births than ${name}`);
+  }
+  assertEqual(Object.values(births).reduce((a, b) => a + b, 0), 120, "the birth budget must still be delivered exactly");
+});
+
+test("57. One lucky, low-evidence agent cannot hand its island the population (evidence damping + bounded movement)", () => {
+  const base = ISLAND_DIVERSITY_DEFAULTS.baseWeight;
+
+  const luckyOnly = islandEvidenceWeight({ population: 1, evidenceSufficientCount: 0, medianFitness: 1_000_000 });
+  assert(Math.abs(luckyOnly - base) < 1e-9, "an island with no sufficient evidence must earn no fitness advantage at all");
+
+  const barelyEvidenced = islandEvidenceWeight({ population: 32, evidenceSufficientCount: 1, medianFitness: 1_000_000 });
+  const wellEvidenced = islandEvidenceWeight({ population: 32, evidenceSufficientCount: 32, medianFitness: 9 });
+  assert(
+    barelyEvidenced < base * 1.1,
+    `1/n evidence may only buy a negligible advantage, got ${barelyEvidenced} vs base ${base}`,
+  );
+  assert(wellEvidenced > base * 1.5, "a fully-evidenced strong island must be able to earn a large advantage");
+
+  const policy = islandDiversityPolicy(192, ["Lucky", "Other"], {});
+  const targets = islandSoftTargets({
+    startCounts: { Lucky: 32, Other: 32 },
+    weights: { Lucky: 1e9, Other: 1 },
+    total: 192,
+    floor: policy.floor,
+    cap: policy.cap,
+    maxShareDelta: policy.maxShareDelta,
+  });
+  const step = Math.round(192 * policy.maxShareDelta);
+  assert(targets.Lucky <= 32 + step, `one generation may move an island by at most ${step} agents, got ${targets.Lucky - 32}`);
+  assert(targets.Lucky <= policy.cap, "the soft target must never exceed the cap even under overwhelming weight");
+});
+
+test("58. The diversity floor protects an island from being starved out while births are available", () => {
+  const policy = islandDiversityPolicy(192, SPECIES, {});
+  const counts = { A: 2, B: 40, C: 40, D: 40, E: 40, F: 30 };
+  const weights = { A: 0.0001, B: 1, C: 1, D: 1, E: 1, F: 1 };
+
+  const protectedBirths = allocateIslandBirths({
+    counts,
+    targets: counts,
+    weights,
+    birthsNeeded: 60,
+    floor: policy.floor,
+    cap: policy.cap,
+  });
+  assert(protectedBirths.A >= policy.floor - 2, `the floored island must be filled to its floor, got ${protectedBirths.A}`);
+  assertEqual(Object.values(protectedBirths).reduce((a, b) => a + b, 0), 60, "births must still sum exactly to the budget");
+
+  const unfloored = allocateIslandBirths({ counts, targets: counts, weights, birthsNeeded: 2, floor: 0, cap: policy.cap });
+  assertEqual(unfloored.A ?? 0, 0, "with the floor disabled a starved island can receive no births at all (extinction possible)");
+  assertEqual(Object.values(unfloored).reduce((a, b) => a + b, 0), 2, "the budget must still be delivered exactly");
+  assert(unfloored.B >= 1, "with the floor disabled births follow the evidence weight alone");
+});
+
+test("59. The monoculture cap is respected by the allocation and by a live 192-agent run", async () => {
+  const policy = islandDiversityPolicy(192, SPECIES, {});
+  const counts = { A: 30, B: 30, C: 30, D: 30, E: 30, F: 30 };
+  const births = allocateIslandBirths({
+    counts,
+    targets: { A: 58, B: 58, C: 58, D: 58, E: 58, F: 58 },
+    weights: { A: 1e6, B: 1, C: 1, D: 1, E: 1, F: 1 },
+    birthsNeeded: 12,
+    floor: policy.floor,
+    cap: policy.cap,
+  });
+  assert(counts.A + births.A <= policy.cap, `the dominant island must not exceed the cap, got ${counts.A + births.A}`);
+  assertEqual(Object.values(births).reduce((a, b) => a + b, 0), 12, "births must sum exactly even when the cap binds");
+
+  const { simulation, advance } = await offlineSimulation({ populationSize: 192, generationTicks: 10, seedLabel: "cap-live-192" });
+  await advance(10 * 20);
+  const snapshot = simulation.snapshot();
+  for (const island of snapshot.islands) {
+    assert(!island.overCap, `${island.name} reported overCap=${island.overCap} at ${island.population} (cap ${island.cap})`);
+    assert(island.population <= policy.cap, `${island.name} exceeded the population cap in a live run`);
+  }
+});
+
+test("60. Migration, random immigration, and research injection never break the global population", async () => {
+  const { simulation, advance } = await offlineSimulation({
+    populationSize: 192,
+    generationTicks: 12,
+    envOverrides: { EVOLVE_ISLAND_MIGRATION_RATE: "1", EVOLVE_ISLAND_MAX_MIGRATIONS: "10000", EVOLVE_RANDOM_IMMIGRANT_RATE: "0.25" },
+    seedLabel: "population-invariants",
+  });
+  simulation.injectResearchCandidate({
+    genome: randomGenome("Momentum", createSeededRandom("population-invariant-genome")),
+    species: "Momentum",
+    familyId: "F-population-invariant",
+    proposalId: "P-population-invariant",
+    authorRole: "signal-researcher",
+    targetRegimes: ["weak-risk-on"],
+    abstainRegimes: [],
+  });
+
+  for (let generation = 0; generation < 25; generation += 1) {
+    await advance(12);
+    const snapshot = simulation.snapshot();
+    assertEqual(snapshot.stats.alive, 192, `alive must stay exactly 192 (generation ${snapshot.generation})`);
+    assertEqual(
+      snapshot.islands.reduce((sum, island) => sum + island.population, 0),
+      192,
+      `island populations must sum to 192 (generation ${snapshot.generation})`,
+    );
+    assertEqual(
+      snapshot.stats.bornTotal - snapshot.stats.terminatedTotal,
+      192,
+      `born - terminated must equal the population (generation ${snapshot.generation})`,
+    );
+  }
+});
+
+test("61. A starved island can go extinct and be revived; the whole bookkeeping stays consistent", async () => {
+  // `Momentum:2` pins one island's *base weight* far below the others and the
+  // diversity floor is disabled, so that island is genuinely starved out and
+  // then re-seeded by the pre-existing revival rule — exactly the extinction
+  // path the new diversity floor is there to protect against.
+  const { simulation, advance } = await offlineSimulation({
+    populationSize: 48,
+    generationTicks: 10,
+    envOverrides: {
+      EVOLVE_ISLAND_MIN_SHARE: "0",
+      EVOLVE_ISLAND_TARGETS: "Momentum:2",
+      EVOLVE_ISLAND_REVIVE_EXTINCT: "true",
+      EVOLVE_ISLAND_MIGRATION_RATE: "0",
+    },
+    seedLabel: "extinction-accounting",
+  });
+
+  let sawRevival = 0;
+  for (let generation = 0; generation < 30; generation += 1) {
+    await advance(10);
+    const snapshot = simulation.snapshot();
+    assertEqual(snapshot.stats.alive, 48, `alive must stay exactly 48 (generation ${snapshot.generation})`);
+    assertEqual(
+      snapshot.islands.reduce((sum, island) => sum + island.population, 0),
+      48,
+      `islands must still sum to the population (generation ${snapshot.generation})`,
+    );
+    assertEqual(
+      snapshot.stats.bornTotal - snapshot.stats.terminatedTotal,
+      48,
+      `born - terminated must equal the population (generation ${snapshot.generation})`,
+    );
+    for (const island of snapshot.islands) {
+      assert(Number.isInteger(island.revivals) && island.revivals >= 0, `${island.name} revivals must be a non-negative integer`);
+      assert(
+        Number.isInteger(island.extinctionEvents) && island.extinctionEvents >= 0,
+        `${island.name} extinction events must be a non-negative integer`,
+      );
+      assert(island.revivals === 0 || island.population > 0, "a revived island must actually be populated again");
+      assert(island.population >= 0 && island.population <= island.cap, `${island.name} must stay within its cap`);
+    }
+    if (snapshot.islands.reduce((sum, island) => sum + island.revivals, 0) > 0) sawRevival += 1;
+  }
+
+  assert(sawRevival > 0, "at least one island must have gone extinct and been revived with the floor disabled");
+  assert(simulation.population.length === 48, "the population must be exact after every revival");
+});
+
+/* ============================================================================
+ * 13. Phase 5A.1 — machine-readable watchdog evidence in research memory
+ * ==========================================================================*/
+
+async function runWatchdogMemoryCycle(root, { trades = 6, minTrades = 8, cycle = 1, evidenceOverrides = {} } = {}) {
+  const evidence = buildEvidencePacket({
+    snapshot: { species: [], researchRegime: "weak-risk-on", topAgents: [], paper: { costs: 0, startingCash: 100 }, stats: { population: 48 } },
+    islands: [],
+    priorConclusions: [],
+    cycle,
+  });
+  return runResearchCycle({
+    root,
+    evidence,
+    cycle,
+    seed: "watchdog-memory",
+    proposalsPerCycle: 6,
+    maxCompilations: 0,
+    watchThresholds: { minTrades },
+    pendingEvidence: [
+      {
+        familyId: "F-watchdog-memory",
+        proposalId: "P-watchdog-memory",
+        authorRole: "execution-researcher",
+        hypothesis: "churn reduction hypothesis",
+        trades,
+        distinctMints: 1,
+        mintNotional: { mintA: 100 },
+        costDrag: 0.5,
+        trainReturn: 0.5,
+        oosReturn: 0.01,
+        stressTotal: 2,
+        stressSurvived: 0,
+        alive: false,
+        ...evidenceOverrides,
+      },
+    ],
+  });
+}
+
+/** A clean, well-evidenced candidate: no watchdog flag should fire. */
+const CLEAN_WATCHDOG_EVIDENCE = Object.freeze({
+  trades: 40,
+  distinctMints: 5,
+  mintNotional: { a: 22, b: 21, c: 20, d: 19, e: 18 },
+  costDrag: 0.01,
+  trainReturn: null,
+  oosReturn: null,
+  stressTotal: 0,
+  stressSurvived: 0,
+});
+
+test("62. A research memory record exposes structured watchdog evidence and stays TESTING (append-only, Arena-gated promotion)", async () => {
+  await withTempRoot(async (root) => {
+    await runWatchdogMemoryCycle(root, { trades: 6, minTrades: 8 });
+    const memory = await readMemoryIndex(root, { limit: 100 });
+    const record = memory.find((entry) => entry.candidateFamily === "F-watchdog-memory");
+    assert(record, "the watchdog-evaluated candidate must have a memory record");
+
+    assertEqual(record.status, MEMORY_STATUS.TESTING, "a watchdog verdict must never promote or reject a record on its own");
+    assert(record.watchdog && typeof record.watchdog === "object", "the record must carry a structured watchdog object");
+    assertEqual(record.watchdog.status, WATCHDOG_VERDICT.QUARANTINED, "the structured status must be machine-readable");
+    assert(Array.isArray(record.watchdog.reasons) && record.watchdog.reasons.length > 0, "the record must expose watchdog reasons");
+    assert(
+      record.watchdog.reasons.some((reason) => reason.includes("very-low-trade-count")),
+      "the reasons must name the flags that produced the verdict",
+    );
+    assert(
+      record.watchdog.flags.includes("very-low-trade-count"),
+      "the machine-readable flag list must be queryable without parsing prose",
+    );
+    assertEqual(record.watchdog.tradeCount, 6, "the record must expose the trade count the verdict was based on");
+    assert(typeof record.watchdog.evaluatedAt === "string", "the record must expose when it was evaluated");
+
+    // Back-compatible flat aliases (promote.mjs' quarantine check reads these).
+    assertEqual(record.watchdogVerdict, WATCHDOG_VERDICT.QUARANTINED, "watchdogVerdict must stay populated");
+    assertEqual(record.watchdogStatus, WATCHDOG_VERDICT.QUARANTINED, "watchdogStatus must stay populated");
+    assert(isQuarantined(memory, "F-watchdog-memory"), "a structured QUARANTINED verdict must still block promotion");
+
+    // The human-readable conclusion is still there, but nothing machine-readable
+    // depends on it.
+    assert(record.conclusion.length > 0, "the human-readable conclusion must still be written");
+
+    // Raw watchdog output normalizes into the same structured shape.
+    const normalized = normalizeWatchdogEvidence({
+      verdict: WATCHDOG_VERDICT.WATCH,
+      flags: [{ flag: "high-cost-drag", detail: "cost drag 50% of bankroll" }],
+      trades: 5,
+      evaluatedAt: "2026-09-17T00:00:00.000Z",
+    });
+    assertEqual(normalized.status, WATCHDOG_VERDICT.WATCH, "a raw verdict must normalize to a structured status");
+    assertEqual(normalized.flags[0], "high-cost-drag", "flag labels must be extracted from the raw flags");
+    assert(normalized.reasons[0].includes("high-cost-drag"), "reasons must retain the flag label and detail");
+    assertEqual(normalized.tradeCount, 5, "the normalization must carry the trade count");
+    assertEqual(normalized.evaluatedAt, "2026-09-17T00:00:00.000Z", "the normalization must carry the evaluation time");
+    assertEqual(normalizeWatchdogEvidence(null), null, "a candidate that was never screened must normalize to null");
+  });
+});
+
+test("63. Watchdog evidence is queryable (status, reasons, trade count, evaluatedAt) without parsing conclusions", async () => {
+  await withTempRoot(async (root) => {
+    await runWatchdogMemoryCycle(root, { trades: 6, minTrades: 8, cycle: 1 });
+    await runWatchdogMemoryCycle(root, { trades: 40, minTrades: 8, cycle: 2, evidenceOverrides: CLEAN_WATCHDOG_EVIDENCE });
+
+    const quarantined = await readWatchdogEvaluations(root, { status: WATCHDOG_VERDICT.QUARANTINED });
+    assertEqual(quarantined.length, 1, "a status filter must return exactly the quarantined evaluations");
+    assertEqual(quarantined[0].candidateFamily, "F-watchdog-memory", "the evaluation must name the family it judged");
+    assertEqual(quarantined[0].watchdog.tradeCount, 6, "the filtered evaluation must carry its trade count");
+
+    const all = await readWatchdogEvaluations(root);
+    assertEqual(all.length, 2, "every watchdog evaluation must be retrievable");
+    assert(all.every((entry) => typeof entry.watchdog.status === "string"), "every evaluation must carry a structured status");
+
+    const memory = await readMemoryIndex(root, { limit: 100 });
+    const stats = watchdogStats({ memoryRecords: memory });
+    assertEqual(stats.evaluated, 2, "the roll-up counts each evaluated record once");
+    assertEqual(stats.QUARANTINED, 1, "the roll-up must count the QUARANTINED verdict");
+    assertEqual(stats.NORMAL, 1, "the clean second evaluation must count as NORMAL");
+    assert(typeof stats.lastEvaluatedAt === "string", "the roll-up must report the most recent evaluation time");
+
+    const summary = summarizeResearchMemory({ memoryRecords: memory });
+    assertEqual(summary.watchdog.evaluated, 2, "the memory summary must expose the watchdog roll-up");
+    assert(summary.byRole["execution-researcher"] >= 2, "the memory summary must expose researcher-role counts");
+  });
+});
+
+test("64. Conclusions carry the same structured watchdog evidence, and history stays append-only", async () => {
+  await withTempRoot(async (root) => {
+    await runWatchdogMemoryCycle(root, { trades: 6, minTrades: 8, cycle: 1 });
+    const afterFirst = await readMemoryIndex(root, { limit: 100 });
+    const firstRecord = afterFirst.find((entry) => entry.candidateFamily === "F-watchdog-memory");
+
+    await runWatchdogMemoryCycle(root, { trades: 6, minTrades: 8, cycle: 2 });
+    const afterSecond = await readMemoryIndex(root, { limit: 100 });
+    const watchdogRecords = afterSecond.filter((entry) => entry.candidateFamily === "F-watchdog-memory");
+    assertEqual(watchdogRecords.length, 2, "each evaluation must append a new record rather than rewriting one");
+
+    const persistedFirst = afterSecond.find((entry) => entry.recordedAt === firstRecord.recordedAt);
+    assert(persistedFirst, "the earlier record must still be present");
+    assertEqual(persistedFirst.status, MEMORY_STATUS.TESTING, "an earlier record's status must never be rewritten in place");
+    assertEqual(persistedFirst.watchdog.status, WATCHDOG_VERDICT.QUARANTINED, "an earlier record's evidence must be preserved");
+
+    const conclusions = JSON.parse(await readFile(path.join(root, "conclusions.json"), "utf8"));
+    const entries = Array.isArray(conclusions.entries) ? conclusions.entries : [];
+    const evaluated = entries.filter((entry) => entry.watchdog && entry.watchdog.status === WATCHDOG_VERDICT.QUARANTINED);
+    assertEqual(evaluated.length, 2, "conclusions must carry the structured verdict alongside the prose");
+    assert(Array.isArray(evaluated[0].watchdog.flags), "the conclusion's watchdog field must expose flag labels");
+  });
+});
+
+/* ============================================================================
+ * 14. Phase 5A.1 — the dashboard state contract (researchSwarm vs historicalResearch)
+ * ==========================================================================*/
+
+test("65. A live Phase 5A research state reaches the dashboard state contract with every swarm field", async () => {
+  await withTempRoot(async (root) => {
+    await writeLivePlusStalePhase3Fixture(root, { swarm: liveSwarmFixture() });
+    const { status, body } = await readDashboardState({ root, requested: "auto" });
+
+    assertEqual(status, 200, "a live state must be served");
+    assertEqual(body.stateContractVersion, DASHBOARD_STATE_CONTRACT_VERSION, "the contract must be versioned");
+    assertEqual(body.stateSource, "live", "auto must serve the live document");
+
+    const swarm = body.researchSwarm;
+    assert(swarm, "the contract must expose a researchSwarm object");
+    for (const field of [
+      "enabled",
+      "provider",
+      "cycle",
+      "regime",
+      "proposalsGenerated",
+      "proposalsAccepted",
+      "proposalsRejected",
+      "compiledFamilies",
+      "injectedCandidates",
+      "memoryRecords",
+      "conclusions",
+      "evaluations",
+      "researcherRoles",
+      "watchdog",
+    ]) {
+      assert(swarm[field] !== undefined, `the swarm state must expose ${field}`);
+    }
+    assertEqual(swarm.proposalsGenerated, 66, "the live proposal count must reach the dashboard");
+    assertEqual(swarm.compiledFamilies, 33, "the live compiled-family count must reach the dashboard");
+    assertEqual(swarm.memoryRecords, 46, "the live memory-record count must reach the dashboard");
+    assertEqual(swarm.researcherRoles["execution-researcher"], 22, "researcher-role counts must reach the dashboard");
+
+    // Watchdog NORMAL / WATCH / QUARANTINED counts, machine-readable.
+    assertEqual(swarm.watchdog.normal, 6, "watchdog NORMAL count");
+    assertEqual(swarm.watchdog.watch, 7, "watchdog WATCH count");
+    assertEqual(swarm.watchdog.quarantined, 0, "watchdog QUARANTINED count");
+    assertEqual(swarm.watchdog.evaluated, 13, "watchdog evaluated count");
+    assert(typeof swarm.watchdog.lastEvaluatedAt === "string", "watchdog evaluation timestamp");
+    assertEqual(swarm.source, "live", "the swarm summary must be labelled with its source document");
+    assertNoNonFinite(swarm, "researchSwarm");
+  });
+});
+
+test("66. A stale Phase 3 replay/experiment cannot be mistaken for, or overwrite, the current research swarm", async () => {
+  await withTempRoot(async (root) => {
+    const { staleExperimentId } = await writeLivePlusStalePhase3Fixture(root, { swarm: liveSwarmFixture() });
+    const { status, body } = await readDashboardState({ root, requested: "auto" });
+
+    assertEqual(status, 200, "the live state must be served");
+    assertEqual(body.stateSource, "live", "a stale replay-state.json must never take the dashboard over from an existing live state");
+    assertEqual(body.researchSwarm.cycle, 11, "the current swarm cycle must be the live one");
+    assert(
+      JSON.stringify(body.researchSwarm).includes("session-demo") === false,
+      "the stale Phase 3 replay dataset must never appear inside the current swarm state",
+    );
+
+    // The Phase 3 information is not removed — it is exposed under a distinct,
+    // explicitly historical field.
+    const historical = body.historicalResearch;
+    assert(historical, "historical research data must still be available");
+    assertEqual(historical.kind, "historical", "historical data must be labelled as historical");
+    assertEqual(historical.experiment.id, staleExperimentId, "the newest experiment report must still be exposed");
+    assert(
+      typeof historical.note === "string" && historical.note.includes("researchSwarm"),
+      "the historical block must point the reader at the current swarm field",
+    );
+
+    // The two concepts are distinct objects: neither field contains the other's
+    // identifying keys.
+    assert(body.historicalResearch.experiment !== undefined, "historicalResearch carries the experiment");
+    assertEqual(body.researchSwarm.proposalsGenerated, 66, "researchSwarm carries the swarm numbers");
+    assertEqual(body.historicalResearch.memoryRecords, undefined, "historicalResearch must not carry swarm counters");
+    assertEqual(body.researchSwarm.dataset, undefined, "researchSwarm must not carry replay dataset metadata");
+  });
+});
+
+test("67. A replay document never blanks the swarm panel: the swarm summary still comes from the live state", async () => {
+  await withTempRoot(async (root) => {
+    await writeLivePlusStalePhase3Fixture(root, { swarm: liveSwarmFixture() });
+    const { status, body } = await readDashboardState({ root, requested: "replay" });
+
+    assertEqual(status, 200, "an explicitly requested replay must be served when the file exists");
+    assertEqual(body.stateSource, "replay", "the requested source must be honored");
+    assertEqual(body.historicalResearch.dataset.id, "session-demo", "the replay metadata must describe the replay document");
+    assertEqual(body.researchSwarm.cycle, 11, "the research swarm summary must still be the live one");
+    assertEqual(body.researchSwarm.source, "live", "the swarm summary must report that it came from the live document");
+    assert(body.researchSwarm.sourceUpdatedAt !== undefined, "the swarm summary must carry provenance");
+  });
+});
+
+test("68. Source selection: live wins whenever it exists (even stale); replay is only a last resort", () => {
+  const stale = 4_000_000;
+  assertEqual(
+    selectStateSource({ requested: "auto", live: { exists: true, mtimeMs: 1 }, replay: { exists: true, mtimeMs: stale } }),
+    "live",
+    "auto must prefer the live document over a replay document",
+  );
+  assertEqual(selectStateSource({ requested: "auto", live: { exists: false }, replay: { exists: true } }), "replay", "auto falls back to replay only when live is absent");
+  assertEqual(selectStateSource({ requested: "auto", live: { exists: false }, replay: { exists: false } }), null, "nothing to serve");
+  assertEqual(selectStateSource({ requested: "live", live: { exists: false }, replay: { exists: true } }), null, "an explicit live request must not silently serve a replay");
+  assertEqual(selectStateSource({ requested: "replay", live: { exists: true }, replay: { exists: false } }), null, "an explicit replay request must not silently serve live state");
+  assertEqual(selectStateSource({ requested: "AUTO", live: { exists: true }, replay: { exists: false } }), "live", "source names are case-insensitive");
+
+  // buildResearchState never merges the two concepts, whatever the documents say.
+  const merged = buildResearchState({
+    document: { researchSwarm: { cycle: 3 }, research: { mode: "replay", dataset: { id: "session-demo" } } },
+    source: "replay",
+    liveDocument: { researchSwarm: { cycle: 9 } },
+    historical: { experiment: { id: "exp-session-demo" } },
+    swarmUpdatedAt: "2026-09-17T20:00:00.000Z",
+  });
+  assertEqual(merged.researchSwarm.cycle, 3, "a replay document's own swarm summary wins when it has one");
+  assertEqual(merged.researchSwarm.dataset, undefined, "the replay metadata must never leak into the swarm object");
+  assertEqual(merged.historicalResearch.dataset.id, "session-demo", "replay metadata belongs to the historical object");
+  assertEqual(merged.historicalResearch.experiment.id, "exp-session-demo", "historical reference data is preserved");
 });
 
 /* ============================================================================

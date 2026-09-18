@@ -4,17 +4,19 @@
 
 EVOLVE is an experimental evolutionary trading-agent laboratory. A population of agents competes under identical market conditions, high-fitness genomes reproduce, weak agents are terminated, and mutations preserve exploration across generations.
 
-> **Current status:** Phase 4 — Champion Arena, regime/stress testing, and the Live Shadow League, on
-> top of Phase 3's historical capture, deterministic replay, and walk-forward evolution. The repository
-> contains no wallet keys, no signer, and no transaction path. It cannot spend real SOL because that
-> capability does not exist in it.
+> **Current status:** Phase 5A — a controlled research swarm (plus the Phase 5A.1 integration
+> correctness pass) on top of Phase 4's Champion Arena, regime/stress testing, and Live Shadow League,
+> on top of Phase 3's historical capture, deterministic replay, and walk-forward evolution. The
+> repository contains no wallet keys, no signer, and no transaction path. It cannot spend real SOL
+> because that capability does not exist in it.
 
 Every monetary number the system produces is **PAPER P&L**. Simulated returns are not real profits.
 Historical backtests and paper results **do not** guarantee future profitability.
 
 ## What works
 
-- 96 continuously running paper agents across six strategy species
+- 48 / 96 / 192 (or arbitrary) continuously running paper agents across six strategy species
+- Soft, diversity-protected strategy islands (evidence-weighted, floored/capped, exact global population)
 - Individual trading genomes with species-specific signal specialisation
 - Live Solana market observations from the Jupiter Developer Platform (Tokens V2)
 - Explicit `auto` / `live` / `synthetic` / `replay` market modes with honest labels
@@ -626,11 +628,11 @@ safe range rather than crashing. No internal code assumes exactly 96 agents.
 The population is split into semi-isolated **islands** — one per existing species (Genesis Hunter,
 Momentum, Reversal, Wallet Flow, Liquidity, Experimental) — that breed primarily from their own members
 (`scripts/engine/islands.mjs`, wired into `breedGeneration` in `scripts/engine/simulation.mjs`). At 192
-agents this starts at 32/32/32/32/32/32. Islands are not just a display grouping: each generation,
-births are allocated per island in proportion to how far under its target it currently sits (deficit
-proportional, largest-remainder apportionment, so the total is always exact), and breeding draws from a
-fixed, pre-generation snapshot of each island's own top performers — never from siblings born earlier in
-the same generation. On top of that:
+agents this **starts** at 32/32/32/32/32/32 — but that is an initialization, not a quota. See
+[Phase 5A.1](#phase-5a1--integration-correctness-pass) for the soft, diversity-protected model that
+replaced the original hard equal per-island target. Breeding always draws from a fixed, pre-generation
+snapshot of each island's own top performers — never from siblings born earlier in the same generation.
+On top of that:
 
 - **Migration** (`EVOLVE_ISLAND_MIGRATION_RATE`, `EVOLVE_ISLAND_MAX_MIGRATIONS`): a bounded fraction of
   survivors relabel to a different island each generation (genome carried over, breeding boundary
@@ -644,9 +646,10 @@ the same generation. On top of that:
   ordinary evidence-ranked selection from there. A poor island is never protected from selection; only
   total extinction is prevented from being permanent.
 
-Per-island population, target, births, deaths, migrations in/out, revivals, extinction events, avg
-return/fitness, trade count, and evidence-sufficient-agent count are all visible in `state.json` under
-`islands` and rendered on the dashboard's Strategy Islands panel.
+Per-island population, population share, initialization target, evidence-adjusted soft target,
+reproductive weight, floor, cap, births, deaths, migrations in/out, revivals, extinction events, paper
+return, mean/median fitness, trade count, and evidence-sufficient-agent count are all visible in
+`state.json` under `islands` and rendered on the dashboard's Strategy Islands panel.
 
 ### Research swarm roles
 
@@ -720,7 +723,10 @@ import, no shell, and no I/O.
 ```
 
 Statuses are `PROPOSED → TESTING → REJECTED`, or (Arena-gated only, see below) `PROMISING`,
-`ARENA_SURVIVOR`, `SHADOW_ELIGIBLE`. Each research cycle reloads prior conclusions first, so researchers
+`ARENA_SURVIVOR`, `SHADOW_ELIGIBLE`. Each memory record also carries a structured `watchdog` object
+(status, flag labels, reasons, the trade count the verdict was based on, and `evaluatedAt`), mirrored
+onto its conclusion line, so watchdog evidence is queryable (`readWatchdogEvaluations`, `watchdogStats`)
+without parsing a sentence. Each research cycle reloads prior conclusions first, so researchers
 do not endlessly re-propose the same rejected region — the mock provider's rationale explicitly
 references prior `REJECTED` proposal ids it is avoiding.
 
@@ -811,10 +817,63 @@ Candidates remains a completely acceptable outcome of the eventual Arena run ove
 ### Commands
 
 ```bash
-npm run validate:phase5a         # Phase 5A validation suite (63 offline cases)
+npm run validate:phase5a         # Phase 5A + 5A.1 validation suite (78 offline cases)
+npm run smoke:swarm              # offline 192-agent island-divergence + swarm-state smoke run
 npm run arena -- --research      # include persisted research candidates as Arena entrants,
                                   # and promote research memory from the result
 ```
+
+## Phase 5A.1 — integration correctness pass
+
+Still **PAPER ONLY**, with no new capability of any kind. Phase 5A.1 fixes three integration defects
+found by inspecting the first genuine 192-agent live research run (66 proposals, 33 compiled families,
+46 memory records, watchdog conclusions, generation 22): the dashboard showed a stale Phase 3 replay
+instead of the live swarm, watchdog results were only readable as prose, and every island had been
+frozen at exactly 32 agents. Each fix narrows behaviour toward "more honest", never toward "more likely
+to produce a survivor".
+
+- **The two research concepts are now two distinct state fields.** `researchSwarm` is the CURRENT Phase 5A
+  research swarm (enabled, cycle, provider, current research regime, proposals
+  generated/accepted/rejected, compiled families, injected candidates, memory records,
+  conclusions/evaluations, per-role counts, and watchdog NORMAL/WATCH/QUARANTINED counts — all
+  machine-readable). `historicalResearch` is Phase 3/4 reference data (replay metadata, the newest
+  experiment report, champion archive, newest arena, Hall of Fame, Shadow League) and is explicitly
+  labelled `kind: "historical"` with a pointer back at `researchSwarm`. The ambiguous old `research`
+  field — which meant "historical replay data" while reading like "the research state" — is gone. Two
+  root causes were fixed: `auto` source selection preferred an existing *replay* document over an
+  existing (merely stale) live one, so the whole dashboard flipped to an older replay file that has no
+  swarm summary at all; and the swarm summary itself was never attached to the response except through
+  the live document. `auto` now serves the live document whenever it exists (a stale live snapshot is
+  still *the* live run — it simply renders the stale strip), only falling back to replay when there is
+  no live state at all, and the swarm summary additionally falls back to the live state file so browsing
+  a historical replay never blanks the swarm panel. All of this lives in
+  `scripts/lib/dashboard-state.mjs`, so the offline validation suite exercises the exact contract the
+  browser consumes.
+- **Watchdog results are structured and queryable.** Every research-memory record (and its mirrored
+  conclusion line) now carries a `watchdog` object: machine status, flag labels, human reasons, the
+  trade count the verdict was based on, and `evaluatedAt` — so "which candidates are quarantined, and
+  why?" is answered by `readWatchdogEvaluations(root, { status })` and a `watchdogStats()` roll-up
+  instead of by parsing a sentence. Memory stays **append-only** and a research cycle still cannot leave
+  anything beyond `PROPOSED` / `TESTING` / `REJECTED`: a `QUARANTINED` verdict remains structured
+  evidence attached to a `TESTING` record (it restricts and blocks promotion, it does not reject), and
+  the Champion Arena remains the only promotion path.
+- **Islands are soft diversity-protected, not hard equal quotas.** Births used to be allocated against a
+  fixed even target every generation, so every island snapped back to exactly `populationSize / N`
+  regardless of evidence — 32/32/32/32/32/32 forever at 192 agents. Now each island's
+  **evidence-adjusted reproductive weight** becomes a desired share (`islandReproductiveWeights`); the
+  advantage is damped by how much of that island's surviving population actually has sufficient
+  evidence, so one lucky barely-evidenced agent buys essentially nothing. Movement toward the desired
+  share is bounded per generation (`EVOLVE_ISLAND_MAX_SHARE_DELTA`, default 6% of the population — the
+  anti-takeover bound), the resulting soft target is clamped into an explicit
+  **floor** (`EVOLVE_ISLAND_MIN_SHARE`, default 8% → 15 agents at 192; `0` re-enables the pre-5A.1
+  "an island may go extinct" path) and **cap** (`EVOLVE_ISLAND_MAX_SHARE`, default 30% → 58 agents at
+  192), and births fill the floor first, then move each island toward its soft target, then place any
+  residue by weight. The one hard invariant is global: `sum(island populations) == EVOLVE_POPULATION_SIZE`
+  exactly, always. Genuine divergence is therefore possible and evidence-driven (for example
+  34/33/33/32/31/29 after 40 offline generations, or 25/41/38/34/22/32 in the live run's terminology),
+  while a one-generation lucky island cannot consume the population, a weak island shrinks substantially
+  without being wiped out, and migration / cross-species crossover / random immigration stay bounded.
+  `EVOLVE_ISLAND_TARGETS` still expresses an initialization/base-weight preference rather than a quota.
 
 ## Validation
 
@@ -996,6 +1055,8 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
 - [x] Configurable population (`EVOLVE_POPULATION_SIZE`: 48/96/192/arbitrary, exact and deterministic)
 - [x] Strategy islands: species-as-breeding-boundary, bounded migration, cross-species crossover, random
       immigration, and extinction revival — tracked per island, actually driving breeding
+- [x] Soft, diversity-protected island allocation: evidence-adjusted reproductive weights, bounded
+      per-generation share movement, explicit floor/cap, and an exact global population (Phase 5A.1)
 - [x] Six structured researcher roles over a bounded, plain-data evidence packet; deterministic offline
       `mock` provider (no LLM key/network required); pluggable provider interface for later
 - [x] Strict-allowlist proposal schema with a static executable-content sandbox scan
@@ -1014,6 +1075,19 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
 - [ ] A non-mock research provider (still just an interface; only the offline mock is implemented)
 - [ ] Automatic Arena re-entry of every compiled candidate on a fixed cadence (currently manual via
       `npm run arena -- --research`)
+
+### Phase 5A.1 — integration correctness pass
+- [x] Distinct state fields: `researchSwarm` (current swarm) vs `historicalResearch` (Phase 3/4 reference
+      data), never merged, both reachable through the dashboard's state contract
+- [x] `auto` state source prefers the live document and can no longer be hijacked by a stale replay;
+      the live swarm summary survives while browsing a historical replay
+- [x] Swarm state exposes enabled / cycle / provider / regime / proposals generated, accepted, rejected /
+      compiled families / injected candidates / memory records / conclusions / evaluations / per-role
+      counts / watchdog NORMAL-WATCH-QUARANTINED counts
+- [x] Watchdog results are machine-readable in research memory and conclusions (status, flags, reasons,
+      trade count, `evaluatedAt`) without parsing prose, with memory still append-only and Arena-gated
+- [x] Offline smoke (`npm run smoke:swarm`): 192 agents, exact island total, real island divergence, and
+      live swarm state visible through the same contract the dashboard reads
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

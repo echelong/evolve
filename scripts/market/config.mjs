@@ -308,8 +308,24 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
     islands: Object.freeze({
       enabled: readBool(env, ["EVOLVE_ISLANDS_ENABLED"], true),
       // Explicit per-island targets ("Name:count,Name:count"). Unset = split
-      // the population approximately evenly across the enabled islands.
+      // the population approximately evenly across the enabled islands. These
+      // are the *initialization / base weight*, not a per-generation quota.
       targetCounts: parseIslandCounts(readFirst(env, ["EVOLVE_ISLAND_TARGETS"]).value),
+      // Phase 5A.1 soft diversity protection. Islands are no longer held at an
+      // identical 1/N quota: births follow each island's evidence-adjusted
+      // reproductive weight, bounded per generation and clamped into these
+      // explicit bounds. Set EVOLVE_ISLAND_MIN_SHARE=0 to let a persistently
+      // failing island actually reach zero (and be revived by the existing
+      // extinction rule) instead of being floored.
+      minShare: clampNumber(readNumber(env, ["EVOLVE_ISLAND_MIN_SHARE"], 0.08), 0, 0.5),
+      maxShare: clampNumber(readNumber(env, ["EVOLVE_ISLAND_MAX_SHARE"], 0.3), 0.02, 1),
+      // Maximum share (of the whole population) one island's target may move in
+      // one generation — the anti-takeover bound.
+      maxShareDelta: clampNumber(readNumber(env, ["EVOLVE_ISLAND_MAX_SHARE_DELTA"], 0.06), 0, 1),
+      // How strongly an evidence-backed fitness advantage can shift an island's
+      // reproductive weight, and the fitness scale the advantage saturates at.
+      advantageStrength: clampNumber(readNumber(env, ["EVOLVE_ISLAND_ADVANTAGE_STRENGTH"], 0.75), 0, 4),
+      fitnessScale: clampNumber(readNumber(env, ["EVOLVE_ISLAND_FITNESS_SCALE"], 8), 0.01, 10_000),
       // Fraction of each island that emigrates to other islands per generation
       // (bounded: migration informs, it must not homogenize).
       migrationRate: clampNumber(readNumber(env, ["EVOLVE_ISLAND_MIGRATION_RATE"], 0.04), 0, 0.25),

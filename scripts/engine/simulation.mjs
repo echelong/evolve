@@ -25,7 +25,14 @@ import {
 import { generateAgentId } from "../lib/ids.mjs";
 import { ORIGIN, createGenealogy } from "./genealogy.mjs";
 import { PAPER_ONLY, paperGuards, simulateEntry, simulateExit } from "./paper.mjs";
-import { islandTargetCounts, allocateBirths, pickOtherIsland } from "./islands.mjs";
+import {
+  islandTargetCounts,
+  allocateIslandBirths,
+  islandDiversityPolicy,
+  islandReproductiveWeights,
+  islandSoftTargets,
+  pickOtherIsland,
+} from "./islands.mjs";
 import { ABSTAIN_STATE, abstentionDecision, riskMultiplierFor } from "./families.mjs";
 import { classifyWindowRegime } from "../arena/orchestrator.mjs";
 
@@ -298,13 +305,33 @@ export function createSimulation({
   const islandRandomImmigrantRate = clampNumber(islandsConfig.randomImmigrantRate, 0, 0.25, 0.03);
   const islandReviveExtinct = islandsConfig.reviveExtinct !== false;
 
+  const { population: populationSize, generationTicks: configuredGenerationTicks } = config.engine;
+
+  // Phase 5A.1: soft diversity-protected islands. `floor`/`cap` are explicit
+  // diversity bounds (never a hard equal quota), and `maxShareDelta` bounds how
+  // far one island's share may move per generation, so a single lucky
+  // generation cannot hand the population to one island. `EVOLVE_ISLAND_MIN_SHARE=0`
+  // opts back into the pre-5A.1 "an island may go extinct" behaviour.
+  const islandPolicy = islandDiversityPolicy(populationSize, islandNames, {
+    minShare: islandsConfig.minShare,
+    maxShare: islandsConfig.maxShare,
+    maxShareDelta: islandsConfig.maxShareDelta,
+  });
+  const islandFloor = islandsEnabled ? islandPolicy.floor : 0;
+  const islandCap = islandsEnabled ? islandPolicy.cap : populationSize;
+  const islandMaxShareDelta = islandsEnabled ? islandPolicy.maxShareDelta : 0;
+
+  // Last generation's evidence-adjusted targets/weights, exposed on the
+  // snapshot so the dashboard can show *why* an island is growing or shrinking.
+  let lastIslandTargets = null;
+  let lastIslandWeights = null;
+
+  /** Base (initialization) split — a weight, never a per-generation quota. */
   function islandTargets() {
     return islandsEnabled
       ? islandTargetCounts(populationSize, islandNames, islandsConfig.targetCounts ?? {})
       : Object.fromEntries(islandNames.map((name) => [name, 0]));
   }
-
-  const { population: populationSize, generationTicks: configuredGenerationTicks } = config.engine;
   // A generation cannot end before agents have had a chance to accumulate
   // evidence, regardless of how short config.engine.generationTicks is set.
   const generationTicks = Math.max(configuredGenerationTicks, minGenerationTicks);
@@ -977,8 +1004,23 @@ export function createSimulation({
       Math.min(populationSize, Math.round(populationSize * survivorFraction)),
     );
     const immigrantCount = Math.max(0, Math.floor(populationSize * immigrantRate));
+    // Phase 5A.1: the island populations this generation started from (before
+    // any culling). The soft diversity policy measures share movement against
+    // *this*, so an island can gain/lose real share across generations without
+    // one lucky generation being able to hand it the whole population.
+    const startCounts = Object.fromEntries(islandNames.map((name) => [name, 0]));
+    for (const agent of population) {
+      if (startCounts[agent.species] !== undefined) startCounts[agent.species] += 1;
+    }
+
     const elites = population.slice(0, eliteCount);
     const survivorPool = population.slice(0, survivorCount);
+    // Phase 5A.1: the ending generation's per-agent evidence is captured here,
+    // before `resetSurvivor` zeroes this generation's accounting, so the island
+    // reproductive weights below are computed from what the agents actually did
+    // (trades / observations / fitness) rather than a fresh, empty ledger.
+    const endingEvidence = new Map();
+    for (const agent of survivorPool) endingEvidence.set(agent.id, agent);
     const deaths = populationSize - survivorCount;
     const culled = population.slice(survivorCount);
     trackDeaths(culled);
@@ -1021,11 +1063,16 @@ export function createSimulation({
       );
     }
 
-    // Remaining births are allocated per island, proportional to how far
-    // under its target each island currently sits (after migration + the
-    // random-immigrant floor above), so breeding pulls every island back
-    // toward its target share instead of drifting wherever fitness happens
-    // to concentrate this generation.
+    // Remaining births follow the Phase 5A.1 soft diversity model. Each
+    // island's *evidence-adjusted reproductive weight* becomes a desired
+    // share; movement toward that share is bounded per generation, and the
+    // resulting soft target is clamped into [diversity floor, monoculture cap].
+    // Births fill the floor first, then move each island toward its soft
+    // target, and their exact sum is always `remainingBirths` — so island
+    // populations may diverge substantially while the global population stays
+    // exact. An island's weight cannot be bought with one lucky agent, because
+    // the fitness advantage is damped by how much of that island's surviving
+    // population actually has sufficient evidence.
     const targets = islandTargets();
     function currentIslandCounts() {
       const counts = Object.fromEntries(islandNames.map((name) => [name, 0]));
@@ -1052,12 +1099,59 @@ export function createSimulation({
     }
 
     const remainingBirths = Math.max(0, populationSize - next.length);
-    const deficits = {};
     const counts = currentIslandCounts();
-    for (const name of islandNames) deficits[name] = targets[name] - counts[name];
+
+    // Per-island evidence for this generation's weights (post-migration labels,
+    // pre-reset measurement — a migrant's evidence follows it to its new island).
+    const islandStats = Object.fromEntries(
+      islandNames.map((name) => [name, { population: 0, trades: 0, evidenceSufficientCount: 0, fitness: [] }]),
+    );
+    for (const agent of next) {
+      const stats = islandStats[agent.species];
+      if (!stats) continue;
+      const measured = endingEvidence.get(agent.id) ?? agent;
+      stats.population += 1;
+      stats.trades += finite(measured.trades, 0);
+      stats.fitness.push(finite(measured.fitness, 0));
+      if (hasSufficientEvidence(measured, evidenceOptions)) stats.evidenceSufficientCount += 1;
+    }
+    for (const stats of Object.values(islandStats)) {
+      const sorted = stats.fitness.sort((a, b) => a - b);
+      stats.meanFitness = sorted.length > 0 ? sorted.reduce((a, b) => a + b, 0) / sorted.length : 0;
+      stats.medianFitness = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : 0;
+    }
+
+    const islandWeights = islandsEnabled
+      ? islandReproductiveWeights(islandStats, {
+          baseWeights: targets,
+          advantageStrength: islandsConfig.advantageStrength,
+          fitnessScale: islandsConfig.fitnessScale,
+        })
+      : Object.fromEntries(islandNames.map((name) => [name, 1]));
+    const softTargets = islandSoftTargets({
+      startCounts,
+      weights: islandWeights,
+      // Shares are measured against the configured population size, not the
+      // interim post-cull count.
+      total: populationSize,
+      floor: islandFloor,
+      cap: islandCap,
+      maxShareDelta: islandMaxShareDelta,
+    });
     const allocation = islandsEnabled
-      ? allocateBirths(deficits, remainingBirths)
+      ? allocateIslandBirths({
+          counts,
+          targets: softTargets,
+          weights: islandWeights,
+          birthsNeeded: remainingBirths,
+          floor: islandFloor,
+          cap: islandCap,
+        })
       : { [islandNames[0]]: remainingBirths };
+    if (islandsEnabled) {
+      lastIslandTargets = softTargets;
+      lastIslandWeights = islandWeights;
+    }
 
     for (const name of islandNames) {
       const slots = allocation[name] ?? 0;
@@ -1382,10 +1476,26 @@ export function createSimulation({
               members.length;
         const avgFitness =
           members.length === 0 ? 0 : members.reduce((sum, agent) => sum + agent.fitness, 0) / members.length;
+        const fitnessValues = members.map((agent) => finite(agent.fitness, 0)).sort((a, b) => a - b);
+        const medianFitness =
+          fitnessValues.length === 0 ? 0 : fitnessValues[Math.floor(fitnessValues.length / 2)];
+        const sufficientCount = members.filter((agent) => hasSufficientEvidence(agent, evidenceOptions)).length;
+        const populationShare = populationSize > 0 ? members.length / populationSize : 0;
         return {
           name,
+          // `target` is the *initialization / base* split (what an even or
+          // explicitly-configured start looks like), never a hard quota.
           target: currentIslandTargets[name] ?? 0,
+          // `softTarget` is this generation's evidence-adjusted, inertia-bounded
+          // aim, clamped into [floor, cap].
+          softTarget: Math.round(finite(lastIslandTargets?.[name], currentIslandTargets[name] ?? 0)),
+          reproductiveWeight: Number.isFinite(lastIslandWeights?.[name])
+            ? round(lastIslandWeights[name], 4)
+            : 1,
+          floor: islandFloor,
+          cap: islandCap,
           population: members.length,
+          share: round(populationShare, 6),
           births: stats.births,
           deaths: stats.deaths,
           migrationsIn: stats.migrationsIn,
@@ -1393,9 +1503,14 @@ export function createSimulation({
           revivals: stats.revivals,
           extinctionEvents: stats.extinctionEvents,
           avgReturn: averageReturnSafe(avgReturn),
+          paperReturn: averageReturnSafe(avgReturn),
           avgFitness: averageReturnSafe(avgFitness),
+          meanFitness: averageReturnSafe(avgFitness),
+          medianFitness: averageReturnSafe(medianFitness),
           trades: members.reduce((sum, agent) => sum + agent.trades, 0),
-          evidenceSufficientCount: members.filter((agent) => hasSufficientEvidence(agent, evidenceOptions)).length,
+          evidenceSufficientCount: sufficientCount,
+          evidenceShare: members.length > 0 ? round(sufficientCount / members.length, 6) : 0,
+          overCap: members.length > islandCap,
           extinct: members.length === 0,
         };
       })

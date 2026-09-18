@@ -22,7 +22,7 @@ import { createMarketConfig, publicConfig } from "./market/config.mjs";
 import { createMarketFeed } from "./market/feed.mjs";
 import { REPLAY_BANNER } from "./market/replay.mjs";
 import { buildEvidencePacket, runResearchCycle } from "./research/cycle.mjs";
-import { loadPriorConclusions, readMemoryIndex } from "./research/memory.mjs";
+import { loadPriorConclusions, readResearchMemorySummary } from "./research/memory.mjs";
 
 export const STATE_DIR = ".evolve";
 export const STATE_FILE = "state.json";
@@ -121,16 +121,32 @@ export function createResearchController({ config, simulation }) {
 
   let cycle = 0;
   let lastGenerationRun = -1;
+  // The Phase 5A research-swarm state contract. Everything the dashboard needs
+  // to describe the CURRENT swarm lives here — this object is what `state.json`
+  // persists as `researchSwarm`, and it is deliberately kept in a field whose
+  // name cannot collide with the API's historical/replay research bucket.
   const summary = {
     enabled,
     provider: researchConfig.provider ?? "mock",
-    cycle: 0,
+    cycle: 0, // current research cycle
+    regime: null, // current research regime (Arena classifier vocabulary)
     proposalsGenerated: 0,
+    proposalsAccepted: 0,
     proposalsRejected: 0,
     compiledCandidates: 0,
-    watchCount: 0,
-    quarantinedCount: 0,
+    compiledFamilies: 0, // accepted proposals whose families were compiled
+    injectedCandidates: 0, // research candidates live in the population right now
     memoryRecords: 0,
+    conclusions: 0,
+    evaluations: 0,
+    researcherRoles: {}, // researcher role -> memory records authored
+    watchdog: {
+      normal: 0,
+      watch: 0,
+      quarantined: 0,
+      evaluated: 0,
+      lastEvaluatedAt: null,
+    },
     lastRunAt: null,
     lastError: null,
     log: [], // bounded, most-recent-first, for the dashboard activity feed
@@ -185,24 +201,41 @@ export function createResearchController({ config, simulation }) {
       }
       simulation.clearResearchEvidence(report.clearedFamilyIds);
 
-      const memoryIndex = await readMemoryIndex(root, { limit: 500 });
+      // Re-read memory so the summary always reflects what is actually on
+      // disk (records, conclusions, role counts, watchdog roll-up) rather than
+      // an in-memory guess — the same numbers the dashboard and any audit see.
+      const memory = await readResearchMemorySummary(root);
 
       summary.cycle = cycle;
+      summary.regime = snapshot.researchRegime ?? summary.regime;
       summary.proposalsGenerated += report.proposed;
+      summary.proposalsAccepted += report.accepted ?? 0;
       summary.proposalsRejected += report.rejectedSchema.length + report.rejectedCompile.length;
       summary.compiledCandidates += report.compiled.length;
-      summary.watchCount = report.watchdog.filter((w) => w.verdict === "WATCH").length;
-      summary.quarantinedCount = memoryIndex.filter((r) => r.watchdogVerdict === "QUARANTINED").length;
-      summary.memoryRecords = memoryIndex.length;
+      summary.compiledFamilies = memory.compiledFamilies;
+      summary.injectedCandidates = simulation.population.filter((agent) => agent.researchMeta).length;
+      summary.memoryRecords = memory.memoryRecords;
+      summary.conclusions = memory.conclusions;
+      summary.evaluations += report.watchdog.length;
+      summary.researcherRoles = { ...memory.byRole };
+      summary.watchdog = {
+        normal: memory.watchdog.NORMAL ?? 0,
+        watch: memory.watchdog.WATCH ?? 0,
+        quarantined: memory.watchdog.QUARANTINED ?? 0,
+        evaluated: memory.watchdog.evaluated ?? 0,
+        lastEvaluatedAt: memory.watchdog.lastEvaluatedAt ?? null,
+      };
       summary.lastRunAt = new Date().toISOString();
       summary.lastError = null;
       summary.log.unshift({
         cycle,
         at: summary.lastRunAt,
         proposed: report.proposed,
+        accepted: report.accepted ?? 0,
         compiled: report.compiled.length,
         rejected: report.rejectedSchema.length + report.rejectedCompile.length,
         watchdogEvaluated: report.watchdog.length,
+        watchdogVerdicts: report.watchdogVerdicts ?? {},
       });
       summary.log = summary.log.slice(0, 10);
     } catch (error) {

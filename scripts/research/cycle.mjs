@@ -140,17 +140,30 @@ export async function runResearchCycle({
     if ((candidateEvidence.trades ?? 0) < Math.min(3, minTrades)) continue; // not enough to say anything yet
 
     const result = evaluateCandidate(candidateEvidence, watchThresholds);
+    const evaluatedAt = new Date(now()).toISOString();
+    // Structured, queryable watchdog evidence — attached to the memory record
+    // (and the conclusion) so "which candidates are QUARANTINED and why" never
+    // requires parsing the human-readable conclusion sentence.
+    const watchdog = {
+      status: result.verdict,
+      flags: result.flags,
+      trades: candidateEvidence.trades ?? 0,
+      evaluatedAt,
+    };
     watchdogReport.push({
       familyId: candidateEvidence.familyId,
       proposalId: candidateEvidence.proposalId,
       verdict: result.verdict,
       flags: result.flags.map((f) => f.flag),
+      tradeCount: candidateEvidence.trades ?? 0,
+      evaluatedAt,
     });
 
-    const status =
-      result.verdict === WATCHDOG_VERDICT.QUARANTINED
-        ? MEMORY_STATUS.TESTING // quarantine restricts, it never rejects outright
-        : MEMORY_STATUS.TESTING;
+    // A research cycle may only ever leave PROPOSED / TESTING / REJECTED.
+    // QUARANTINED restricts (it blocks promotion and further injection); it is
+    // deliberately NOT a rejection, so the record stays TESTING and the verdict
+    // lives in structured watchdog evidence. Promotion stays Arena-gated.
+    const status = MEMORY_STATUS.TESTING;
 
     const record = createMemoryRecord({
       proposalId: candidateEvidence.proposalId,
@@ -164,13 +177,13 @@ export async function runResearchCycle({
       drawdown: candidateEvidence.maxDrawdown,
       costDrag: candidateEvidence.costDrag,
       status,
+      watchdog,
+      evaluatedAt,
       conclusion:
         result.verdict === WATCHDOG_VERDICT.QUARANTINED
           ? `QUARANTINED: ${result.flags.map((f) => f.flag).join(", ")}`
           : `watchdog ${result.verdict.toLowerCase()} after ${candidateEvidence.trades ?? 0} trades`,
     });
-    record.watchdogVerdict = result.verdict;
-    record.watchdogFlags = result.flags;
 
     await appendMemoryRecord(root, record);
     await appendConclusion(root, {
@@ -178,7 +191,8 @@ export async function runResearchCycle({
       authorRole: candidateEvidence.authorRole,
       status,
       conclusion: record.conclusion,
-      at: new Date(now()).toISOString(),
+      at: evaluatedAt,
+      watchdog: { ...watchdog, status: result.verdict },
     });
 
     if (!candidateEvidence.alive) clearedFamilyIds.push(candidateEvidence.familyId);
@@ -243,10 +257,15 @@ export async function runResearchCycle({
   return {
     cycle,
     proposed: rawProposals.length,
+    accepted: validProposals.length,
     rejectedSchema,
     compiled,
     rejectedCompile,
     watchdog: watchdogReport,
+    watchdogVerdicts: watchdogReport.reduce((acc, entry) => {
+      acc[entry.verdict] = (acc[entry.verdict] ?? 0) + 1;
+      return acc;
+    }, {}),
     clearedFamilyIds,
   };
 }
