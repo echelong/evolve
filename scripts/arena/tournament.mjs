@@ -39,6 +39,8 @@ import {
   mergeResearchAncestry,
   summarizeResearchCohort,
 } from "./research-cohort.mjs";
+import { childLineage, immigrantLineage, seedLineageId } from "../research/ab-cohort.mjs";
+import { buildAbComparison, summarizeAbForSummary } from "./ab-comparison.mjs";
 
 export const ARENA_RUNNER_VERSION = 1;
 
@@ -60,10 +62,52 @@ function carriedMeta(source) {
   if (source?.origin) meta.origin = source.origin;
   if (source?.research) meta.research = source.research;
   if (source?.researchAncestry) meta.researchAncestry = source.researchAncestry;
+  // Phase 5A.3: cohort + lineage identity travel with a re-entering genome, so
+  // an unchanged seed is still an exact original of its cohort.
+  if (source?.cohort) meta.cohort = source.cohort;
+  if (source?.lineage) meta.lineage = source.lineage;
+  if (source?.lineageId) meta.lineageId = source.lineageId;
   return meta;
 }
 
-export function buildEntrantPool({ champions = [], population = 24, seed = "arena", championShare = 0.2, immigrantShare = 0.15, eliteCarryover = [] } = {}) {
+/** Cohort/lineage metadata for a BRED child (empty outside A/B mode). */
+function childLineageMeta(...parents) {
+  const lineage = childLineage(...parents);
+  if (!lineage) return {};
+  return { cohort: lineage.cohort, lineageId: lineage.lineageId, lineage };
+}
+
+/**
+ * A random immigrant inside one cohort's evolutionary budget. Outside A/B mode
+ * (`cohort` null) this is exactly the old plain immigrant object — no cohort,
+ * no lineage, no behavior change.
+ */
+function immigrantEntrant(genome, species, cohort) {
+  if (!cohort) return { genome, species, origin: "immigrant" };
+  const digest = digestOf(genome);
+  return {
+    genome,
+    species,
+    origin: "immigrant",
+    digest,
+    cohort,
+    lineageId: seedLineageId(cohort, digest),
+    lineage: immigrantLineage(cohort, digest),
+  };
+}
+
+export function buildEntrantPool({
+  champions = [],
+  population = 24,
+  seed = "arena",
+  championShare = 0.2,
+  immigrantShare = 0.15,
+  eliteCarryover = [],
+  // Phase 5A.3: when supplied, random immigrants are tagged with this cohort
+  // (and its own lineage) so every A/B entrant stays attributable. Null keeps
+  // the pre-5A.3 behavior byte-for-byte.
+  cohort = null,
+} = {}) {
   const random = createSeededRandom(`pool:${seed}`);
   const entrants = [];
 
@@ -102,6 +146,7 @@ export function buildEntrantPool({ champions = [], population = 24, seed = "aren
         species: a.species ?? "Experimental",
         origin: "evolved",
         ...(descendant ? { research: descendant, researchAncestry: ancestry } : {}),
+        ...childLineageMeta(a, b),
       });
     } else if (champions.length === 1) {
       const child = mutateGenome(champions[0].genome, { scale: 0.08, random });
@@ -112,17 +157,18 @@ export function buildEntrantPool({ champions = [], population = 24, seed = "aren
         species: champions[0].species ?? "Experimental",
         origin: "evolved",
         ...(descendant ? { research: descendant, researchAncestry: ancestry } : {}),
+        ...childLineageMeta(champions[0]),
       });
     } else {
       const species = SPECIES[i % SPECIES.length];
-      entrants.push({ genome: randomGenome(species, random), species, origin: "immigrant" });
+      entrants.push(immigrantEntrant(randomGenome(species, random), species, cohort));
     }
   }
 
   // Random immigrants keep exploration alive no matter how strong the champions are.
   for (let i = 0; i < immigrantSlots; i += 1) {
     const species = SPECIES[Math.floor(random() * SPECIES.length)];
-    entrants.push({ genome: randomGenome(species, random), species, origin: "immigrant" });
+    entrants.push(immigrantEntrant(randomGenome(species, random), species, cohort));
   }
 
   for (const entrant of eliteCarryover ?? []) {
@@ -249,6 +295,16 @@ export async function runArenaTournament({
   minUniqueRatio = null,
   maxSpeciesShare = null,
   researchEnabled = null,
+  // Phase 5A.3 A/B benchmark: when `abAccounting` is supplied the tournament
+  // emits a matched-cohort comparison artifact. The evaluation, scoring, gates,
+  // stress profiles and datasets above are IDENTICAL for every entrant — the
+  // only thing cohort identity does is split the reporting.
+  abAccounting = null,
+  abConfig = null,
+  abRoles = null,
+  abSpeciesMatched = false,
+  abBootstrapIterations = null,
+  abBootstrapSeed = null,
 }) {
   const startedAt = Date.now();
   const log = (message, detail = null) => {
@@ -390,6 +446,12 @@ export async function runArenaTournament({
       reason: entry.reason ?? null,
       // Phase 5A.2: first-class research provenance (exact identity vs ancestry).
       research: researchProvenance(entrant),
+      // Phase 5A.3: cohort + lineage identity for the A/B benchmark, plus the
+      // compact paper evidence every comparison metric is derived from.
+      cohort: entrant.cohort ?? null,
+      lineage: entrant.lineage ?? null,
+      lineageId: entrant.lineageId ?? entrant.lineage?.lineageId ?? null,
+      paperEvidence: summarizePaperEvidence(evaluations.get(entrant), detail),
       distinctMintDiagnostics: detail?.distinctMintDiagnostics ?? null,
     };
   });
@@ -400,6 +462,31 @@ export async function runArenaTournament({
     typeof researchRoleMetrics === "function"
       ? await researchRoleMetrics({ candidateRows, entrants })
       : researchRoleMetrics;
+
+  // ---------------- Phase 5A.3: matched A/B comparison ----------------------
+  // Computed AFTER the single shared evaluation, from this run's own rows. The
+  // cohorts consumed identical datasets, seeds, windows, stress profiles,
+  // scoring and gates by construction — this only splits the reporting.
+  const abArtifact =
+    abAccounting != null
+      ? buildAbComparison({
+          arenaId,
+          candidateRows,
+          entrants,
+          accounting: { ...abAccounting, speciesMatched: abSpeciesMatched === true },
+          config: abConfig ?? {},
+          datasets,
+          seeds,
+          stressProfiles,
+          knownRoles: abRoles?.known ?? [],
+          advisoryRoles: abRoles?.advisory ?? [],
+          bootstrapIterations:
+            Number.isFinite(Number(abBootstrapIterations)) && Number(abBootstrapIterations) > 0
+              ? Number(abBootstrapIterations)
+              : undefined,
+          bootstrapSeed: abBootstrapSeed ?? undefined,
+        })
+      : null;
 
   // Explicit stage membership, written to rounds.json so a stage artifact can
   // be inspected without recomputing the funnel.
@@ -525,6 +612,8 @@ export async function runArenaTournament({
       accounting: researchAccounting,
       roleMetrics: resolvedRoleMetrics,
     }),
+    // Phase 5A.3: compact A/B section (the full artifact is written alongside).
+    abComparison: summarizeAbForSummary(abArtifact),
     baselines,
     diversity,
     diversityVerdict: verdict,
@@ -548,10 +637,11 @@ export async function runArenaTournament({
       gatesConfig: config.arena?.gates ?? {},
       candidateRows,
       stageMembers,
+      abArtifact,
     });
   }
 
-  return { summary, details, statuses, scored, evaluations, candidateRows, championLeague, stageMembers };
+  return { summary, details, statuses, scored, evaluations, candidateRows, championLeague, stageMembers, abArtifact };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -718,6 +808,49 @@ function round2(value) {
   return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
 }
 
+/** Median of the finite entries in a list (null when there are none). */
+function medianOf(values) {
+  const sorted = (values ?? []).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/**
+ * Compact per-candidate paper evidence used by the Phase 5A.3 A/B comparison.
+ * Every value is a median over this candidate's own OOS runs, so a cohort
+ * median is a median of medians — descriptive only, never a return forecast.
+ */
+export function summarizePaperEvidence(evaluation, detail = null) {
+  const oosRuns = (evaluation?.oosRuns ?? []).filter((run) => run?.metrics);
+  const stressRuns = (evaluation?.stressRuns ?? []).filter((run) => run?.metrics);
+  const pick = (selector) => oosRuns.map((run) => selector(run.metrics));
+  const regimePerformance = detail?.regimePerformance ?? {};
+  return {
+    oosRunCount: oosRuns.length,
+    stressRunCount: stressRuns.length,
+    medianNetReturn: medianOf(pick((metrics) => metrics.netReturn)),
+    medianGrossReturn: medianOf(pick((metrics) => metrics.grossReturn)),
+    medianCostDrag: medianOf(pick((metrics) => metrics.costDrag)),
+    medianTrades: medianOf(pick((metrics) => metrics.trades)),
+    medianDistinctMints: medianOf(pick((metrics) => metrics.distinctMints)),
+    medianTopMintNotionalShare: medianOf(pick((metrics) => metrics.mintDiagnostics?.topMintNotionalShare)),
+    medianDrawdown: medianOf(pick((metrics) => metrics.maxDrawdown)),
+    catastrophicEvents: (detail?.components?.catastrophicEvents ?? 0),
+    stressSurvived: detail?.components?.stressSurvived ?? 0,
+    stressTotal: detail?.components?.stressTotal ?? 0,
+    stressSurvival: detail?.stressSurvival ?? {},
+    regimeRuns: Object.keys(regimePerformance).length,
+    regimePositive: Object.values(regimePerformance).filter((row) => (row?.medianNetReturn ?? 0) > 0).length,
+    regimeCoverage: Object.fromEntries(
+      Object.entries(regimePerformance).map(([regime, row]) => [regime, row?.medianNetReturn ?? null]),
+    ),
+    oosWindows: detail?.components?.oosWindows ?? 0,
+    seeds: detail?.components?.seeds ?? 0,
+    observations: detail?.components?.observations ?? 0,
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Output writing                                                             */
 /* -------------------------------------------------------------------------- */
@@ -736,6 +869,7 @@ async function writeArenaOutputs({
   gatesConfig = {},
   candidateRows = null,
   stageMembers = null,
+  abArtifact = null,
 }) {
   const dir = path.join(arenasDir, arenaId);
   await mkdir(dir, { recursive: true });
@@ -785,6 +919,8 @@ async function writeArenaOutputs({
     "champion-league.json": summary.championLeague ?? [],
     "deployment-candidates.json": summary.deploymentCandidates,
     "rounds.json": { funnel: summary.funnel, stageMembers: stageMembers ?? null },
+    // Phase 5A.3: dedicated matched-cohort A/B artifact (written only in A/B mode).
+    ...(abArtifact ? { "ab-comparison.json": abArtifact } : {}),
   };
 
   for (const [name, payload] of Object.entries(files)) {

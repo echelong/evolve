@@ -34,6 +34,12 @@ import { listCompiledCandidates, listProposals } from "../research/memory.mjs";
 export const RESEARCH_ARENA_MODE = Object.freeze({
   CHALLENGER: "challenger",
   FAIR: "fair",
+  // Phase 5A.3: matched, equal-resource research-vs-conventional A/B benchmark.
+  // Challenger asks "can fresh research challengers beat mature incumbents?";
+  // fair asks "what happens when research ancestry participates under equal
+  // evolutionary rules?"; A/B asks "does research-guided INITIALIZATION beat a
+  // matched conventional control when both cohorts get identical resources?".
+  AB: "ab",
 });
 
 export const RESEARCH_IDENTITY = Object.freeze({
@@ -186,6 +192,9 @@ export function researchProvenance(row) {
     ],
     researchAncestorRoles: [...(research?.researchAncestorRoles ?? ancestry?.roles ?? [])],
     diversified: research?.diversified === true,
+    // Phase 5A.3: cohort tag travels with provenance when present, so A/B
+    // attribution survives into every artifact. Null outside A/B mode.
+    cohort: row?.cohort ?? row?.lineage?.cohort ?? null,
   };
 }
 

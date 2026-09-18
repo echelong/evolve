@@ -4,12 +4,12 @@
 
 EVOLVE is an experimental evolutionary trading-agent laboratory. A population of agents competes under identical market conditions, high-fitness genomes reproduce, weak agents are terminated, and mutations preserve exploration across generations.
 
-> **Current status:** Phase 5A.2 — a controlled research swarm (including the Phase 5A.1 integration
-> correctness pass and the Phase 5A.2 research-cohort correctness + experimental-quality pass) on top
-> of Phase 4's Champion Arena, regime/stress testing, and Live Shadow League, on top of Phase 3's
-> historical capture, deterministic replay, and walk-forward evolution. The repository contains no
-> wallet keys, no signer, and no transaction path. It cannot spend real SOL because that capability
-> does not exist in it.
+> **Current status:** Phase 5A.3 — controlled, matched Research vs Conventional **A/B benchmarking**
+> (on top of the Phase 5A.2 research-cohort correctness pass, the Phase 5A.1 integration correctness
+> pass, and the Phase 5A controlled research swarm), on top of Phase 4's Champion Arena,
+> regime/stress testing, and Live Shadow League, on top of Phase 3's historical capture, deterministic
+> replay, and walk-forward evolution. The repository contains no wallet keys, no signer, and no
+> transaction path. It cannot spend real SOL because that capability does not exist in it.
 
 Every monetary number the system produces is **PAPER P&L**. Simulated returns are not real profits.
 Historical backtests and paper results **do not** guarantee future profitability.
@@ -38,6 +38,8 @@ Historical backtests and paper results **do not** guarantee future profitability
 - Champion Arena: large-scale tournament with regime/stress testing and a transparent Arena Score
 - Live Shadow League: frozen Deployment Candidates paper-trading genuine current market data
 - Validation suites, syntax sweep, offline engine, replay, and arena smoke runs
+- Matched A/B Arena mode: equal-resource Research vs Conventional cohorts, no cloning, cohort/lineage
+  attribution through evolution, cross-cohort crossover disabled, and a dedicated `ab-comparison.json`
 
 ## Run
 
@@ -74,6 +76,7 @@ npm run validate:arena   # Phase 4 arena/shadow checks (offline)
 npm run validate:phase41 # Phase 4.1 correctness-pass checks (offline)
 npm run validate:phase5a # Phase 5A + 5A.1 research-swarm checks (offline)
 npm run validate:phase5a2# Phase 5A.2 research-cohort checks (offline)
+npm run validate:phase5a3# Phase 5A.3 matched research-vs-conventional A/B checks (offline)
 npm run smoke:engine     # deterministic synthetic-mode evolution smoke run
 npm run smoke:replay     # offline record → replay → walk-forward smoke run
 npm run smoke:arena      # tiny offline Champion Arena funnel
@@ -1081,6 +1084,208 @@ npm run arena -- --research-mode fair DATASET   # equal-treatment cohort
 EVOLVE_RESEARCH_MIN_UNIQUE_RATIO=0.95 npm run arena -- --research-mode fair <dataset>
 EVOLVE_RESEARCH_MAX_SPECIES_SHARE=0.5 EVOLVE_ARENA_RESEARCH_SHARE=0.4 npm run arena -- --research-mode fair <dataset>
 npm run validate:phase5a2                       # Phase 5A.2 suite (60 offline cases)
+npm run arena -- --research-mode ab DATASET     # matched A/B benchmark (Phase 5A.3)
+npm run validate:phase5a3                       # Phase 5A.3 suite (69 offline cases)
+```
+
+## Phase 5A.3 — controlled research vs conventional A/B benchmarking
+
+Still **PAPER ONLY**, with no wallet, no signing, and no execution path of any kind. Phase 5A.3 adds
+one thing: a way to ask a *controlled* question instead of an encouraging-looking one.
+
+Phase 5A.2's fair mode was a real improvement, but it could not separate "research works" from
+"research was most of the population": in the 200-entrant fair run, research ancestry supplied 169
+entrants (≈84.5%) against 31 conventional ones, all 8 Champion League finalists were research
+descendants, and the research cohort held 47 of the top 50. That is a striking pattern — and it is
+**not a controlled comparison**, because the two populations were wildly different sizes.
+
+The question Phase 5A.3 exists to answer is narrow:
+
+> **Does research-guided evolution outperform conventional evolution when both cohorts receive equal
+> resources and equal evolutionary treatment?**
+
+The system is *not* tuned toward a positive answer. A null or negative result is a valid outcome, and
+the report says so in plain language.
+
+### Three separate research modes
+
+| Mode | Question it answers |
+| --- | --- |
+| `challenger` (default) | Can fresh research challengers beat already-evolved incumbents? |
+| `fair` | What happens when research ancestry participates under equal evolutionary rules in one mixed cohort? |
+| `ab` | Does research-guided **initialization** beat a **matched** conventional control under identical resources? |
+
+These are deliberately kept as three different experiments. A/B does not replace either of the others.
+
+### Matched cohort construction and the no-cloning policy
+
+```bash
+EVOLVE_ARENA_POPULATION=200 npm run arena -- --research-mode ab <dataset>
+```
+
+With `EVOLVE_ARENA_POPULATION=200` a 50/50 A/B test targets **100 research + 100 conventional**.
+Sizing is matched, not requested-and-hoped-for:
+
+```text
+requestedPerCohort = requested total / 2            (symmetric by construction)
+matchedPerCohort   = min(requestedPerCohort,
+                         unique research seed genomes,
+                         unique conventional seed genomes)
+```
+
+If only 42 genuinely unique research genomes exist, the run is **42 vs 42** — never 42 vs 158. The
+shortfall is reported (`requestedPerCohort`, `actualPerCohort`, `seedShortage`, `matchedDowngrade`,
+`shortageReason`) and startup prints it before anything is evaluated:
+
+```text
+[arena] A/B cohorts: research=42 conventional=42 total=84 (requested 100 per cohort)
+[arena] A/B unique seeds: research 42 (0 duplicate digest(s) rejected) conventional 100 (...)
+[arena] A/B SHORTAGE: matched cohort downgraded to 42 per cohort. only 42 unique research seed ...
+[arena] A/B shortage handling: BOTH cohorts were reduced symmetrically — never 42 vs 158, and never by cloning.
+```
+
+**A genome is never cloned to fill a slot.** A duplicate seed digest occupies no second slot, on either
+side, and `clonedToFillQuota` is always `0`. Descendants may legitimately converge onto the same genome
+during evolution; that is recorded as **convergence** (`descendantConvergence`, `repeatedDigests`)
+rather than silently de-duplicated.
+
+If a cohort would otherwise be too small to say anything, descendant expansion can be enabled
+explicitly (`EVOLVE_ARENA_AB_EXPAND=1`). That grows each cohort to the requested size by **ordinary
+evolution under identical rules** — ancestry preserved, seed accounting unchanged — not by duplicating
+seeds or jittering duplicates into looking distinct.
+
+### Cohort identity, lineage, and independence
+
+Every entrant and every descendant in A/B mode carries:
+
+- `cohort: research | conventional`
+- `lineageId` (digest-derived and stable — never index-derived)
+- the original seed digest(s)
+- `parentLineageIds`
+- `generation` (0 for a founder)
+- `identity: exact-original | descendant`, plus `founderKind: seed | immigrant | descendant`
+- research family / proposal / author-role ancestry where applicable
+
+**Cross-cohort crossover is disabled for the benchmark.** Research breeds only with research, and
+conventional only with conventional: the two cohorts are pre-evolved in complete isolation, each from
+its own survivors. `childLineage` still *reports* `crossCohort: true` if it is ever asked to merge two
+cohorts, and every artifact records `crossCohortCrossovers` — it must be `0`. Hybrid experiments that
+deliberately allow crossing are a different experiment and are not this benchmark.
+
+### Equal evolution, equal scoring, equal evaluation
+
+Neither cohort gets a custom mutation rate, selection rule, survivor fraction, breeder share, immigrant
+budget, scoring bonus, or gate. Both are pre-evolved by the same builder with the same parameters; the
+only difference between the two calls is the RNG seed label, so the two independent cohorts do not draw
+identical random numbers.
+
+Benchmark construction and evaluation are separated, so no cohort can receive evaluation feedback the
+other does not:
+
+```text
+1. seed creation (unique digests, matched size)
+2. equal cohort expansion / pre-evolution (identical rounds, rules, budgets)
+3. freeze the two candidate pools
+4. ONE shared tournament evaluation — same datasets, windows, seeds, stress profiles, scoring, gates
+5. funnel
+6. comparative report
+```
+
+Both cohorts are evaluated in a **single** `runArenaTournament` call, which is what guarantees dataset,
+window, seed, stress, scoring and gate parity rather than merely asserting it. The artifact records it:
+`equalStartingSlots`, `equalEvolutionaryRules`, `equalScoring`, `equalGates`,
+`scoringBonusForEitherCohort: 0`, `crossCohortCrossover: false`.
+
+### Conventional control construction
+
+**Conventional** means: the ordinary Arena entrant-pool construction the repository already uses —
+archived champions re-entering (never protected), mutated/crossover children, and random species
+immigrants. It is built to the matched size and de-duplicated by genome digest exactly like the research
+side.
+
+Because species mix can move results on its own, an optional **species-matched** control is available:
+
+```bash
+EVOLVE_ARENA_AB_SPECIES_MATCHED=1 npm run arena -- --research-mode ab <dataset>
+```
+
+That builds fresh standard species/genome controls whose species counts equal the Research cohort's,
+removing species composition as a confound. Whether or not it is enabled, the report always prints both
+species distributions and `species.matched`, and lists an unmatched species mix as a **limitation**.
+
+### Metrics
+
+`summary.json` carries a compact `abComparison` block; the full report is written to
+`.evolve/arenas/<arena-id>/ab-comparison.json`:
+
+- **Cohort size** — requested, actual, unique seed lineages, unique final genomes, genome diversity,
+  descendant convergence, seed duplicates rejected, shortage and reason
+- **Arena performance** — best/median/mean score, score quartiles and IQR, best/median rank, top-10 /
+  top-25 / top-50 counts, GROUP / STRESS / Champion League counts, deployment count
+- **Trading evidence** (paper) — median trades, distinct mints, top-mint notional share, drawdown, net
+  paper return, gross paper return, cost drag
+- **Robustness** — stress survival (overall, mild, moderate), regime coverage, OOS behaviour, failed-gate
+  distribution per cohort
+- **Diversity** — unique genome ratio, lineage concentration, species distribution, family distribution
+- **Role-lineage** (section below)
+- **Distinct-mint diagnostics** (section below)
+- **Statistics** — descriptive medians/means/IQRs and a **deterministic** percentile bootstrap of the
+  difference (fixed seed and iteration count, so re-running reproduces the interval byte-for-byte)
+
+### Role-level research performance
+
+For every research role (`signal-researcher`, `regime-researcher`, `execution-researcher`,
+`risk-researcher`, `diversity-researcher`, `adversarial-critic`) the artifact reports starting unique
+seeds, descendants at the freeze, median Arena score, best rank, GROUP / STRESS / Champion League counts,
+failed gates, median distinct mints, median drawdown, and median net paper return. A role that produces
+no compilable strategy — the adversarial critic is advisory by construction — is reported as
+**advisory / inactive**. No entrant is ever fabricated to fill a role.
+
+### Distinct-mint issue: research problem or general problem?
+
+The previous fair run had 38 `minimum distinct mints` failures. The gate is **unchanged**
+(`minDistinctMints = 4`, still frozen). Instead the A/B report now shows the same diagnostic block for
+**both** cohorts — candidate opportunities, eligible mints, traded mints, distinct mints, blocked /
+abstained / below-threshold ticks, failure count against the gate, and a distribution of the recorded
+rejection reasons. That is what makes it possible to tell whether narrow market coverage is specific to
+research-guided genomes or a general property of the strategy space.
+
+### Interpreting the result
+
+Read the A/B report as an **observation**, not a finding:
+
+- "Research cohort higher/lower/equal on the observed paper metric" — that is the strongest claim made
+- no significance test is performed, no p-value is claimed, and `statistics.significance` is `null` with
+  an explanation
+- sample sizes are small, walk-forward windows overlap by design, and observations within a cohort are
+  not statistically independent, so the bootstrap interval describes spread rather than proving anything
+- the cohorts are matched by construction, but a difference can still come from species mix (unless
+  species-matched mode is on), from the specific conventional construction chosen, or from luck
+
+**No profitability claim is made anywhere.** A higher paper score in one cohort is not evidence of
+future profit, and zero Deployment Candidates remains a completely acceptable outcome.
+
+### A future provider experiment (documented, NOT implemented)
+
+The A/B benchmark is the instrument built to evaluate a real research provider later:
+
+> **DeepSeek V4.1 Flash via Cline, xhigh**
+
+It is **not implemented** in this phase. There is no client, no new key handling, and an unrecognized
+provider name still falls back to the offline deterministic mock rather than making a network call.
+DeepSeek is not part of Phase 5A.3. The framework is now ready to run that experiment when it is
+explicitly started — see `## Roadmap`.
+
+### Commands
+
+```bash
+npm run arena -- --research-mode ab <dataset>              # matched A/B benchmark
+EVOLVE_ARENA_POPULATION=200 npm run arena -- --research-mode ab <dataset>
+EVOLVE_ARENA_AB_EXPAND=1 npm run arena -- --research-mode ab <dataset>          # opt-in descendant expansion
+EVOLVE_ARENA_AB_SPECIES_MATCHED=1 npm run arena -- --research-mode ab <dataset> # species-matched control
+EVOLVE_ARENA_AB_BOOTSTRAP_ITERATIONS=5000 npm run arena -- --research-mode ab <dataset>
+EVOLVE_ARENA_WORKERS=8 npm run arena -- --research-mode ab <dataset>
+npm run validate:phase5a3                                  # Phase 5A.3 suite (69 offline cases)
 ```
 
 ## Validation
@@ -1359,6 +1564,29 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
 - [x] `npm run validate:phase5a2` — 60 offline cases
 - [ ] Non-mock provider experiment: **DeepSeek V4.1 Flash via Cline, xhigh** (documented, not implemented)
 - [ ] Automatic Arena re-entry of every compiled candidate on a fixed cadence
+
+### Phase 5A.3 — controlled research vs conventional A/B benchmarking
+- [x] `--research-mode ab`: two matched cohorts (`research`, `conventional`) with equal starting slots
+- [x] Symmetric sizing: a shortfall shrinks BOTH cohorts (`matchedPerCohort`), never 42 vs 158
+- [x] No-cloning policy enforced and reported (`clonedToFillQuota: 0`, duplicate seed digests rejected)
+- [x] Opt-in descendant expansion (`EVOLVE_ARENA_AB_EXPAND=1`) via ordinary identical evolution
+- [x] Cohort/lineage attribution on every entrant: cohort, lineageId, seed digest, parent lineages,
+      generation, exact-original vs descendant, founder kind, research family/role ancestry
+- [x] Cross-cohort crossover disabled; cohorts pre-evolved in complete isolation; `crossCohortCrossovers`
+      reported and required to be `0`
+- [x] Evolution / scoring / dataset / window / seed / stress / gate parity enforced by one shared
+      evaluation and recorded in the artifact
+- [x] Conventional control = ordinary Arena entrant-pool construction; optional species-matched control
+- [x] Primary metrics (cohort size, Arena performance, paper trading evidence, robustness, diversity)
+- [x] Descriptive statistics plus a deterministic percentile bootstrap; no significance claim
+- [x] Role-level research lineage metrics, advisory roles marked instead of fabricated
+- [x] Comparative distinct-mint diagnostics for both cohorts, with the gate unchanged
+- [x] `ab-comparison.json` artifact plus a compact `abComparison` block in `summary.json`
+- [x] One-command A/B run with explicit startup accounting
+- [x] `npm run validate:phase5a3` — 69 offline cases
+- [x] Challenger, fair, and normal Arena modes unchanged
+- [ ] Real provider experiment: **DeepSeek V4.1 Flash via Cline, xhigh** (documented, NOT implemented —
+      DeepSeek is not part of Phase 5A.3)
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

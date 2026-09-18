@@ -5,14 +5,28 @@
  *   npm run arena                              # registry sweep over .evolve/history
  *   npm run arena -- <dataset-dir>             # one dataset
  *   npm run arena -- <dir1> <dir2> ...         # several datasets
- *   npm run arena -- --research <dataset-dir>  # include the persisted research cohort
- *   npm run arena -- --research-mode fair      # equal-treatment cohort comparison
+ *   npm run arena -- --research <dataset-dir>    # include the persisted research cohort
+ *   npm run arena -- --research-mode fair <dir>  # equal-treatment cohort comparison
+ *   npm run arena -- --research-mode ab <dir>    # matched research-vs-conventional A/B
  *
  * Runs the full tournament funnel over the requested datasets with the real
  * paper replay engine and writes outputs to .evolve/arenas/<arena-id>/.
  *
  * Everything is PAPER ONLY. No real-money execution exists in this repository.
  *
+ * Research modes (Phase 5A.3 keeps all three separate):
+ *   challenger  can fresh research challengers beat mature incumbents?
+ *   fair        what happens when research ancestry participates under equal
+ *               evolutionary rules in one mixed cohort?
+ *   ab          does research-guided INITIALIZATION beat a MATCHED conventional
+ *               control that receives identical resources, identical
+ *               evolutionary rules, identical datasets/windows/seeds/stress,
+ *               identical scoring and identical gates?
+ *
+ * A/B mode is matched by construction: both cohorts get the same number of
+ * starting slots, and a shortfall shrinks BOTH cohorts symmetrically. A
+genome is never cloned to fill a cohort, and cross-cohort crossover is disabled.
+
  * Phase 5A.2 notes:
  *   - `--research` is a BOOLEAN flag: `--research DATASET`, `DATASET --research`,
  *     and `--research=true DATASET` all mean the same thing and all leave the
@@ -64,6 +78,14 @@ import {
   composeFairCohort,
   researchEntrantsFromCohort,
 } from "./arena/research-cohort.mjs";
+import {
+  AB_COHORT,
+  AB_DEFAULTS,
+  buildMatchedAbCohort,
+  describeAbCohorts,
+  speciesMatchedConventionalSeeds,
+} from "./research/ab-cohort.mjs";
+import { ADVISORY_ROLES, PROPOSING_ROLES } from "./research/provider.mjs";
 
 const PAPER_NOTICE =
   "PAPER ONLY. Every number is simulated paper accounting over historical observations. Arena results do NOT predict future profitability.";
@@ -79,6 +101,12 @@ async function exists(target) {
   } catch {
     return false;
   }
+}
+
+/** Compact display helper for the console report (never prints NaN). */
+function fmt(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  return String(Math.round(value * 1000) / 1000);
 }
 
 function intEnv(value, fallback, { min = 1, max = 1_000_000 } = {}) {
@@ -143,6 +171,100 @@ async function preEvolve({
       seed: `arena:${label}:gen${gen}:${[...seeds].join(",")}`,
       championShare: 0.35,
       immigrantShare: 0.15,
+    });
+  }
+  return pool;
+}
+
+/**
+ * Phase 5A.3: pre-evolve ONE cohort in complete isolation.
+ *
+ * Identical in every respect to `preEvolve` — same survivor fraction, same
+ * breeder share, same mutation scale, same immigrant treatment, same number of
+ * rounds — except that it only ever sees its own cohort's genomes, which is
+ * how cross-cohort crossover is disabled for the benchmark. Both cohorts call
+ * this with the same arguments (only the RNG seed label differs, so the two
+ * cohorts are not forced to draw the same random numbers).
+ */
+async function preEvolveCohort({
+  entrants,
+  rounds,
+  population,
+  seeds,
+  datasetRefs,
+  config,
+  workers,
+  cacheDir,
+  useCache,
+  label,
+}) {
+  let pool = entrants;
+  const survivorFraction = 0.3;
+  const championShare = 0.35;
+  const immigrantShare = 0.15;
+
+  // Descendant expansion (opt-in): grow the starting seed cohort to its target
+  // size using the ordinary entrant-pool builder. This is evolution, not
+  // cloning — ancestry is preserved — and it is applied identically to both
+  // cohorts.
+  if (population !== pool.length) {
+    console.log(`[arena] ab: ${label} expanding ${pool.length} seed genome(s) -> ${population} via ordinary entrant-pool breeding`);
+    pool = buildEntrantPool({
+      champions: pool,
+      population,
+      seed: `arena:ab:${label}:expand:${[...seeds].join(",")}`,
+      championShare,
+      immigrantShare,
+      cohort: label,
+    });
+  }
+
+  for (let gen = 1; gen < rounds; gen += 1) {
+    console.log(`[arena] ab: ${label} generation ${gen}/${rounds - 1}: pre-evolving cohort (cheap screen, no stress)`);
+    const screen = await runArenaTournament({
+      datasets: datasetRefs,
+      config,
+      entrants: pool,
+      seeds: [seeds[0]],
+      stressProfiles: [],
+      maxWindows: 1,
+      workers,
+      cacheDir,
+      useCache,
+      arenaId: null,
+      arenasDir: null,
+      onProgress: ({ message }) => {
+        if (message) console.log(`[arena]   ${label} gen${gen}: ${message}`);
+      },
+    });
+    const survivorCount = Math.max(2, Math.ceil(pool.length * survivorFraction));
+    const survivors = screen.summary.leaderboard
+      .slice(0, survivorCount)
+      .map((row) => {
+        const entrant = pool.find((e) => (e.digest ?? digestOf(e.genome)) === row.digest);
+        return entrant
+          ? {
+              digest: row.digest,
+              genome: entrant.genome,
+              species: entrant.species,
+              origin: entrant.origin,
+              ...(entrant.cohort ? { cohort: entrant.cohort } : {}),
+              ...(entrant.lineage ? { lineage: entrant.lineage } : {}),
+              ...(entrant.lineageId ? { lineageId: entrant.lineageId } : {}),
+              ...(entrant.research ? { research: entrant.research } : {}),
+              ...(entrant.researchAncestry ? { researchAncestry: entrant.researchAncestry } : {}),
+            }
+          : null;
+      })
+      .filter(Boolean);
+    // Breeders are drawn only from THIS cohort's own survivors.
+    pool = buildEntrantPool({
+      champions: survivors.length > 0 ? survivors : pool,
+      population,
+      seed: `arena:ab:${label}:gen${gen}:${[...seeds].join(",")}`,
+      championShare,
+      immigrantShare,
+      cohort: label,
     });
   }
   return pool;
@@ -249,6 +371,16 @@ async function main() {
   );
   const strictUniqueness =
     args["strict-research-uniqueness"] === true || process.env.EVOLVE_RESEARCH_STRICT_UNIQUENESS === "1";
+  // Phase 5A.3 A/B knobs. Descendant expansion is opt-in: by default a matched
+  // cohort is exactly as large as the smaller side's unique seed count.
+  const abExpandDescendants = process.env.EVOLVE_ARENA_AB_EXPAND === "1";
+  const abSpeciesMatched = process.env.EVOLVE_ARENA_AB_SPECIES_MATCHED === "1";
+  const abBootstrapIterations = intEnv(
+    process.env.EVOLVE_ARENA_AB_BOOTSTRAP_ITERATIONS,
+    AB_DEFAULTS.bootstrapIterations,
+    { min: 0, max: 200_000 },
+  );
+  const abBootstrapSeed = process.env.EVOLVE_ARENA_AB_BOOTSTRAP_SEED ?? AB_DEFAULTS.bootstrapSeed;
 
   const champions = await loadChampionCandidates(config.championsDir ?? ".evolve/champions");
   console.log(`[arena] requested arena population: ${population}`);
@@ -327,8 +459,124 @@ async function main() {
 
   let entrants;
   let researchAccounting = null;
+  let abContext = null;
 
-  if (includeResearch && researchMode === RESEARCH_ARENA_MODE.FAIR) {
+  if (includeResearch && researchMode === RESEARCH_ARENA_MODE.AB) {
+    // ---- Phase 5A.3: matched research-vs-conventional A/B cohort ----------
+    const shareRaw =
+      process.env.EVOLVE_ARENA_RESEARCH_SHARE != null
+        ? Number(process.env.EVOLVE_ARENA_RESEARCH_SHARE)
+        : AB_DEFAULTS.researchShare;
+    const abShare = Number.isFinite(shareRaw) ? Math.min(1, Math.max(0, shareRaw)) : AB_DEFAULTS.researchShare;
+    const requestedPerCohort = Math.max(
+      0,
+      Math.min(Math.round(population * abShare), Math.round(population * (1 - abShare))),
+    );
+    const preliminaryMatched = Math.min(requestedPerCohort, researchEntrants.length);
+
+    // Conventional control construction. Default: the ordinary Arena entrant
+    // pool (archived champions re-entering, mutated/crossover children, random
+    // species immigrants). Species-matched mode instead initializes fresh
+    // standard species/genome controls whose species counts equal the Research
+    // cohort's, removing species composition as a confound.
+    let conventionalSeeds;
+    if (abSpeciesMatched) {
+      conventionalSeeds = speciesMatchedConventionalSeeds({
+        researchSeeds: researchEntrants,
+        population: preliminaryMatched,
+        seed: `arena:ab:${[...seeds].join(",")}`,
+      });
+      console.log(
+        `[arena] A/B species-matched control: ${conventionalSeeds.length} fresh species/genome seed(s) matched to the research species counts`,
+      );
+    } else {
+      conventionalSeeds = buildEntrantPool({
+        champions,
+        population: Math.max(1, requestedPerCohort),
+        seed: `arena:ab:conventional:${[...seeds].join(",")}`,
+        championShare: 0.2,
+        immigrantShare: 0.15,
+      });
+    }
+
+    const abBuilt = buildMatchedAbCohort({
+      requestedPopulation: population,
+      researchShare: abShare,
+      researchSeeds: researchEntrants,
+      conventionalSeeds,
+      expandDescendants: abExpandDescendants,
+    });
+    if (!abBuilt.ok) {
+      console.error(`[arena] A/B MODE FAILED: ${abBuilt.error}`);
+      console.error(
+        "[arena] A/B mode refuses to run an unmatched population: a matched cohort needs at least one unique research seed and one unique conventional seed, and nothing is cloned to work around a shortage.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const account = abBuilt.accounting;
+    console.log(`[arena] A/B cohorts: ${describeAbCohorts(account)} (requested ${account.requestedPerCohort} per cohort)`);
+    console.log(
+      `[arena] A/B unique seeds: research ${account.uniqueResearchSeeds} (${account.seedDuplicatesRejected.research} duplicate digest(s) rejected) conventional ${account.uniqueConventionalSeeds} (${account.seedDuplicatesRejected.conventional} duplicate digest(s) rejected)`,
+    );
+    if (account.downgraded) {
+      console.warn(
+        `[arena] A/B SHORTAGE: matched cohort downgraded to ${account.matchedPerCohort} per cohort. ${account.shortageReason}`,
+      );
+      console.warn("[arena] A/B shortage handling: BOTH cohorts were reduced symmetrically — never 42 vs 158, and never by cloning.");
+    }
+    if (account.expandDescendants) {
+      console.log(
+        `[arena] A/B descendant expansion ON: each cohort evolves from ${account.matchedPerCohort} matched seed(s) to ${account.targetPerCohort} entrant(s) under identical rules (ancestry preserved).`,
+      );
+    }
+    console.log(
+      `[arena] A/B parity: identical datasets, seeds, windows, stress profiles, scoring, gates, generations (${generations}), survivor/breeder/mutation/crossover rules; cross-cohort crossover DISABLED; no cohort bonus.`,
+    );
+
+    const perCohortTarget = account.targetPerCohort;
+    let researchPool = abBuilt.research;
+    let conventionalPoolAb = abBuilt.conventional;
+    if (generations > 1 || perCohortTarget !== researchPool.length) {
+      // Each cohort is pre-evolved in complete isolation: research breeds only
+      // with research, conventional only with conventional.
+      researchPool = await preEvolveCohort({
+        entrants: researchPool,
+        rounds: generations,
+        population: perCohortTarget,
+        seeds,
+        datasetRefs,
+        config,
+        workers,
+        cacheDir,
+        useCache,
+        label: AB_COHORT.RESEARCH,
+      });
+      conventionalPoolAb = await preEvolveCohort({
+        entrants: conventionalPoolAb,
+        rounds: generations,
+        population: perCohortTarget,
+        seeds,
+        datasetRefs,
+        config,
+        workers,
+        cacheDir,
+        useCache,
+        label: AB_COHORT.CONVENTIONAL,
+      });
+    }
+    entrants = [...researchPool, ...conventionalPoolAb];
+    researchAccounting = { mode: RESEARCH_ARENA_MODE.AB, ...account };
+    abContext = {
+      accounting: researchAccounting,
+      perCohortTarget,
+      speciesMatched: abSpeciesMatched,
+    };
+    console.log(
+      `[arena] A/B final pools: research=${researchPool.length} conventional=${conventionalPoolAb.length} total=${entrants.length}`,
+    );
+  } else if (includeResearch && researchMode === RESEARCH_ARENA_MODE.FAIR) {
     // FAIR COHORT: one mixed cohort, identical pre-evolution for every lineage.
     const shareOverride =
       process.env.EVOLVE_ARENA_RESEARCH_SHARE != null
@@ -363,7 +611,9 @@ async function main() {
   }
 
   // ---- Pre-evolution ------------------------------------------------------
-  if (generations > 1) {
+  // A/B mode pre-evolves its two cohorts separately (above) so that research
+  // and conventional lineages can never cross.
+  if (generations > 1 && researchMode !== RESEARCH_ARENA_MODE.AB) {
     entrants = await preEvolve({
       entrants,
       rounds: generations,
@@ -447,6 +697,28 @@ async function main() {
     minUniqueRatio,
     maxSpeciesShare,
     researchEnabled: includeResearch,
+    // Phase 5A.3: matched A/B reporting (identical evaluation for everyone).
+    abAccounting: abContext?.accounting ?? null,
+    abConfig: abContext
+      ? {
+          generations,
+          workers,
+          survivorFraction: 0.3,
+          breederShare: 0.35,
+          mutationScale: config.evolution?.mutationScale ?? null,
+          crossoverRate: config.evolution?.crossoverRate ?? null,
+          immigrantRate: config.evolution?.immigrantRate ?? null,
+          randomImmigrantShare: 0.15,
+          championShare: 0.35,
+          immigrantShare: 0.15,
+        }
+      : null,
+    abRoles: abContext
+      ? { known: [...PROPOSING_ROLES, ...ADVISORY_ROLES], advisory: [...ADVISORY_ROLES] }
+      : null,
+    abSpeciesMatched: abContext?.speciesMatched === true,
+    abBootstrapIterations,
+    abBootstrapSeed,
     onProgress: ({ message }) => {
       if (message) console.log(`[arena] ${message}`);
     },
@@ -593,6 +865,49 @@ async function main() {
     if (memorySummary) {
       console.log(`  research memory: ${memorySummary.memoryRecords} records · ${memorySummary.conclusions} conclusions · watchdog NORMAL/WATCH/QUARANTINED ${memorySummary.watchdog.NORMAL}/${memorySummary.watchdog.WATCH}/${memorySummary.watchdog.QUARANTINED}`);
     }
+  }
+
+  // ---- Phase 5A.3: compact matched A/B report ----------------------------
+  const ab = result.summary.abComparison;
+  if (ab) {
+    console.log("");
+    console.log("Matched A/B comparison (research vs conventional, PAPER ONLY):");
+    console.log(
+      `  cohort construction: requested ${fmt(ab.cohortConstruction.requestedPerCohort)} per cohort · actual ${fmt(ab.cohortConstruction.actualPerCohort)} per cohort · total ${fmt(ab.cohortConstruction.actualTotal)}`,
+    );
+    console.log(
+      `  unique seeds: research ${ab.cohortConstruction.uniqueResearchSeeds} · conventional ${ab.cohortConstruction.uniqueConventionalSeeds} · shortage research ${ab.cohortConstruction.shortage.research} conventional ${ab.cohortConstruction.shortage.conventional} · cloned-to-fill ${ab.cohortConstruction.clonedToFillQuota}`,
+    );
+    console.log(
+      `  cohort size: research ${ab.cohortSize.research} · conventional ${ab.cohortSize.conventional} · equal=${ab.cohortSize.equalSize} · unique final genomes research ${ab.cohortSize.researchUniqueFinalGenomes} / conventional ${ab.cohortSize.conventionalUniqueFinalGenomes}`,
+    );
+    for (const [name, cohort] of [
+      ["research", ab.research],
+      ["conventional", ab.conventional],
+    ]) {
+      if (!cohort) continue;
+      console.log(
+        `  ${name.padEnd(13)} best ${fmt(cohort.bestScore)} · median score ${fmt(cohort.medianScore)} · best rank ${fmt(cohort.bestRank)} · median rank ${fmt(cohort.medianRank)} · top10 ${cohort.top10Count} top25 ${cohort.top25Count} top50 ${cohort.top50Count} · GROUP ${cohort.groupCount} STRESS ${cohort.stressCount} CL ${cohort.championLeagueCount} deploy ${cohort.deploymentCount}`,
+      );
+      console.log(
+        `  ${" ".repeat(13)} median trades ${fmt(cohort.medianTrades)} · mints ${fmt(cohort.medianDistinctMints)} · drawdown ${fmt(cohort.medianDrawdown)} · net paper ${fmt(cohort.medianNetPaperReturn)} · diversity ${fmt(cohort.genomeDiversity)} · stress survival ${cohort.stressSurvivalCount}`,
+      );
+    }
+    const cmp = ab.comparison?.arenaScore ?? null;
+    if (cmp) {
+      const interval = cmp.medianDifferenceInterval
+        ? ` · bootstrap 95% [${fmt(cmp.medianDifferenceInterval.low)}, ${fmt(cmp.medianDifferenceInterval.high)}] (deterministic, descriptive only)`
+        : "";
+      console.log(
+        `  arena score: research median ${fmt(cmp.researchMedian)} vs conventional median ${fmt(cmp.conventionalMedian)} · median difference ${fmt(cmp.medianDifference)}${interval}`,
+      );
+    }
+    console.log(
+      `  species matched: ${ab.species?.matched === true} (${ab.species?.matchMode ?? "unmatched"}) · no significance claim is made`,
+    );
+    console.log(
+      "  PAPER ONLY. Research cohort higher/lower/equal on the observed paper metrics above — a difference is an observation, not proof, and not a profitability claim.",
+    );
   }
   console.log("");
   console.log(`Real-market evidence: ${summary.real.count} dataset(s), ${summary.real.realDataHours.toFixed(1)}h · synthetic evidence: ${summary.synthetic.count} dataset(s), ${summary.synthetic.syntheticDataHours.toFixed(1)}h (never counted as real)`);
