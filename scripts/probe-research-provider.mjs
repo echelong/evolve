@@ -26,6 +26,7 @@ import {
   REGISTERED_PROVIDERS,
   UnknownResearchProviderError,
   requireProviderName,
+  resolveEffectiveProviderTimeoutMs,
   resolveProviderConfig,
 } from "./research/provider-config.mjs";
 import { formatProbeReport, probeDeepSeekClineProvider } from "./research/providers/deepseek-cline.mjs";
@@ -117,9 +118,15 @@ async function main() {
   const resolvedProvider = resolution.provider;
 
   const experimentId = args.experiment ? String(args.experiment) : null;
-  const timeoutMs = args["timeout-ms"]
-    ? Math.max(1_000, Number.parseInt(String(args["timeout-ms"]), 10) || envConfig.timeoutMs)
-    : envConfig.timeoutMs;
+  // The ONE resolver shared with the `research` CLI and the cohort runner
+  // (see `provider-config.mjs`): CLI override → environment → documented
+  // default. Never a silent fallback to an unrelated magic number.
+  const { timeoutMs } = resolveEffectiveProviderTimeoutMs({
+    cliRaw: args["timeout-ms"],
+    envConfig,
+    warn: (message) => console.error(message),
+  });
+  console.log(`  provider timeout    ${timeoutMs}ms`);
 
   let result;
   if (resolvedProvider === "mock") {

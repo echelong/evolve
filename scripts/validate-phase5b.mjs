@@ -52,10 +52,13 @@ import {
   DEEPSEEK_CLINE_REASONING,
   PROVIDER_STATUS,
   PROVIDER_DEFAULTS,
+  PROVIDER_TIMEOUT_BOUNDS,
   REGISTERED_PROVIDERS,
   RESEARCH_PROVIDER,
   UnknownResearchProviderError,
   requireProviderName,
+  resolveEffectiveProviderTimeoutMs,
+  resolveProviderTimeoutMs,
   resolveProviderConfig,
   unknownProviderMessage,
   validateProviderName,
@@ -86,7 +89,7 @@ import {
   createDeepSeekClineProvider,
   probeDeepSeekClineProvider,
 } from "./research/providers/deepseek-cline.mjs";
-import { generateResearchCohort, inspectResearchCohort } from "./research/cohort-runner.mjs";
+import { createRunBudget, generateResearchCohort, inspectResearchCohort } from "./research/cohort-runner.mjs";
 import { createResearchController } from "./evolve-engine.mjs";
 import {
   createResearchExperiment,
@@ -1906,7 +1909,7 @@ test("64. `npm run research` exits non-zero on an invalid provider and creates n
       stubBag,
     );
     assertEqual(mockRun.status, 0, "explicit `mock` still works");
-    assert(mockRun.stdout.includes("provider       mock"), "the CLI reports the provider actually used");
+    assert(mockRun.stdout.includes("provider            mock"), "the CLI reports the provider actually used");
     const created = await listResearchExperiments(baseRoot);
     assertEqual(created.length, 1, "exactly one valid experiment exists");
     assertEqual(created[0].provider, "mock", "the created experiment is labelled with the real provider");
@@ -2011,6 +2014,408 @@ test("67. No provider fallback path exists anywhere in the research subsystem", 
     false,
     "the old 'unknown name → mock default' branch is gone",
   );
+});
+
+/* ============================================================================
+ * N. Timeout resolution and run-level call-budget (Phase 5B.1 bugfix)
+ *
+ * A real DeepSeek cohort (`exp-20260918T104256Z-deepseek-cline-a7abe2`, kept
+ * untouched on disk as failure evidence) ran every provider subprocess at a
+ * silent 9000ms instead of the documented 180000ms default, and its second
+ * cycle was refused outright with `PROVIDER_BUDGET_EXCEEDED` even though only
+ * 5 of the requested 10 calls had been made. These tests pin down both root
+ * causes and the corrected behaviour, offline and deterministically.
+ * ==========================================================================*/
+
+test("68. resolveProviderTimeoutMs resolves the documented default, honours an explicit env override, and never silently substitutes an unrelated magic number for an invalid value", () => {
+  const clean = resolveProviderTimeoutMs({});
+  assertEqual(clean.timeoutMs, PROVIDER_DEFAULTS.timeoutMs, "with nothing set, the documented default governs");
+  assertEqual(PROVIDER_DEFAULTS.timeoutMs, 180_000, "the documented default is exactly 180000ms");
+  assertEqual(clean.source, "default", "the source is reported as the default");
+  assertEqual(clean.invalid, false, "no invalid input was given");
+
+  const withEnv = resolveProviderTimeoutMs({ EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "60000" });
+  assertEqual(withEnv.timeoutMs, 60_000, "an explicit env value overrides the default");
+  assertEqual(withEnv.source, "env", "the source is reported as the environment");
+  assertEqual(withEnv.invalid, false, "a well-formed env value is not flagged invalid");
+
+  const warnings = [];
+  const warn = (message) => warnings.push(message);
+
+  const invalidText = resolveProviderTimeoutMs({ EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "not-a-number" }, { warn });
+  assertEqual(invalidText.timeoutMs, PROVIDER_DEFAULTS.timeoutMs, "a non-numeric env value falls back to the documented default");
+  assertEqual(invalidText.invalid, true, "the invalid value is flagged, not silently accepted");
+  assertEqual(invalidText.timeoutMs === 9000, false, "an invalid timeout NEVER silently becomes 9000ms (the unrelated Jupiter-quote default)");
+  assert(warnings.some((m) => m.includes("invalid EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS")), "the invalid value is reported, not swallowed");
+
+  warnings.length = 0;
+  const zero = resolveProviderTimeoutMs({ EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "0" }, { warn });
+  assertEqual(zero.timeoutMs, PROVIDER_DEFAULTS.timeoutMs, "a zero timeout is rejected, not accepted as instant");
+  assertEqual(zero.invalid, true, "zero is flagged invalid");
+  assert(warnings.length > 0, "a zero timeout is reported");
+
+  warnings.length = 0;
+  const huge = resolveProviderTimeoutMs({ EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "999999999999" }, { warn });
+  assertEqual(huge.timeoutMs, PROVIDER_TIMEOUT_BOUNDS.max, "an out-of-bounds env value is clamped to the documented max, not accepted verbatim");
+  assertEqual(huge.invalid, false, "a clamped-but-numeric value is not the same as an invalid one");
+  assert(warnings.some((m) => m.includes("outside")), "the clamp itself is reported");
+});
+
+test("69. resolveEffectiveProviderTimeoutMs: CLI override beats env, which beats the documented default -- ONE shared precedence chain", () => {
+  const noEnv = resolveProviderConfig({});
+  assertEqual(noEnv.timeoutMs, PROVIDER_DEFAULTS.timeoutMs, "with nothing set, resolveProviderConfig also reports the documented default");
+  assertEqual(noEnv.timeoutMsSource, "default", "resolveProviderConfig reports the timeout source too");
+
+  const withEnv = resolveProviderConfig({ EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "60000" });
+  assertEqual(withEnv.timeoutMs, 60_000, "resolveProviderConfig honours the env override for timeoutMs");
+  assertEqual(withEnv.timeoutMsSource, "env", "the source is reported as the environment");
+
+  assertEqual(
+    resolveEffectiveProviderTimeoutMs({ cliRaw: null, envConfig: noEnv }).timeoutMs,
+    PROVIDER_DEFAULTS.timeoutMs,
+    "with no CLI override and no env, the documented default is the effective timeout",
+  );
+  const cliOverDefault = resolveEffectiveProviderTimeoutMs({ cliRaw: "30000", envConfig: noEnv });
+  assertEqual(cliOverDefault.timeoutMs, 30_000, "an explicit CLI value overrides the documented default");
+  assertEqual(cliOverDefault.source, "cli", "the source is reported as the CLI");
+
+  const cliOverEnv = resolveEffectiveProviderTimeoutMs({ cliRaw: "30000", envConfig: withEnv });
+  assertEqual(cliOverEnv.timeoutMs, 30_000, "an explicit CLI value ALSO overrides an explicit env value");
+  assertEqual(cliOverEnv.source, "cli", "the CLI is reported as the winning source");
+
+  const noCli = resolveEffectiveProviderTimeoutMs({ cliRaw: null, envConfig: withEnv });
+  assertEqual(noCli.timeoutMs, 60_000, "with no CLI override, the env-resolved value passes through unchanged");
+  assertEqual(noCli.source, "env", "the env is reported as the source when no CLI override is given");
+
+  const warnings = [];
+  const invalidCli = resolveEffectiveProviderTimeoutMs({
+    cliRaw: "nope",
+    envConfig: withEnv,
+    warn: (message) => warnings.push(message),
+  });
+  assertEqual(invalidCli.timeoutMs, 60_000, "an invalid CLI override falls back to the env-resolved value, not an unrelated default");
+  assert(warnings.some((m) => m.includes("--provider-timeout-ms")), "the invalid CLI override is reported, not silently ignored");
+});
+
+test("70. No hidden 9000ms fallback: the unrelated market/dataset config's own timeoutMs never overwrites the provider timeout", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    // This is exactly what `research.mjs` passes as `options.config` for
+    // TRAIN-evidence parsing -- and its `timeoutMs` (the Jupiter quote
+    // timeout) previously leaked into the provider config via
+    // `{ ...envConfig, ...options.config }`, which is how a real cohort ran
+    // every call at 9000ms instead of the documented 180000ms default.
+    const marketConfig = createMarketConfig({ EVOLVE_JUPITER_TIMEOUT_MS: "9000" }, { loadEnv: false });
+    assertEqual(marketConfig.timeoutMs, 9000, "sanity: the market config's OWN timeoutMs is the unrelated Jupiter-quote timeout");
+
+    const bag = stubEnv("timeout", { EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "1500" });
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      baseRoot: path.join(dir, "research"),
+      cycles: 1,
+      proposalsPerCycle: 1,
+      maxProviderCalls: 1,
+      env: { ...process.env, ...bag },
+      config: marketConfig, // must NOT leak its own timeoutMs into the provider
+      experimentId: "exp-20260918T000000Z-deepseek-cline-timeoutleak",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(
+      report.experiment.limits.timeoutMs,
+      1500,
+      "the persisted effective timeout is the RESEARCH provider's own env value, never the market config's 9000ms",
+    );
+    assertEqual(
+      report.providerRuns[0].status,
+      PROVIDER_STATUS.TIMEOUT,
+      "the stub (which sleeps far longer than 1500ms) is bounded by the 1500ms provider timeout, proving that value actually governed the subprocess",
+    );
+    assert(
+      report.providerRuns[0].reason.includes("1500ms"),
+      "the timeout reason names the actual configured bound, never the unrelated 9000ms",
+    );
+  });
+});
+
+test("71. The `research` CLI and the probe CLI report and are governed by the SAME effective timeout resolver", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const bag = { EVOLVE_RESEARCH_CLINE_BIN: sharedStubPath, EVOLVE_TEST_STUB_MODE: "ok", EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS: "55000" };
+
+    const researchRun = cliCommand(
+      "scripts/research.mjs",
+      [
+        "--provider", "deepseek-cline", "--cycles", "1", "--roles", "signal-researcher",
+        "--max-calls", "1", "--base-root", path.join(dir, "research"),
+      ],
+      bag,
+    );
+    assertEqual(researchRun.status, 0, "the research CLI run succeeds");
+    assert(researchRun.stdout.includes("provider timeout    55000ms"), "the research CLI startup reports the effective timeout from the environment");
+
+    const probeRun = cliCommand("scripts/probe-research-provider.mjs", ["--provider", "deepseek-cline"], bag);
+    assertEqual(probeRun.status, 0, "the probe run succeeds");
+    assert(probeRun.stdout.includes("provider timeout    55000ms"), "the probe reports the SAME effective timeout as the research CLI");
+
+    // An explicit CLI override on the research CLI wins over the environment.
+    const overrideRun = cliCommand(
+      "scripts/research.mjs",
+      [
+        "--provider", "deepseek-cline", "--cycles", "1", "--roles", "signal-researcher", "--max-calls", "1",
+        "--provider-timeout-ms", "12000", "--base-root", path.join(dir, "research2"),
+      ],
+      bag,
+    );
+    assertEqual(overrideRun.status, 0, "the CLI-override run succeeds");
+    assert(overrideRun.stdout.includes("provider timeout    12000ms"), "--provider-timeout-ms overrides the environment at startup");
+
+    const overrideProbe = cliCommand(
+      "scripts/probe-research-provider.mjs",
+      ["--provider", "deepseek-cline", "--timeout-ms", "12000"],
+      bag,
+    );
+    assertEqual(overrideProbe.status, 0, "the probe CLI override run succeeds");
+    assert(overrideProbe.stdout.includes("provider timeout    12000ms"), "the probe's own CLI override behaves identically");
+
+    const researchSource = await readFile("scripts/research.mjs", "utf8");
+    const probeSource = await readFile("scripts/probe-research-provider.mjs", "utf8");
+    assert(researchSource.includes("resolveEffectiveProviderTimeoutMs"), "the research CLI uses the one shared resolver");
+    assert(probeSource.includes("resolveEffectiveProviderTimeoutMs"), "the probe CLI uses the one shared resolver");
+  });
+});
+
+test("72. The effective provider timeout (not just the raw env value) is persisted into experiment metadata, in both `limits` and `request`", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      provider: stubProvider("ok", { root: path.join(dir, "provider") }),
+      baseRoot: path.join(dir, "research"),
+      cycles: 1,
+      proposalsPerCycle: 1,
+      maxProviderCalls: 1,
+      providerTimeoutMs: 42_000,
+      experimentId: "exp-20260918T000000Z-deepseek-cline-timeoutmeta",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(report.experiment.limits.timeoutMs, 42_000, "the explicit override is what gets persisted, not the env default");
+    assertEqual(report.experiment.limits.maxAttemptsPerCall, PROVIDER_DEFAULTS.maxAttempts, "maxAttemptsPerCall is persisted alongside the timeout");
+    assertEqual(report.experiment.request.providerTimeoutMs, 42_000, "the request block also records the effective timeout");
+    assertEqual(report.experiment.request.requestedCycles, 1, "requestedCycles is persisted");
+    assertEqual(report.experiment.request.proposalsPerCycle, 1, "proposalsPerCycle is persisted");
+    assertEqual(report.experiment.request.requestedProposalTotal, 1, "requestedProposalTotal is persisted");
+    assertEqual(report.experiment.request.maxProviderCalls, 1, "maxProviderCalls is persisted in the request block");
+
+    const reread = await readResearchExperiment(report.experimentRoot);
+    assertEqual(reread.limits.timeoutMs, 42_000, "the persisted-and-reread experiment reports the SAME effective timeout a future session would see");
+  });
+});
+
+test("73. 2 cycles x 5 proposals/cycle with max-calls 10 permits exactly 10 real provider calls, split 5/5 across cycles", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      baseRoot: path.join(dir, "research"),
+      cycles: 2,
+      proposalsPerCycle: 5,
+      maxProviderCalls: 10,
+      roles: [...PROPOSING_ROLES],
+      env: { ...process.env, ...stubEnv("ok", { EVOLVE_TEST_STUB_COUNTER: counter }) },
+      experimentId: "exp-20260918T000000Z-deepseek-cline-budget10",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(await readCounter(counter), 10, "exactly 10 real subprocess calls were made");
+    const c = report.experiment.counters;
+    assertEqual(c.attemptedProviderCalls, 10, "the experiment counts exactly 10 attempted provider calls");
+    assertEqual(c.successfulProviderCalls, 10, "all 10 calls succeeded with the healthy stub");
+    assertEqual(c.failedProviderCalls, 0, "no call failed");
+    assertEqual(c.budgetRemaining, 0, "the budget is fully (and only) consumed, never overrun");
+    assertDeepEqual(
+      c.callsByCycle,
+      { "1": 5, "2": 5 },
+      "the 10 calls split 5/5 across the two cycles -- proving the budget is shared across the whole run, not recreated per cycle",
+    );
+    assertEqual(
+      c.providerStatuses[PROVIDER_STATUS.BUDGET_EXCEEDED] ?? 0,
+      0,
+      "no call was ever refused: 2 x 5 requested equals the 10-call budget exactly (this is the exact shape of the original bug, where cycle 2 was wrongly refused)",
+    );
+    assertEqual(report.experiment.status, "COMPLETED", "a fully successful bounded run completes cleanly");
+  });
+});
+
+test("74. Calls 6-10 are permitted and call 11 is refused as PROVIDER_BUDGET_EXCEEDED naming the CONFIGURED run-level limit", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    // 2 cycles x 6 proposals = 12 requested against a 10-call budget: the
+    // budget boundary falls INSIDE cycle 2, which is what actually produces a
+    // visible PROVIDER_BUDGET_EXCEEDED refusal record for the 11th call.
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      baseRoot: path.join(dir, "research"),
+      cycles: 2,
+      proposalsPerCycle: 6,
+      maxProviderCalls: 10,
+      roles: [...PROPOSING_ROLES, "signal-researcher"],
+      env: { ...process.env, ...stubEnv("ok", { EVOLVE_TEST_STUB_COUNTER: counter }) },
+      experimentId: "exp-20260918T000000Z-deepseek-cline-budget11",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(await readCounter(counter), 10, "the 11th slot never reaches the subprocess: exactly 10 real calls were made");
+    const c = report.experiment.counters;
+    assertEqual(c.attemptedProviderCalls, 10, "calls 1 through 10 are all permitted");
+    assertEqual(c.callsByCycle["1"], 6, "cycle 1's full 6 requested calls are permitted (calls 1-6)");
+    assertEqual(c.callsByCycle["2"], 4, "cycle 2 gets calls 7-10 before the shared budget runs out");
+    assertEqual(c.budgetRemaining, 0, "no budget remains");
+    assertEqual(c.providerStatuses[PROVIDER_STATUS.BUDGET_EXCEEDED], 1, "exactly one refusal is recorded for the 11th attempted call");
+    const refusal = report.providerRuns.find((run) => run.status === PROVIDER_STATUS.BUDGET_EXCEEDED);
+    assert(refusal, "the refusal run record exists");
+    assertEqual(
+      refusal.reason,
+      "provider call budget of 10 reached; no further calls were made",
+      "the refusal names the CONFIGURED run-level limit (10), never `proposalsPerCycle` (6) -- this is the exact wiring bug that once made a 2x5/max-10 run refuse its whole second cycle",
+    );
+  });
+});
+
+test("75. A failed provider call still consumes the run budget (failures count as calls)", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const report = await generateResearchCohort({
+      providerName: DEEPSEEK_CLINE_PROVIDER,
+      baseRoot: path.join(dir, "research"),
+      cycles: 1,
+      proposalsPerCycle: 5,
+      maxProviderCalls: 3,
+      env: { ...process.env, ...stubEnv("garbage", { EVOLVE_TEST_STUB_COUNTER: counter }) },
+      experimentId: "exp-20260918T000000Z-deepseek-cline-budgetfail",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(await readCounter(counter), 3, "only the budgeted 3 subprocess calls were made, even though every one failed");
+    const c = report.experiment.counters;
+    assertEqual(c.attemptedProviderCalls, 3, "3 failed calls still counted as 3 attempts");
+    assertEqual(c.failedProviderCalls, 3, "all 3 attempts are recorded as failures");
+    assertEqual(c.successfulProviderCalls, 0, "none succeeded");
+    assertEqual(c.budgetRemaining, 0, "the budget is exhausted by failures alone, not just by successes");
+    assertEqual(c.providerStatuses[PROVIDER_STATUS.BUDGET_EXCEEDED], 1, "the remaining requested slots collapse into a single refusal once the budget is gone");
+  });
+});
+
+test("76. createRunBudget: cache hits and replays never consume the real-call budget; refusals never consume it either", () => {
+  const budget = createRunBudget(3);
+  assertEqual(budget.maxCalls, 3, "the configured ceiling is fixed at creation and is never recomputed");
+  assertEqual(budget.remainingCalls, 3, "nothing has been attempted yet");
+
+  budget.recordCycle(1, [
+    { status: PROVIDER_STATUS.OK, cacheHit: false, replay: false },
+    { status: PROVIDER_STATUS.OK, cacheHit: true, replay: false },
+    { status: PROVIDER_STATUS.OK, cacheHit: false, replay: true },
+  ]);
+  assertEqual(budget.attemptedCalls, 1, "only the real (non-cached, non-replayed) call is attempted");
+  assertEqual(budget.successfulCalls, 1, "exactly the one real call is counted as successful");
+  assertEqual(budget.remainingCalls, 2, "cache hits and replays leave the shared budget untouched");
+  assertDeepEqual(budget.callsByCycle, { "1": 1 }, "only the real call is attributed to cycle 1");
+
+  budget.recordCycle(2, [
+    { status: PROVIDER_STATUS.BUDGET_EXCEEDED, reason: "provider call budget of 3 reached; no further calls were made" },
+  ]);
+  assertEqual(budget.attemptedCalls, 1, "a budget refusal is not itself counted as an attempted call");
+  assertEqual(budget.remainingCalls, 2, "a refusal does not further shrink the remaining budget");
+
+  budget.recordCycle(2, [
+    { status: PROVIDER_STATUS.TIMEOUT, cacheHit: false, replay: false },
+    { status: PROVIDER_STATUS.PROCESS_ERROR, cacheHit: false, replay: false },
+  ]);
+  assertEqual(budget.attemptedCalls, 3, "failed calls still consume the shared run budget");
+  assertEqual(budget.providerFailures, 2, "the two failures are counted");
+  assertEqual(budget.remainingCalls, 0, "the budget is now fully consumed");
+  assertDeepEqual(
+    budget.callsByCycle,
+    { "1": 1, "2": 2 },
+    "calls are attributed to the cycle they actually happened in, while the ceiling itself stays shared across the whole run",
+  );
+});
+
+test("77. Integration: a cache hit through the real provider does not inflate the run budget's attempted calls", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const root = path.join(dir, "provider");
+    const evidence = buildResearchEvidencePacket({ experimentId: "exp-cache-budget", regimeDistribution: { "sideways-chop": 1 } });
+    const env = { EVOLVE_TEST_STUB_COUNTER: counter, EVOLVE_RESEARCH_PROVIDER_CACHE: "1" };
+    const provider = stubProvider("ok", { root, env });
+    // A budget of 2 keeps the pre-call budget gate open for the second
+    // (cache-hit-eligible) slot, so this isolates cache accounting from the
+    // separate pre-call budget gate.
+    const budget = createRunBudget(2);
+
+    const first = await provider.propose({ evidence, count: 1, cycle: 1, cacheEnabled: true, maxCallsPerRun: budget.maxCalls });
+    budget.recordCycle(1, provider.runs.slice(-1));
+    assertEqual(first.length, 1, "the first (live) call returns a proposal");
+    assertEqual(await readCounter(counter), 1, "exactly one subprocess ran for the live call");
+    assertEqual(budget.attemptedCalls, 1, "the live call consumed one unit of the shared budget");
+    assertEqual(budget.remainingCalls, 1, "one call of budget remains");
+
+    const second = await provider.propose({ evidence, count: 1, cycle: 2, cacheEnabled: true, maxCallsPerRun: budget.maxCalls });
+    budget.recordCycle(2, provider.runs.slice(-1));
+    assertEqual(await readCounter(counter), 1, "the cache hit never reached the subprocess");
+    assertEqual(second.length, 1, "the cache hit still returns the (reused) proposal");
+    assertEqual(budget.attemptedCalls, 1, "a cache hit does not consume any additional budget");
+    assertEqual(budget.remainingCalls, 1, "the remaining budget is unchanged by the cache hit");
+  });
+});
+
+test("78. `--max-calls` on the `research` CLI propagates all the way into the provider subprocess runtime", async () => {
+  await stubExecutable();
+  await withTempDir(async (dir) => {
+    const counter = path.join(dir, "calls.log");
+    const bag = { EVOLVE_RESEARCH_CLINE_BIN: sharedStubPath, EVOLVE_TEST_STUB_MODE: "ok", EVOLVE_TEST_STUB_COUNTER: counter };
+    const run = cliCommand(
+      "scripts/research.mjs",
+      [
+        "--provider", "deepseek-cline",
+        "--cycles", "2",
+        "--roles", PROPOSING_ROLES.join(","),
+        "--proposals-per-cycle", "5",
+        "--max-calls", "10",
+        "--base-root", path.join(dir, "research"),
+      ],
+      bag,
+    );
+    assertEqual(run.status, 0, "the CLI run succeeds");
+    assertEqual(await readCounter(counter), 10, "exactly the configured 10 real subprocess calls were made end to end through the CLI");
+    assert(run.stdout.includes("max provider calls  10"), "the CLI reports the configured max calls at startup");
+    assert(run.stdout.includes("requested total     10"), "the CLI reports the requested proposal total (2 x 5) at startup");
+    assert(run.stdout.includes("cycles              2"), "the CLI reports the requested cycle count at startup");
+    assert(run.stdout.includes("proposals/cycle     5"), "the CLI reports proposals/cycle at startup");
+  });
+});
+
+test("79. The mock provider is unaffected by the timeout/call-budget bugfix", async () => {
+  await withTempDir(async (dir) => {
+    const report = await generateResearchCohort({
+      providerName: "mock",
+      baseRoot: path.join(dir, "research"),
+      cycles: 2,
+      proposalsPerCycle: 3,
+      maxProviderCalls: 1, // deliberately tiny -- the offline mock must never be gated by it
+      experimentId: "exp-20260918T000000Z-mock-budget-unaffected",
+      now: () => 1_700_000_000_000,
+    });
+    assertEqual(report.experiment.provider, "mock", "the mock provider was used");
+    assertEqual(
+      report.experiment.limits.timeoutMs,
+      PROVIDER_DEFAULTS.timeoutMs,
+      "the mock still reports the documented default timeout (unused, but the field stays well-defined)",
+    );
+    assertEqual(report.experiment.counters.attemptedProviderCalls, 0, "the offline mock makes no real provider calls to attempt");
+    assertEqual(report.experiment.counters.budgetRemaining, 1, "the call-budget accounting stays well-formed (and untouched) for the mock");
+    assert(report.experiment.counters.compilerAccepted > 0, "the mock still proposes and compiles genomes exactly as before");
+  });
 });
 
 /* ============================================================================

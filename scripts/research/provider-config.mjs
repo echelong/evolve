@@ -142,6 +142,15 @@ export const PROVIDER_DEFAULTS = Object.freeze({
   cacheEnabled: false,
 });
 
+/**
+ * Bounds for the external-provider subprocess timeout. An xHigh reasoning call
+ * through Cline routinely runs 10-30s; the floor keeps a misconfigured value
+ * from silently becoming a fast-local-tool timeout (that is exactly how a
+ * DeepSeek cohort once ran at 9000ms instead of the documented 180000ms — see
+ * `resolveProviderTimeoutMs` / `resolveEffectiveProviderTimeoutMs`).
+ */
+export const PROVIDER_TIMEOUT_BOUNDS = Object.freeze({ min: 1_000, max: 3_600_000 });
+
 const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_VALUES = new Set(["0", "false", "no", "off"]);
 
@@ -167,6 +176,75 @@ export function readStringEnv(env, key, fallback = "") {
   if (raw === undefined || raw === null) return fallback;
   const text = String(raw).trim();
   return text.length > 0 ? text : fallback;
+}
+
+/**
+ * Resolve the provider subprocess timeout from the environment ONLY — the
+ * single place that decides what `EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS` means.
+ *
+ * Precedence: environment value (bounds-clamped) → documented default
+ * (`PROVIDER_DEFAULTS.timeoutMs`, currently 180000ms). An invalid value
+ * (non-numeric, zero, negative) is never silently swallowed into an unrelated
+ * magic number — it is reported through `warn` and the documented default is
+ * used instead, and that fact is visible in the returned `invalid` flag.
+ *
+ * @returns {{ timeoutMs: number, source: "env"|"default", invalid: boolean }}
+ */
+export function resolveProviderTimeoutMs(env = process.env, { warn = null } = {}) {
+  const raw = env?.EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return { timeoutMs: PROVIDER_DEFAULTS.timeoutMs, source: "default", invalid: false };
+  }
+  const parsed = Number.parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    warn?.(
+      `[research] invalid EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS='${raw}' (must be a positive integer); using the documented default ${PROVIDER_DEFAULTS.timeoutMs}ms`,
+    );
+    return { timeoutMs: PROVIDER_DEFAULTS.timeoutMs, source: "default", invalid: true };
+  }
+  const clamped = Math.min(PROVIDER_TIMEOUT_BOUNDS.max, Math.max(PROVIDER_TIMEOUT_BOUNDS.min, parsed));
+  if (clamped !== parsed) {
+    warn?.(
+      `[research] EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS=${parsed} is outside [${PROVIDER_TIMEOUT_BOUNDS.min},${PROVIDER_TIMEOUT_BOUNDS.max}]; clamped to ${clamped}ms`,
+    );
+  }
+  return { timeoutMs: clamped, source: "env", invalid: false };
+}
+
+/**
+ * The ONE resolver every entry point (the `research` CLI, the probe CLI, the
+ * cohort runner) must call to learn the timeout that will actually govern a
+ * provider subprocess. Precedence, most to least specific:
+ *
+ *   1. an explicit CLI override (`--provider-timeout-ms` / `--timeout-ms`), if given and valid
+ *   2. the process environment (`EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS`), via `resolveProviderTimeoutMs`
+ *   3. the documented default (`PROVIDER_DEFAULTS.timeoutMs`)
+ *
+ * An invalid or out-of-bounds CLI value is never silently substituted for an
+ * unrelated default: it is reported through `warn` and the run falls back to
+ * step 2/3 instead.
+ *
+ * @param {{ cliRaw?: string|number|null, envConfig: { timeoutMs: number, timeoutMsSource?: string }, warn?: Function|null }} args
+ * @returns {{ timeoutMs: number, source: "cli"|"env"|"default" }}
+ */
+export function resolveEffectiveProviderTimeoutMs({ cliRaw = null, envConfig, warn = null } = {}) {
+  if (cliRaw === undefined || cliRaw === null || String(cliRaw).trim() === "") {
+    return { timeoutMs: envConfig.timeoutMs, source: envConfig.timeoutMsSource ?? "env" };
+  }
+  const parsed = Number.parseInt(String(cliRaw).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    warn?.(
+      `[research] invalid --provider-timeout-ms '${cliRaw}' (must be a positive integer); using ${envConfig.timeoutMs}ms (${envConfig.timeoutMsSource ?? "env"})`,
+    );
+    return { timeoutMs: envConfig.timeoutMs, source: envConfig.timeoutMsSource ?? "env" };
+  }
+  const clamped = Math.min(PROVIDER_TIMEOUT_BOUNDS.max, Math.max(PROVIDER_TIMEOUT_BOUNDS.min, parsed));
+  if (clamped !== parsed) {
+    warn?.(
+      `[research] --provider-timeout-ms ${parsed} is outside [${PROVIDER_TIMEOUT_BOUNDS.min},${PROVIDER_TIMEOUT_BOUNDS.max}]; clamped to ${clamped}ms`,
+    );
+  }
+  return { timeoutMs: clamped, source: "cli" };
 }
 
 /**
@@ -200,7 +278,7 @@ export function validateProviderName(name) {
  *
  * @param {Record<string, string|undefined>} [env]
  */
-export function resolveProviderConfig(env = process.env) {
+export function resolveProviderConfig(env = process.env, { warn = null } = {}) {
   const rawRequested = readStringEnv(env, "EVOLVE_RESEARCH_PROVIDER", "").toLowerCase();
   const validation = validateProviderName(rawRequested);
   const specified = rawRequested.length > 0;
@@ -228,10 +306,14 @@ export function resolveProviderConfig(env = process.env) {
     profile: readStringEnv(env, "EVOLVE_RESEARCH_CLINE_PROFILE", DEEPSEEK_CLINE_PROFILE),
     executable,
     executableIsScript: /\.(mjs|cjs|js)$/i.test(executable),
-    timeoutMs: readIntEnv(env, "EVOLVE_RESEARCH_PROVIDER_TIMEOUT_MS", PROVIDER_DEFAULTS.timeoutMs, {
-      min: 1_000,
-      max: 3_600_000,
-    }),
+    ...(() => {
+      const resolvedTimeout = resolveProviderTimeoutMs(env, { warn });
+      return {
+        timeoutMs: resolvedTimeout.timeoutMs,
+        timeoutMsSource: resolvedTimeout.source,
+        timeoutMsInvalid: resolvedTimeout.invalid,
+      };
+    })(),
     maxAttempts: Math.max(
       1,
       readIntEnv(env, "EVOLVE_RESEARCH_PROVIDER_MAX_ATTEMPTS", PROVIDER_DEFAULTS.maxAttempts, { min: 1, max: 5 }),

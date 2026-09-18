@@ -39,6 +39,7 @@ import {
   PROVIDER_STATUS,
   UnknownResearchProviderError,
   requireProviderName,
+  resolveEffectiveProviderTimeoutMs,
   resolveProviderConfig,
 } from "./provider-config.mjs";
 import { providerStateSummary } from "./provider-runtime.mjs";
@@ -172,6 +173,54 @@ async function trainEvidenceFromDatasetSafe({ datasetDir, config }) {
   }
 }
 /* ============================================================================
+ * Run-level call budget (Phase 5B.1 bugfix)
+ * ==========================================================================*/
+
+/**
+ * ONE explicit budget shared across every cycle of a run. `maxCalls` is fixed
+ * at creation and never shrinks or gets recreated per cycle — that was the
+ * bug: a per-call ceiling was previously recomputed from `proposalsPerCycle`
+ * (`min(remaining, count)`), which coincidentally equalled the real budget on
+ * cycle 1 but became a stale, already-exhausted ceiling on cycle 2.
+ *
+ * A `PROVIDER_BUDGET_EXCEEDED` refusal is bookkeeping, not a call: it never
+ * reaches the provider subprocess, so it does not consume `attemptedCalls`.
+ * `providerFailures` counts real attempts that did not succeed (timeouts,
+ * process errors, schema rejections, …) — never the refusals themselves.
+ */
+export function createRunBudget(maxCalls) {
+  const budget = {
+    maxCalls: Math.max(1, Math.round(Number(maxCalls) || 1)),
+    attemptedCalls: 0,
+    successfulCalls: 0,
+    providerFailures: 0,
+    callsByCycle: {},
+    get remainingCalls() {
+      return Math.max(0, budget.maxCalls - budget.attemptedCalls);
+    },
+    /** Fold one cycle's provider-run delta into the shared, run-level totals. */
+    recordCycle(cycle, runs = []) {
+      const key = cycle === null || cycle === undefined ? "unknown" : String(cycle);
+      let attempted = 0;
+      for (const run of Array.isArray(runs) ? runs : []) {
+        if (run?.status === PROVIDER_STATUS.BUDGET_EXCEEDED) continue; // a refusal, not a call
+        // A cache hit or a replay never reaches the subprocess (see
+        // `deepseek-cline.mjs`: `stats.calls` is not incremented for either
+        // path), so neither one consumes the real-call budget.
+        if (run?.cacheHit === true || run?.replay === true) continue;
+        attempted += 1;
+        if (run?.status === PROVIDER_STATUS.OK) budget.successfulCalls += 1;
+        else budget.providerFailures += 1;
+      }
+      budget.attemptedCalls += attempted;
+      if (attempted > 0) budget.callsByCycle[key] = (budget.callsByCycle[key] ?? 0) + attempted;
+      return budget;
+    },
+  };
+  return budget;
+}
+
+/* ============================================================================
  * Cohort generation
  * ==========================================================================*/
 
@@ -188,7 +237,22 @@ async function trainEvidenceFromDatasetSafe({ datasetDir, config }) {
  * cycles — a single run can never become an unbounded LLM loop.
  */
 export async function generateResearchCohort(options = {}) {
-  const envConfig = resolveProviderConfig(options.env ?? process.env);
+  const warn = options.warn ?? ((message) => console.warn(message));
+  const envConfig = resolveProviderConfig(options.env ?? process.env, { warn });
+
+  // The ONE resolver every entry point uses (see `provider-config.mjs`):
+  // explicit override (here, `options.providerTimeoutMs`, e.g. the `research`
+  // CLI's `--provider-timeout-ms`) → environment → documented default. This is
+  // deliberately kept separate from `options.config`, which is an unrelated
+  // market/dataset config used only to build TRAIN evidence below — merging the
+  // two previously let an 9000ms Jupiter-quote timeout silently overwrite the
+  // 180000ms provider default whenever `options.config` happened to also carry
+  // a `timeoutMs` field.
+  const { timeoutMs: providerTimeoutMs } = resolveEffectiveProviderTimeoutMs({
+    cliRaw: options.providerTimeoutMs ?? null,
+    envConfig,
+    warn,
+  });
 
   // `options.providerName` is an EXPLICIT request; otherwise the environment (or
   // its absence) decides. Either way an explicit unregistered name fails closed.
@@ -228,10 +292,13 @@ export async function generateResearchCohort(options = {}) {
   const experimentRoot = experimentRootFor(baseRoot, experimentId);
 
   // ---- provider ------------------------------------------------------------
+  // `providerConfig` carries ONLY the resolved provider identity/limits
+  // (never the unrelated `options.config` market/dataset config — see above).
+  const providerConfig = { ...envConfig, timeoutMs: providerTimeoutMs };
   const provider =
     options.provider ??
     resolveResearchProvider(providerName, {
-      config: options.config ? { ...envConfig, ...options.config } : envConfig,
+      config: providerConfig,
       env: options.env ?? process.env,
       root: path.join(experimentRoot, "provider"),
       experimentId,
@@ -271,10 +338,23 @@ export async function generateResearchCohort(options = {}) {
       maxMemoryRecords: limits.maxMemoryRecords,
       maxProviderCalls,
       cacheEnabled: (options.cacheEnabled ?? envConfig.cacheEnabled) === true,
-      timeoutMs: envConfig.timeoutMs,
+      // The EFFECTIVE timeout (CLI override → env → documented default), not
+      // just the env-resolved value — this is the number that actually governed
+      // every provider subprocess in this run.
+      timeoutMs: providerTimeoutMs,
+      maxAttemptsPerCall: envConfig.maxAttempts,
     },
     rolePlan: roles,
   });
+  const requestedProposalTotal = cycles * proposalsPerCycle;
+  experiment.request = {
+    requestedCycles: cycles,
+    proposalsPerCycle,
+    requestedProposalTotal,
+    maxProviderCalls,
+    providerTimeoutMs,
+    maxAttemptsPerCall: envConfig.maxAttempts,
+  };
   experiment.counters.cyclesRequested = cycles;
   experiment.notes.push(
     `evidence classes: ${(evidence.evidenceClasses ?? []).join(", ") || "none"}; excluded: ${(evidence.excludedEvidenceClasses ?? []).join(", ")}`,
@@ -289,26 +369,38 @@ export async function generateResearchCohort(options = {}) {
   const seenProposalIds = new Set();
   const runCursor = { value: Array.isArray(provider.runs) ? provider.runs.length : 0 };
 
+  // ONE run-level budget, created once and shared across every cycle (Phase
+  // 5B.1 bugfix: `proposalsPerCycle` must never define the global call cap —
+  // see `createRunBudget`). `maxCalls` never shrinks or gets recreated per
+  // cycle; only `attemptedCalls` grows as real (non-refused) provider calls
+  // happen.
+  const runBudget = createRunBudget(maxProviderCalls);
+
   const wrapper = {
     name: provider.name ?? providerName,
     model: provider.model ?? null,
     reasoning: provider.reasoning ?? null,
     offline: provider.offline === true,
     async propose(input) {
-      const remaining = Math.max(0, maxProviderCalls - providerRuns.length);
-      if (remaining === 0) return [];
+      if (runBudget.remainingCalls === 0) return [];
       const proposals = await provider.propose({
         ...input,
         roles,
         root: path.join(experimentRoot, "provider"),
         experimentId,
         cacheEnabled: options.cacheEnabled ?? envConfig.cacheEnabled,
-        maxCallsPerRun: Math.min(remaining, Math.max(1, Number(input.count) || remaining)),
+        // The run-level ceiling is CONSTANT for the whole run — never a
+        // per-call "remaining" value recomputed from `proposalsPerCycle`. A
+        // provider compares its own cumulative call count against this same
+        // constant every time, so cycle 2 never mistakes "5 already used" for
+        // "budget exhausted at 5".
+        maxCallsPerRun: maxProviderCalls,
       });
       const all = Array.isArray(provider.runs) ? provider.runs : [];
       const delta = all.slice(runCursor.value);
       runCursor.value = all.length;
       providerRuns.push(...delta);
+      runBudget.recordCycle(input.cycle ?? null, delta);
       return disambiguateProposalIds(Array.isArray(proposals) ? proposals : [], seenProposalIds);
     },
   };
@@ -330,7 +422,7 @@ export async function generateResearchCohort(options = {}) {
       now,
     });
     cycleResults.push(result);
-    if (providerRuns.length >= maxProviderCalls) break;
+    if (runBudget.remainingCalls === 0) break;
   }
 
   // ---- finalize ------------------------------------------------------------
@@ -343,6 +435,14 @@ export async function generateResearchCohort(options = {}) {
   });
   experiment.providerRunIds = providerRuns.map((run) => run.providerRunId);
   experiment.schemaVersion = RESEARCH_EXPERIMENT_VERSION;
+
+  // The precise, unambiguous run-level accounting (Phase 5B.1): distinct from
+  // `counters.providerCalls` (every record, including budget refusals).
+  experiment.counters.attemptedProviderCalls = runBudget.attemptedCalls;
+  experiment.counters.successfulProviderCalls = runBudget.successfulCalls;
+  experiment.counters.failedProviderCalls = runBudget.providerFailures;
+  experiment.counters.budgetRemaining = runBudget.remainingCalls;
+  experiment.counters.callsByCycle = { ...runBudget.callsByCycle };
 
   const anyProposal = cycleResults.some((result) => (result?.accepted ?? 0) > 0);
   const anyFailure = providerRuns.some((run) => run.status !== PROVIDER_STATUS.OK);

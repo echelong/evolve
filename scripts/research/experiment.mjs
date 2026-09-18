@@ -98,7 +98,9 @@ export function createResearchExperiment({
       maxProviderCalls: limits.maxProviderCalls ?? null,
       cacheEnabled: limits.cacheEnabled === true,
       timeoutMs: limits.timeoutMs ?? null,
+      maxAttemptsPerCall: limits.maxAttemptsPerCall ?? null,
     },
+    request: null,
     counters: {
       cyclesRequested: 0,
       cyclesCompleted: 0,
@@ -113,6 +115,15 @@ export function createResearchExperiment({
       providerCalls: 0,
       providerFailures: 0,
       cacheHits: 0,
+      // Phase 5B.1: the precise, unambiguous run-level call accounting — set at
+      // finalize by `generateResearchCohort` from the shared run budget.
+      // `providerCalls`/`providerFailures` above count every RECORD (including
+      // BUDGET_EXCEEDED refusals); these count only real subprocess attempts.
+      attemptedProviderCalls: 0,
+      successfulProviderCalls: 0,
+      failedProviderCalls: 0,
+      budgetRemaining: null,
+      callsByCycle: {},
       providerStatuses: {},
       speciesDistribution: {},
       familyDistribution: {},

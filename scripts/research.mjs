@@ -28,6 +28,7 @@ import {
   REGISTERED_PROVIDERS,
   UnknownResearchProviderError,
   requireProviderName,
+  resolveEffectiveProviderTimeoutMs,
   resolveProviderConfig,
 } from "./research/provider-config.mjs";
 import { RESEARCH_PROMPT_VERSION, proposingRoles } from "./research/prompt.mjs";
@@ -42,6 +43,7 @@ const VALUE_FLAGS = [
   "roles",
   "proposals-per-cycle",
   "max-calls",
+  "provider-timeout-ms",
   "experiment",
   "dataset",
   "memory-root",
@@ -62,6 +64,7 @@ function usage() {
     "  --roles <a,b,..>           researcher roles to call (default: all proposing roles)",
     "  --proposals-per-cycle <n>  provider calls per cycle (default: roles.length)",
     "  --max-calls <n>            hard cap on provider calls for the WHOLE run",
+    `  --provider-timeout-ms <n>  wall-clock bound per provider subprocess (default: env, else ${PROVIDER_DEFAULTS.timeoutMs}ms)`,
     "  --experiment <id>          reuse/name the experiment (default: generated)",
     "  --dataset <dir|auto>       recorded dataset for TRAIN evidence (auto = newest recorded)",
     "  --memory-root <dir>        research-memory root read through the filtered view",
@@ -222,20 +225,35 @@ async function main() {
     1,
     Number.parseInt(String(args["proposals-per-cycle"] ?? roles.length), 10) || roles.length,
   );
+  const requestedProposalTotal = cycles * proposalsPerCycle;
   const datasetDir = await pickDataset(args.dataset ? String(args.dataset) : null);
   const cacheEnabled =
     args.cache === true ? true : args["no-cache"] === true ? false : envConfig.cacheEnabled === true;
 
+  // The ONE resolver shared with the probe CLI and the cohort runner (see
+  // `provider-config.mjs`): CLI override → environment → documented default.
+  const { timeoutMs: providerTimeoutMs } = resolveEffectiveProviderTimeoutMs({
+    cliRaw: args["provider-timeout-ms"],
+    envConfig,
+    warn: (message) => console.error(message),
+  });
+
   console.log("EVOLVE research cohort generation (PAPER ONLY — no trading, no wallet, no execution)");
-  console.log(`  provider       ${resolvedProviderName}${providerResolution.defaulted ? " (default: EVOLVE_RESEARCH_PROVIDER is unset)" : ""}`);
+  console.log(`  provider            ${resolvedProviderName}${providerResolution.defaulted ? " (default: EVOLVE_RESEARCH_PROVIDER is unset)" : ""}`);
   if (resolvedProviderName !== "mock") {
-    console.log(`  model          ${envConfig.model} (reasoning ${envConfig.reasoning}, profile ${envConfig.profile})`);
+    console.log(`  model               ${envConfig.model}`);
+    console.log(`  reasoning           ${envConfig.reasoning}`);
   }
-  console.log(`  prompt version ${RESEARCH_PROMPT_VERSION}`);
-  console.log(`  roles          ${roles.join(", ")}`);
-  console.log(`  cycles         ${cycles}   calls/cycle ${proposalsPerCycle}   max calls/run ${maxCalls}`);
-  console.log(`  dataset        ${datasetDir ?? "(none — memory-only evidence)"}`);
-  console.log(`  cache          ${cacheEnabled ? "on" : "off"}`);
+  console.log(`  prompt version      ${RESEARCH_PROMPT_VERSION}`);
+  console.log(`  roles               ${roles.join(", ")}`);
+  console.log(`  cycles              ${cycles}`);
+  console.log(`  proposals/cycle     ${proposalsPerCycle}`);
+  console.log(`  requested total     ${requestedProposalTotal}`);
+  console.log(`  max provider calls  ${maxCalls}`);
+  console.log(`  provider timeout    ${providerTimeoutMs}ms`);
+  console.log(`  retry attempts      ${envConfig.maxAttempts}`);
+  console.log(`  cache enabled       ${cacheEnabled ? "true" : "false"}`);
+  console.log(`  dataset             ${datasetDir ?? "(none — memory-only evidence)"}`);
 
   const report = await generateResearchCohort({
     providerName: resolvedProviderName,
@@ -244,9 +262,13 @@ async function main() {
     roles,
     proposalsPerCycle,
     maxProviderCalls: maxCalls,
+    providerTimeoutMs,
     experimentId: args.experiment ? String(args.experiment) : null,
     datasetDir,
     memoryRoot: args["memory-root"] ? path.resolve(String(args["memory-root"])) : baseRoot,
+    // Market/dataset config for TRAIN-evidence parsing ONLY — never merged
+    // into the provider config (see `cohort-runner.mjs`), so its own
+    // `timeoutMs` (the Jupiter quote timeout) can never shadow the provider's.
     config: createMarketConfig(),
     seed: args.seed ? String(args.seed) : "evolve",
     cacheEnabled,
