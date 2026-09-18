@@ -544,6 +544,29 @@ export function buildAbComparison({
   const researchSpecies = speciesCounts(researchRows);
   const conventionalSpecies = speciesCounts(conventionalRows);
   const speciesVerdict = speciesMatchVerdict(researchSpecies, conventionalSpecies);
+  // Phase 5A.3.1: REQUESTED vs EFFECTIVE match mode. The requested mode comes
+  // from the run configuration; the effective mode is only ever
+  // "species-matched" when the frozen cohorts really are species-identical, so
+  // the artifact can never claim species-matched while `matched` is false.
+  const requestedMatchMode =
+    accounting?.requestedMatchMode ?? (accounting?.speciesMatched === true ? "species-matched" : "unmatched");
+  const speciesMatchRequested = requestedMatchMode === "species-matched";
+  const speciesMatchRecord = accounting?.speciesMatch ?? null;
+  const effectiveMatchMode =
+    speciesMatchRequested && speciesVerdict.matched ? "species-matched" : "unmatched";
+  const speciesMatchInvariant = {
+    requested: speciesMatchRequested,
+    requestedMatchMode,
+    effectiveMatchMode,
+    matched: speciesVerdict.matched,
+    referenceCounts: speciesMatchRecord?.referenceCounts ?? null,
+    agreedCounts: speciesMatchRecord?.quotas ?? speciesMatchRecord?.counts ?? null,
+    shortfall: speciesMatchRecord?.shortfall ?? null,
+    symmetricShrink: speciesMatchRecord?.symmetricShrink === true,
+    noCloning: speciesMatchRecord?.noCloning === true,
+    enforcement: speciesMatchRecord?.enforcement ?? null,
+    satisfied: speciesMatchRequested ? speciesVerdict.matched : true,
+  };
 
   const researchDiversity = cohortDiversity(researchEntrants, researchRows);
   const conventionalDiversity = cohortDiversity(conventionalEntrants, conventionalRows);
@@ -555,9 +578,17 @@ export function buildAbComparison({
     "No significance test is performed and no p-value is claimed. Bootstrap intervals are descriptive.",
     "Research-guided initialization is compared here against a conventional control built by the ordinary Arena entrant-pool construction; a different conventional construction would be a different experiment.",
   ];
-  if (!speciesVerdict.matched) {
+  if (speciesMatchRequested && !speciesVerdict.matched) {
+    limitations.push(
+      "STRICT SPECIES MATCHING WAS REQUESTED BUT IS NOT SATISFIED for the frozen cohorts: this run is NOT a valid species-controlled A/B baseline, and no difference reported here can be attributed to research-guided initialization.",
+    );
+  } else if (!speciesVerdict.matched) {
     limitations.push(
       "Species composition is NOT matched between cohorts, so part of any observed difference may come from species mix rather than from research-guided initialization (enable species-matched A/B to remove this confound).",
+    );
+  } else {
+    limitations.push(
+      `Species composition is enforced identical across cohorts (requested and effective match mode: species-matched; quotas ${JSON.stringify(speciesMatchInvariant.agreedCounts ?? researchSpecies)}). Each species sub-cohort evolved independently with the same resources in both arms.`,
     );
   }
   if (accounting?.downgraded) {
@@ -631,6 +662,15 @@ export function buildAbComparison({
       expandDescendants: accounting?.expandDescendants === true,
       crossCohortCrossover: false,
       symmetricStartingSlots: accounting?.symmetricStartingSlots === true,
+      // Phase 5A.3.1: which control was requested, which was actually enforced,
+      // and the per-species quotas both arms evolved with.
+      requestedMatchMode,
+      effectiveMatchMode,
+      speciesMatchRequested,
+      speciesQuotas: speciesMatchInvariant.agreedCounts,
+      speciesShortfall: speciesMatchInvariant.shortfall,
+      speciesSymmetricShrink: speciesMatchInvariant.symmetricShrink,
+      speciesSubCohortEvolution: speciesMatchRequested ? "independent per-species sub-cohorts, equal resources both arms" : null,
     },
     cohortSize: {
       research: researchRows.length,
@@ -681,10 +721,17 @@ export function buildAbComparison({
       conventional: conventionalSpecies,
       matched: speciesVerdict.matched,
       deltas: speciesVerdict.deltas,
-      matchMode: accounting?.speciesMatched === true ? "species-matched" : "unmatched",
+      // `matchMode` is the EFFECTIVE mode (never claims species-matched unless
+      // the frozen cohorts really are species-identical).
+      requestedMatchMode,
+      effectiveMatchMode,
+      matchMode: effectiveMatchMode,
+      invariant: speciesMatchInvariant,
       note: speciesVerdict.matched
         ? "Species composition is identical across cohorts."
-        : "Species composition differs across cohorts; species mix is a confound for any observed difference.",
+        : speciesMatchRequested
+          ? "Species composition differs across cohorts even though a strict species match was requested; this run is not a valid species-controlled A/B baseline."
+          : "Species composition differs across cohorts; species mix is a confound for any observed difference.",
     },
     families: {
       research: familyCounts(researchRows),

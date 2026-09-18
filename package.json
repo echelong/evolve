@@ -12,7 +12,7 @@
     "validate:market": "node scripts/validate-market.mjs",
     "validate:syntax": "node scripts/check-syntax.mjs",
     "smoke:engine": "node scripts/smoke-engine.mjs",
-    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm",
+    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run validate:phase5a31 && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm",
     "probe:market": "node scripts/probe-jupiter.mjs",
     "record:market": "node scripts/record-market.mjs",
     "fixture:market": "node scripts/make-fixture.mjs",
@@ -29,7 +29,8 @@
     "validate:phase41": "node scripts/validate-phase41.mjs",
     "validate:phase5a": "node scripts/validate-phase5a.mjs",
     "validate:phase5a2": "node scripts/validate-phase5a2.mjs",
-    "validate:phase5a3": "node scripts/validate-phase5a3.mjs"
+    "validate:phase5a3": "node scripts/validate-phase5a3.mjs",
+    "validate:phase5a31": "node scripts/validate-phase5a31.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.46.0",

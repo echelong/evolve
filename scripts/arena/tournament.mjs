@@ -107,9 +107,15 @@ export function buildEntrantPool({
   // (and its own lineage) so every A/B entrant stays attributable. Null keeps
   // the pre-5A.3 behavior byte-for-byte.
   cohort = null,
+  // Phase 5A.3.1: restrict exploratory genomes (random immigrants, and the
+  // placeholder genomes used when no champion exists yet) to this species list.
+  // Null keeps the ordinary behavior of drawing from every SPECIES.
+  immigrantSpecies = null,
 } = {}) {
   const random = createSeededRandom(`pool:${seed}`);
   const entrants = [];
+  const allowedSpecies =
+    Array.isArray(immigrantSpecies) && immigrantSpecies.length > 0 ? immigrantSpecies : SPECIES;
 
   const championSlots = Math.min(champions.length, Math.floor(population * championShare));
   const immigrantSlots = Math.max(1, Math.floor(population * immigrantShare));
@@ -160,14 +166,14 @@ export function buildEntrantPool({
         ...childLineageMeta(champions[0]),
       });
     } else {
-      const species = SPECIES[i % SPECIES.length];
+      const species = allowedSpecies[i % allowedSpecies.length];
       entrants.push(immigrantEntrant(randomGenome(species, random), species, cohort));
     }
   }
 
   // Random immigrants keep exploration alive no matter how strong the champions are.
   for (let i = 0; i < immigrantSlots; i += 1) {
-    const species = SPECIES[Math.floor(random() * SPECIES.length)];
+    const species = allowedSpecies[Math.floor(random() * allowedSpecies.length)];
     entrants.push(immigrantEntrant(randomGenome(species, random), species, cohort));
   }
 
@@ -176,6 +182,87 @@ export function buildEntrantPool({
   }
 
   return entrants.slice(0, population);
+}
+
+/**
+ * Phase 5A.3.1: build the next generation of one cohort at EXACTLY the
+ * requested per-species quotas.
+ *
+ * Strict species-matched A/B mode needs the species distribution to survive
+ * evolution, which the ordinary pool builder cannot guarantee: it injects a
+ * random-species immigrant every generation and selects survivors globally by
+ * score, so whichever species happens to win a survivor slot reproduces and
+ * can take over the cohort.
+ *
+ * This builder therefore evolves each species SUB-COHORT independently with
+ * the ordinary builder (same champion share, immigrant share, crossover and
+ * mutation rules), restricted to its own species. Consequences, all of them
+ * deliberate and identically applied to both cohorts:
+ *
+ *   - the species distribution is invariant across generations (a quota is
+ *     filled with exactly that many genomes of exactly that species);
+ *   - no genome is cloned and no species is ever substituted;
+ *   - a species whose members all lost the cheap screen falls back to its own
+ *     previous members (quota preservation — not performance selection);
+ *   - a single-slot species keeps its own representative (elite carryover),
+ *     which is how a 1-genome species survives without being replaced or
+ *     duplicated.
+ */
+export function buildSpeciesPreservingPool({
+  champions = [],
+  members = [],
+  quotas = {},
+  seed = "species-pool",
+  championShare = 0.35,
+  immigrantShare = 0.15,
+  cohort = null,
+} = {}) {
+  const speciesOf = (entry) =>
+    typeof entry?.species === "string" && entry.species.length > 0 ? entry.species : null;
+  const pool = [];
+  const speciesList = Object.keys(quotas ?? {})
+    .filter((species) => Number(quotas?.[species] ?? 0) > 0)
+    .sort();
+
+  for (const species of speciesList) {
+    const quota = Math.max(0, Math.floor(Number(quotas[species]) || 0));
+    if (quota === 0) continue;
+    if (quota === 1) {
+      // One-slot species: keep its own representative, unchanged. One distinct
+      // genome in one slot — elite carryover, never a duplicate.
+      const representative =
+        champions.find((entry) => speciesOf(entry) === species) ??
+        members.find((entry) => speciesOf(entry) === species) ??
+        immigrantEntrant(randomGenome(species, createSeededRandom(`${seed}:species:${species}`)), species, cohort);
+      pool.push({ ...representative });
+      continue;
+    }
+    const ownChampions = champions.filter((entry) => speciesOf(entry) === species);
+    const ownMembers = members.filter((entry) => speciesOf(entry) === species);
+    const breeders = ownChampions.length > 0 ? ownChampions : ownMembers;
+    if (breeders.length === 0) {
+      // No member of this species exists: fill the quota with fresh standard
+      // species initialization — still that species, never another one.
+      const random = createSeededRandom(`${seed}:species:${species}`);
+      for (let index = 0; index < quota; index += 1) {
+        pool.push(immigrantEntrant(randomGenome(species, random), species, cohort));
+      }
+      continue;
+    }
+    pool.push(
+      ...buildEntrantPool({
+        champions: breeders,
+        population: quota,
+        seed: `${seed}:species:${species}`,
+        championShare,
+        immigrantShare,
+        cohort,
+        immigrantSpecies: [species],
+      }),
+    );
+  }
+
+  return pool;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -303,6 +390,10 @@ export async function runArenaTournament({
   abConfig = null,
   abRoles = null,
   abSpeciesMatched = false,
+  // Phase 5A.3.1: the strict species-match record (reference counts, agreed
+  // per-species quotas, shortfall) verified at the freeze. Reporting only — the
+  // evaluation itself stays identical for every entrant.
+  abSpeciesMatch = null,
   abBootstrapIterations = null,
   abBootstrapSeed = null,
 }) {
@@ -473,7 +564,12 @@ export async function runArenaTournament({
           arenaId,
           candidateRows,
           entrants,
-          accounting: { ...abAccounting, speciesMatched: abSpeciesMatched === true },
+          accounting: {
+            ...abAccounting,
+            speciesMatched: abSpeciesMatched === true,
+            requestedMatchMode: abSpeciesMatched === true ? "species-matched" : "unmatched",
+            speciesMatch: abSpeciesMatch ?? abAccounting?.speciesMatch ?? null,
+          },
           config: abConfig ?? {},
           datasets,
           seeds,

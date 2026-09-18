@@ -1213,6 +1213,36 @@ That builds fresh standard species/genome controls whose species counts equal th
 removing species composition as a confound. Whether or not it is enabled, the report always prints both
 species distributions and `species.matched`, and lists an unmatched species mix as a **limitation**.
 
+#### Strict species matching (Phase 5A.3.1)
+
+Species matching is **enforced at the formal evaluation freeze**, not merely applied to the starting
+seeds. Phase 5A.3.1 fixed a real correctness bug: matching used to be applied only to the conventional
+SEEDS, while pre-evolution (random-species immigrants + score-based survivor selection) then changed both
+cohorts' distributions. A run could therefore request species matching, report
+`matchMode: "species-matched"`, and still report `matched: false` — an artifact that looked like a valid
+species-controlled baseline but was not one. Matching now works like this:
+
+- the reference distribution is the Research cohort **as naturally produced** (never reshaped, never
+  re-sorted by performance);
+- the Conventional control is generated to those exact counts, and every control digest is unique —
+  no cloning, and no control is ever a copy of a Research genome;
+- **both** cohorts then evolve with **independent per-species sub-cohorts** under identical resources
+  (same generations, survivor/breeder/mutation/crossover rules, immigrant budget, all quotas), so the
+  distribution cannot drift: a species whose members lose the cheap screen falls back to its own members,
+  and random immigrants stay inside their species;
+- the invariant `speciesCounts(research) === speciesCounts(conventional)` is asserted at the freeze.
+  It passes loudly (`species match invariant: PASS`) or the run **stops before evaluation** — nothing is
+  evaluated, no artifact is written, and no species-matched claim is made;
+- if a requested species cannot be filled with unique controls, **both** cohorts shrink symmetrically by
+  the same per-species amount (still: never cloned, never substituted). A match that cannot be built at
+  all fails with an explicit reason.
+
+The artifact records `species.requestedMatchMode`, `species.effectiveMatchMode`, `species.matched` and a
+`species.invariant` block (reference counts, agreed per-species quotas, shortfall, no-cloning).
+`effectiveMatchMode` can never say `species-matched` while `matched` is `false`, and
+`species.matchMode` is an alias of the EFFECTIVE mode. The startup log prints the requested flag, the
+reference Research species counts and the constructed Conventional counts.
+
 ### Metrics
 
 `summary.json` carries a compact `abComparison` block; the full report is written to
@@ -1260,7 +1290,8 @@ Read the A/B report as an **observation**, not a finding:
 - sample sizes are small, walk-forward windows overlap by design, and observations within a cohort are
   not statistically independent, so the bootstrap interval describes spread rather than proving anything
 - the cohorts are matched by construction, but a difference can still come from species mix (unless
-  species-matched mode is on), from the specific conventional construction chosen, or from luck
+  species-matched mode is on — and then the match is enforced at the freeze, or the run refuses to
+  evaluate), from the specific conventional construction chosen, or from luck
 
 **No profitability claim is made anywhere.** A higher paper score in one cohort is not evidence of
 future profit, and zero Deployment Candidates remains a completely acceptable outcome.
@@ -1282,10 +1313,11 @@ explicitly started — see `## Roadmap`.
 npm run arena -- --research-mode ab <dataset>              # matched A/B benchmark
 EVOLVE_ARENA_POPULATION=200 npm run arena -- --research-mode ab <dataset>
 EVOLVE_ARENA_AB_EXPAND=1 npm run arena -- --research-mode ab <dataset>          # opt-in descendant expansion
-EVOLVE_ARENA_AB_SPECIES_MATCHED=1 npm run arena -- --research-mode ab <dataset> # species-matched control
+EVOLVE_ARENA_AB_SPECIES_MATCHED=1 npm run arena -- --research-mode ab <dataset> # strict species-matched control
 EVOLVE_ARENA_AB_BOOTSTRAP_ITERATIONS=5000 npm run arena -- --research-mode ab <dataset>
 EVOLVE_ARENA_WORKERS=8 npm run arena -- --research-mode ab <dataset>
 npm run validate:phase5a3                                  # Phase 5A.3 suite (69 offline cases)
+npm run validate:phase5a31                                 # Phase 5A.3.1 strict species-match suite (24 offline cases)
 ```
 
 ## Validation

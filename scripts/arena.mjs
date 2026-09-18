@@ -54,7 +54,7 @@ import {
   DEFAULT_HOF_DIR,
   ARENA_STAGE,
 } from "./arena/orchestrator.mjs";
-import { buildEntrantPool, runArenaTournament } from "./arena/tournament.mjs";
+import { buildEntrantPool, buildSpeciesPreservingPool, runArenaTournament } from "./arena/tournament.mjs";
 import { planDatasetWindows } from "./arena/evaluator.mjs";
 import { digestOf } from "./lib/hash.mjs";
 import {
@@ -83,7 +83,12 @@ import {
   AB_DEFAULTS,
   buildMatchedAbCohort,
   describeAbCohorts,
-  speciesMatchedConventionalSeeds,
+  describeSpeciesCounts,
+  enforceSpeciesMatchInvariant,
+  planSpeciesMatchedCohort,
+  scaleSpeciesCounts,
+  speciesCountsOf,
+  speciesMatchRequested,
 } from "./research/ab-cohort.mjs";
 import { ADVISORY_ROLES, PROPOSING_ROLES } from "./research/provider.mjs";
 
@@ -197,26 +202,43 @@ async function preEvolveCohort({
   cacheDir,
   useCache,
   label,
+  // Phase 5A.3.1: when supplied (strict species-matched A/B), every generation
+  // is rebuilt at EXACTLY these per-species quotas using
+  // `buildSpeciesPreservingPool`, so the species distribution cannot drift.
+  // Both cohorts receive the same quotas and the same resources.
+  speciesMatch = null,
 }) {
   let pool = entrants;
   const survivorFraction = 0.3;
   const championShare = 0.35;
   const immigrantShare = 0.15;
+  const quotas = speciesMatch?.quotas ?? null;
 
   // Descendant expansion (opt-in): grow the starting seed cohort to its target
   // size using the ordinary entrant-pool builder. This is evolution, not
   // cloning — ancestry is preserved — and it is applied identically to both
-  // cohorts.
+  // cohorts. Under strict species matching the expansion is quota-preserving
+  // too, so the expanded cohorts stay species-identical.
   if (population !== pool.length) {
-    console.log(`[arena] ab: ${label} expanding ${pool.length} seed genome(s) -> ${population} via ordinary entrant-pool breeding`);
-    pool = buildEntrantPool({
-      champions: pool,
-      population,
-      seed: `arena:ab:${label}:expand:${[...seeds].join(",")}`,
-      championShare,
-      immigrantShare,
-      cohort: label,
-    });
+    console.log(`[arena] ab: ${label} expanding ${pool.length} seed genome(s) -> ${population} via ordinary ${quotas ? "species-preserving " : ""}entrant-pool breeding`);
+    pool = quotas
+      ? buildSpeciesPreservingPool({
+          champions: pool,
+          members: pool,
+          quotas,
+          seed: `arena:ab:${label}:expand:${[...seeds].join(",")}`,
+          championShare,
+          immigrantShare,
+          cohort: label,
+        })
+      : buildEntrantPool({
+          champions: pool,
+          population,
+          seed: `arena:ab:${label}:expand:${[...seeds].join(",")}`,
+          championShare,
+          immigrantShare,
+          cohort: label,
+        });
   }
 
   for (let gen = 1; gen < rounds; gen += 1) {
@@ -257,15 +279,31 @@ async function preEvolveCohort({
           : null;
       })
       .filter(Boolean);
-    // Breeders are drawn only from THIS cohort's own survivors.
-    pool = buildEntrantPool({
-      champions: survivors.length > 0 ? survivors : pool,
-      population,
-      seed: `arena:ab:${label}:gen${gen}:${[...seeds].join(",")}`,
-      championShare,
-      immigrantShare,
-      cohort: label,
-    });
+    const breeders = survivors.length > 0 ? survivors : pool;
+    if (quotas) {
+      // Strict species matching: rebuild the cohort at the same per-species
+      // quotas. A species whose members all lost this screen falls back to its
+      // own previous members (quota preservation), never to another species.
+      pool = buildSpeciesPreservingPool({
+        champions: breeders,
+        members: pool,
+        quotas,
+        seed: `arena:ab:${label}:gen${gen}:${[...seeds].join(",")}`,
+        championShare,
+        immigrantShare,
+        cohort: label,
+      });
+    } else {
+      // Breeders are drawn only from THIS cohort's own survivors.
+      pool = buildEntrantPool({
+        champions: breeders,
+        population,
+        seed: `arena:ab:${label}:gen${gen}:${[...seeds].join(",")}`,
+        championShare,
+        immigrantShare,
+        cohort: label,
+      });
+    }
   }
   return pool;
 }
@@ -374,7 +412,7 @@ async function main() {
   // Phase 5A.3 A/B knobs. Descendant expansion is opt-in: by default a matched
   // cohort is exactly as large as the smaller side's unique seed count.
   const abExpandDescendants = process.env.EVOLVE_ARENA_AB_EXPAND === "1";
-  const abSpeciesMatched = process.env.EVOLVE_ARENA_AB_SPECIES_MATCHED === "1";
+  const abSpeciesMatched = speciesMatchRequested(process.env);
   const abBootstrapIterations = intEnv(
     process.env.EVOLVE_ARENA_AB_BOOTSTRAP_ITERATIONS,
     AB_DEFAULTS.bootstrapIterations,
@@ -472,23 +510,45 @@ async function main() {
       0,
       Math.min(Math.round(population * abShare), Math.round(population * (1 - abShare))),
     );
-    const preliminaryMatched = Math.min(requestedPerCohort, researchEntrants.length);
-
     // Conventional control construction. Default: the ordinary Arena entrant
     // pool (archived champions re-entering, mutated/crossover children, random
-    // species immigrants). Species-matched mode instead initializes fresh
+    // species immigrants). STRICT species-matched mode instead builds fresh
     // standard species/genome controls whose species counts equal the Research
-    // cohort's, removing species composition as a confound.
+    // cohort's EXACTLY, and then evolves BOTH cohorts species-preserving so the
+    // distribution cannot drift before the formal freeze.
     let conventionalSeeds;
+    let speciesPlan = null;
     if (abSpeciesMatched) {
-      conventionalSeeds = speciesMatchedConventionalSeeds({
+      // ---- Phase 5A.3.1: strict species matching --------------------------
+      // The reference distribution is the Research cohort AS NATURALLY
+      // PRODUCED by the research pipeline. It is never reshaped to look nicer,
+      // never sorted by performance, and never substituted.
+      console.log("[arena] A/B species-match requested: true");
+      speciesPlan = planSpeciesMatchedCohort({
         researchSeeds: researchEntrants,
-        population: preliminaryMatched,
+        requestedPerCohort,
         seed: `arena:ab:${[...seeds].join(",")}`,
       });
+      if (!speciesPlan.ok) {
+        console.error(`[arena] A/B SPECIES-MATCH FAILED: ${speciesPlan.error}`);
+        console.error(
+          "[arena] a species-matched control was requested, so this run refuses to build an unmatched A/B baseline. No genome is cloned and no species is substituted.",
+        );
+        process.exitCode = 1;
+        return;
+      }
       console.log(
-        `[arena] A/B species-matched control: ${conventionalSeeds.length} fresh species/genome seed(s) matched to the research species counts`,
+        `[arena] A/B species-match reference (research cohort as produced): ${describeSpeciesCounts(speciesPlan.requestedCounts)}`,
       );
+      console.log(
+        `[arena] A/B species-match conventional controls: ${describeSpeciesCounts(speciesCountsOf(speciesPlan.conventional))} (${speciesPlan.conventional.length} fresh species/genome seed(s))`,
+      );
+      if (speciesPlan.symmetricShrink) {
+        console.warn(
+          `[arena] A/B SPECIES-MATCH SHORTAGE: ${describeSpeciesCounts(speciesPlan.shortfall)} could not be produced as unique controls — BOTH cohorts were shrunk symmetrically to ${describeSpeciesCounts(speciesPlan.counts)} (never cloned, never substituted).`,
+        );
+      }
+      conventionalSeeds = speciesPlan.conventional;
     } else {
       conventionalSeeds = buildEntrantPool({
         champions,
@@ -502,7 +562,10 @@ async function main() {
     const abBuilt = buildMatchedAbCohort({
       requestedPopulation: population,
       researchShare: abShare,
-      researchSeeds: researchEntrants,
+      // Strict mode feeds the identical (deduped, species-trimmed) reference
+      // list that the controls were generated from, so both arms carry the same
+      // per-species counts into evolution.
+      researchSeeds: speciesPlan ? speciesPlan.research : researchEntrants,
       conventionalSeeds,
       expandDescendants: abExpandDescendants,
     });
@@ -536,6 +599,10 @@ async function main() {
     );
 
     const perCohortTarget = account.targetPerCohort;
+    // Strict species matching: the same per-species quotas drive BOTH cohorts'
+    // evolution (identical resources per species in each arm).
+    const speciesQuotas = speciesPlan ? scaleSpeciesCounts(speciesPlan.counts, perCohortTarget) : null;
+    const speciesMatchConfig = speciesQuotas ? { quotas: speciesQuotas } : null;
     let researchPool = abBuilt.research;
     let conventionalPoolAb = abBuilt.conventional;
     if (generations > 1 || perCohortTarget !== researchPool.length) {
@@ -552,6 +619,7 @@ async function main() {
         cacheDir,
         useCache,
         label: AB_COHORT.RESEARCH,
+        speciesMatch: speciesMatchConfig,
       });
       conventionalPoolAb = await preEvolveCohort({
         entrants: conventionalPoolAb,
@@ -564,18 +632,67 @@ async function main() {
         cacheDir,
         useCache,
         label: AB_COHORT.CONVENTIONAL,
+        speciesMatch: speciesMatchConfig,
       });
     }
     entrants = [...researchPool, ...conventionalPoolAb];
-    researchAccounting = { mode: RESEARCH_ARENA_MODE.AB, ...account };
+    console.log(
+      `[arena] A/B final pools: research=${researchPool.length} conventional=${conventionalPoolAb.length} total=${entrants.length}`,
+    );
+
+    // ---- Phase 5A.3.1: strict species-match invariant -----------------------
+    // Checked at the FORMAL EVALUATION FREEZE, immediately before the shared
+    // tournament. On failure the run stops here: no evaluation, no artifact, and
+    // never a species-matched claim.
+    let speciesMatchRecord = null;
+    if (speciesMatchConfig) {
+      const freeze = enforceSpeciesMatchInvariant({
+        research: researchPool,
+        conventional: conventionalPoolAb,
+        expectedCounts: speciesQuotas,
+        requested: true,
+      });
+      console.log(`[arena] A/B species counts at freeze — research: ${describeSpeciesCounts(freeze.researchCounts)}`);
+      console.log(`[arena] A/B species counts at freeze — conventional: ${describeSpeciesCounts(freeze.conventionalCounts)}`);
+      console.log(`[arena] A/B species quotas: ${describeSpeciesCounts(speciesQuotas)}`);
+      if (!freeze.ok) {
+        console.error(`[arena] species match invariant: FAIL — ${freeze.reason}`);
+        console.error(
+          "[arena] refusing to evaluate: this run would NOT be a valid species-controlled A/B baseline. Nothing is cloned, no species is substituted, and no approval is implied.",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      console.log("[arena] species match invariant: PASS");
+      speciesMatchRecord = {
+        requested: true,
+        matched: true,
+        referenceCounts: speciesPlan.requestedCounts,
+        conventionalControlCounts: speciesCountsOf(speciesPlan.conventional),
+        quotas: speciesQuotas,
+        researchCounts: freeze.researchCounts,
+        conventionalCounts: freeze.conventionalCounts,
+        shortfall: speciesPlan.shortfall,
+        symmetricShrink: speciesPlan.symmetricShrink,
+        noCloning: true,
+        substitutedSpecies: 0,
+        enforcement: "independent per-species sub-cohorts, equal quotas/resources in both arms",
+      };
+    }
+
+    researchAccounting = {
+      mode: RESEARCH_ARENA_MODE.AB,
+      ...account,
+      speciesMatch: speciesMatchRecord,
+      requestedMatchMode: abSpeciesMatched ? "species-matched" : "unmatched",
+      effectiveMatchMode: speciesMatchRecord ? "species-matched" : "unmatched",
+    };
     abContext = {
       accounting: researchAccounting,
       perCohortTarget,
       speciesMatched: abSpeciesMatched,
+      speciesMatch: speciesMatchRecord,
     };
-    console.log(
-      `[arena] A/B final pools: research=${researchPool.length} conventional=${conventionalPoolAb.length} total=${entrants.length}`,
-    );
   } else if (includeResearch && researchMode === RESEARCH_ARENA_MODE.FAIR) {
     // FAIR COHORT: one mixed cohort, identical pre-evolution for every lineage.
     const shareOverride =
@@ -717,6 +834,7 @@ async function main() {
       ? { known: [...PROPOSING_ROLES, ...ADVISORY_ROLES], advisory: [...ADVISORY_ROLES] }
       : null,
     abSpeciesMatched: abContext?.speciesMatched === true,
+    abSpeciesMatch: abContext?.speciesMatch ?? null,
     abBootstrapIterations,
     abBootstrapSeed,
     onProgress: ({ message }) => {
@@ -903,7 +1021,7 @@ async function main() {
       );
     }
     console.log(
-      `  species matched: ${ab.species?.matched === true} (${ab.species?.matchMode ?? "unmatched"}) · no significance claim is made`,
+      `  species matched: ${ab.species?.matched === true} (requested ${ab.species?.requestedMatchMode ?? "unmatched"} · effective ${ab.species?.effectiveMatchMode ?? ab.species?.matchMode ?? "unmatched"}) · no significance claim is made`,
     );
     console.log(
       "  PAPER ONLY. Research cohort higher/lower/equal on the observed paper metrics above — a difference is an observation, not proof, and not a profitability claim.",

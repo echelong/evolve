@@ -402,37 +402,404 @@ export function buildMatchedAbCohort({
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* Phase 5A.3.1: STRICT species matching                                      */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Optional species-matched conventional control (Phase 5A.3, section J).
+ * The species of an entrant / artifact row. Missing species is reported as
+ * `null` (never invented) so a cohort that cannot be species-matched fails
+ * loudly instead of matching against a fabricated species.
+ */
+export function speciesOf(entry) {
+  if (typeof entry?.species === "string" && entry.species.length > 0) return entry.species;
+  const researchSpecies = entry?.research?.species;
+  if (typeof researchSpecies === "string" && researchSpecies.length > 0) return researchSpecies;
+  return null;
+}
+
+/** Deterministic species counts for entrants / artifact rows. */
+export function speciesCountsOf(entries = []) {
+  const out = {};
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const species = speciesOf(entry);
+    if (!species) continue;
+    out[species] = (out[species] ?? 0) + 1;
+  }
+  return out;
+}
+
+/** Exact equality of two species distributions (absent species count as zero). */
+export function speciesCountsEqual(a = {}, b = {}) {
+  const keys = new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})]);
+  for (const key of keys) {
+    if ((a?.[key] ?? 0) !== (b?.[key] ?? 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * Compare two species distributions. `matched` is true only when EVERY species
+ * count is identical on both sides.
+ */
+export function speciesMatchVerdict(researchCounts = {}, conventionalCounts = {}) {
+  const species = [
+    ...new Set([...Object.keys(researchCounts ?? {}), ...Object.keys(conventionalCounts ?? {})]),
+  ].sort();
+  const deltas = {};
+  let matched = true;
+  for (const key of species) {
+    const delta = (researchCounts?.[key] ?? 0) - (conventionalCounts?.[key] ?? 0);
+    deltas[key] = delta;
+    if (delta !== 0) matched = false;
+  }
+  return { matched, deltas, species };
+}
+
+/**
+ * Is the strict species-matched control requested? Only the exact value `1`
+ * enables it, matching every other EVOLVE_ARENA_* boolean in this repository.
+ */
+export function speciesMatchRequested(env = {}) {
+  return String(env?.EVOLVE_ARENA_AB_SPECIES_MATCHED ?? "") === "1";
+}
+
+/**
+ * Scale a species distribution to a new total with largest-remainder
+ * allocation. Deterministic and symmetric: the same input counts always
+ * produce the same quotas, so both A/B arms receive identical per-species
+ * resources.
+ */
+export function scaleSpeciesCounts(counts = {}, total = 0) {
+  const target = Math.max(0, Math.round(Number(total) || 0));
+  const entries = Object.entries(counts ?? {})
+    .filter(([, count]) => Number.isFinite(Number(count)) && Number(count) > 0)
+    .map(([species, count]) => [species, Number(count)]);
+  const sum = entries.reduce((acc, [, count]) => acc + count, 0);
+  if (target === 0 || sum === 0) return {};
+  const order = entries.map(([species]) => species).sort();
+  const exact = new Map(order.map((species) => [species, (Number(counts[species]) / sum) * target]));
+  const out = {};
+  let allocated = 0;
+  for (const species of order) {
+    const floor = Math.floor(exact.get(species));
+    out[species] = floor;
+    allocated += floor;
+  }
+  const remainders = order
+    .map((species) => ({ species, remainder: exact.get(species) - out[species] }))
+    .sort((a, b) => b.remainder - a.remainder || (a.species < b.species ? -1 : 1));
+  let remaining = target - allocated;
+  for (const { species } of remainders) {
+    if (remaining <= 0) break;
+    out[species] += 1;
+    remaining -= 1;
+  }
+  let guard = 0;
+  while (remaining > 0 && order.length > 0 && guard < order.length) {
+    out[order[0]] += 1;
+    remaining -= 1;
+    guard += 1;
+  }
+  return out;
+}
+
+/**
+ * Generate species-exact conventional controls: for every requested species,
+ * that many FRESH, standard species-initialized genomes.
  *
- * Builds exactly the Research cohort's species counts using the ordinary
- * species/genome initialization every species already uses, so a match on the
- * species axis removes species composition as a confound. This is a DIFFERENT
- * conventional construction from the default entrant-pool control and is
- * therefore opt-in — the report always states which one was used.
+ * Hard rules (all enforced here, not by convention):
+ *   - a generated digest is never reused (`avoidDigests` plus the digests of
+ *     this batch), so no genome occupies a second slot and no control can be a
+ *     copy of a Research genome;
+ *   - a species is NEVER substituted for another — an unattainable quota is
+ *     reported as a shortfall instead;
+ *   - generation is deterministic for a given seed.
+ *
+ * @param {{
+ *   counts?: Record<string, number>,
+ *   seed?: string,
+ *   avoidDigests?: string[],
+ *   maxAttemptsPerGenome?: number,
+ * }} options
+ */
+export function speciesMatchControlSeeds({
+  counts = {},
+  seed = "ab-species-match",
+  avoidDigests = [],
+  maxAttemptsPerGenome = 64,
+} = {}) {
+  const avoid = new Set((Array.isArray(avoidDigests) ? avoidDigests : []).filter(Boolean));
+  const attemptsPerGenome = Math.max(1, Math.round(Number(maxAttemptsPerGenome) || 1));
+  const random = createSeededRandom(`ab-species-match:${seed}`);
+  const seeds = [];
+  const achievedCounts = {};
+  const shortfall = {};
+  // Deterministic species order: the requested species (sorted) first. Species
+  // with a zero count consume no slot.
+  const order = [...new Set([...Object.keys(counts ?? {}).sort(), ...SPECIES])];
+  for (const species of order) {
+    const count = Math.max(0, Math.round(Number(counts?.[species] ?? 0) || 0));
+    if (count === 0) continue;
+    let made = 0;
+    const budget = count * attemptsPerGenome;
+    for (let attempt = 0; attempt < budget && made < count; attempt += 1) {
+      const genome = randomGenome(species, random);
+      const digest = digestOf(genome);
+      if (avoid.has(digest)) continue;
+      avoid.add(digest);
+      seeds.push({ genome, species, origin: "immigrant", digest });
+      made += 1;
+    }
+    achievedCounts[species] = made;
+    if (made < count) shortfall[species] = count - made;
+  }
+  return {
+    seeds,
+    achievedCounts,
+    shortfall,
+    requestedCounts: { ...counts },
+    ok: Object.keys(shortfall).length === 0,
+  };
+}
+
+/**
+ * Keep, per species, only the first `counts[species]` entries — in the cohort's
+ * own natural order. Used for a symmetric per-species shrink; it never selects
+ * by performance and never changes a retained genome.
+ */
+export function trimSpeciesCounts(entries = [], counts = {}) {
+  const seen = {};
+  const out = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const species = speciesOf(entry);
+    if (!species) continue;
+    const limit = Number(counts?.[species] ?? 0);
+    if (!Number.isFinite(limit) || limit <= 0) continue;
+    const used = seen[species] ?? 0;
+    if (used >= limit) continue;
+    seen[species] = used + 1;
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Build the complete strict species-matched plan for one A/B run.
+ *
+ * The REFERENCE distribution is the Research cohort exactly as the research
+ * pipeline produced it (never reshaped, never re-sorted by performance). The
+ * conventional controls are generated to those exact species counts, and a
+ * quota that cannot be filled as UNIQUE controls shrinks BOTH cohorts
+ * symmetrically — with no cloning and no species substitution anywhere.
+ *
+ * @param {{
+ *   researchSeeds?: object[],
+ *   requestedPerCohort?: number,
+ *   seed?: string,
+ *   maxAttemptsPerGenome?: number,
+ *   extraAvoidDigests?: string[],
+ * }} options
+ */
+export function planSpeciesMatchedCohort({
+  researchSeeds = [],
+  requestedPerCohort = 0,
+  seed = "ab-species-match",
+  maxAttemptsPerGenome = 64,
+  extraAvoidDigests = [],
+} = {}) {
+  const researchUnique = dedupeSeedEntrants(researchSeeds).unique;
+  const request = Math.max(0, Math.round(Number(requestedPerCohort) || 0));
+  const perCohort = Math.min(request, researchUnique.length);
+  const referenceSeeds = researchUnique.slice(0, perCohort);
+  const requestedCounts = speciesCountsOf(referenceSeeds);
+  const identified = Object.values(requestedCounts).reduce((acc, count) => acc + count, 0);
+  const base = {
+    requestedMatchMode: "species-matched",
+    requestedPerCohort: request,
+    perCohort,
+    uniqueResearchSeeds: researchUnique.length,
+    requestedCounts,
+    cloningToFillQuota: 0,
+    substitutedSpecies: 0,
+  };
+
+  if (perCohort === 0) {
+    return {
+      ...base,
+      ok: false,
+      counts: {},
+      matchedPerCohort: 0,
+      research: [],
+      conventional: [],
+      shortfall: {},
+      symmetricShrink: false,
+      noCloning: true,
+      error: "no unique research seed genome is available to species-match against",
+    };
+  }
+  if (identified !== referenceSeeds.length) {
+    return {
+      ...base,
+      ok: false,
+      counts: {},
+      matchedPerCohort: 0,
+      research: [],
+      conventional: [],
+      shortfall: {},
+      symmetricShrink: false,
+      noCloning: true,
+      error: `${referenceSeeds.length - identified} research seed genome(s) carry no species identity, so an exact species match cannot be guaranteed`,
+    };
+  }
+
+  const controls = speciesMatchControlSeeds({
+    counts: requestedCounts,
+    seed,
+    avoidDigests: [
+      ...referenceSeeds.map((entry) => genomeDigestOf(entry)).filter(Boolean),
+      ...(Array.isArray(extraAvoidDigests) ? extraAvoidDigests.filter(Boolean) : []),
+    ],
+    maxAttemptsPerGenome,
+  });
+  const counts = { ...controls.achievedCounts };
+  const research = trimSpeciesCounts(referenceSeeds, counts);
+  const conventional = trimSpeciesCounts(controls.seeds, counts);
+  const matchedPerCohort = Object.values(counts).reduce((acc, count) => acc + count, 0);
+  if (matchedPerCohort === 0) {
+    return {
+      ...base,
+      ok: false,
+      counts,
+      matchedPerCohort,
+      research,
+      conventional,
+      shortfall: controls.shortfall,
+      symmetricShrink: true,
+      noCloning: true,
+      error: `no unique species-matched control genome could be produced for ${JSON.stringify(requestedCounts)} (shortfall ${JSON.stringify(controls.shortfall)}); species are never substituted and genomes are never cloned`,
+    };
+  }
+
+  return {
+    ...base,
+    ok: true,
+    counts,
+    matchedPerCohort,
+    research,
+    conventional,
+    shortfall: controls.shortfall,
+    symmetricShrink: !controls.ok,
+    noCloning: true,
+    error: null,
+  };
+}
+
+/**
+ * The strict species-matching INVARIANT, checked at the formal evaluation
+ * freeze: speciesCounts(research) === speciesCounts(conventional) exactly —
+ * plus no cloned/duplicated genome digest inside a cohort and no digest shared
+ * across cohorts. Returns an explicit verdict; a caller must never continue on
+ * `ok: false`.
+ */
+export function enforceSpeciesMatchInvariant({
+  research = [],
+  conventional = [],
+  expectedCounts = null,
+  requested = true,
+} = {}) {
+  const researchList = Array.isArray(research) ? research : [];
+  const conventionalList = Array.isArray(conventional) ? conventional : [];
+  const researchCounts = speciesCountsOf(researchList);
+  const conventionalCounts = speciesCountsOf(conventionalList);
+  const verdict = speciesMatchVerdict(researchCounts, conventionalCounts);
+
+  const digestsIn = (rows) => {
+    const seen = new Set();
+    const duplicates = [];
+    for (const row of rows) {
+      const digest = genomeDigestOf(row);
+      if (!digest) continue;
+      if (seen.has(digest)) duplicates.push(digest);
+      else seen.add(digest);
+    }
+    return { digests: seen, duplicates };
+  };
+  const researchDigests = digestsIn(researchList);
+  const conventionalDigests = digestsIn(conventionalList);
+  const sharedDigests = [...conventionalDigests.digests]
+    .filter((digest) => researchDigests.digests.has(digest))
+    .sort();
+
+  const expected = expectedCounts == null ? null : { ...expectedCounts };
+  const expectedSatisfied =
+    expected == null
+      ? true
+      : speciesCountsEqual(researchCounts, expected) && speciesCountsEqual(conventionalCounts, expected);
+
+  const reasons = [];
+  if (!verdict.matched) {
+    reasons.push(
+      `species counts differ (research ${JSON.stringify(researchCounts)} vs conventional ${JSON.stringify(conventionalCounts)})`,
+    );
+  }
+  if (researchDigests.duplicates.length > 0 || conventionalDigests.duplicates.length > 0) {
+    reasons.push(
+      `no-cloning violated: duplicate genome digest inside a cohort (research ${researchDigests.duplicates.length}, conventional ${conventionalDigests.duplicates.length})`,
+    );
+  }
+  if (sharedDigests.length > 0) {
+    reasons.push(`no-cloning violated: ${sharedDigests.length} genome digest(s) appear in BOTH cohorts`);
+  }
+  if (!expectedSatisfied) {
+    reasons.push(`frozen species counts deviate from the agreed quotas ${JSON.stringify(expected)}`);
+  }
+  const ok = reasons.length === 0;
+  return {
+    ok,
+    requested: requested === true,
+    matched: verdict.matched,
+    researchCounts,
+    conventionalCounts,
+    deltas: verdict.deltas,
+    expectedCounts: expected,
+    expectedSatisfied,
+    sharedDigests,
+    duplicateDigests: {
+      research: researchDigests.duplicates,
+      conventional: conventionalDigests.duplicates,
+    },
+    researchCohortSize: researchList.length,
+    conventionalCohortSize: conventionalList.length,
+    reason: ok ? null : reasons.join("; "),
+  };
+}
+
+/** One-line species distribution, e.g. `Reversal 12, Wallet Flow 1`. */
+export function describeSpeciesCounts(counts = {}) {
+  const entries = Object.entries(counts ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  if (entries.length === 0) return "(none)";
+  return entries.map(([species, count]) => `${species} ${count}`).join(", ");
+}
+
+/**
+ * Species-matched conventional controls over a Research seed list (Phase 5A.3
+ * entry point, kept for compatibility). Species-exact, deterministic, and
+ * digest-unique: the same seed list always yields the same controls.
  *
  * @param {{ researchSeeds?: object[], population?: number, seed?: string }} options
  */
 export function speciesMatchedConventionalSeeds({ researchSeeds = [], population = 0, seed = "ab-species-match" } = {}) {
   const seeds = Array.isArray(researchSeeds) ? researchSeeds : [];
   const target = Math.max(0, Math.min(Math.round(Number(population) || 0), seeds.length));
-  const counts = {};
-  for (const entry of seeds.slice(0, target)) {
-    const species = entry?.species ?? entry?.research?.species ?? "Experimental";
-    counts[species] = (counts[species] ?? 0) + 1;
-  }
-  const random = createSeededRandom(`ab-species-match:${seed}`);
-  const out = [];
-  // Deterministic species order: research species first (sorted), then any
-  // remaining standard species (so zero-count species consume no slot).
-  const order = [...new Set([...Object.keys(counts).sort(), ...SPECIES])];
-  for (const species of order) {
-    const count = counts[species] ?? 0;
-    for (let index = 0; index < count; index += 1) {
-      out.push({ genome: randomGenome(species, random), species, origin: "immigrant" });
-    }
-  }
-  return out;
+  const reference = seeds.slice(0, target);
+  const counts = speciesCountsOf(reference);
+  const { seeds: controls } = speciesMatchControlSeeds({
+    counts,
+    seed,
+    avoidDigests: reference.map((entry) => genomeDigestOf(entry)).filter(Boolean),
+  });
+  return controls;
 }
 
 /** Compact one-line startup summary, e.g. `research=84 conventional=84 total=168`. */
