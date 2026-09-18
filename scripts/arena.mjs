@@ -430,6 +430,10 @@ async function main() {
   console.log(`[arena] seeds=${seeds.length} champions re-entering=${champions.length} workers=${workers || "auto"} generations=${generations}`);
 
   const cacheDir = path.join(".evolve", "arena-cache");
+  // Phase 5C: the replication runner keeps its per-dataset arenas inside its own
+  // run directory (`EVOLVE_ARENA_DIR`), so the shared `.evolve/arenas` registry
+  // is never polluted with replication output. Default behavior is unchanged.
+  const arenasDir = process.env.EVOLVE_ARENA_DIR ?? DEFAULT_ARENA_DIR;
   const useCache = args["no-cache"] !== true;
   const maxWindows = args["max-windows"] ? Number(args["max-windows"]) : null;
 
@@ -807,7 +811,7 @@ async function main() {
     cacheDir,
     useCache,
     arenaId,
-    arenasDir: DEFAULT_ARENA_DIR,
+    arenasDir,
     researchCohort,
     researchMode: includeResearch ? researchMode : null,
     researchAccounting,
@@ -863,7 +867,10 @@ async function main() {
   }
 
   // ---- Hall of Fame merge -------------------------------------------------
-  const hofDir = config.hallOfFameDir ?? DEFAULT_HOF_DIR;
+  // Phase 5C: `EVOLVE_HALL_OF_FAME_DIR` lets the replication runner keep its
+  // runs from writing into the shared historical Hall of Fame. Default
+  // behavior is unchanged.
+  const hofDir = process.env.EVOLVE_HALL_OF_FAME_DIR ?? config.hallOfFameDir ?? DEFAULT_HOF_DIR;
   await ensureDir(hofDir);
   const hofFile = path.join(hofDir, "index.json");
   let hof = { members: [] };
@@ -939,7 +946,7 @@ async function main() {
       if (experiment) {
         const summary = researchExperimentSummary(experiment);
         await writeFile(
-          path.join(DEFAULT_ARENA_DIR, arenaId, "research-experiment.json"),
+          path.join(arenasDir, arenaId, "research-experiment.json"),
           `${JSON.stringify({ ...summary, researchRoot }, null, 2)}\n`,
           "utf8",
         );

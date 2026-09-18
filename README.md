@@ -77,6 +77,10 @@ npm run validate:phase41 # Phase 4.1 correctness-pass checks (offline)
 npm run validate:phase5a # Phase 5A + 5A.1 research-swarm checks (offline)
 npm run validate:phase5a2# Phase 5A.2 research-cohort checks (offline)
 npm run validate:phase5a3# Phase 5A.3 matched research-vs-conventional A/B checks (offline)
+npm run validate:phase5b # Phase 5B DeepSeek-provider checks (offline, stub Cline)
+npm run validate:phase5c # Phase 5C multi-dataset replication checks (offline)
+npm run datasets:research # Phase 5C dataset registry (classification, overlap, eligibility)
+npm run replicate:research -- --cohorts  # freeze/inspect the frozen research cohorts
 npm run smoke:engine     # deterministic synthetic-mode evolution smoke run
 npm run smoke:replay     # offline record → replay → walk-forward smoke run
 npm run smoke:arena      # tiny offline Champion Arena funnel
@@ -1516,6 +1520,199 @@ failure is caught, recorded as a provider status, and the paper engine continues
 experiments, prefer the bounded cohort command above (generate once, then point the Arena at the
 experiment root), which keeps the live loop on the deterministic mock.
 
+## Phase 5C — Multi-Dataset Replication
+
+Still **PAPER ONLY**, with no wallet, no signing, and no execution path of any kind. Phase 5C does
+not add any new capability to trade, and it does not tune anything.
+
+Phase 5B answered a narrow question on **one development dataset**: did the DeepSeek research cohort
+beat the deterministic mock cohort in a matched A/B Arena on
+`session-20260917T164922Z-live`? The answer was an observation, not a result — no significance claim
+and no winner. Phase 5C asks a different question:
+
+> **Do the observed Research-vs-Conventional deltas REPLICATE across independent market samples?**
+
+### What Phase 5C is (and is not)
+
+```text
+frozen Mock research cohort
+  + frozen DeepSeek research cohort
+  + multiple INDEPENDENT real datasets
+  + the SAME strict, species-matched A/B Arena
+  → per-dataset within-run deltas
+  → cross-dataset descriptive replication analysis
+```
+
+Key properties, stated plainly:
+
+- **Research cohorts are frozen.** Primary replication never asks DeepSeek for new hypotheses. Phase 5C
+  tests whether an *already-created* cohort generalizes, not whether a model can write a different
+  strategy after seeing each dataset. That would be research generation, not replication.
+- **Primary replication makes ZERO LLM calls.** The frozen cohort is a directory of compiled genomes;
+  the Arena reads it with `EVOLVE_RESEARCH_ROOT` and generates each provider's own conventional control
+  deterministically. `freeze.replication.llmCallsRequired` is `false` and the runner pins
+  `EVOLVE_RESEARCH_PROVIDER=mock` so no external provider is even resolvable.
+- **New datasets must be independent real captures.** A capture is a replication dataset only if it is
+  `REAL` (live-only), `complete`, fingerprinted, long enough, rich enough, has zero temporal overlap
+  with the already-selected datasets, and is not fingerprint-identical to one already counted.
+- **Internal species matching remains per provider × dataset.** The Mock arm is matched to its own
+  conventional control; the DeepSeek arm is matched to *its* own control. The two provider arms are
+  deliberately **not** species-identical to each other — that is what keeps the provider comparison
+  honest.
+- **The unit of replication is the DATASET.** Individual genomes are never pooled across datasets as
+  independent observations, and walk-forward windows sliced out of one capture are never treated as
+  separate datasets.
+- **Synthetic does not count as real**, mixed data does not count as real, and an interrupted
+  (`recording`) capture is not a replication sample — a `*-live` directory is validated, never assumed.
+- **Overlapping datasets do not count independently.** Overlap duration and both overlap fractions are
+  computed; any overlap marks the pair `NOT_INDEPENDENT` and excludes the later capture.
+- **No tuning from replication outcomes.** Eligibility is performance-blind by construction: no
+  eligibility function ever receives a score, return, rank, or gate outcome.
+- **Descriptive statistics only.** No significance test, no p-value, `significance: null`,
+  `verdict: null`. Uncertainty, where shown, is a deterministic **dataset-level** bootstrap.
+- **No profitability claim.** A replication status describes observed paper deltas. Nothing here
+  predicts profit, and zero Deployment Candidates remains a perfectly acceptable outcome.
+
+### The freeze artifact
+
+`npm run replicate:research -- --verify-freeze` compares the LIVE code/config against
+`.evolve/replication/phase5c-freeze.json` and **fails** on critical drift — a changed Arena score
+version, generations, gate table, prompt version, proposal-schema version, evidence-packet version,
+compiler version, watchdog version, species-match mode, or DeepSeek model/reasoning would all be a
+different experiment and are refused. Advisory (non-fatal) drift is reported separately. The
+`freezeDigest` is deterministic (it excludes only the wall-clock `createdAt`), and every replication
+unit records it.
+
+### Frozen cohorts
+
+```text
+.evolve/replication/cohorts/<key>/
+  compiled/F-*.json        exactly the frozen genomes (Arena-readable)
+  experiment.json          provider provenance, when the source recorded one
+  cohort-manifest.json     genome digest, species, family, proposal/role ancestry, cohortDigest
+```
+
+Two cohorts are frozen, from sources that are **never mutated**:
+
+| Cohort | Source | Provider |
+| --- | --- | --- |
+| `mock` | `.evolve/research` (the canonical mock A/B cohort) | `mock` (deterministic, offline) |
+| `deepseek` | `exp-20260918T115857Z-deepseek-cline-a7abe2` | `deepseek-cline` / `deepseek/deepseek-v4.1-flash` (`xhigh`) |
+
+A research root is staged per unit, so a run's Arena promotion step can never write into the frozen
+artifact or into the historical `.evolve/research` memory.
+
+### Dataset registry, independence, leakage, eligibility
+
+```bash
+npm run datasets:research          # human table
+npm run datasets:research -- --json
+```
+
+Every dataset under `.evolve/history` is classified `REAL` / `SYNTHETIC` / `MIXED` / `INVALID` and
+validated (manifest present, `complete`, fingerprint valid, positive duration, snapshots present).
+The report includes id, path, fingerprint, start/end, duration, snapshots, observations, unique mints,
+feed source, capture interval, completion state, error counts, temporal overlap with every other REAL
+capture (with both overlap fractions), the eligibility decision and its reasons, and the
+`DEVELOPMENT` / `REPLICATION` / `CONTAMINATED` / `UNKNOWN` / `INELIGIBLE` / `NON_REAL` / `INVALID` role.
+
+The **leakage matrix** classifies every (cohort × dataset) pair:
+
+| Class | Meaning |
+| --- | --- |
+| `DEVELOPMENT` | the development/original-benchmark dataset — never an independent replication sample |
+| `CONTAMINATED` | used to generate a cohort's TRAIN evidence, recorded in a prior manual decision, or evaluated by a prior Arena (Arena/gate tuning exposure) |
+| `CLEAN_REPLICATION` | no recorded use by research generation, compiler/arena/gate tuning, or a prior manual decision |
+| `UNKNOWN` | the provenance records needed to decide are unavailable — conservatively NOT eligible |
+
+Only `CLEAN_REPLICATION` pairs may support a cross-dataset generalization statement.
+
+### Running replication
+
+```bash
+npm run replicate:research -- --cohorts            # freeze/print the frozen cohort manifests
+npm run replicate:research -- --verify-freeze      # FAIL on critical config drift
+npm run replicate:research -- --freeze phase5c --datasets auto
+npm run replicate:research -- --datasets session-A,session-B
+npm run replicate:research -- --plan               # deterministic plan, no Arena is run
+npm run replicate:research -- --summary            # cross-dataset summary
+```
+
+For each eligible dataset the runner executes the same strict species-matched A/B experiment twice —
+once with the frozen Mock cohort, once with the frozen DeepSeek cohort — each against its own freshly
+generated deterministic conventional control. Execution is **synchronous and resumable**: the run
+manifest is rewritten after every completed unit, finished units are never redone, failed units are
+retried on resume, and `--rerun` re-executes a completed unit only when explicitly asked (labelled
+with the unit it replaces). There is no daemon and no hidden background process.
+
+Run identity is deterministic: `rep-<digest>` over the freeze digest, the frozen cohort digests, the
+providers, and the frozen evaluation config; `unit-<digest>` over the replication id, provider, dataset
+fingerprint, and cohort digest. Re-running the identical experiment reproduces the identical ids and is
+detected rather than silently replaced. A run whose commit or working tree does not match the freeze is
+refused unless `--dev` is passed, and is then permanently labelled `NON_CANONICAL`.
+
+### Aggregation
+
+For each dataset with both providers complete:
+
+```text
+mockDelta     = Mock     research arm − its own matched conventional arm
+deepseekDelta = DeepSeek research arm − its own matched conventional arm
+deltaOfDeltas = deepseekDelta − mockDelta        (the SAME dataset)
+```
+
+Cross-dataset aggregation then reports, per metric: n, per-dataset delta, median, mean, min, max, q1,
+q3, positive/negative/zero counts, and direction consistency. Lower-is-better metrics (cost drag,
+drawdown, final rank) keep their **raw** sign — `direction` is metadata only, and nothing is rewritten
+into an artificial benefit. If at least three CLEAN datasets exist, leave-one-dataset-out sensitivity
+is reported (labelled sensitivity analysis, never cross-validation). Regime composition is read-only
+context from the existing classifier; no threshold is fitted.
+
+Replication status vocabulary (descriptive, not a rating):
+
+| CLEAN datasets | Status |
+| --- | --- |
+| 0 | `NO_REPLICATION_EVIDENCE` |
+| 1 | `SINGLE_REPLICATION` |
+| 2 | `LIMITED_REPLICATION` |
+| 3+ | `MULTI_DATASET_REPLICATION` |
+| fewer than 2 clean datasets exist | `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` |
+
+### Minimum-dataset policy
+
+Walk-forward windows from one capture are **not** independent datasets, and Phase 5C never manufactures
+extra datasets by slicing one hour-long capture into pseudo-independent pieces. If the repository does
+not hold enough independent clean real captures, the correct result is
+`INSUFFICIENT_INDEPENDENT_REAL_DATASETS`: the implementation is complete and the replication run simply
+waits for future captures. Real market history is collected with the existing, unmodified commands:
+
+```bash
+EVOLVE_MARKET_MODE=live npm run record:market -- --minutes 60 --interval 5000
+```
+
+Capture separate sessions at different times and regimes, let each run finalize (`complete`, with a
+fingerprint), and do not change capture behavior, endpoints, or filters to influence how a strategy
+scores. Observation remains strictly read-only.
+
+### Commands
+
+```bash
+npm run replicate:research -- --cohorts
+npm run replicate:research -- --verify-freeze
+npm run replicate:research -- --plan
+npm run replicate:research -- --freeze phase5c --datasets auto
+npm run replicate:research -- --summary
+npm run datasets:research
+npm run validate:phase5c
+```
+
+### Dashboard
+
+The Research/Arena state carries a compact `replication` block (freeze digest, real datasets, clean
+replication datasets, frozen cohort counts, completed/pending/failed units, current replication
+status) and a small Phase 5C panel. It reads only tiny artifacts — never the full per-dataset metric
+tables — and exposes no credentials.
+
 ## Validation
 
 ```bash
@@ -1690,6 +1887,40 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
   evidence accounting is preserved; evaluated candidates keep species-specific gene bounds; no Phase 5A.2
   module contains a wallet, signing, or transaction-execution path
 
+Phase 5C adds `npm run validate:phase5c` (73 offline cases):
+
+- **Freeze** — the artifact is clock-independent and deterministic; the digest is stable for identical
+  config and changes when anything does; the critical Arena/runner/cache/evaluator versions, population,
+  generations, seeds, stress profiles, survivor/breeder/mutation values, the gate table, evidence
+  thresholds, concentration bounds, provider config and every research version are all recorded;
+  critical drift FAILS verification while advisory drift is reported separately; a dirty tree or a
+  changed commit is labelled `NON_CANONICAL`
+- **Frozen cohorts** — the mock and DeepSeek cohorts are frozen with unique genomes, deterministic
+  cohort digests, and a payload that verifies byte-for-byte against the manifest; refreezing is
+  idempotent and never overwrites a different cohort
+- **Datasets** — discovery validates contents instead of trusting a `-live` name; synthetic/mixed are
+  separated and never counted as real; duplicate fingerprints count once; temporal overlap is detected
+  with both overlap fractions; invalid/incomplete captures are rejected; the development dataset is
+  classified `DEVELOPMENT` and never selected; walk-forward windows are never separate datasets
+- **Leakage & eligibility** — clean captures are `CLEAN_REPLICATION`, a previously-evaluated dataset is
+  `CONTAMINATED` (naming the arena), unavailable provenance is conservatively `UNKNOWN` and ineligible,
+  and eligibility is proven performance-blind (adding scores/returns/ranks/gate status cannot change a
+  decision)
+- **Identity, resume, provenance** — deterministic `rep-`/`unit-` ids, one unit per provider × dataset,
+  frozen cohorts staged into a unit-private research root that is never written to, the freeze digest
+  and dataset fingerprint recorded on every unit, crash-safe resume (failed units are retried, completed
+  units are not), an explicit labelled rerun, and equal resources / no cloning / strict species matching
+- **Metrics & pairing** — within-run deltas, raw lower-is-better signs, a delta-of-deltas that requires
+  the SAME dataset on both sides and is exactly `deepseek − mock`
+- **Aggregation** — the dataset is the unit, genome rows are never pooled, positive/negative/zero counts,
+  medians/means/quantiles, a deterministic dataset-level bootstrap, leave-one-out sensitivity (disabled
+  below three datasets), read-only regime context, `significance: null`, `verdict: null`, the status
+  vocabulary, and the `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` message
+- **Integrity & safety** — the canonical Phase 5B arenas and the DeepSeek research experiment stay
+  byte-identical, `compare:research` still declares no winner, the Phase 5B and strict A/B invariants
+  still hold, no Phase 5C module contains a wallet/signing/execution path, and replication shells out
+  only to the project's own Arena CLI with the deterministic provider pinned
+
 ## Roadmap
 
 ### Phase 1 — evolutionary lab
@@ -1816,6 +2047,25 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
 - [x] Challenger, fair, and normal Arena modes unchanged
 - [x] `deepseek-cline` available as an OPTIONAL provider since Phase 5B — the A/B instrument is ready for it, no run executed here
 - [ ] Real provider A/B result: **DeepSeek V4.1 Flash via Cline, xhigh** — implementation + instrument are ready; the 58-minute matched run has not been executed
+
+### Phase 5C — multi-dataset replication
+- [x] Versioned experiment freeze (`phase5c-freeze.json`) with a deterministic `freezeDigest`
+- [x] Freeze verification that FAILS on critical config drift (score/gates/prompt/compiler/species match)
+- [x] Frozen Mock and DeepSeek research cohorts as immutable, Arena-readable manifests
+- [x] Dataset registry: REAL/SYNTHETIC/MIXED/INVALID, fingerprints, completion state, error counts
+- [x] Temporal overlap analysis (both fractions) — overlapping captures are never independent
+- [x] Explicit, performance-blind eligibility criteria persisted with reasons per dataset
+- [x] Leakage matrix (DEVELOPMENT / CONTAMINATED / CLEAN_REPLICATION / UNKNOWN) per cohort × dataset
+- [x] Synchronous, resumable replication runner (`rep-`/`unit-` deterministic ids, no daemon)
+- [x] Frozen cohorts re-evaluated against each dataset with fresh species-matched controls per provider
+- [x] Zero LLM calls during replication; provider pinned to the deterministic mock
+- [x] Per-dataset metrics, paired delta-of-deltas, cross-dataset aggregation at the dataset level
+- [x] Descriptive statistics + deterministic dataset-level bootstrap; `significance: null`, `verdict: null`
+- [x] Leave-one-dataset-out sensitivity (≥3 clean datasets) and read-only regime context
+- [x] Replication status vocabulary + `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` handling
+- [x] `datasets:research`, `replicate:research` (freeze/cohorts/plan/run/summary), dashboard block
+- [x] `npm run validate:phase5c` — 73 offline cases
+- [ ] Canonical real Phase 5C replication run — waits for ≥2 independent CLEAN real captures
 
 ### Phase 5B — optional DeepSeek research provider (Cline CLI)
 - [x] `deepseek-cline` provider behind the existing provider abstraction; `mock` stays the default

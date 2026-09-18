@@ -497,6 +497,86 @@ export async function loadShadowLeague(dir) {
 }
 
 /**
+ * Compact Phase 5C replication status (PAPER ONLY, read-only).
+ *
+ * Reads only tiny artifacts: the freeze digest, the frozen cohort manifests,
+ * and the newest run's compact `status.json` (plus the run manifest's unit
+ * statuses). It never loads the large per-dataset summary tables, so the
+ * once-per-second dashboard poll stays cheap. No credentials, no genome rows.
+ */
+export async function loadReplicationState(root = path.join(process.cwd(), ".evolve")) {
+  const baseDir = path.join(root, "replication");
+  const freeze = await readJsonFile(path.join(baseDir, "phase5c-freeze.json"));
+  const cohorts = {};
+  for (const key of ["mock", "deepseek"]) {
+    const manifest = await readJsonFile(path.join(baseDir, "cohorts", key, "cohort-manifest.json"));
+    if (manifest) cohorts[key] = { count: manifest.count ?? null, cohortDigest: manifest.cohortDigest ?? null, provider: manifest.provider ?? null };
+  }
+
+  let dirs = [];
+  try {
+    dirs = (await readdir(baseDir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith("rep-"))
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    dirs = [];
+  }
+  const newest = dirs.length > 0 ? dirs[dirs.length - 1] : null;
+
+  let statusRecord = null;
+  let unitCounts = null;
+  if (newest) {
+    statusRecord = await readJsonFile(path.join(baseDir, newest, "status.json"));
+    const manifest = await readJsonFile(path.join(baseDir, newest, "manifest.json"));
+    if (manifest) {
+      const units = asArray(manifest.units);
+      const count = (value) => units.filter((unit) => unit.status === value).length;
+      unitCounts = {
+        total: units.length,
+        completed: count("COMPLETED"),
+        pending: count("PENDING") + count("RUNNING"),
+        failed: count("FAILED"),
+        skipped: count("SKIPPED") + count("INVALID_DATASET") + count("CONTAMINATED"),
+      };
+    }
+  }
+
+  if (!freeze && !statusRecord) {
+    return {
+      available: false,
+      paperOnly: true,
+      note: "No Phase 5C replication run has been prepared in this workspace yet (npm run replicate:research).",
+    };
+  }
+
+  return {
+    available: true,
+    paperOnly: true,
+    freezeVersion: freeze?.freezeVersion ?? null,
+    freezeDigest: freeze?.freezeDigest ?? null,
+    cohorts,
+    replicationId: statusRecord?.replicationId ?? newest ?? null,
+    status: statusRecord?.status ?? null,
+    replicationStatus: statusRecord?.replicationStatus ?? null,
+    realDatasets: statusRecord?.realDatasets ?? null,
+    cleanReplicationDatasets: statusRecord?.cleanReplicationDatasets ?? null,
+    eligibleReplicationDatasets: statusRecord?.eligibleReplicationDatasets ?? null,
+    developmentDatasets: statusRecord?.developmentDatasets ?? null,
+    contaminatedDatasets: statusRecord?.contaminatedDatasets ?? null,
+    unknownLeakageDatasets: statusRecord?.unknownLeakageDatasets ?? null,
+    syntheticDatasets: statusRecord?.syntheticDatasets ?? null,
+    duplicateFingerprintGroups: statusRecord?.duplicateFingerprintGroups ?? null,
+    units: unitCounts ?? statusRecord?.units ?? null,
+    significance: null,
+    verdict: null,
+    note:
+      statusRecord?.note ??
+      "Frozen research cohorts are re-evaluated against independent real datasets. Descriptive only — no winner and no profitability claim.",
+  };
+}
+
+/**
  * Assemble the two-mode research state.
  *
  * `researchSwarm` is the CURRENT Phase 5A swarm summary. It is taken from the
@@ -578,6 +658,7 @@ export async function readDashboardState({ root = path.join(process.cwd(), ".evo
     const arena = await loadLatestArena(path.join(root, "arenas"));
     const hallOfFame = await loadHallOfFame(path.join(root, "hall-of-fame"));
     const shadow = await loadShadowLeague(path.join(root, "shadow"));
+    const replication = await loadReplicationState(root);
 
     const researchState = buildResearchState({
       document,
@@ -610,6 +691,8 @@ export async function readDashboardState({ root = path.join(process.cwd(), ".evo
           // The two distinct concepts, side by side and never merged.
           researchSwarm: researchState.researchSwarm,
           historicalResearch: researchState.historicalResearch,
+          // Phase 5C: compact, read-only multi-dataset replication status.
+          replication,
         }
       : {
           error: "Unreadable engine state.",

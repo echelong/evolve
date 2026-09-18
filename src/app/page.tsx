@@ -326,6 +326,9 @@ type EvolveState = {
   // Phase 5A: the CURRENT controlled research swarm's cycle summary — the
   // propose -> validate -> compile -> watchdog -> memory loop.
   researchSwarm?: ResearchSwarm | null;
+  // Phase 5C: compact, read-only multi-dataset replication status. Counts and
+  // a freeze digest only — never the full per-dataset metric tables.
+  replication?: ReplicationState | null;
   stateContractVersion?: number;
   stateStale?: boolean;
   genealogy?: { nodes: number; lineages: number; prunedNodes: number; activeLineages: number; extinctLineages: number; maxGeneration: number };
@@ -343,6 +346,29 @@ type EvolveState = {
   };
   universe?: { tracked: number; max: number; usable: number; fresh: number; evicted: number };
   runtime?: { uptimeMs: number; startedAt: string; paperStartingCash: number; speciesCount: number; totalTrades: number; frozen: boolean };
+};
+
+type ReplicationState = {
+  available: boolean;
+  paperOnly?: boolean;
+  freezeVersion?: string | null;
+  freezeDigest?: string | null;
+  replicationId?: string | null;
+  status?: string | null;
+  replicationStatus?: string | null;
+  realDatasets?: number | null;
+  cleanReplicationDatasets?: number | null;
+  eligibleReplicationDatasets?: number | null;
+  developmentDatasets?: number | null;
+  contaminatedDatasets?: number | null;
+  unknownLeakageDatasets?: number | null;
+  syntheticDatasets?: number | null;
+  duplicateFingerprintGroups?: number | null;
+  cohorts?: Record<string, { count: number | null; cohortDigest: string | null; provider: string | null }>;
+  units?: { total: number; completed: number; pending: number; failed: number; skipped: number } | null;
+  significance: null;
+  verdict: null;
+  note?: string;
 };
 
 type Range = { start: number; end: number };
@@ -1240,6 +1266,99 @@ function EvolutionResearchPanel({ state, research }: { state: EvolveState; resea
  * breeding boundary — this shows whether island targets are actually being
  * held, not just a re-labelled species breakdown.
  */
+/**
+ * Phase 5C replication panel. Descriptive only: it shows how many independent
+ * real datasets exist and the frozen cohort digests — never a winner, and never
+ * a profitability claim. Absent entirely when no replication run was prepared.
+ */
+function ReplicationPanel({ state }: { state: EvolveState }) {
+  const replication = state.replication ?? null;
+  if (!replication) return null;
+
+  return (
+    <div className="panel replication-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">
+            PAPER RESEARCH <span className="paper-tag">PAPER</span>
+          </p>
+          <h2>Multi-dataset replication (Phase 5C)</h2>
+        </div>
+        <FlaskConical size={20} />
+      </div>
+
+      {replication.available ? (
+        <>
+          <div className="health-grid">
+            <div className="health-item">
+              <span>Freeze</span>
+              <strong>{replication.freezeVersion ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Freeze digest</span>
+              <strong className="mono">{(replication.freezeDigest ?? "—").slice(0, 12)}</strong>
+            </div>
+            <div className="health-item">
+              <span>Replication status</span>
+              <strong>{replication.status ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Real datasets</span>
+              <strong>{replication.realDatasets ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Clean replication datasets</span>
+              <strong>{replication.cleanReplicationDatasets ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Development / contaminated</span>
+              <strong>
+                {replication.developmentDatasets ?? "—"} / {replication.contaminatedDatasets ?? "—"}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Unknown leakage / synthetic</span>
+              <strong>
+                {replication.unknownLeakageDatasets ?? "—"} / {replication.syntheticDatasets ?? "—"}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Frozen cohorts</span>
+              <strong>
+                {Object.entries(replication.cohorts ?? {})
+                  .map(([key, cohort]) => `${key} ${cohort.count ?? "?"}`)
+                  .join(" · ") || "—"}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Units completed</span>
+              <strong>
+                {replication.units?.completed ?? 0} / {replication.units?.total ?? 0}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Units pending / failed</span>
+              <strong>
+                {replication.units?.pending ?? 0} / {replication.units?.failed ?? 0}
+              </strong>
+            </div>
+          </div>
+          <p className="health-note">
+            Research cohorts are frozen; each independent real dataset re-evaluates the SAME cohorts against a freshly
+            generated species-matched control. The dataset is the replication unit, overlapping captures are not
+            independent, and no significance or profitability claim is made.
+          </p>
+        </>
+      ) : (
+        <p className="health-note">
+          {replication.note ??
+            "No Phase 5C replication run has been prepared yet — run npm run replicate:research -- --cohorts to freeze the research cohorts."}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function IslandsPanel({ state }: { state: EvolveState }) {
   const islands = state.islands ?? [];
   const totalPopulation = islands.reduce((sum, island) => sum + island.population, 0);
@@ -2238,6 +2357,12 @@ function Dashboard({
         <section className="dashboard-grid research-grid">
           <IslandsPanel state={state} />
           <ResearchSwarmPanel state={state} />
+        </section>
+      ) : null}
+
+      {state.replication ? (
+        <section className="dashboard-grid research-grid">
+          <ReplicationPanel state={state} />
         </section>
       ) : null}
 
