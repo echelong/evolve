@@ -23,27 +23,11 @@ import { createManualClock } from "./engine/clock.mjs";
 import { createSeededRandom } from "./lib/random.mjs";
 import { createMarketConfig } from "./market/config.mjs";
 import { createMarketFeed } from "./market/feed.mjs";
+import { parseArgs } from "./lib/args.mjs";
 
-export function parseArgs(argv) {
-  // Positional arguments (a dataset path, for example) land in `args._`.
-  const args = { _: [] };
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith("--")) {
-      args._.push(token);
-      continue;
-    }
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    if (next === undefined || next.startsWith("--")) {
-      args[key] = true;
-    } else {
-      args[key] = next;
-      index += 1;
-    }
-  }
-  return args;
-}
+// Re-exported for backward compatibility: fixture generation has no boolean
+// flags of its own, so callers that imported the old parser keep working.
+export { parseArgs };
 
 /**
  * Build a synthetic-only fixture dataset.

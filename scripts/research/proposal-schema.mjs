@@ -23,7 +23,7 @@
  * PAPER ONLY research machinery. Nothing here trades or executes.
  */
 
-import { GENOME_KEYS, GENE_BOUNDS } from "../engine/genome.mjs";
+import { GENOME_KEYS, GENE_BOUNDS, SPECIES } from "../engine/genome.mjs";
 import { FAMILY_NAMES } from "../engine/families.mjs";
 import { REGIMES } from "../arena/orchestrator.mjs";
 
@@ -51,6 +51,11 @@ const ALLOWED_TOP_KEYS = Object.freeze([
   "targetRegimes",
   "abstainRegimes",
   "parentFamilies",
+  // Optional explicit species label for the compiled genome. Without it the
+  // family's lead parent decides (the pre-5A.2 behaviour); with it, all six
+  // strategy species — including Experimental, which no preset blend can
+  // produce — are reachable by the research pipeline. Enum-checked below.
+  "targetSpecies",
   "changes",
   "rationale",
   "risks",
@@ -180,6 +185,17 @@ export function validateProposal(raw, { schemaVersion = PROPOSAL_SCHEMA_VERSION 
 
   const parentFamilies = sanitizeStringList(raw.parentFamilies, MAX_LENGTHS.parentFamilies, ALLOWED_FAMILIES, "parentFamilies", fail);
 
+  // Optional, but if present it must be a real species name (never a freeform
+  // label that would leak into island/species bookkeeping).
+  let targetSpecies = null;
+  if (raw.targetSpecies !== undefined && raw.targetSpecies !== null) {
+    if (typeof raw.targetSpecies !== "string" || !SPECIES.includes(raw.targetSpecies)) {
+      fail(`targetSpecies must be one of ${SPECIES.join(", ")}`);
+    } else {
+      targetSpecies = raw.targetSpecies;
+    }
+  }
+
   const risks = sanitizeStringList(raw.risks, MAX_LENGTHS.risks, null, "risks", fail, MAX_LENGTHS.riskItem);
 
   const changes = validateChanges(raw.changes, fail);
@@ -197,6 +213,7 @@ export function validateProposal(raw, { schemaVersion = PROPOSAL_SCHEMA_VERSION 
       targetRegimes,
       abstainRegimes,
       parentFamilies,
+      ...(targetSpecies ? { targetSpecies } : {}),
       changes,
       rationale,
       risks,

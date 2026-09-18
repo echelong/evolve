@@ -64,6 +64,36 @@ export const ARENA_STAGE = Object.freeze({
   DEPLOYMENT: "DEPLOYMENT CANDIDATES",
 });
 
+/**
+ * Phase 5A.2: candidate GATE status, deliberately separate from the legacy
+ * `CANDIDATE_STATUS` label. `CANDIDATE_STATUS.ARENA_SURVIVOR` never meant "in
+ * the Champion League final 8" — it meant "cleared every deployment gate but
+ * was classified a specialist". Splitting the concepts removes the ambiguity:
+ *
+ *   gateStatus = GATES_PASSED         every configured deployment gate passed
+ *   gateStatus = GATES_FAILED         at least one gate failed
+ *   gateStatus = INSUFFICIENT_EVIDENCE not enough evidence to judge at all
+ *
+ * Tournament progression is a separate axis (`TOURNAMENT_STAGE_ORDER`), and the
+ * final eight are the explicit `championLeague` list on the Arena summary —
+ * never inferred from a status string.
+ */
+export const GATE_STATUS = Object.freeze({
+  GATES_PASSED: "GATES_PASSED",
+  GATES_FAILED: "GATES_FAILED",
+  INSUFFICIENT_EVIDENCE: "INSUFFICIENT_EVIDENCE",
+});
+
+/** Tournament stages in funnel order (values match ARENA_STAGE). */
+export const TOURNAMENT_STAGE_ORDER = Object.freeze([
+  ARENA_STAGE.QUALIFICATION,
+  ARENA_STAGE.GROUP,
+  ARENA_STAGE.STRESS,
+  ARENA_STAGE.OOS,
+  ARENA_STAGE.CHAMPION_LEAGUE,
+  ARENA_STAGE.DEPLOYMENT,
+]);
+
 /** Shared directory helper. */
 export async function ensureDir(dir) {
   await mkdir(dir, { recursive: true });
@@ -825,22 +855,32 @@ export function evaluateSurvivalGates({
 
   let status;
   let reason;
+  let gateStatus;
   if (!sufficientEvidence) {
     status = CANDIDATE_STATUS.INSUFFICIENT_EVIDENCE;
+    gateStatus = GATE_STATUS.INSUFFICIENT_EVIDENCE;
     reason = "did not meet minimum evidence gates (trades/mints/observations)";
   } else if (failed.length > 0) {
     status = CANDIDATE_STATUS.ELIMINATED;
+    gateStatus = GATE_STATUS.GATES_FAILED;
     reason = failed.map((gate) => gate.label).join(", ");
   } else if (strategyType === STRATEGY_TYPE.SPECIALIST) {
     status = CANDIDATE_STATUS.ARENA_SURVIVOR;
+    gateStatus = GATE_STATUS.GATES_PASSED;
     reason = "specialist: additional regime-breadth validation required before deployment consideration";
   } else {
     status = CANDIDATE_STATUS.DEPLOYMENT_CANDIDATE;
+    gateStatus = GATE_STATUS.GATES_PASSED;
     reason = "passed all configured deployment gates (PAPER ONLY — not a profitability or safety claim)";
   }
 
   return {
     status,
+    // Phase 5A.2: explicit, unambiguous gate outcome. `deploymentGateStatus`
+    // is the same value under the name downstream consumers/tests asked for.
+    gateStatus,
+    deploymentGateStatus: gateStatus,
+    deploymentEligible: status === CANDIDATE_STATUS.DEPLOYMENT_CANDIDATE,
     reason,
     gates,
     passed: gates.length - failed.length,
@@ -1031,7 +1071,98 @@ export function aggregateCandidateEvaluation({
     ...overrides,
   };
 
-  return { digest, species: species ?? null, components, regimePerformance, stressSurvival };
+  return {
+    digest,
+    species: species ?? null,
+    components,
+    regimePerformance,
+    stressSurvival,
+    distinctMintDiagnostics: buildDistinctMintDiagnostics({ components, evidenceRuns }),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Phase 5A.2: distinct-mint diagnostics                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Explain WHY a candidate traded too few distinct mints, from evidence the
+ * engine actually recorded. This is diagnostic output only: it never changes
+ * `minimum distinct mints`, never relaxes a filter, and never awards credit.
+ *
+ * @returns {string[]} human-readable causes, ordered by how much evidence supports them
+ */
+export function explainDistinctMintShortfall(diagnostics = {}, minDistinctMints = 0) {
+  const reasons = [];
+  const d = diagnostics ?? {};
+  const mints = Math.max(0, Number(d.distinctMints ?? 0));
+  if (minDistinctMints > 0 && mints >= minDistinctMints) return reasons;
+
+  if ((d.eligibleMints ?? 0) > 0 && (d.eligibleMints ?? 0) <= mints) {
+    reasons.push(`the eligible universe itself was narrow (${d.eligibleMints} mints ever passed the genome's gates)`);
+  }
+  if ((d.noEligibleTicks ?? 0) > 0 && (d.eligibleTicks ?? 0) === 0) {
+    reasons.push(`no token ever cleared the genome's filters (${d.noEligibleTicks} ticks with zero eligible tokens)`);
+  }
+  if ((d.belowThresholdTicks ?? 0) > (d.trades ?? 0) * 3) {
+    reasons.push(`the entry-score threshold was rarely satisfied (${d.belowThresholdTicks} ticks below threshold)`);
+  }
+  if ((d.abstainedTicks ?? 0) > 0) {
+    reasons.push(`declared abstention skipped ${d.abstainedTicks} ticks`);
+  }
+  if ((d.blockedEntries ?? 0) > 0) {
+    reasons.push(`${d.blockedEntries} entries were blocked (position sizing or observed liquidity)`);
+  }
+  if ((d.pausedTicks ?? 0) > 0) {
+    reasons.push(`new entries were paused for ${d.pausedTicks} ticks (degraded feed)`);
+  }
+  if ((d.topMintNotionalShare ?? 0) >= 0.8 && mints <= 1) {
+    reasons.push("trading notional concentrated on a single mint");
+  }
+  if (reasons.length === 0) {
+    reasons.push("no single filter dominated; the evidence window simply offered few eligible mints");
+  }
+  return reasons;
+}
+
+/** Pool the per-run mint diagnostics into one candidate-level explanation. */
+export function buildDistinctMintDiagnostics({ components = {}, evidenceRuns = [] } = {}) {
+  const sum = {
+    opportunitiesObserved: 0,
+    eligibleTicks: 0,
+    eligibleMints: 0,
+    mintsEntered: 0,
+    trades: 0,
+    blockedEntries: 0,
+    abstainedTicks: 0,
+    noEligibleTicks: 0,
+    belowThresholdTicks: 0,
+    pausedTicks: 0,
+  };
+  let topMintNotionalShare = 0;
+  let runsWithDiagnostics = 0;
+  for (const run of Array.isArray(evidenceRuns) ? evidenceRuns : []) {
+    const md = run?.metrics?.mintDiagnostics;
+    if (!md || typeof md !== "object") continue;
+    runsWithDiagnostics += 1;
+    for (const key of Object.keys(sum)) {
+      const value = Number(md[key]);
+      if (Number.isFinite(value)) sum[key] += value;
+    }
+    const share = Number(md.topMintNotionalShare);
+    if (Number.isFinite(share)) topMintNotionalShare = Math.max(topMintNotionalShare, share);
+  }
+  const diagnostics = {
+    ...sum,
+    eligibleMints: Math.max(sum.eligibleMints, sum.mintsEntered),
+    distinctMints: Math.max(0, Math.round(components.distinctMints ?? 0)),
+    topMintNotionalShare: round6(topMintNotionalShare),
+    runsWithDiagnostics,
+  };
+  return {
+    ...diagnostics,
+    explanation: explainDistinctMintShortfall(diagnostics, 0),
+  };
 }
 
 /**
@@ -1077,8 +1208,12 @@ export function aggregateArenaResult({
     components: aggregate.components,
     regimePerformance: aggregate.regimePerformance,
     stressSurvival: aggregate.stressSurvival,
+    distinctMintDiagnostics: aggregate.distinctMintDiagnostics ?? null,
     arenaScore,
     status: gates.status,
+    gateStatus: gates.gateStatus,
+    deploymentGateStatus: gates.deploymentGateStatus,
+    deploymentEligible: gates.deploymentEligible,
     reason: gates.reason,
     gates: gates.gates,
     gateCounts: { passed: gates.passed, failed: gates.failed, total: gates.total },

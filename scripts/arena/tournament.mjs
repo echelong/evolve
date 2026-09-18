@@ -25,12 +25,20 @@ import {
   adaptMutationScale,
   ARENA_CACHE_VERSION,
   ARENA_SCORE_VERSION,
+  ARENA_STAGE,
+  GATE_STATUS,
   computeGenomeMetrics,
   diversityVerdict,
   DEFAULT_DEPLOYMENT_GATES,
   STRESS_PROFILES,
 } from "./orchestrator.mjs";
 import { EVALUATOR_VERSION } from "./evaluator.mjs";
+import {
+  descendantResearchMeta,
+  researchProvenance,
+  mergeResearchAncestry,
+  summarizeResearchCohort,
+} from "./research-cohort.mjs";
 
 export const ARENA_RUNNER_VERSION = 1;
 
@@ -46,6 +54,15 @@ export const WORKER_PATH = path.join(__dirname, "arena-worker.mjs");
  * immigrants, and mutated/crossover children of champions.
  * Deterministic given (champions, config, seed).
  */
+/** Provenance fields carried verbatim from a parent entrant. */
+function carriedMeta(source) {
+  const meta = {};
+  if (source?.origin) meta.origin = source.origin;
+  if (source?.research) meta.research = source.research;
+  if (source?.researchAncestry) meta.researchAncestry = source.researchAncestry;
+  return meta;
+}
+
 export function buildEntrantPool({ champions = [], population = 24, seed = "arena", championShare = 0.2, immigrantShare = 0.15, eliteCarryover = [] } = {}) {
   const random = createSeededRandom(`pool:${seed}`);
   const entrants = [];
@@ -54,29 +71,48 @@ export function buildEntrantPool({ champions = [], population = 24, seed = "aren
   const immigrantSlots = Math.max(1, Math.floor(population * immigrantShare));
   const evolvedSlots = Math.max(0, population - championSlots - immigrantSlots);
 
-  // Existing champions re-enter and must be able to lose.
+  // Existing champions re-enter and must be able to lose. Their provenance is
+  // carried verbatim: an unchanged research seed is still an exact original
+  // research genome, not a descendant of one.
   for (let i = 0; i < championSlots; i += 1) {
     const champ = champions[i % Math.max(1, champions.length)];
     if (!champ) break;
     entrants.push({
       genome: champ.genome,
       species: champ.species ?? "Champion",
-      origin: "champion",
       digest: champ.digest,
+      ...carriedMeta(champ),
+      origin: champ.origin ?? "champion",
     });
   }
 
   // "Evolved" slots: deterministic children of champions (crossover+mutation)
-  // or fresh species-preset genomes when no champions exist yet.
+  // or fresh species-preset genomes when no champions exist yet. Research
+  // ancestry survives breeding, but a bred child is labelled a DESCENDANT —
+  // never as an exact original research genome (Phase 5A.2 fair mode).
   for (let i = 0; i < evolvedSlots; i += 1) {
     if (champions.length >= 2) {
       const a = champions[Math.floor(random() * champions.length)];
       const b = champions[Math.floor(random() * champions.length)];
       const child = mutateGenome(crossoverGenomes(a.genome, b.genome, { random }), { scale: 0.08, random });
-      entrants.push({ genome: child, species: a.species ?? "Experimental", origin: "evolved" });
+      const ancestry = mergeResearchAncestry(a, b);
+      const descendant = descendantResearchMeta(ancestry);
+      entrants.push({
+        genome: child,
+        species: a.species ?? "Experimental",
+        origin: "evolved",
+        ...(descendant ? { research: descendant, researchAncestry: ancestry } : {}),
+      });
     } else if (champions.length === 1) {
       const child = mutateGenome(champions[0].genome, { scale: 0.08, random });
-      entrants.push({ genome: child, species: champions[0].species ?? "Experimental", origin: "evolved" });
+      const ancestry = mergeResearchAncestry(champions[0]);
+      const descendant = descendantResearchMeta(ancestry);
+      entrants.push({
+        genome: child,
+        species: champions[0].species ?? "Experimental",
+        origin: "evolved",
+        ...(descendant ? { research: descendant, researchAncestry: ancestry } : {}),
+      });
     } else {
       const species = SPECIES[i % SPECIES.length];
       entrants.push({ genome: randomGenome(species, random), species, origin: "immigrant" });
@@ -206,6 +242,13 @@ export async function runArenaTournament({
   onProgress = null,
   arenaId = null,
   arenasDir = null,
+  researchCohort = null,
+  researchMode = null,
+  researchAccounting = null,
+  researchRoleMetrics = null,
+  minUniqueRatio = null,
+  maxSpeciesShare = null,
+  researchEnabled = null,
 }) {
   const startedAt = Date.now();
   const log = (message, detail = null) => {
@@ -276,6 +319,9 @@ export async function runArenaTournament({
     if (!detail) continue;
     statuses.set(entrant, {
       status: detail.status,
+      gateStatus: detail.gateStatus ?? null,
+      deploymentGateStatus: detail.deploymentGateStatus ?? null,
+      deploymentEligible: detail.deploymentEligible === true,
       reason: detail.reason,
       gates: detail.gates,
       arenaScore: detail.arenaScore.score,
@@ -283,9 +329,89 @@ export async function runArenaTournament({
   }
 
   const deploymentCandidates = [...statuses.entries()]
-    .filter(([, row]) => row.status === "DEPLOYMENT CANDIDATE")
+    .filter(([, row]) => row.deploymentEligible === true)
     .map(([entrant, row]) => ({ entrant, ...row }))
     .sort((a, b) => b.arenaScore - a.arenaScore);
+
+  // ---------------- Tournament stage accounting (Phase 5A.2) ----------------
+  // The funnel stages are sets of entrants. For every entrant we record the
+  // HIGHEST stage it survived and, when it was culled, WHICH stage culled it,
+  // plus its overall rank. "The final eight" is therefore an explicit list
+  // (`championLeague`), never something inferred from a status string.
+  const qualificationSet = new Set(qualification.survivors);
+  const groupSet = new Set(group.survivors);
+  const stressSet = new Set(stress.survivors);
+  const championSet = new Set(championLeague.survivors);
+
+  const stageFor = (entrant) => {
+    if (championSet.has(entrant)) {
+      return { highestStage: ARENA_STAGE.CHAMPION_LEAGUE, eliminatedAtStage: null };
+    }
+    if (stressSet.has(entrant)) {
+      return { highestStage: ARENA_STAGE.STRESS, eliminatedAtStage: ARENA_STAGE.CHAMPION_LEAGUE };
+    }
+    if (groupSet.has(entrant)) {
+      return { highestStage: ARENA_STAGE.GROUP, eliminatedAtStage: ARENA_STAGE.STRESS };
+    }
+    if (qualificationSet.has(entrant)) {
+      return { highestStage: ARENA_STAGE.QUALIFICATION, eliminatedAtStage: ARENA_STAGE.GROUP };
+    }
+    return { highestStage: null, eliminatedAtStage: ARENA_STAGE.QUALIFICATION };
+  };
+
+  const digestFor = (entrant) => entrant.digest ?? digestOf(entrant.genome);
+  const rankedEntrants = [...entrants].sort((a, b) => {
+    const sa = scored.get(a) ?? -Infinity;
+    const sb = scored.get(b) ?? -Infinity;
+    if (sb !== sa) return sb - sa;
+    return String(digestFor(a)).localeCompare(String(digestFor(b)));
+  });
+  const rankByEntrant = new Map(rankedEntrants.map((entrant, index) => [entrant, index + 1]));
+
+  const candidateRows = rankedEntrants.map((entrant) => {
+    const detail = details.get(entrant) ?? null;
+    const entry = statuses.get(entrant) ?? {};
+    const stage = stageFor(entrant);
+    const rank = rankByEntrant.get(entrant) ?? null;
+    return {
+      digest: digestFor(entrant),
+      species: entrant.species ?? null,
+      origin: entrant.origin ?? null,
+      score: round2(scored.get(entrant) ?? 0),
+      finalRank: rank,
+      highestStage: stage.highestStage,
+      eliminatedAtStage: stage.eliminatedAtStage,
+      status: entry.status ?? null,
+      gateStatus: entry.gateStatus ?? null,
+      deploymentGateStatus: entry.deploymentGateStatus ?? null,
+      deploymentEligible: entry.deploymentEligible === true,
+      isChampionLeagueFinalist: championSet.has(entrant),
+      failedGates: (entry.gates ?? []).filter((gate) => !gate.pass).map((gate) => gate.label),
+      reason: entry.reason ?? null,
+      // Phase 5A.2: first-class research provenance (exact identity vs ancestry).
+      research: researchProvenance(entrant),
+      distinctMintDiagnostics: detail?.distinctMintDiagnostics ?? null,
+    };
+  });
+
+  // Role-level research metrics need this run's rows, so the caller may pass a
+  // provider function resolved once, after the rows exist.
+  const resolvedRoleMetrics =
+    typeof researchRoleMetrics === "function"
+      ? await researchRoleMetrics({ candidateRows, entrants })
+      : researchRoleMetrics;
+
+  // Explicit stage membership, written to rounds.json so a stage artifact can
+  // be inspected without recomputing the funnel.
+  const stageMembers = {
+    [ARENA_STAGE.QUALIFICATION]: qualification.survivors.map(digestFor),
+    [ARENA_STAGE.GROUP]: group.survivors.map(digestFor),
+    [ARENA_STAGE.STRESS]: stress.survivors.map(digestFor),
+    [ARENA_STAGE.CHAMPION_LEAGUE]: championLeague.survivors.map(digestFor),
+    [ARENA_STAGE.DEPLOYMENT]: deploymentCandidates.map(
+      (row) => row.entrant.digest ?? digestOf(row.entrant.genome),
+    ),
+  };
 
   // Every stage's `rule` documents exactly what "survivors" means there.
   // STRESS genuinely culls (candidates.json still carries full stress detail
@@ -348,27 +474,57 @@ export async function runArenaTournament({
     seeds: [...seeds],
     stressProfiles: [...stressProfiles],
     funnel,
-    leaderboard: [...scored.entries()]
-      .map(([entrant, score]) => ({
-        digest: entrant.digest ?? digestOf(entrant.genome),
-        species: entrant.species,
-        origin: entrant.origin,
-        score: round2(score),
-        status: statuses.get(entrant)?.status,
-        // Compact elimination context: which named gates this candidate
-        // failed, not the whole candidate/gate-detail object (see
-        // candidates.json for full per-gate pass/fail + numbers).
-        failedGates: (statuses.get(entrant)?.gates ?? [])
-          .filter((gate) => !gate.pass)
-          .map((gate) => gate.label),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 50),
+    leaderboard: candidateRows.slice(0, 50).map((row) => ({
+      digest: row.digest,
+      species: row.species,
+      origin: row.origin,
+      score: row.score,
+      status: row.status,
+      gateStatus: row.gateStatus,
+      deploymentGateStatus: row.deploymentGateStatus,
+      deploymentEligible: row.deploymentEligible,
+      finalRank: row.finalRank,
+      highestStage: row.highestStage,
+      eliminatedAtStage: row.eliminatedAtStage,
+      isChampionLeagueFinalist: row.isChampionLeagueFinalist,
+      // Compact elimination context: which named gates this candidate failed,
+      // not the whole candidate/gate-detail object (see candidates.json for
+      // full per-gate pass/fail + numbers).
+      failedGates: row.failedGates,
+      research: row.research,
+    })),
+    // The Champion League final eight, explicitly identified.
+    championLeague: candidateRows
+      .filter((row) => row.isChampionLeagueFinalist)
+      .sort((a, b) => a.finalRank - b.finalRank)
+      .map((row, index) => ({
+        leagueRank: index + 1,
+        digest: row.digest,
+        species: row.species,
+        origin: row.origin,
+        score: row.score,
+        finalRank: row.finalRank,
+        research: row.research,
+      })),
     deploymentCandidates: deploymentCandidates.map((row) => ({
       digest: row.entrant.digest ?? digestOf(row.entrant.genome),
       species: row.entrant.species,
       score: round2(row.arenaScore),
+      gateStatus: row.gateStatus ?? GATE_STATUS.GATES_PASSED,
+      research: researchProvenance(row.entrant),
     })),
+    researchSummary: summarizeResearchCohort({
+      enabled: researchEnabled ?? Boolean(researchCohort),
+      mode: researchMode ?? null,
+      cohort: researchCohort,
+      candidates: candidateRows,
+      championLeagueDigests: [...championSet].map((entrant) => digestFor(entrant)),
+      deploymentDigests: deploymentCandidates.map((row) => row.entrant.digest ?? digestOf(row.entrant.genome)),
+      minUniqueRatio: minUniqueRatio ?? undefined,
+      maxSpeciesShare: maxSpeciesShare ?? undefined,
+      accounting: researchAccounting,
+      roleMetrics: resolvedRoleMetrics,
+    }),
     baselines,
     diversity,
     diversityVerdict: verdict,
@@ -390,10 +546,12 @@ export async function runArenaTournament({
       evidence,
       stressProfiles,
       gatesConfig: config.arena?.gates ?? {},
+      candidateRows,
+      stageMembers,
     });
   }
 
-  return { summary, details, statuses, scored, evaluations };
+  return { summary, details, statuses, scored, evaluations, candidateRows, championLeague, stageMembers };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -576,33 +734,57 @@ async function writeArenaOutputs({
   evidence = null,
   stressProfiles = [],
   gatesConfig = {},
+  candidateRows = null,
+  stageMembers = null,
 }) {
   const dir = path.join(arenasDir, arenaId);
   await mkdir(dir, { recursive: true });
 
-  const candidates = entrants.map((entrant) => {
-    const digest = entrant.digest ?? digestOf(entrant.genome);
-    const detail = details.get(entrant);
-    return {
-      digest,
-      species: entrant.species,
-      origin: entrant.origin,
-      score: round2(scored.get(entrant) ?? 0),
-      status: statuses.get(entrant)?.status ?? null,
-      reason: statuses.get(entrant)?.reason ?? null,
-      components: detail?.components ?? null,
-      regimePerformance: detail?.regimePerformance ?? null,
-      stressSurvival: detail?.stressSurvival ?? null,
-      gates: detail?.gates ?? null,
-    };
-  });
+  // Phase 5A.2: candidates.json carries first-class provenance (origin,
+  // familyId, proposalId, authorRole, research family, regimes, genome digest,
+  // ancestry), explicit gate/champion-league status, and the distinct-mint
+  // diagnostics — no digest reconstruction required downstream.
+  const byDigest = new Map();
+  for (const entrant of entrants) byDigest.set(entrant.digest ?? digestOf(entrant.genome), entrant);
+
+  const candidates = Array.isArray(candidateRows) && candidateRows.length > 0
+    ? candidateRows.map((row) => {
+        const entrant = byDigest.get(row.digest);
+        const detail = entrant ? details.get(entrant) : null;
+        return {
+          ...row,
+          components: detail?.components ?? null,
+          regimePerformance: detail?.regimePerformance ?? null,
+          stressSurvival: detail?.stressSurvival ?? null,
+          gates: detail?.gates ?? null,
+        };
+      })
+    : entrants.map((entrant) => {
+        const digest = entrant.digest ?? digestOf(entrant.genome);
+        const detail = details.get(entrant);
+        return {
+          digest,
+          species: entrant.species,
+          origin: entrant.origin,
+          score: round2(scored.get(entrant) ?? 0),
+          status: statuses.get(entrant)?.status ?? null,
+          gateStatus: statuses.get(entrant)?.gateStatus ?? null,
+          reason: statuses.get(entrant)?.reason ?? null,
+          research: researchProvenance(entrant),
+          components: detail?.components ?? null,
+          regimePerformance: detail?.regimePerformance ?? null,
+          stressSurvival: detail?.stressSurvival ?? null,
+          gates: detail?.gates ?? null,
+        };
+      });
 
   const files = {
     "summary.json": summary,
     "candidates.json": candidates,
     "leaderboard.json": summary.leaderboard,
+    "champion-league.json": summary.championLeague ?? [],
     "deployment-candidates.json": summary.deploymentCandidates,
-    "rounds.json": summary.funnel,
+    "rounds.json": { funnel: summary.funnel, stageMembers: stageMembers ?? null },
   };
 
   for (const [name, payload] of Object.entries(files)) {

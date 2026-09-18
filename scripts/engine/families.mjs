@@ -200,6 +200,28 @@ export const CANDIDATE_FAMILIES = Object.freeze({
     parents: ["Reversal", "Wallet Flow"],
     description: "contrarian re-entries timed by net buyer flow turns",
   }),
+  // Phase 5A.2: the remaining approved directions. These add no new signal and
+  // no executable artifact — they are still deterministic two-preset blends
+  // resolved to plain genome fields. They exist because the pre-5A.2 family
+  // list could only ever name Momentum, Genesis Hunter, and Reversal as a lead
+  // parent, so Wallet Flow and Liquidity were unreachable as compiled species.
+  // Experimental is reachable through an explicit `targetSpecies` instead, since
+  // Experimental has no preset to blend.
+  "Genesis Hunter x Momentum": defineFamily({
+    name: "Genesis Hunter x Momentum",
+    parents: ["Genesis Hunter", "Momentum"],
+    description: "young-pool launch hunting confirmed by early momentum expansion",
+  }),
+  "Wallet Flow x Reversal": defineFamily({
+    name: "Wallet Flow x Reversal",
+    parents: ["Wallet Flow", "Reversal"],
+    description: "flow-led contrarian re-entries once buyer imbalance turns",
+  }),
+  "Liquidity x Wallet Flow": defineFamily({
+    name: "Liquidity x Wallet Flow",
+    parents: ["Liquidity", "Wallet Flow"],
+    description: "deep, safe pools entered only on genuine net-buyer flow",
+  }),
 });
 
 export const FAMILY_NAMES = Object.freeze(Object.keys(CANDIDATE_FAMILIES));

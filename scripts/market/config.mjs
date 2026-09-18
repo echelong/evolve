@@ -368,6 +368,13 @@ export function createMarketConfig(env = process.env, { loadEnv = true } = {}) {
       cycleEveryGenerations: clampNumber(readInt(env, ["EVOLVE_RESEARCH_CYCLE_EVERY_GENERATIONS"], 2), 0, 10_000),
       proposalsPerCycle: clampNumber(readInt(env, ["EVOLVE_RESEARCH_PROPOSALS_PER_CYCLE"], 6), 1, 64),
       maxCompilationsPerCycle: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_COMPILATIONS_PER_CYCLE"], 3), 0, 64),
+      // Phase 5A.2 cohort guards. `minUniqueRatio` is the fraction of a
+      // research cohort that must be genuinely unique genomes; `maxSpeciesShare`
+      // is the diversity guard against one species consuming the whole cohort
+      // (a research-diversity rule, never a performance rule).
+      minUniqueRatio: clampNumber(readNumber(env, ["EVOLVE_RESEARCH_MIN_UNIQUE_RATIO"], 0.9), 0, 1),
+      maxSpeciesShare: clampNumber(readNumber(env, ["EVOLVE_RESEARCH_MAX_SPECIES_SHARE"], 0.6), 0, 1),
+      strictUniqueness: readBool(env, ["EVOLVE_RESEARCH_STRICT_UNIQUENESS"], false),
       maxProposalsKept: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_PROPOSALS_KEPT"], 200), 10, 10_000),
       maxMemoryKept: clampNumber(readInt(env, ["EVOLVE_RESEARCH_MAX_MEMORY_KEPT"], 500), 10, 100_000),
       proposalSchemaVersion: clampNumber(readInt(env, ["EVOLVE_RESEARCH_PROPOSAL_SCHEMA_VERSION"], 1), 1, 99),

@@ -742,6 +742,8 @@ export function createSimulation({
 
     if (!ctx.allowNewEntries) {
       agent.status = STATUS.PAUSED;
+      // Phase 5A.2 diagnostic: ticks where no entry was even possible.
+      agent.stagePausedTicks = (agent.stagePausedTicks ?? 0) + 1;
       agent.lastAction = "Entries paused — market feed degraded";
       markToMarket(agent, ctx);
       return;
@@ -767,6 +769,9 @@ export function createSimulation({
       agent.researchRiskMultiplier = riskMultiplierFor(posture.state);
       if (posture.state === ABSTAIN_STATE.ABSTAIN) {
         agent.status = STATUS.SCANNING;
+        // Phase 5A.2 diagnostic: declared abstention is a legitimate choice,
+        // but it must be visible when explaining a thin distinct-mint count.
+        agent.stageAbstainedTicks = (agent.stageAbstainedTicks ?? 0) + 1;
         agent.lastAction = `Abstaining — ${posture.reason}`;
         markToMarket(agent, ctx);
         return;
@@ -775,9 +780,16 @@ export function createSimulation({
 
     let best = null;
     let bestScore = -Infinity;
+    let eligibleCount = 0;
 
     for (const market of ctx.tradeable) {
       if (!passesGates(agent.genome, market, ctx)) continue;
+      eligibleCount += 1;
+      // Phase 5A.2 diagnostics: WHY a candidate traded too few distinct
+      // mints. Bounded by distinct-mint count, never by tick count, so a
+      // long-lived agent cannot grow this without limit.
+      agent.stageEligibleMints = agent.stageEligibleMints ?? {};
+      agent.stageEligibleMints[market.mint] = (agent.stageEligibleMints[market.mint] ?? 0) + 1;
       const score = scoreMarket(agent.genome, market);
       if (score > bestScore) {
         bestScore = score;
@@ -785,9 +797,14 @@ export function createSimulation({
       }
     }
 
+    agent.stageOpportunities = (agent.stageOpportunities ?? 0) + ctx.tradeable.length;
+    agent.stageEligibleTicks = (agent.stageEligibleTicks ?? 0) + eligibleCount;
+
     agent.status = STATUS.SCANNING;
 
     if (!best || bestScore < agent.genome.entryScoreThreshold) {
+      if (!best) agent.stageNoEligibleTicks = (agent.stageNoEligibleTicks ?? 0) + 1;
+      else agent.stageBelowThresholdTicks = (agent.stageBelowThresholdTicks ?? 0) + 1;
       agent.lastAction = best
         ? `Scanning ${best.symbol} ${bestScore.toFixed(2)} < ${agent.genome.entryScoreThreshold.toFixed(2)}`
         : "Scanning — no eligible token";
@@ -798,6 +815,7 @@ export function createSimulation({
     ctx.bestScore = bestScore;
     if (!openPosition(agent, best, ctx)) {
       ctx.bestScore = null;
+      agent.stageBlockedEntries = (agent.stageBlockedEntries ?? 0) + 1;
     }
     markToMarket(agent, ctx);
   }
@@ -859,6 +877,16 @@ export function createSimulation({
       maxDrawdown: agent.stageMaxDrawdown ?? 0,
       observations: agent.stageObservations ?? 0,
       netReturn: startingCash > 0 ? (agent.stagePnl ?? 0) / startingCash : 0,
+      // Phase 5A.2 distinct-mint diagnostics: the reasons a candidate may
+      // have traded too few mints, exposed as evidence rather than guessed.
+      opportunitiesObserved: agent.stageOpportunities ?? 0,
+      eligibleTicks: agent.stageEligibleTicks ?? 0,
+      eligibleMints: Object.keys(agent.stageEligibleMints ?? {}).length,
+      blockedEntries: agent.stageBlockedEntries ?? 0,
+      abstainedTicks: agent.stageAbstainedTicks ?? 0,
+      noEligibleTicks: agent.stageNoEligibleTicks ?? 0,
+      belowThresholdTicks: agent.stageBelowThresholdTicks ?? 0,
+      pausedTicks: agent.stagePausedTicks ?? 0,
     };
   }
 

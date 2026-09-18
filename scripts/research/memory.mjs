@@ -45,6 +45,56 @@ export const MEMORY_STATUS = Object.freeze({
   SHADOW_ELIGIBLE: "SHADOW_ELIGIBLE",
 });
 
+/**
+ * Phase 5A.2: the explicit candidate lifecycle, one step more precise than
+ * `status`. Status stays the coarse, long-standing vocabulary (PROPOSED /
+ * TESTING / REJECTED / PROMISING / …) so every existing reader keeps working;
+ * `outcome` records exactly WHICH step a proposal stopped at:
+ *
+ *   PROPOSED -> (schema) -> REJECTED_SCHEMA
+ *            -> (compiler) -> REJECTED_COMPILER
+ *            -> (uniqueness) -> REJECTED_DUPLICATE
+ *            -> COMPILED -> injected -> TESTING
+ *            -> (watchdog) -> WATCH | QUARANTINED
+ *            -> (Arena) -> ARENA_EVALUATED -> PROMISING / ARENA_SURVIVOR / SHADOW_ELIGIBLE
+ *
+ * A QUARANTINED outcome can never become deployment/shadow eligible: promotion
+ * refuses it outright (see promote.mjs).
+ */
+export const MEMORY_OUTCOME = Object.freeze({
+  PROPOSED: "PROPOSED",
+  REJECTED_SCHEMA: "REJECTED_SCHEMA",
+  REJECTED_COMPILER: "REJECTED_COMPILER",
+  REJECTED_DUPLICATE: "REJECTED_DUPLICATE",
+  COMPILED: "COMPILED",
+  TESTING: "TESTING",
+  WATCH: "WATCH",
+  QUARANTINED: "QUARANTINED",
+  ARENA_EVALUATED: "ARENA_EVALUATED",
+  PROMISING: "PROMISING",
+  ARENA_SURVIVOR: "ARENA_SURVIVOR",
+  SHADOW_ELIGIBLE: "SHADOW_ELIGIBLE",
+});
+
+/**
+ * The lifecycle as an ordered list, for documentation, dashboards, and tests.
+ * Each entry says where a candidate can go next; nothing here is executable.
+ */
+export const RESEARCH_LIFECYCLE = Object.freeze([
+  { step: "PROPOSED", detail: "provider output received" },
+  { step: "REJECTED_SCHEMA", detail: "failed strict proposal-schema validation" },
+  { step: "REJECTED_COMPILER", detail: "failed deterministic compilation (unknown gene/family)" },
+  { step: "REJECTED_DUPLICATE", detail: "compiled genome digest already present in the research cohort" },
+  { step: "COMPILED", detail: "deterministic compiler produced a candidate genome" },
+  { step: "TESTING", detail: "injected into a live/replay population" },
+  { step: "WATCH", detail: "watchdog flagged the candidate (continues, labelled)" },
+  { step: "QUARANTINED", detail: "watchdog quarantined the candidate (can never deploy)" },
+  { step: "ARENA_EVALUATED", detail: "the candidate appeared in a real Arena leaderboard" },
+  { step: "PROMISING", detail: "Arena-qualified with adequate evidence — NOT profitability" },
+  { step: "ARENA_SURVIVOR", detail: "survived the full Arena funnel" },
+  { step: "SHADOW_ELIGIBLE", detail: "reached Deployment Candidate status (still paper-only)" },
+]);
+
 /** PROMISING is documented as a research milestone, never profitability. */
 export const STATUS_NOTES = Object.freeze({
   PROPOSED: "accepted by the schema, awaiting evaluation",
@@ -252,6 +302,7 @@ export function createMemoryRecord({
   failedGates = [],
   conclusion = "",
   status = MEMORY_STATUS.PROPOSED,
+  outcome = null,
   watchdog = null,
   evaluatedAt = null,
 }) {
@@ -276,6 +327,9 @@ export function createMemoryRecord({
     failedGates: [...failedGates],
     conclusion: String(conclusion ?? "").slice(0, 400),
     status,
+    // Explicit lifecycle outcome. Defaults to the status when the caller does
+    // not name one, so pre-5A.2 call sites keep writing a sensible value.
+    outcome: typeof outcome === "string" && outcome.length > 0 ? outcome : status,
     // Structured watchdog evidence (null until the candidate has been screened).
     // `watchdogVerdict` / `watchdogStatus` are flat aliases so an existing
     // reader (promote.mjs' quarantine check, older memory rows) keeps working.
@@ -330,7 +384,7 @@ export async function readMemoryIndex(root, { limit = 100 } = {}) {
  */
 export async function appendConclusion(
   root,
-  { proposalId, authorRole, status, conclusion, at = null, watchdog = null },
+  { proposalId, authorRole, status, outcome = null, conclusion, at = null, watchdog = null },
 ) {
   const file = path.join(root, CONCLUSIONS_FILE);
   const current = await readJson(file, { schemaVersion: RESEARCH_MEMORY_VERSION, entries: [] });
@@ -340,6 +394,7 @@ export async function appendConclusion(
     proposalId,
     authorRole,
     status,
+    outcome: typeof outcome === "string" && outcome.length > 0 ? outcome : status,
     conclusion: String(conclusion ?? "").slice(0, 400),
     at: at ?? new Date().toISOString(),
     ...(watchdogEvidence ? { watchdog: watchdogEvidence } : {}),
@@ -421,9 +476,13 @@ export function summarizeResearchMemory({
 } = {}) {
   const byStatus = {};
   for (const status of Object.values(MEMORY_STATUS)) byStatus[status] = 0;
+  const byOutcome = {};
+  for (const outcome of Object.values(MEMORY_OUTCOME)) byOutcome[outcome] = 0;
   const byRole = {};
   for (const record of memoryRecords ?? []) {
     if (record?.status && byStatus[record.status] !== undefined) byStatus[record.status] += 1;
+    const outcome = record?.outcome ?? record?.status;
+    if (outcome && byOutcome[outcome] !== undefined) byOutcome[outcome] += 1;
     const role = record?.authorRole ?? "unknown";
     byRole[role] = (byRole[role] ?? 0) + 1;
   }
@@ -435,6 +494,7 @@ export function summarizeResearchMemory({
     memoryRecords: (memoryRecords ?? []).length,
     conclusions: (conclusions ?? []).length,
     byStatus,
+    byOutcome,
     byRole,
     watchdog: watchdogStats({ memoryRecords, conclusions }),
     note: "Research statuses describe the evaluation journey. PROMISING is not profitability.",
@@ -471,6 +531,134 @@ export async function readWatchdogEvaluations(root, { limit = 500, status = null
     });
   }
   return evaluations;
+}
+
+/**
+ * Phase 5A.2: per-researcher-role metrics, derived from persisted records that
+ * already exist on disk — never from a live in-memory guess. Answers "is each
+ * researcher role contributing meaningfully distinct search behaviour?".
+ *
+ * @param {{
+ *   proposals?: object[],      // listProposals() records ({ proposal: { authorRole } })
+ *   compiled?: object[],       // listCompiledCandidates() entries
+ *   memoryRecords?: object[],
+ *   conclusions?: object[],
+ *   arenaRows?: object[],      // Arena leaderboard rows carrying authorRole
+ * }} options
+ */
+export function roleResearchMetrics({
+  proposals = [],
+  compiled = [],
+  memoryRecords = [],
+  conclusions = [],
+  arenaRows = [],
+} = {}) {
+  const roles = {};
+  const ensure = (role) => {
+    const key = typeof role === "string" && role.length > 0 ? role : "unknown";
+    if (!roles[key]) {
+      roles[key] = {
+        role: key,
+        proposalsGenerated: 0,
+        schemaAccepted: 0,
+        compilationAccepted: 0,
+        duplicateRejected: 0,
+        uniqueGenomes: 0,
+        arenaEntrants: 0,
+        medianArenaScore: null,
+        bestArenaRank: null,
+        gateFailures: 0,
+        watchdog: { NORMAL: 0, WATCH: 0, QUARANTINED: 0 },
+      };
+      roles[key]._proposalIds = new Set();
+      roles[key]._digests = new Set();
+      roles[key]._scores = [];
+    }
+    return roles[key];
+  };
+
+  for (const record of proposals ?? []) {
+    const role = ensure(record?.proposal?.authorRole);
+    roles[role.role]._proposalIds.add(record?.proposal?.proposalId ?? `anon-${roles[role.role].proposalsGenerated}`);
+    roles[role.role].proposalsGenerated += 1;
+  }
+
+  const PASSED_SCHEMA = new Set([
+    MEMORY_OUTCOME.REJECTED_COMPILER,
+    MEMORY_OUTCOME.REJECTED_DUPLICATE,
+    MEMORY_OUTCOME.COMPILED,
+    MEMORY_OUTCOME.TESTING,
+    MEMORY_OUTCOME.WATCH,
+    MEMORY_OUTCOME.QUARANTINED,
+    MEMORY_OUTCOME.ARENA_EVALUATED,
+    MEMORY_OUTCOME.PROMISING,
+    MEMORY_OUTCOME.ARENA_SURVIVOR,
+    MEMORY_OUTCOME.SHADOW_ELIGIBLE,
+    MEMORY_OUTCOME.PROPOSED,
+  ]);
+
+  for (const entry of conclusions ?? []) {
+    const role = ensure(entry?.authorRole);
+    const outcome = entry?.outcome ?? entry?.status ?? null;
+    if (!PASSED_SCHEMA.has(outcome)) continue;
+    roles[role.role]._proposalIds.add(entry?.proposalId ?? "unknown");
+  }
+  for (const row of Object.values(roles)) row.schemaAccepted = row._proposalIds.size;
+
+  for (const entry of compiled ?? []) {
+    const role = ensure(entry?.authorRole);
+    roles[role.role].compilationAccepted += 1;
+    // Pre-5A.2 artifacts predate the persisted `genomeDigest` field; recompute
+    // it from the genome so a legacy cohort still reports honest uniqueness.
+    const digest = entry?.genomeDigest ?? (entry?.genome ? digestOf(entry.genome) : null);
+    if (typeof digest === "string") roles[role.role]._digests.add(digest);
+  }
+
+  const outcomeCounts = new Map();
+  for (const entry of conclusions ?? []) {
+    const outcome = entry?.outcome ?? entry?.status ?? null;
+    if (typeof outcome !== "string") continue;
+    outcomeCounts.set(outcome, (outcomeCounts.get(outcome) ?? 0) + 1);
+    const role = ensure(entry?.authorRole);
+    if (outcome === MEMORY_OUTCOME.REJECTED_DUPLICATE) roles[role.role].duplicateRejected += 1;
+  }
+
+  for (const record of memoryRecords ?? []) {
+    const role = ensure(record?.authorRole);
+    const watchdog = record?.watchdog?.status ?? record?.watchdogStatus ?? record?.watchdogVerdict ?? null;
+    if (watchdog && roles[role.role].watchdog[watchdog] !== undefined) roles[role.role].watchdog[watchdog] += 1;
+  }
+
+  for (const row of arenaRows ?? []) {
+    // Arena candidate rows carry the author role inside their research
+    // provenance; accept either shape.
+    const role = ensure(row?.authorRole ?? row?.research?.authorRole);
+    roles[role.role].arenaEntrants += 1;
+    if (Number.isFinite(row?.score)) roles[role.role]._scores.push(row.score);
+    if (Number.isFinite(row?.finalRank) && (roles[role.role].bestArenaRank === null || row.finalRank < roles[role.role].bestArenaRank)) {
+      roles[role.role].bestArenaRank = row.finalRank;
+    }
+    roles[role.role].gateFailures += Array.isArray(row?.failedGates) ? row.failedGates.length : 0;
+  }
+
+  const out = {};
+  for (const [key, row] of Object.entries(roles)) {
+    const scores = [...row._scores].sort((a, b) => a - b);
+    out[key] = {
+      role: row.role,
+      proposalsGenerated: row.proposalsGenerated,
+      schemaAccepted: row.schemaAccepted,
+      compilationAccepted: row.compilationAccepted,
+      duplicateRejected: row.duplicateRejected,
+      uniqueGenomes: row._digests.size,
+      arenaEntrants: row.arenaEntrants,
+      medianArenaScore: scores.length > 0 ? scores[Math.floor(scores.length / 2)] : null,
+      bestArenaRank: row.bestArenaRank,
+      gateFailures: row.gateFailures,
+      watchdog: { ...row.watchdog },
+    };
+  }
+  return out;
 }
 
 /** Deterministic digest of a proposal for cross-referencing in memory. */

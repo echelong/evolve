@@ -135,6 +135,11 @@ export function createResearchController({ config, simulation }) {
     proposalsRejected: 0,
     compiledCandidates: 0,
     compiledFamilies: 0, // accepted proposals whose families were compiled
+    uniqueRatio: 0, // most recent cohort's unique-genome ratio
+    duplicateRejections: 0, // cumulative duplicate genomes refused a slot
+    speciesDistribution: {}, // most recent cohort's compiled species mix
+    outcomes: {}, // cumulative explicit lifecycle outcomes
+    roleMetrics: {}, // per-researcher-role contribution
     injectedCandidates: 0, // research candidates live in the population right now
     memoryRecords: 0,
     conclusions: 0,
@@ -184,6 +189,10 @@ export function createResearchController({ config, simulation }) {
         provider: researchConfig.provider,
         proposalsPerCycle: researchConfig.proposalsPerCycle,
         maxCompilations: researchConfig.maxCompilationsPerCycle,
+        // Phase 5A.2 cohort guards (uniqueness + species concentration).
+        maxSpeciesShare: researchConfig.maxSpeciesShare,
+        minUniqueRatio: researchConfig.minUniqueRatio,
+        strictUniqueness: researchConfig.strictUniqueness === true,
         watchThresholds: config.researchWatch ?? {},
         pendingEvidence,
       });
@@ -212,6 +221,13 @@ export function createResearchController({ config, simulation }) {
       summary.proposalsAccepted += report.accepted ?? 0;
       summary.proposalsRejected += report.rejectedSchema.length + report.rejectedCompile.length;
       summary.compiledCandidates += report.compiled.length;
+      summary.uniqueRatio = report.uniqueRatio ?? 0;
+      summary.duplicateRejections += report.rejectedDuplicates ?? 0;
+      summary.speciesDistribution = { ...(report.speciesDistribution ?? {}) };
+      summary.roleMetrics = report.roleMetrics ?? {};
+      for (const [outcome, count] of Object.entries(report.outcomes ?? {})) {
+        summary.outcomes[outcome] = (summary.outcomes[outcome] ?? 0) + count;
+      }
       summary.compiledFamilies = memory.compiledFamilies;
       summary.injectedCandidates = simulation.population.filter((agent) => agent.researchMeta).length;
       summary.memoryRecords = memory.memoryRecords;
@@ -234,6 +250,9 @@ export function createResearchController({ config, simulation }) {
         accepted: report.accepted ?? 0,
         compiled: report.compiled.length,
         rejected: report.rejectedSchema.length + report.rejectedCompile.length,
+        duplicateRejections: report.rejectedDuplicates ?? 0,
+        uniqueRatio: report.uniqueRatio ?? 0,
+        species: { ...(report.speciesDistribution ?? {}) },
         watchdogEvaluated: report.watchdog.length,
         watchdogVerdicts: report.watchdogVerdicts ?? {},
       });

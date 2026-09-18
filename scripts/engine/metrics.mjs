@@ -167,6 +167,22 @@ export function summarizeAgent(agent, { startingCash = 100, ledger = null } = {}
     mintNotional: Object.fromEntries(mintNotional),
     consistency: round(consistency, 4),
     holding: Boolean(agent?.position),
+    // Phase 5A.2: an explicit explanation of WHY a candidate traded too few
+    // distinct mints — never a change to the `minimum distinct mints` gate.
+    mintDiagnostics: {
+      opportunitiesObserved: Math.max(0, Math.round(finite(agent?.opportunities, 0))),
+      eligibleTicks: Math.max(0, Math.round(finite(agent?.eligibleTicks, 0))),
+      eligibleMints: Math.max(0, Math.round(finite(agent?.eligibleMintCount, 0))),
+      mintsEntered: mintPnl.size,
+      trades,
+      distinctMints: mintPnl.size,
+      topMintNotionalShare: round(totalNotional > 0 ? maxMintNotional / totalNotional : 0, 4),
+      blockedEntries: Math.max(0, Math.round(finite(agent?.blockedEntries, 0))),
+      abstainedTicks: Math.max(0, Math.round(finite(agent?.abstainedTicks, 0))),
+      noEligibleTicks: Math.max(0, Math.round(finite(agent?.noEligibleTicks, 0))),
+      belowThresholdTicks: Math.max(0, Math.round(finite(agent?.belowThresholdTicks, 0))),
+      pausedTicks: Math.max(0, Math.round(finite(agent?.pausedTicks, 0))),
+    },
   };
 }
 
@@ -397,6 +413,18 @@ export function stageView(agent) {
     realizedPnl: agent.stagePnl ?? agent.realizedPnl,
     position: agent.position,
     ledger: agent.stageLedger ?? agent.ledger,
+    // Phase 5A.2 distinct-mint diagnostics (bounded by mint count).
+    opportunities: agent.stageOpportunities ?? 0,
+    eligibleTicks: agent.stageEligibleTicks ?? 0,
+    eligibleMintCount:
+      agent.stageEligibleMints && typeof agent.stageEligibleMints === "object"
+        ? Object.keys(agent.stageEligibleMints).length
+        : 0,
+    blockedEntries: agent.stageBlockedEntries ?? 0,
+    abstainedTicks: agent.stageAbstainedTicks ?? 0,
+    noEligibleTicks: agent.stageNoEligibleTicks ?? 0,
+    belowThresholdTicks: agent.stageBelowThresholdTicks ?? 0,
+    pausedTicks: agent.stagePausedTicks ?? 0,
   };
 }
 

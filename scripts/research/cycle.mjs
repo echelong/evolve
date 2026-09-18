@@ -1,10 +1,11 @@
 /**
- * Controlled recursive research cycle (Phase 5A).
+ * Controlled recursive research cycle (Phase 5A / 5A.2).
  *
  *   market evidence -> researchers propose -> schema validation ->
- *   deterministic compilation -> candidate genomes -> (caller injects into
- *   the live/replay population) -> watchdog evaluation of what the PREVIOUS
- *   cycle injected -> research memory -> next cycle
+ *   deterministic compilation (genome-digest uniqueness enforced) ->
+ *   candidate genomes -> (caller injects into the live/replay population) ->
+ *   watchdog evaluation of what the PREVIOUS cycle injected -> research memory
+ *   -> next cycle
  *
  * This module is deliberately I/O-light and simulation-agnostic: it takes an
  * evidence packet and a list of evidence records for candidates the caller is
@@ -18,24 +19,39 @@
  * in response to an actual Arena result. A research cycle can only reach
  * PROPOSED, TESTING, or REJECTED; it cannot self-promote.
  *
+ * Phase 5A.2: every step now records an explicit lifecycle OUTCOME
+ * (REJECTED_SCHEMA / REJECTED_COMPILER / REJECTED_DUPLICATE / COMPILED /
+ * TESTING / WATCH / QUARANTINED) alongside the coarse status, and a compiled
+ * genome already present in the persisted cohort is never silently re-added.
+ *
  * PAPER ONLY research machinery.
  */
 
 import {
+  MEMORY_OUTCOME,
   MEMORY_STATUS,
   appendConclusion,
   appendMemoryRecord,
   createMemoryRecord,
+  listCompiledCandidates,
   loadPriorConclusions,
+  roleResearchMetrics,
   saveCompiledCandidate,
   saveProposal,
 } from "./memory.mjs";
 import { validateProposal } from "./proposal-schema.mjs";
-import { compileProposals } from "./compiler.mjs";
+import { DUPLICATE_GENOME, PROPOSAL_COMPILER_VERSION, compileProposals } from "./compiler.mjs";
 import { evaluateCandidate, WATCHDOG_VERDICT } from "./watchdog.mjs";
 import { resolveResearchProvider } from "./provider.mjs";
+import {
+  RESEARCH_COHORT_DEFAULTS,
+  cohortUniquenessVerdict,
+  genomeDigestOf,
+  roleDistribution,
+  speciesDistribution,
+} from "./cohort.mjs";
 
-export const RESEARCH_CYCLE_VERSION = 1;
+export const RESEARCH_CYCLE_VERSION = 2;
 
 /**
  * Build the bounded, structured evidence packet researchers see, from a
@@ -90,6 +106,20 @@ export function buildEvidencePacket({ snapshot, islands = [], priorConclusions =
   };
 }
 
+/** Digest every compiled candidate already persisted for this cohort. */
+async function loadExistingCompiledDigests(root) {
+  const existing = await listCompiledCandidates(root, { limit: 500 });
+  const digests = new Set();
+  const byDigest = new Map();
+  for (const entry of existing) {
+    const digest = genomeDigestOf(entry);
+    if (!digest) continue;
+    digests.add(digest);
+    if (!byDigest.has(digest)) byDigest.set(digest, entry);
+  }
+  return { digests: [...digests], byDigest };
+}
+
 /**
  * Run one research cycle: evaluate what the previous cycle injected, then
  * propose + validate + compile the next batch.
@@ -102,19 +132,13 @@ export function buildEvidencePacket({ snapshot, islands = [], priorConclusions =
  *   provider?: string,
  *   proposalsPerCycle?: number,
  *   maxCompilations?: number,
+ *   maxSpeciesShare?: number,
+ *   minUniqueRatio?: number,
+ *   strictUniqueness?: boolean,
  *   watchThresholds?: object,
  *   pendingEvidence?: Array<object>,  // from simulation.getResearchEvidence()
  *   now?: () => number,
  * }} options
- * @returns {Promise<{
- *   cycle: number,
- *   proposed: number,
- *   rejectedSchema: Array<{proposalId: string, errors: string[]}>,
- *   compiled: Array<object>,
- *   rejectedCompile: Array<{proposalId: string, reasons: string[]}>,
- *   watchdog: Array<{familyId: string, proposalId: string, verdict: string}>,
- *   clearedFamilyIds: string[],
- * }>}
  */
 export async function runResearchCycle({
   root,
@@ -124,12 +148,19 @@ export async function runResearchCycle({
   provider = "mock",
   proposalsPerCycle = 6,
   maxCompilations = 3,
+  maxSpeciesShare = RESEARCH_COHORT_DEFAULTS.maxSpeciesShare,
+  minUniqueRatio = RESEARCH_COHORT_DEFAULTS.minUniqueRatio,
+  strictUniqueness = false,
   watchThresholds = {},
   pendingEvidence = [],
   now = () => Date.now(),
 } = {}) {
   const watchdogReport = [];
   const clearedFamilyIds = [];
+  const outcomes = {};
+  const bump = (key, count = 1) => {
+    outcomes[key] = (outcomes[key] ?? 0) + count;
+  };
 
   // 1) Evaluate whatever the previous cycle(s) are still tracking. A
   // candidate needs at least a few trades before its watchdog verdict means
@@ -164,6 +195,13 @@ export async function runResearchCycle({
     // deliberately NOT a rejection, so the record stays TESTING and the verdict
     // lives in structured watchdog evidence. Promotion stays Arena-gated.
     const status = MEMORY_STATUS.TESTING;
+    const outcome =
+      result.verdict === WATCHDOG_VERDICT.QUARANTINED
+        ? MEMORY_OUTCOME.QUARANTINED
+        : result.verdict === WATCHDOG_VERDICT.WATCH
+          ? MEMORY_OUTCOME.WATCH
+          : MEMORY_OUTCOME.TESTING;
+    bump(outcome);
 
     const record = createMemoryRecord({
       proposalId: candidateEvidence.proposalId,
@@ -177,6 +215,7 @@ export async function runResearchCycle({
       drawdown: candidateEvidence.maxDrawdown,
       costDrag: candidateEvidence.costDrag,
       status,
+      outcome,
       watchdog,
       evaluatedAt,
       conclusion:
@@ -190,6 +229,7 @@ export async function runResearchCycle({
       proposalId: candidateEvidence.proposalId,
       authorRole: candidateEvidence.authorRole,
       status,
+      outcome,
       conclusion: record.conclusion,
       at: evaluatedAt,
       watchdog: { ...watchdog, status: result.verdict },
@@ -201,20 +241,51 @@ export async function runResearchCycle({
   // 2) Propose: providers only ever see the bounded evidence packet + prior
   // conclusions, never source code or credentials.
   const priorConclusions = await loadPriorConclusions(root);
-  const resolvedProvider = resolveResearchProvider(provider);
+  // A provider is anything with a `propose` function: the built-in offline
+  // mock by name, or an explicitly injected provider object (used by tests to
+  // drive specific cohorts deterministically).
+  const resolvedProvider =
+    typeof provider?.propose === "function" ? provider : resolveResearchProvider(provider);
   const rawProposals = resolvedProvider.propose({
     evidence: { ...evidence, priorConclusions },
     count: proposalsPerCycle,
     seed,
     cycle,
   });
+  const rawList = Array.isArray(rawProposals) ? rawProposals : [];
+  bump(MEMORY_OUTCOME.PROPOSED, rawList.length);
 
   const rejectedSchema = [];
   const validProposals = [];
-  for (const raw of rawProposals) {
+  for (const raw of rawList) {
     const { ok, errors, proposal } = validateProposal(raw);
     if (!ok) {
-      rejectedSchema.push({ proposalId: raw?.proposalId ?? "unknown", errors });
+      const proposalId = raw?.proposalId ?? "unknown";
+      rejectedSchema.push({ proposalId, errors });
+      bump(MEMORY_OUTCOME.REJECTED_SCHEMA);
+      // Explicit lifecycle: a schema rejection is remembered, so researchers
+      // can see (and avoid) the region rather than rediscovering it.
+      const schemaAt = new Date(now()).toISOString();
+      await appendMemoryRecord(
+        root,
+        createMemoryRecord({
+          proposalId,
+          authorRole: typeof raw?.authorRole === "string" ? raw.authorRole : null,
+          hypothesis: typeof raw?.hypothesis === "string" ? raw.hypothesis : "",
+          status: MEMORY_STATUS.REJECTED,
+          outcome: MEMORY_OUTCOME.REJECTED_SCHEMA,
+          conclusion: `schema rejected: ${errors.join("; ")}`,
+          evaluatedAt: schemaAt,
+        }),
+      );
+      await appendConclusion(root, {
+        proposalId,
+        authorRole: typeof raw?.authorRole === "string" ? raw.authorRole : null,
+        status: MEMORY_STATUS.REJECTED,
+        outcome: MEMORY_OUTCOME.REJECTED_SCHEMA,
+        conclusion: `schema rejected: ${errors.join("; ")}`,
+        at: schemaAt,
+      });
       continue;
     }
     await saveProposal(root, proposal, { status: MEMORY_STATUS.PROPOSED });
@@ -222,23 +293,48 @@ export async function runResearchCycle({
   }
 
   // 3) Compile: the deterministic compiler — never the provider — decides
-  // which genes exist, their ranges, and the species-aware bounds.
-  const { compiled, rejected: rejectedCompile } = compileProposals({
+  // which genes exist, their ranges, the species-aware bounds, and
+  // (Phase 5A.2) whether a compiled genome is genuinely NEW to this cohort.
+  const existing = await loadExistingCompiledDigests(root);
+  const { compiled, rejected: rejectedCompile, stats: compileStats } = compileProposals({
     proposals: validProposals,
     maxCompilations,
+    maxSpeciesShare,
+    existingDigests: existing.digests,
     now,
   });
 
+  const rejectedDuplicates = rejectedCompile.filter((row) => row.code === DUPLICATE_GENOME);
   for (const row of rejectedCompile) {
+    const outcome = row.code === DUPLICATE_GENOME ? MEMORY_OUTCOME.REJECTED_DUPLICATE : MEMORY_OUTCOME.REJECTED_COMPILER;
+    bump(outcome);
+    const authorRole = validProposals.find((p) => p.proposalId === row.proposalId)?.authorRole ?? null;
+    const conclusion = `${outcome.toLowerCase().replace(/_/g, " ")}: ${row.reasons.join("; ")}`;
+    const rejectedAt = new Date(now()).toISOString();
+    // Duplicate rejection (and compiler rejection) is RECORDED, not silent.
+    await appendMemoryRecord(
+      root,
+      createMemoryRecord({
+        proposalId: row.proposalId,
+        authorRole,
+        hypothesis: "",
+        status: MEMORY_STATUS.REJECTED,
+        outcome,
+        conclusion,
+        evaluatedAt: rejectedAt,
+      }),
+    );
     await appendConclusion(root, {
       proposalId: row.proposalId,
-      authorRole: validProposals.find((p) => p.proposalId === row.proposalId)?.authorRole ?? null,
+      authorRole,
       status: MEMORY_STATUS.REJECTED,
-      conclusion: `compiler rejected: ${row.reasons.join("; ")}`,
-      at: new Date(now()).toISOString(),
+      outcome,
+      conclusion,
+      at: rejectedAt,
     });
   }
 
+  const roleDistributionInCycle = roleDistribution(compiled);
   for (const entry of compiled) {
     await saveCompiledCandidate(root, entry);
     const proposal = validProposals.find((p) => p.proposalId === entry.proposalId);
@@ -249,23 +345,59 @@ export async function runResearchCycle({
       candidateFamily: entry.familyId,
       regimesTested: entry.targetRegimes,
       status: MEMORY_STATUS.TESTING,
-      conclusion: "compiled and injected into a live/replay population",
+      outcome: MEMORY_OUTCOME.COMPILED,
+      conclusion: entry.diversified
+        ? `compiled (deterministically diversified inside the proposal's declared range) and injected into a live/replay population`
+        : "compiled and injected into a live/replay population",
     });
+    // Carry the canonical identity + provenance onto the memory record.
+    record.genomeDigest = entry.genomeDigest ?? genomeDigestOf(entry);
+    record.species = entry.species ?? null;
+    record.family = entry.family ?? null;
+    record.diversified = entry.diversified === true;
     await appendMemoryRecord(root, record);
+    bump(MEMORY_OUTCOME.COMPILED);
   }
+
+  const acceptedEntrants = compiled.length;
+  const uniqueDigests = new Set(compiled.map((entry) => entry.genomeDigest)).size;
+  const uniqueness = cohortUniquenessVerdict({
+    uniqueDigests,
+    acceptedEntrants,
+    minUniqueRatio,
+    strict: strictUniqueness,
+  });
+
+  const roleMetrics = roleResearchMetrics({
+    proposals: validProposals.map((proposal) => ({ proposal })),
+    compiled,
+  });
 
   return {
     cycle,
-    proposed: rawProposals.length,
+    version: RESEARCH_CYCLE_VERSION,
+    compilerVersion: PROPOSAL_COMPILER_VERSION,
+    proposed: rawList.length,
     accepted: validProposals.length,
     rejectedSchema,
-    compiled,
     rejectedCompile,
+    rejectedDuplicates: rejectedDuplicates.length,
+    compiled,
     watchdog: watchdogReport,
     watchdogVerdicts: watchdogReport.reduce((acc, entry) => {
       acc[entry.verdict] = (acc[entry.verdict] ?? 0) + 1;
       return acc;
     }, {}),
     clearedFamilyIds,
+    outcomes,
+    roleMetrics,
+    roleDistribution: roleDistributionInCycle,
+    speciesDistribution: speciesDistribution(compiled),
+    uniqueGenomes: uniqueDigests,
+    duplicateGenomes: Math.max(0, acceptedEntrants - uniqueDigests) + rejectedDuplicates.length,
+    uniqueRatio: uniqueness.ratio,
+    uniquenessThreshold: uniqueness.threshold,
+    uniquenessVerdict: uniqueness,
+    compileStats,
   };
 }

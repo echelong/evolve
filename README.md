@@ -4,11 +4,12 @@
 
 EVOLVE is an experimental evolutionary trading-agent laboratory. A population of agents competes under identical market conditions, high-fitness genomes reproduce, weak agents are terminated, and mutations preserve exploration across generations.
 
-> **Current status:** Phase 5A — a controlled research swarm (plus the Phase 5A.1 integration
-> correctness pass) on top of Phase 4's Champion Arena, regime/stress testing, and Live Shadow League,
-> on top of Phase 3's historical capture, deterministic replay, and walk-forward evolution. The
-> repository contains no wallet keys, no signer, and no transaction path. It cannot spend real SOL
-> because that capability does not exist in it.
+> **Current status:** Phase 5A.2 — a controlled research swarm (including the Phase 5A.1 integration
+> correctness pass and the Phase 5A.2 research-cohort correctness + experimental-quality pass) on top
+> of Phase 4's Champion Arena, regime/stress testing, and Live Shadow League, on top of Phase 3's
+> historical capture, deterministic replay, and walk-forward evolution. The repository contains no
+> wallet keys, no signer, and no transaction path. It cannot spend real SOL because that capability
+> does not exist in it.
 
 Every monetary number the system produces is **PAPER P&L**. Simulated returns are not real profits.
 Historical backtests and paper results **do not** guarantee future profitability.
@@ -66,11 +67,17 @@ npm run record:market   # capture normalized market snapshots into a dataset
 npm run replay -- <dir> # replay a recorded dataset through the paper engine
 npm run experiment -- <dir>  # walk-forward TRAIN/VALIDATE/TEST research run
 npm run fixture:market  # write a small deterministic synthetic fixture dataset
-npm run validate        # syntax + market + history validation + both smoke runs
-npm run validate:market # Phase 2 behaviour checks (15 cases, offline)
-npm run validate:history# Phase 3 checks (30 cases, offline)
-npm run smoke:engine    # deterministic synthetic-mode evolution smoke run
-npm run smoke:replay    # offline record → replay → walk-forward smoke run
+npm run validate         # syntax + every phase validation suite + every smoke run
+npm run validate:market  # Phase 2 behaviour checks (offline)
+npm run validate:history # Phase 3 checks (offline)
+npm run validate:arena   # Phase 4 arena/shadow checks (offline)
+npm run validate:phase41 # Phase 4.1 correctness-pass checks (offline)
+npm run validate:phase5a # Phase 5A + 5A.1 research-swarm checks (offline)
+npm run validate:phase5a2# Phase 5A.2 research-cohort checks (offline)
+npm run smoke:engine     # deterministic synthetic-mode evolution smoke run
+npm run smoke:replay     # offline record → replay → walk-forward smoke run
+npm run smoke:arena      # tiny offline Champion Arena funnel
+npm run smoke:swarm      # offline 192-agent island-divergence + swarm-state smoke run
 ```
 
 ## Market modes
@@ -761,7 +768,8 @@ Arena gate.
 
 `scripts/engine/families.mjs` defines the only combinations Phase 5A may target — deterministic blends of
 two existing species presets (`Momentum x Wallet Flow`, `Genesis x Flow`, `Reversal x Liquidity`,
-`Momentum x Liquidity`, `Reversal x Flow`) with fixed blending rules (weights average, binary gates AND,
+`Momentum x Liquidity`, `Reversal x Flow`, plus the Phase 5A.2 directions `Genesis Hunter x Momentum`,
+`Wallet Flow x Reversal`, and `Liquidity x Wallet Flow`) with fixed blending rules (weights average, binary gates AND,
 risk genes take the most conservative parent). A family still resolves to plain existing genome fields —
 Phase 5A introduces no new signal and no executable artifact. Arbitrary feature/indicator-source
 generation is explicitly out of scope for this phase.
@@ -874,6 +882,206 @@ to produce a survivor".
   while a one-generation lucky island cannot consume the population, a weak island shrinks substantially
   without being wiped out, and migration / cross-species crossover / random immigration stay bounded.
   `EVOLVE_ISLAND_TARGETS` still expresses an initialization/base-weight preference rather than a quota.
+
+## Phase 5A.2 — research cohort correctness + experimental quality
+
+Still **PAPER ONLY**, with no new capability of any kind. Phase 5A.2 is a focused correctness and
+experimental-quality pass over the first genuine Research Arena. That run supplied 233 entrants
+(200 conventional + 33 research), and the research cohort behaved worse than the numbers suggested:
+33 research entrant slots collapsed to only **13 unique genomes**, every compiled candidate was a
+**Momentum** genome, two researcher roles never compiled at all, and `--research <dataset>` silently
+ran a registry sweep over every recorded dataset. Each defect below was reproduced, root-caused, and
+fixed without weakening a single Arena gate. **No live recording was rerun for this pass** — every
+number below is reproducible offline.
+
+### 1. `--research` is a boolean flag (CLI parsing)
+
+The shared parser treated every `--flag` as taking a value, so `npm run arena -- --research DATASET`
+bound `DATASET` to `research` and left no positional at all — the run silently swept the entire
+dataset registry. `scripts/lib/args.mjs` now knows which flags are boolean. All three spellings are
+equivalent and always leave the dataset positional:
+
+```bash
+npm run arena -- --research DATASET
+npm run arena -- DATASET --research
+npm run arena -- --research=true DATASET
+```
+
+Flags that legitimately take a value (`--research-mode fair`, `--max-windows 3`, `--seed abc`) still
+work, `--research=false` / `--no-research` disable research, and an unknown flag followed by a value
+still consumes it (backwards compatible). Arena startup now prints the selected dataset count and ids,
+whether research is enabled and in which mode, the requested population, the research candidates
+discovered, the conventional entrants, and the total entrant count, so a misconfigured experiment is
+hard to miss.
+
+### 2. Research genome uniqueness is enforced by digest
+
+A research candidate's canonical identity is `digestOf(genome)`. The previous compiler keyed its
+deduplication on a *proposal-scoped* `familyId`, so byte-identical genomes produced by different
+proposals were written as separate artifacts and each consumed its own Arena slot. The compiler
+(`scripts/research/compiler.mjs`) now:
+
+1. compiles the proposal,
+2. computes `digestOf(genome)`,
+3. accepts it if the digest is new to the cohort,
+4. otherwise **deterministically diversifies inside the region the proposal itself declared** — a
+   proposal that declares `[min, max]` has already declared every point in that range acceptable, so a
+   collision re-draws a different point from that same range using a seed derived from the proposal id
+   and the colliding digest (never random noise, and never outside `GENE_BOUNDS`/compiler limits),
+5. recompiles and rechecks, and
+6. rejects as `DUPLICATE_GENOME` when there is no declared range to move inside.
+
+Diversification is recorded on the compiled entry (`diversified`, `diversificationAttempt`) and in
+research memory. Nothing about it is faithful-by-luck: the same proposals always produce the same
+cohort.
+
+### 3. Research novelty metrics
+
+`EVOLVE_RESEARCH_MIN_UNIQUE_RATIO` (default `0.90`) is the minimum fraction of a research cohort that
+must be genuinely unique genomes:
+
+```text
+uniqueGenomeRatio = uniqueDigests / acceptedResearchEntrants
+```
+
+Below the threshold the run emits an explicit warning, and `EVOLVE_RESEARCH_STRICT_UNIQUENESS=1`
+refuses to run the Arena with a degraded cohort. Research memory records every duplicate rejection
+(`REJECTED_DUPLICATE`) and every diversification, so the cohort is auditable without reconstructing
+digests by hand.
+
+### 4. Species/family collapse
+
+Root cause, reproduced against the real persisted artifacts: `compileProposals` stopped after
+`maxCompilations` while iterating proposals in order, and the first three proposals were always the
+signal / regime / execution roles — whose families were all Momentum blends. So every compiled
+candidate was Momentum, and the risk / diversity roles were compiled **zero** times. A second cause
+compounded it: the mock provider's per-role parameter regions were constant (except the signal role),
+so each role produced the identical genome every cycle.
+
+Fixes, all evidence-driven and none of them a quota:
+
+- the compiler now orders valid compile jobs **round-robin across target families**, so a small
+  `maxCompilations` spreads across families instead of taking the first N;
+- proposals may declare an explicit `targetSpecies` (enum-validated against the six real species), which
+  is what makes **Experimental** reachable at all — it has no preset to blend;
+- three additional approved two-preset families were added (`Genesis Hunter x Momentum`,
+  `Wallet Flow x Reversal`, `Liquidity x Wallet Flow`) so Wallet Flow and Liquidity are reachable as
+  compiled species. They add no new signal and no executable artifact;
+- the mock provider now chooses species from the evidence packet (regime, island/species statistics,
+  cost drag, under-representation) and only falls back to a deterministic all-species rotation when the
+evidence is genuinely silent — so all six species are reachable and the mix is evidence-driven, not a
+  hardcoded balanced list;
+- `EVOLVE_RESEARCH_MAX_SPECIES_SHARE` (default `0.60`) is a research-**diversity** guard, never a
+  performance rule. If one species exceeds the configured share the compiler tries alternative
+  evidence-supported proposals, and if none exist it **preserves the proposals and emits an explicit
+  concentration warning** rather than fabricating diversity. Arena gates are never weakened.
+
+### 5. Role diversity and role metrics
+
+`adversarial-critic` is a documented **advisory-only** role: it criticizes other researchers'
+hypotheses and never originates a compilable proposal, so it consumes no Arena slot. The other five
+roles each declare at least one non-degenerate parameter range, so repeated cycles with changing
+evidence produce different genomes. Role-level metrics (proposals generated, schema accepted,
+compilation accepted, duplicate rejected, unique genomes, Arena entrants, median Arena score, best
+Arena rank, gate failures, watchdog NORMAL/WATCH/QUARANTINED) are computed by `roleResearchMetrics()`
+from persisted records. Arena score feedback never mutates a future proposal — train/validate/test
+separation is untouched, and research memory can only inform future hypotheses through prior
+conclusions, exactly as before.
+
+### 6. First-class Arena provenance
+
+Every research entrant now carries `origin`, `familyId`, `proposalId`, `authorRole`, the research
+family, `targetRegimes`, `abstainRegimes`, and `researchGenomeDigest`, and that provenance is
+propagated into the entrant, `candidates.json`, `leaderboard.json`, the Champion League artifact,
+deployment-candidate output, `rounds.json`, and the summary's `researchSummary`. Identifying a research
+candidate no longer requires digest reconstruction. When a research seed is later bred, its children are
+labelled `identity: "descendant"` with `researchAncestorFamilyIds` / `researchAncestorProposalIds` and
+**no** `researchGenomeDigest` — a mutated descendant is never passed off as an exact original research
+genome.
+
+### 7. Arena status semantics
+
+`status = ARENA SURVIVOR` never meant "one of the Champion League eight"; it meant "cleared every
+deployment gate but was classified a specialist". The concepts are now separate and unambiguous:
+
+| Field | Values |
+| --- | --- |
+| `gateStatus` / `deploymentGateStatus` | `GATES_PASSED` \| `GATES_FAILED` \| `INSUFFICIENT_EVIDENCE` |
+| `deploymentEligible` | `true` only for a Deployment Candidate |
+| `highestStage` | the last tournament stage survived (`QUALIFICATION` … `CHAMPION LEAGUE`) |
+| `eliminatedAtStage` | the stage that culled the candidate (`null` for a finalist) |
+| `finalRank` | 1..n rank over every entrant |
+| `isChampionLeagueFinalist` | membership in the explicit `championLeague` list |
+
+Every candidate exposes all of them, and `summary.championLeague` is the Champion League final eight as
+an explicit list. The legacy `CANDIDATE_STATUS` labels are retained for the Hall of Fame and the Shadow
+League, and promotion now reads explicit stage/gate information (with the legacy status string only as a
+fallback for older leaderboards).
+
+### 8. Challenger mode (default) and FAIR COHORT mode
+
+```bash
+npm run arena -- --research DATASET                    # challenger (default)
+npm run arena -- --research-mode fair DATASET          # equal treatment
+```
+
+**`challenger`** preserves the existing behaviour: build the conventional population, pre-evolve it for
+`EVOLVE_ARENA_GENERATIONS`, then append fresh research candidates. It answers *can fresh research ideas
+beat already-evolved incumbents?*
+
+**`fair`** puts research and conventional seeds into **one mixed cohort** that receives identical
+pre-evolution, datasets, seeds, stress profiles, scoring, gates, and generations. Cohort composition is
+configurable (`EVOLVE_ARENA_RESEARCH_SHARE`, default `0.5`, or `EVOLVE_ARENA_RESEARCH_COUNT`). If fewer
+**unique** research genomes exist than requested, the shortfall is **reported** and absorbed by
+conventional seeds — genomes are never cloned to fill a quota (`clonedToFillQuota` is always `0`), and
+lineage is preserved so descendants of research seeds remain identifiable. The summary reports starting
+research/conventional seeds, final unique research/conventional lineages, median and best score by
+ancestry, Champion League representation by ancestry, and deployment representation by ancestry.
+
+### 9. Distinct-mint diagnostics (the gate is unchanged)
+
+22 of the 33 research candidates failed `minimum distinct mints` in the real run. That gate is
+**unchanged** (`EVOLVE_DEPLOYMENT_GATES.minDistinctMints = 4`, still frozen). Instead the engine now
+records *why* a candidate traded too few mints — opportunities observed, eligible mints after filters,
+mints actually entered, blocked entries, abstained ticks, no-eligible-token ticks, below-threshold ticks,
+paused ticks, trade count, distinct mints, and the top-mint notional share — and the Arena pools those
+into a per-candidate `distinctMintDiagnostics` block with a plain-language `explanation`. The research
+system has to learn to produce broader-evidence candidates; the gate is not tuned to let it through.
+
+### 10. Deterministic mock provider (DeepSeek is NOT integrated)
+
+Phase 5A.2 remains offline-testable, deterministic, and reproducible with **no provider key and no
+network**. `mock` is still the only implemented provider and remains the baseline any future provider
+must be compared against. **DeepSeek is explicitly not integrated.** The future intended experiment is
+documented only as:
+
+> **DeepSeek V4.1 Flash via Cline, xhigh**
+
+It is not implemented, there is no client, no key handling beyond the existing environment-only
+placeholder, and an unrecognized provider name still falls back to the offline mock instead of making a
+network call. Until that experiment runs, every research number in this repository comes from the
+deterministic mock.
+
+### 11. Research candidate lifecycle
+
+`PROPOSED → (schema) → REJECTED_SCHEMA` \| `→ (compiler) → REJECTED_COMPILER` \|
+`→ (uniqueness) → REJECTED_DUPLICATE` \| `→ COMPILED → injected → TESTING → (watchdog) → WATCH` \|
+`QUARANTINED → (Arena) → ARENA_EVALUATED → PROMISING / ARENA_SURVIVOR / SHADOW_ELIGIBLE`. Each record
+carries the granular `outcome` next to the coarse, unchanged `status` (`PROPOSED` / `TESTING` /
+`REJECTED` / promoted), so no existing reader breaks. `WATCH` candidates continue but are labelled;
+`QUARANTINED` can never become deployment/shadow eligible and can never self-clear.
+
+### Commands
+
+```bash
+npm run arena -- --research <dataset>           # challenger research cohort (default)
+npm run arena -- DATASET --research             # identical, flag after the dataset
+npm run arena -- --research=true DATASET        # identical, explicit boolean
+npm run arena -- --research-mode fair DATASET   # equal-treatment cohort
+EVOLVE_RESEARCH_MIN_UNIQUE_RATIO=0.95 npm run arena -- --research-mode fair <dataset>
+EVOLVE_RESEARCH_MAX_SPECIES_SHARE=0.5 EVOLVE_ARENA_RESEARCH_SHARE=0.4 npm run arena -- --research-mode fair <dataset>
+npm run validate:phase5a2                       # Phase 5A.2 suite (60 offline cases)
+```
 
 ## Validation
 
@@ -1008,6 +1216,46 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
   stays fully finite; `"unknown"` (the classifier's no-data sentinel) is never offered as a proposable
   regime; culled research-candidate evidence survives until explicitly cleared
 
+Phase 5A.1 is folded into `npm run validate:phase5a` (78 offline cases), which also covers the
+`researchSwarm` vs `historicalResearch` state contract and source-selection rules.
+
+Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
+
+- **CLI parsing** — `--research DATASET`, `DATASET --research`, and `--research=true DATASET` all produce
+  `research === true` with the dataset still positional and the exact requested dataset count preserved;
+  `--research=false` / `--no-research` disable it; value flags and unknown-flag values still work
+- **Uniqueness** — duplicate compiled genomes consume one slot, not several; rejection is deterministic;
+  deterministic diversification stays inside the declared range **and** inside compiler bounds and
+  reproduces exactly; compiler stats (requested / compiled / duplicate / diversified) are accurate
+- **Novelty** — `uniqueGenomeRatio` arithmetic, the warning/failure thresholds at the configured minimum,
+  and `ratioEnv` clamping/fallback; repeated provider output can never silently consume multiple slots
+- **Species reachability** — all six strategy species are reachable through provider + compiler; the
+  compiler does not silently default every proposal to Momentum; a small `maxCompilations` still spreads
+  across families; the concentration guard flags a concentrated cohort, **preserves** the proposals, and
+  never converts one into an unrelated species or alters a genome; evidence-driven targeting picks a
+  different species than the silent-evidence rotation
+- **Roles** — the adversarial critic is advisory-only; role-level metrics count proposals, schema
+  acceptance, compilation, duplicate rejections, unique genomes, entrants, median score, best rank, gate
+  failures, and watchdog verdicts; Arena scores are reported, never fed back into proposals
+- **Provenance** — provenance is first-class on the entrant, survives into `candidates.json`, the
+  leaderboard, and `summary.researchSummary`; exact research identity is distinguishable from descendant
+  ancestry; a bred child never claims the original genome digest but keeps its ancestor ids
+- **Status semantics** — gate status is explicit and separate from the legacy survivor label; a
+  specialist that clears every gate reports `GATES_PASSED` while staying `ARENA SURVIVOR` and *not*
+  deployment-eligible; every candidate exposes `highestStage`, `eliminatedAtStage`, `finalRank`, and a
+  deployment gate status; the final eight are an explicit list
+- **Promotion** — promotion reads explicit stage/gate information first and the legacy status string only
+  as a fallback; a real Arena match is still required; quarantine still blocks promotion
+- **Modes** — challenger appends research on top of the requested population; fair builds one mixed
+  cohort, gives both lineages the same pre-evolution builder, never clones to fill a missing quota, and
+  reports the shortfall
+- **Accounting and diagnostics** — every entrant is ranked exactly once with dense 1..n ranks; top-50 /
+  GROUP / failed-gate / top-8 research counts match the underlying rows; live runs carry distinct-mint
+  diagnostics; the `minimum distinct mints` gate is verified unchanged
+- **Determinism and safety** — a research Arena run is identical across worker counts; real vs synthetic
+  evidence accounting is preserved; evaluated candidates keep species-specific gene bounds; no Phase 5A.2
+  module contains a wallet, signing, or transaction-execution path
+
 ## Roadmap
 
 ### Phase 1 — evolutionary lab
@@ -1067,7 +1315,7 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
       inject → watchdog → memory → next cycle)
 - [x] Deterministic reward-hacking watchdog with `NORMAL`/`WATCH`/`QUARANTINED` and non-self-clearing
       quarantine
-- [x] Meta-evolution over five approved existing-family combinations (no new signals, no code generation)
+- [x] Meta-evolution over approved existing-family combinations (no new signals, no code generation)
 - [x] Deterministic regime specialization and `ACTIVE`/`REDUCED_RISK`/`ABSTAIN`, scoped to research
       candidates, replay-reproducible
 - [x] Arena-gated promotion by genome digest — researchers cannot self-promote
@@ -1088,6 +1336,29 @@ Phase 5A adds `npm run validate:phase5a` (63 offline cases):
       trade count, `evaluatedAt`) without parsing prose, with memory still append-only and Arena-gated
 - [x] Offline smoke (`npm run smoke:swarm`): 192 agents, exact island total, real island divergence, and
       live swarm state visible through the same contract the dashboard reads
+
+### Phase 5A.2 — research cohort correctness + experimental quality
+- [x] Boolean-aware CLI parsing: `--research DATASET`, `DATASET --research`, `--research=true DATASET`
+- [x] Arena startup prints dataset count/ids, research enabled + mode, requested population, research
+      candidates discovered, conventional entrants, and total entrants
+- [x] Research genome uniqueness by `digestOf(genome)`, with deterministic in-range diversification and
+      `DUPLICATE_GENOME` rejection; duplicate rejections and diversifications recorded in memory
+- [x] Research-cohort novelty metric + `EVOLVE_RESEARCH_MIN_UNIQUE_RATIO` warning/failure
+- [x] Species collapse fixed: breadth-first compilation, explicit `targetSpecies`, three additional
+      approved families, evidence-driven species targeting, and all six species reachable
+- [x] `EVOLVE_RESEARCH_MAX_SPECIES_SHARE` diversity guard that warns instead of fabricating diversity
+- [x] Role diversity: advisory-only critic documented; the other five roles contribute distinct,
+      changing search behaviour; per-role metrics computed from persisted records
+- [x] First-class Arena research provenance (entrant → candidates → leaderboard → champion league →
+      deployment → summary), with ancestry kept separate from exact identity
+- [x] Explicit gate status, tournament stage, `eliminatedAtStage`, `finalRank`, and an explicit Champion
+      League final eight; promotion reads stage/gate information
+- [x] CHALLENGER mode preserved as the default; FAIR COHORT mode with equal treatment and no cloning
+- [x] Distinct-mint diagnostics explaining thin mint counts, with the gate itself unchanged
+- [x] Mock provider remains the deterministic default; DeepSeek NOT integrated
+- [x] `npm run validate:phase5a2` — 60 offline cases
+- [ ] Non-mock provider experiment: **DeepSeek V4.1 Flash via Cline, xhigh** (documented, not implemented)
+- [ ] Automatic Arena re-entry of every compiled candidate on a fixed cadence
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

@@ -1155,6 +1155,7 @@ test("24. No wallet, signing, or transaction-execution path exists (including in
       if (normalized.endsWith("scripts/validate-history.mjs")) continue;
       if (normalized.endsWith("scripts/validate-arena.mjs")) continue;
       if (normalized.endsWith("scripts/validate-phase5a.mjs")) continue;
+      if (normalized.endsWith("scripts/validate-phase5a2.mjs")) continue;
 
       const text = await readFile(path.join(PROJECT_ROOT, relative), "utf8");
       for (const pattern of FORBIDDEN_PATTERNS) {
