@@ -146,6 +146,11 @@ export const JEV_STATUS = Object.freeze({
   AUTH_ERROR: "JEV_AUTH_ERROR",
   RATE_LIMIT: "JEV_RATE_LIMIT",
   INTERNAL_ERROR: "JEV_INTERNAL_ERROR",
+  // Added for the Phase 5F.1 resilience layer: the provider was not called at
+  // all because a bounded provider-health cooldown was still active (and the
+  // caller did not explicitly override it). This is a deliberate fail-safe, not
+  // a provider failure — zero network attempts were made.
+  COOLDOWN: "JEV_COOLDOWN",
 });
 
 export const JEV_FAILURE_STATUSES = Object.freeze([
@@ -159,6 +164,7 @@ export const JEV_FAILURE_STATUSES = Object.freeze([
   JEV_STATUS.AUTH_ERROR,
   JEV_STATUS.RATE_LIMIT,
   JEV_STATUS.INTERNAL_ERROR,
+  JEV_STATUS.COOLDOWN,
 ]);
 
 /** Recorded in place of a decision whenever Jev did not produce one. */
@@ -225,6 +231,76 @@ export function resolveJevModelName(config = {}, { provider = config.provider, o
 
 export const JEV_TIMEOUT_BOUNDS = Object.freeze({ min: 1_000, max: 120_000 });
 export const JEV_MAX_CALLS_BOUNDS = Object.freeze({ min: 1, max: 500 });
+
+/* ============================================================================
+ * Phase 5F.1 — transport resilience configuration
+ * ==========================================================================*/
+
+/**
+ * LOGICAL vs PHYSICAL budgets, deliberately separate:
+ *
+ *   `EVOLVE_JEV_MAX_CALLS`    maximum LOGICAL Jev decisions in one run
+ *                             (unchanged Phase 5D semantics)
+ *   `EVOLVE_JEV_MAX_ATTEMPTS` maximum PHYSICAL transport attempts used to obtain
+ *                             ONE logical decision
+ *
+ * Neither is ever unbounded. A logical decision is still ONE shadow decision no
+ * matter how many transport attempts it took to obtain it.
+ */
+export const JEV_MAX_ATTEMPTS_BOUNDS = Object.freeze({ min: 1, max: 5 });
+export const JEV_BACKOFF_MS_BOUNDS = Object.freeze({ min: 0, max: 600_000 });
+export const JEV_COOLDOWN_MS_BOUNDS = Object.freeze({ min: 0, max: 3_600_000 });
+
+export const JEV_TRANSPORT_DEFAULTS = Object.freeze({
+  maxAttempts: 3,
+  backoffBaseMs: 1_000,
+  backoffMaxMs: 30_000,
+  cooldownMs: 60_000,
+  // Bounded escalation ceiling: the breaker is never indefinite.
+  cooldownMaxMs: 900_000,
+});
+
+/**
+ * A transport chain may only ever name SAME-JEV routes. The offline mock is not
+ * a transport, and no other decision model (`gpt`, `claude`, `gemini`, …) can
+ * ever appear in a chain — `parseJevTransportChain` refuses anything else.
+ */
+export const JEV_TRANSPORT_CHAIN_PROVIDERS = Object.freeze([JEV_PROVIDER.VERCEL, JEV_PROVIDER.TYPESAFE]);
+export const JEV_TRANSPORT_CHAIN_MAX = 3;
+
+/**
+ * Parse `EVOLVE_JEV_TRANSPORT_CHAIN` (e.g. `vercel-jev,typesafe-jev`).
+ *
+ * An absent/empty value means "single selected provider only" — the default.
+ * Any name that is not a same-Jev route is a configuration error, never a
+ * silent substitution.
+ *
+ * @returns {{ chain: string[], error: string|null }}
+ */
+export function parseJevTransportChain(raw) {
+  const text = String(raw ?? "").trim();
+  if (text.length === 0) return { chain: [], error: null };
+  const names = text
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+  if (names.length === 0) return { chain: [], error: null };
+  if (names.length > JEV_TRANSPORT_CHAIN_MAX) {
+    return { chain: [], error: `EVOLVE_JEV_TRANSPORT_CHAIN lists ${names.length} routes (max ${JEV_TRANSPORT_CHAIN_MAX})` };
+  }
+  const unique = [...new Set(names)];
+  for (const name of unique) {
+    if (!JEV_TRANSPORT_CHAIN_PROVIDERS.includes(name)) {
+      return {
+        chain: [],
+        error:
+          `EVOLVE_JEV_TRANSPORT_CHAIN may only name same-Jev routes ` +
+          `(${JEV_TRANSPORT_CHAIN_PROVIDERS.join(", ")}); got '${name}'`,
+      };
+    }
+  }
+  return { chain: unique, error: null };
+}
 
 export function readStringEnv(env, key, fallback = "") {
   const raw = env?.[key];
@@ -325,7 +401,9 @@ export function resolveJevConfig(env = process.env) {
   const providerConfigError =
     specified && !providerValidation.recognized ? unknownJevProviderMessage(rawProvider) : null;
   const modeConfigError = !modeValid ? unsupportedJevModeMessage(rawMode) : null;
-  const configError = providerConfigError ?? modeConfigError ?? null;
+  const transportChainParse = parseJevTransportChain(readStringEnv(env, "EVOLVE_JEV_TRANSPORT_CHAIN", ""));
+  const transportChainError = transportChainParse.error;
+  const configError = providerConfigError ?? modeConfigError ?? transportChainError ?? null;
 
   const provider = !specified ? null : providerValidation.recognized ? providerValidation.name : null;
 
@@ -393,6 +471,33 @@ export function resolveJevConfig(env = process.env) {
     maxCallsPerRun: maxCallsRaw,
     minConfidence,
     cacheEnabled: readBoolEnv(env, "EVOLVE_JEV_CACHE", JEV_DEFAULTS.cacheEnabled),
+    // ---- Phase 5F.1 transport resilience ---------------------------------
+    // PHYSICAL attempts per LOGICAL decision. Bounded, never unbounded.
+    maxAttemptsPerCall: readIntEnv(env, "EVOLVE_JEV_MAX_ATTEMPTS", JEV_TRANSPORT_DEFAULTS.maxAttempts, {
+      min: JEV_MAX_ATTEMPTS_BOUNDS.min,
+      max: JEV_MAX_ATTEMPTS_BOUNDS.max,
+    }),
+    backoffBaseMs: readIntEnv(env, "EVOLVE_JEV_BACKOFF_BASE_MS", JEV_TRANSPORT_DEFAULTS.backoffBaseMs, {
+      min: JEV_BACKOFF_MS_BOUNDS.min,
+      max: JEV_BACKOFF_MS_BOUNDS.max,
+    }),
+    backoffMaxMs: readIntEnv(env, "EVOLVE_JEV_BACKOFF_MAX_MS", JEV_TRANSPORT_DEFAULTS.backoffMaxMs, {
+      min: JEV_BACKOFF_MS_BOUNDS.min,
+      max: JEV_BACKOFF_MS_BOUNDS.max,
+    }),
+    cooldownMs: readIntEnv(env, "EVOLVE_JEV_COOLDOWN_MS", JEV_TRANSPORT_DEFAULTS.cooldownMs, {
+      min: JEV_COOLDOWN_MS_BOUNDS.min,
+      max: JEV_COOLDOWN_MS_BOUNDS.max,
+    }),
+    cooldownMaxMs: readIntEnv(env, "EVOLVE_JEV_COOLDOWN_MAX_MS", JEV_TRANSPORT_DEFAULTS.cooldownMaxMs, {
+      min: JEV_COOLDOWN_MS_BOUNDS.min,
+      max: JEV_COOLDOWN_MS_BOUNDS.max,
+    }),
+    // Empty by default: a single, explicitly selected provider. An opt-in chain
+    // is only ever honoured when every named route has its OWN real credential.
+    transportChain: transportChainParse.chain,
+    transportChainConfigured: transportChainParse.chain.length > 0,
+    transportChainError,
   };
 }
 

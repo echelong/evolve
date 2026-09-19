@@ -50,6 +50,7 @@ import {
   DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER,
   JEV_STATUS,
 } from "../config.mjs";
+import { retryAfterMsOf } from "../transport.mjs";
 import { redactSecrets } from "../../lib/sanitize.mjs";
 
 export const VERCEL_JEV_PROVIDER = "vercel-jev";
@@ -57,7 +58,13 @@ export const VERCEL_JEV_TRANSPORT = "vercel-ai-gateway";
 export const VERCEL_JEV_UPSTREAM_PROVIDER = DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER;
 export const VERCEL_JEV_DEFAULT_MODEL = DEFAULT_VERCEL_JEV_MODEL;
 
-/** Exactly one provider attempt per EVOLVE call: no SDK-level retry storm. */
+/**
+ * Exactly one provider attempt per EVOLVE call: no SDK-level retry storm.
+ *
+ * UNCHANGED in Phase 5F.1. EVOLVE's own transport layer now owns retries and it
+ * must never run at the same time as an SDK-level retry — otherwise attempt
+ * accounting becomes opaque and `providerAttemptCount` stops being true.
+ */
 export const VERCEL_JEV_MAX_RETRIES = 0;
 
 /* ============================================================================
@@ -531,6 +538,12 @@ export function createVercelJevProvider({
           ok: false,
           status: classified.status,
           reason: classified.reason,
+          // The bounded HTTP status and a single bounded `retryAfterMs` number
+          // (never raw headers) are what EVOLVE's own transport layer uses to
+          // decide whether a retry is warranted. The status vocabulary and the
+          // `maxRetries: 0` request above are unchanged.
+          httpStatus: classified.httpStatus,
+          retryAfterMs: retryAfterMsOf(error),
           providerMetadata: buildVercelProviderMetadata({
             model,
             upstreamProvider,

@@ -19,6 +19,11 @@
 
 import { digestOf } from "../../lib/hash.mjs";
 import { PRIMARY_RISK_VOCAB, RESEARCH_DISPOSITION_VOCAB } from "../questions.mjs";
+import {
+  EXTERNAL_EVIDENCE_QUALITY_LEVELS,
+  PRIMARY_CONCERN_VOCAB,
+  RESEARCH_DISPOSITION_VOCAB as EXTERNAL_RESEARCH_DISPOSITION_VOCAB,
+} from "../../jev-external-bridge.mjs";
 import { REGIMES } from "../../arena/orchestrator.mjs";
 
 export const MOCK_JEV_PROVIDER = "mock-jev";
@@ -180,8 +185,100 @@ function answerMarketQuestions(packet) {
 }
 
 /**
+ * Deterministically answer the external bounded-evidence question set from the
+ * bounded Jev projection.
+ *
+ * Heuristics only — never a real research assessment, never a routing signal.
+ * Every ratio is optional: a missing (null) field is treated as "not observed",
+ * never as a positive signal.
+ */
+function answerExternalQuestionSet(packet) {
+  const features = packet?.features ?? {};
+  const counts = packet?.counts ?? {};
+  const records = Number.isFinite(counts.records) ? counts.records : 0;
+  const failures = Number.isFinite(counts.failures) ? counts.failures : 0;
+  const sourceCount = Number.isFinite(features.sourceCount) ? features.sourceCount : 0;
+  const coordinationCount = Number.isFinite(features.coordinationIndicatorCount)
+    ? features.coordinationIndicatorCount
+    : 0;
+  const fetchFailureRate = Number.isFinite(features.fetchFailureRate) ? features.fetchFailureRate : 0;
+  const coverages = [
+    features.authorCoverage,
+    features.textCoverage,
+    features.linkCoverage,
+    features.publishedAtCoverage,
+    features.engagementCoverage,
+  ].filter((value) => Number.isFinite(value));
+  const coverageAvg = coverages.length > 0 ? coverages.reduce((sum, value) => sum + value, 0) / coverages.length : 0;
+
+  const random = seededRandom(digestOf(packet));
+  let breadth = 0;
+  if (records >= 5) breadth += 0.3;
+  if (records >= 20) breadth += 0.2;
+  if (sourceCount >= 2) breadth += 0.2;
+  breadth += 0.3 * coverageAvg;
+  breadth = Math.min(0.98, Math.max(0.02, breadth + (random() - 0.5) * 0.05));
+
+  const sufficiency = Math.min(0.98, Math.max(0.02, breadth));
+  const corroboration = Math.min(0.98, Math.max(0.02, breadth - 0.2 * coordinationCount - failures * 0.1));
+
+  let qualityScore = Math.round(breadth * 4);
+  qualityScore = Math.max(0, Math.min(4, qualityScore));
+  const qualityProbabilities = {};
+  for (let level = 0; level <= 4; level += 1) {
+    qualityProbabilities[level] = Math.max(0, 1 - Math.abs(level - qualityScore) / 2);
+  }
+  const qualityTotal = Object.values(qualityProbabilities).reduce((a, b) => a + b, 0) || 1;
+  for (const key of Object.keys(qualityProbabilities)) qualityProbabilities[key] /= qualityTotal;
+
+  const concern = pickWeighted(PRIMARY_CONCERN_VOCAB, [
+    records < 5 ? 0.8 : 0.05, // insufficient_sample
+    records > 0 && sourceCount <= 1 ? 0.7 : 0.05, // source_concentration
+    coverageAvg < 0.5 ? 0.7 : 0.05, // low_field_coverage
+    coordinationCount > 0 ? 0.85 : 0.05, // coordination_pattern
+    failures > 0 || fetchFailureRate > 0 ? 0.8 : 0.05, // fetch_instability
+    0.15, // no_obvious_concern (baseline)
+  ]);
+
+  const disposition = pickWeighted(EXTERNAL_RESEARCH_DISPOSITION_VOCAB, [
+    0.15, // ignore
+    records < 5 ? 0.8 : 0.45, // observe
+    breadth >= 0.7 && coordinationCount === 0 ? 0.8 : 0.05, // escalate_to_deep_research
+  ]);
+
+  return {
+    evidenceSufficiency: { type: "noul", noul: Number(sufficiency.toFixed(4)) },
+    primaryConcern: {
+      type: "choice",
+      choice: concern.choice,
+      confidence: Number(concern.confidence.toFixed(4)),
+      probabilities: concern.probabilities,
+    },
+    evidenceQuality: {
+      type: "score",
+      score: Number(qualityScore.toFixed(4)),
+      confidence: Number((qualityProbabilities[qualityScore] ?? 0.5).toFixed(4)),
+      legend: Object.fromEntries(EXTERNAL_EVIDENCE_QUALITY_LEVELS.map((entry, index) => [index, entry])),
+      probabilities: qualityProbabilities,
+    },
+    corroborationConfidence: { type: "noul", noul: Number(corroboration.toFixed(4)) },
+    researchDisposition: {
+      type: "choice",
+      choice: disposition.choice,
+      confidence: Number(disposition.confidence.toFixed(4)),
+      probabilities: disposition.probabilities,
+    },
+  };
+}
+
+/**
  * Create the mock-jev provider. Conforms to the narrow contract:
  * `evaluate({ state, questions, context })`.
+ *
+ * The candidate and market branches are UNCHANGED. A third branch answers the
+ * external bounded-evidence question set, detected by its unique question name
+ * (`evidenceSufficiency`) so it can never be confused with either of the other
+ * two sets.
  */
 export function createMockJevProvider() {
   return {
@@ -192,8 +289,13 @@ export function createMockJevProvider() {
     syntheticDecision: true,
     async evaluate({ state, questions, context = {} } = {}) {
       const questionNames = Object.keys(questions ?? {});
-      const isMarket = questionNames.length === 1 && questionNames[0] === "regime";
-      const answers = isMarket ? answerMarketQuestions(state) : answerCandidateQuestions(state);
+      const isExternal = questionNames.includes("evidenceSufficiency");
+      const isMarket = !isExternal && questionNames.length === 1 && questionNames[0] === "regime";
+      const answers = isExternal
+        ? answerExternalQuestionSet(state)
+        : isMarket
+          ? answerMarketQuestions(state)
+          : answerCandidateQuestions(state);
       return {
         ok: true,
         model: MOCK_JEV_MODEL,

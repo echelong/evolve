@@ -18,6 +18,7 @@ import path from "node:path";
 import { digestOf } from "../lib/hash.mjs";
 import { isSensitiveKey, redactSecrets } from "../lib/sanitize.mjs";
 import { JEV_STATUS } from "./config.mjs";
+import { boundedProviderAttempts } from "./transport.mjs";
 
 export const JEV_RUNTIME_VERSION = 1;
 
@@ -274,7 +275,13 @@ export function createJevRunRecord({
   answers = null,
   rawResponseDigest = null,
   providerMetadata = null,
+  providerAttempts = null,
+  providerAttemptCount = 0,
 }) {
+  // Every PHYSICAL transport attempt is preserved — including the failed ones
+  // that preceded an eventual success — through a whitelist-by-shape normalizer
+  // that can never carry a credential, header, or raw payload.
+  const attempts = Array.isArray(providerAttempts) ? boundedProviderAttempts(providerAttempts) : null;
   return {
     schemaVersion: JEV_RUNTIME_VERSION,
     jevRunId,
@@ -307,6 +314,13 @@ export function createJevRunRecord({
     // always present (`null` when the provider reported nothing) so every run
     // record has the same shape regardless of provider.
     providerMetadata: boundedProviderMetadata(providerMetadata) ?? null,
+    // Phase 5F.1 transport provenance. `providerAttemptCount` is the number of
+    // PHYSICAL attempts actually made for this ONE logical decision (0 for a
+    // cache hit, a disabled provider, or an exhausted call budget; 1 for the
+    // ordinary single-attempt case). `providerAttempts` holds the bounded
+    // per-attempt records — a failed attempt is never discarded.
+    providerAttemptCount: attempts ? attempts.length : Math.max(0, Math.round(Number(providerAttemptCount) || 0)),
+    providerAttempts: attempts,
   };
 }
 

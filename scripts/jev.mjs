@@ -27,7 +27,7 @@ import {
   resolveJevConfig,
   resolveJevModelName,
 } from "./jev/config.mjs";
-import { resolveJevProvider } from "./jev/provider.mjs";
+import { createResilientJevProvider } from "./jev/provider.mjs";
 import {
   buildCandidateDecisionPacket,
   buildMarketDecisionPacket,
@@ -57,7 +57,7 @@ import {
 
 loadEnvFiles();
 
-const BOOLEAN_FLAGS = ["json", "help", "save", "market", "stats"];
+const BOOLEAN_FLAGS = ["json", "help", "save", "market", "stats", "override-cooldown"];
 const VALUE_FLAGS = ["provider", "fixture", "experiment", "model", "timeout-ms"];
 
 const SUPPORTED_FIXTURES = Object.freeze(["synthetic"]);
@@ -76,6 +76,7 @@ function usage() {
     "  --experiment <id>   persist under this experiment id (created if it does not exist)",
     "  --save              persist the decision even without an explicit --experiment (a new id is generated)",
     "  --stats             print experiment counters/health instead of asking a question",
+    "  --override-cooldown force a call even while a transient-failure cooldown is active",
     "  --json              print machine-readable output",
     "",
     "Jev is SHADOW ONLY: this CLI never trades, never routes a candidate, and never",
@@ -187,13 +188,19 @@ async function main() {
     override: args.model !== undefined ? String(args.model) : null,
   });
   const timeoutMs = args["timeout-ms"] ? Number.parseInt(String(args["timeout-ms"]), 10) : envConfig.timeoutMs;
-  const provider = resolveJevProvider(resolution.provider, {
-    apiKey: envConfig.apiKey,
-    gatewayApiKey: envConfig.gatewayApiKey,
-    model,
-    baseURL: envConfig.baseURL,
+  // Phase 5F.1: the SAME bounded transport resilience policy as `jev:external`.
+  // Up to `EVOLVE_JEV_MAX_ATTEMPTS` physical attempts per logical decision,
+  // transient failures only, bounded backoff/jitter, and a provider-health
+  // cooldown that is only bypassed by an explicit `--override-cooldown`.
+  // `mock-jev` and any fail-closed config-error provider are returned unwrapped.
+  const resilient = createResilientJevProvider({
+    selectedProvider: resolution.provider,
+    config: envConfig,
+    modelOverride: args.model !== undefined ? String(args.model) : null,
     timeoutMs,
+    overrideCooldown: args["override-cooldown"] === true,
   });
+  const provider = resilient.provider;
 
   const isMarket = args.market === true;
   const questionSetId = isMarket ? JEV_MARKET_QUESTION_SET_ID : JEV_CANDIDATE_QUESTION_SET_ID;
@@ -273,6 +280,8 @@ async function main() {
         syntheticDecision: run.syntheticDecision === true,
         deterministicComparators,
         predictedAt: run.completedAt,
+        providerAttempts: run.providerAttempts ?? null,
+        providerAttemptCount: run.providerAttemptCount ?? null,
       }),
     );
   }
@@ -285,6 +294,8 @@ async function main() {
     status: run.status,
     reason: run.reason,
     latencyMs: run.latencyMs,
+    providerAttemptCount: run.providerAttemptCount ?? 0,
+    providerAttempts: run.providerAttempts ?? null,
     decision: decision === "NO_JEV_DECISION" ? "NO_JEV_DECISION" : decision,
     persisted: root !== null,
   };
@@ -297,7 +308,11 @@ async function main() {
     console.log(`  question set ${questionSetId} v${questionSetVersion}`);
     console.log(`  status       ${run.status}`);
     console.log(`  latency      ${Number.isFinite(run.latencyMs) ? `${run.latencyMs}ms` : "n/a"}`);
+    console.log(`  attempts     ${run.providerAttemptCount ?? 0} physical (max ${resilient.settings?.maxAttempts ?? 1} per logical decision)`);
     console.log(`  persisted    ${root ? `yes (${experimentId})` : "no"}`);
+    if (run.status === "JEV_COOLDOWN") {
+      console.log("  COOLDOWN     no network call was made; pass --override-cooldown to force one");
+    }
     console.log(`  decision     ${JSON.stringify(output.decision)}`);
   }
 

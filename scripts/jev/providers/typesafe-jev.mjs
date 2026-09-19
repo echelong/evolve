@@ -35,37 +35,54 @@ import {
 } from "@typesafe-ai/sdk";
 
 import { JEV_STATUS } from "../config.mjs";
+import { retryAfterMsOf } from "../transport.mjs";
 
 export const TYPESAFE_JEV_PROVIDER = "typesafe-jev";
+
+/**
+ * The bounded transport label recorded on every attempt record for this route.
+ * It matches `JEV_PROVIDER_TRANSPORT[JEV_PROVIDER.TYPESAFE]` in `config.mjs`, and
+ * it is what lets a later calibration tell a DIRECT TypeSafe decision apart from
+ * one that arrived through the Vercel AI Gateway for the same underlying model.
+ */
+export const TYPESAFE_JEV_TRANSPORT = "typesafe-sdk";
 
 /**
  * Map an SDK-thrown error (or a constructor-time configuration error) to one
  * of EVOLVE's explicit Jev statuses. Never re-throws: every failure mode must
  * become a status the caller can record and continue past.
+ *
+ * The status VOCABULARY is unchanged from Phase 5D (pinned by
+ * `validate:phase5d`: 401/403 stay `JEV_CONFIG_ERROR`, 429/5xx stay
+ * `JEV_HTTP_ERROR`). Phase 5F.1 additionally reports the bounded numeric
+ * `httpStatus` and a single bounded `retryAfterMs` so EVOLVE's OWN transport
+ * layer can tell a transient outage (retryable) from a typo (not retryable)
+ * without reinterpreting the status label.
  */
 function classifyError(error) {
   if (error instanceof APITimeoutError) {
-    return { status: JEV_STATUS.TIMEOUT, reason: `Jev call timed out after ${error.timeoutMs}ms` };
+    return { status: JEV_STATUS.TIMEOUT, reason: `Jev call timed out after ${error.timeoutMs}ms`, httpStatus: null };
   }
   if (error instanceof APIUserAbortError) {
-    return { status: JEV_STATUS.UNAVAILABLE, reason: "Jev call was aborted" };
+    return { status: JEV_STATUS.UNAVAILABLE, reason: "Jev call was aborted", httpStatus: null };
   }
   if (error instanceof APIConnectionError) {
-    return { status: JEV_STATUS.UNAVAILABLE, reason: `Jev connection failed: ${error.message}` };
+    return { status: JEV_STATUS.UNAVAILABLE, reason: `Jev connection failed: ${error.message}`, httpStatus: null };
   }
   if (error instanceof APIError) {
+    const httpStatus = Number.isFinite(error.status) ? error.status : null;
     if (error.status === 401 || error.status === 403) {
-      return { status: JEV_STATUS.CONFIG_ERROR, reason: `Jev authentication failed (HTTP ${error.status})` };
+      return { status: JEV_STATUS.CONFIG_ERROR, reason: `Jev authentication failed (HTTP ${error.status})`, httpStatus };
     }
-    return { status: JEV_STATUS.HTTP_ERROR, reason: `Jev HTTP error ${error.status}: ${error.message}` };
+    return { status: JEV_STATUS.HTTP_ERROR, reason: `Jev HTTP error ${error.status}: ${error.message}`, httpStatus };
   }
   if (error instanceof TypeSafeError) {
     // Thrown for missing API key / invalid client configuration / empty questions
     // BEFORE any network call is attempted — a configuration error, not a
     // runtime provider failure.
-    return { status: JEV_STATUS.CONFIG_ERROR, reason: `Jev configuration error: ${error.message}` };
+    return { status: JEV_STATUS.CONFIG_ERROR, reason: `Jev configuration error: ${error.message}`, httpStatus: null };
   }
-  return { status: JEV_STATUS.UNAVAILABLE, reason: `Jev call failed: ${error?.message ?? error}` };
+  return { status: JEV_STATUS.UNAVAILABLE, reason: `Jev call failed: ${error?.message ?? error}`, httpStatus: null };
 }
 
 /**
@@ -115,6 +132,7 @@ export function createTypeSafeJevProvider({
   return {
     name: TYPESAFE_JEV_PROVIDER,
     model,
+    transport: TYPESAFE_JEV_TRANSPORT,
     offline: false,
     external: true,
     syntheticDecision: false,
@@ -138,7 +156,9 @@ export function createTypeSafeJevProvider({
         };
       } catch (error) {
         const classified = classifyError(error);
-        return { ok: false, ...classified };
+        // Bounded, non-secret transport hints only: the HTTP status number and
+        // one clamped `retryAfterMs` (never raw headers).
+        return { ok: false, ...classified, retryAfterMs: retryAfterMsOf(error) };
       }
     },
   };

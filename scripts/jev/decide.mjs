@@ -234,6 +234,12 @@ export async function jevDecide({
   // decision.
   const providerMetadata = boundedProviderMetadata(outcome?.providerMetadata ?? null);
 
+  // PHYSICAL transport attempts. When the resilience layer ran, it reports every
+  // attempt it made (including the transient failures that preceded a success).
+  // A provider that reports nothing made exactly one attempt — the pre-5F.1
+  // behaviour, unchanged.
+  const providerAttempts = Array.isArray(outcome?.providerAttempts) ? outcome.providerAttempts : null;
+
   const run = createJevRunRecord({
     jevRunId,
     experimentId,
@@ -255,6 +261,8 @@ export async function jevDecide({
     answers,
     rawResponseDigest,
     providerMetadata,
+    providerAttempts,
+    providerAttemptCount: providerAttempts ? providerAttempts.length : 1,
   });
   run.cacheKey = cacheKey;
   run.syntheticDecision = outcome?.syntheticDecision === true;

@@ -2009,6 +2009,13 @@ EVOLVE_JEV_TIMEOUT_MS      default: 20000, clamped to [1000, 120000]; applies to
 EVOLVE_JEV_MAX_CALLS       default: 20, clamped to [1, 500]; applies identically to vercel-jev
 EVOLVE_JEV_MIN_CONFIDENCE  offline confidence-gating analysis only — never an operational threshold
 EVOLVE_JEV_CACHE           default: true
+EVOLVE_JEV_MAX_ATTEMPTS    default: 3, clamped to [1, 5]; PHYSICAL attempts per LOGICAL decision
+EVOLVE_JEV_BACKOFF_BASE_MS default: 1000; exponential backoff base (attempt 1 ~base, attempt 2 ~2x)
+EVOLVE_JEV_BACKOFF_MAX_MS  default: 30000; backoff ceiling
+EVOLVE_JEV_COOLDOWN_MS     default: 60000; cooldown after an exhausted transient decision (escalating)
+EVOLVE_JEV_COOLDOWN_MAX_MS default: 900000 (15 min); hard ceiling for the escalated cooldown
+EVOLVE_JEV_TRANSPORT_CHAIN empty (default) = single selected provider; vercel-jev,typesafe-jev opts in
+EVOLVE_JEV_HEALTH_DIR      default: .evolve/jev/provider-health (bounded cooldown state, no secrets)
 ```
 
 The direct route's default model is the pinned `jev-1.13.0`; the gateway route's default model is the
@@ -2449,6 +2456,263 @@ Social evidence may be noisy, duplicated or manipulated. External intelligence i
 EVOLVE: it has to demonstrate value experimentally before any future use, and it can never bypass the
 deterministic evaluator.
 
+## Phase 5F.0 — External Intelligence → Jev Shadow Experiment Bridge
+
+Phase 5F.0 adds an **explicit SHADOW experiment harness** that lets Phase 5D Jev inspect a frozen
+external-intelligence packet. It is **experimentation, not operational routing**.
+
+```text
+Frozen External Capture
+  → Offline Replay (zero network)
+  → external-intelligence-packet-v1 (audited)
+  → dedicated bounded Jev projection (a SECOND whitelist)
+  → jev-external-intelligence-v1 (fixed question set)
+  → explicit SHADOW Jev experiment (one bounded provider call)
+  → persisted hypothetical disposition (immutable decision record)
+  → STOP
+```
+
+**Operational external-intelligence routing remains OFF.** `JEV_ROUTING_ACTIVE` and
+`DEEPSEEK_ROUTING_ACTIVE` are still hard-coded `false`; the intelligence subsystem can never invoke Jev
+automatically, and **Jev can never invoke DeepSeek**. Even a recorded `escalate_to_deep_research`
+disposition is only a hypothetical — it triggers no research, no DeepSeek call, no capture, no Arena run.
+
+### New packet kind and version
+
+The bridge does **not** overload the candidate or market packet. It introduces its own kind and its own
+version constant (`JEV_EXTERNAL_INTELLIGENCE_DECISION_PACKET_VERSION = 1`); the existing
+`JEV_DECISION_PACKET_VERSION` is untouched.
+
+| Item | Value |
+| --- | --- |
+| Packet kind | `JEV_EXTERNAL_INTELLIGENCE_DECISION_PACKET` |
+| Packet version | `1` (separate constant) |
+| Question set | `jev-external-intelligence-v1` (v1) |
+
+### Bounded Jev projection
+
+`buildExternalIntelligenceJevPacket(...)` accepts an already-built `external-intelligence-packet-v1`,
+**first** requires `assertPacketAllowed(externalPacket)`, then requires
+`packet.routing.jevRoutingActive === false`, `packet.routing.deepseekRoutingActive === false`,
+`shadowOnly === true`, `paperOnly === true` and `readOnly === true`. Only then does it build a **second
+whitelist projection**.
+
+Allowed: `packetVersion`, `packetKind`, `sourceCapture` (`captureId`, `captureManifestDigest`,
+`packetDigest`, `provider`, `querySetId`, `featureVersion`, `channels`), `counts` (`records`, `channels`,
+`failures`, `timeouts`, `calls`), the bounded feature vector (`mentionCount` … `fetchFailureRate`,
+`coordinationIndicatorCount`, `coordinationIndicatorIds`) and fixed `limitations`.
+
+Excluded by construction: raw records, raw text, text excerpts, URLs, author ids, repository names,
+search-result descriptions, credentials, API keys, cookies, executable material, command previews,
+`captureAgeMs`, Arena results, candidate outcomes, validation/test/OOS outcomes, future observations,
+the deterministic `evidenceQuality` label, and the coordination indicators' prose `rule` strings (only
+their bounded ids and count are carried).
+
+### Deterministic evidenceQuality is withheld, then recorded as a comparator
+
+The external packet carries a deterministic `evidenceQuality` label. Jev is asked to **judge evidence
+quality independently**, so the label is deliberately **not** put in the Jev state. It is recorded
+afterwards as post-build comparator metadata:
+
+```json
+deterministicComparators: {
+  externalEvidenceQuality, coordinationIndicatorCount, recordCount,
+  sourceCount, queryCoverage, fetchFailureRate
+}
+```
+
+These are things EVOLVE already knows from the frozen capture — they are never future outcomes.
+
+### Fixed question set `jev-external-intelligence-v1`
+
+No question is generated dynamically; the set is never the candidate/TRAIN set (`jev-question-set-v1`)
+nor the market-regime set (`jev-market-v1`).
+
+| Question | Type | Meaning |
+| --- | --- | --- |
+| `evidenceSufficiency` | noul | Is the frozen evidence broad/corroborated enough to support a research conclusion beyond observation? (never a profitability probability) |
+| `primaryConcern` | choice | One dominant concern from a fixed six-label vocabulary |
+| `evidenceQuality` | score | Five-level 0..4 rubric, judged **blind** |
+| `corroborationConfidence` | noul | Is there meaningful corroboration across independent observations/sources? |
+| `researchDisposition` | choice | Hypothetical next research step |
+
+`primaryConcern` vocabulary (fixed): `insufficient_sample`, `source_concentration`,
+`low_field_coverage`, `coordination_pattern`, `fetch_instability`, `no_obvious_concern`.
+
+`researchDisposition` vocabulary (exactly the existing future external-intelligence vocabulary):
+`ignore`, `observe`, `escalate_to_deep_research`. **Even `escalate_to_deep_research` must not invoke
+DeepSeek** — it is only a recorded hypothetical disposition.
+
+### Machine reuse, budget and persistence
+
+The bridge reuses the existing Phase 5D machinery — provider resolution (`mock-jev`, `typesafe-jev`,
+`vercel-jev`), typed normalization, the status vocabulary, timeout handling, the call budget, provider
+metadata, caching, `jevDecide()`, the immutable decision store, and the existing
+`.evolve/jev/experiments/<id>/` storage. It creates no second provider subsystem, no second cache, and no
+parallel `.evolve/jev-external` hierarchy.
+
+- Provider selection is explicit and **fail-closed**: unset ⇒ disabled, an unknown name is a hard error,
+  and there is **no fallback** of any kind.
+- The call budget is checked **before** the provider is invoked. The external CLI defaults
+  `EVOLVE_JEV_MAX_CALLS` to `1`.
+- `--save` writes a normal Jev experiment plus provider run, cache entry (when enabled) and an immutable
+  decision record. The decision's `subjectDigest` is the source external packet's `packetDigest`; its
+  `packetKind` is `JEV_EXTERNAL_INTELLIGENCE_DECISION_PACKET`; its `questionSetId` is
+  `jev-external-intelligence-v1`. No raw capture file is duplicated into Jev storage.
+
+### CLI
+
+```bash
+npm run jev:external -- --capture <capture-id> --provider <provider> [--save]
+```
+
+It requires an EXISTING frozen capture, replays it offline, performs integrity verification, builds the
+external packet, runs `assertPacketAllowed`, derives the dedicated Jev packet, builds
+`jev-external-intelligence-v1`, optionally calls exactly one selected provider, and persists only when
+requested. It never calls Agent-Reach, never takes a capture, never touches live internet except the
+explicitly selected Jev provider, never calls DeepSeek and never runs the Arena.
+
+### Caveat
+
+The first V2 capture (`capture-20260919T130756Z`) is a one-record GitHub **infrastructure** capture with
+`evidenceQuality: WEAK`. It is suitable for proving plumbing end to end — **not** for claiming any useful
+market signal. A `WEAK` evidence label and a Jev `observe`/`ignore` disposition are the expected result.
+Calibration of external-intelligence decisions is out of scope for Phase 5F.0: an external decision has
+no Arena outcome contract yet, so `npm run calibrate:jev` is not extended to it and missing Arena
+outcomes are never treated as a failure.
+
+## Phase 5F.1 — Resilient Jev Transport
+
+Phase 5D/5F.0 deliberately sent `maxRetries: 0` to the AI SDK and made exactly **one** physical attempt
+per EVOLVE call. That correctly prevented hidden retry storms — and it also meant a single transient
+HTTP 429 ended an entire shadow experiment (`JEV_RATE_LIMIT`, one attempt, stop). Phase 5F.1 adds an
+**explicit, EVOLVE-owned** resilience layer *below* one logical decision. It does not guarantee HTTP 200;
+it maximizes the probability of eventually obtaining a valid `JEV_OK` while staying bounded, auditable,
+and honest about every failure.
+
+### Logical decisions vs physical attempts
+
+```text
+ONE logical Jev decision            (counted once against EVOLVE_JEV_MAX_CALLS)
+  └── 1..N PHYSICAL transport attempts
+        attempt 1 -> 429   -> backoff -> retry
+        attempt 2 -> 503   -> backoff -> retry
+        attempt 3 -> 200   -> JEV_OK
+```
+
+That is still **ONE shadow decision**, and it reports `providerAttemptCount: 3` with all three attempt
+records — the failed ones are never discarded. Counting a retried call as several Jev decisions would
+corrupt every calibration and provenance number EVOLVE produces.
+
+| Budget | Meaning | Default | Bounds |
+| --- | --- | --- | --- |
+| `EVOLVE_JEV_MAX_CALLS` | maximum **LOGICAL** Jev decisions per run (unchanged) | `20` (`1` in `jev:external`) | 1..500 |
+| `EVOLVE_JEV_MAX_ATTEMPTS` | maximum **PHYSICAL** attempts per logical decision | `3` | 1..5 |
+
+### What is retried, and what is not
+
+| Retried (transient) | Never retried |
+| --- | --- |
+| HTTP `429` / `JEV_RATE_LIMIT` | `400`, `401`, `402`, `403`, `404`, `422` |
+| HTTP `502`, `503`, `504` (and retryable `5xx`) | malformed typed response (`JEV_INVALID_RESPONSE`) |
+| `JEV_TIMEOUT` | invalid question schema |
+| temporary connection reset / DNS / network failures (`JEV_UNAVAILABLE`) | configuration error, authentication error |
+| | unknown provider / unknown model, packet-audit failure |
+
+The HTTP status code decides whenever one is available, which is what keeps the DIRECT TypeSafe route
+honest: it classifies 429/5xx as `JEV_HTTP_ERROR` (pinned Phase 5D behaviour), so retryability is read
+from the status code rather than the label. An auth or config error will not improve by sleeping, so it
+is never retried and never opens a cooldown.
+
+### Backoff, jitter and `Retry-After`
+
+Exponential backoff with bounded jitter: `base · 2^(attempt-1)`, clamped to `EVOLVE_JEV_BACKOFF_MAX_MS`,
+then multiplied by a factor drawn from `[0.75, 1.25)` — so attempt 1 waits ~1s, attempt 2 ~2s, and
+simultaneous agents never retry in lockstep.
+
+A standard `Retry-After` is recognized from the bounded error/header shapes the AI SDK and Gateway errors
+expose (integer seconds **or** an HTTP-date, including one `RetryError` unwrap level) and is used instead
+of the schedule for that wait. It is **clamped** to 60 seconds, a malformed value is ignored, and only a
+single bounded `retryAfterMs` number is ever persisted — raw headers, cookies and credentials never are.
+
+`sleepImpl` and `randomImpl` are injectable, so the whole suite runs offline with zero real delay and a
+deterministic jitter draw.
+
+### Provider-health cooldown (bounded circuit breaker)
+
+Cross-run protection lives under the Jev subsystem at `.evolve/jev/provider-health/<provider>.json`
+(`EVOLVE_JEV_HEALTH_DIR` overrides the location) and contains exactly:
+
+```json
+{ "provider", "model", "consecutiveTransientFailures", "lastFailureStatus",
+  "lastFailureAt", "cooldownUntil", "lastSuccessAt", "formatVersion" }
+```
+
+No secrets of any kind. When a logical decision exhausts every attempt on **exclusively** transient
+failures, the streak increments and a cooldown opens, escalating geometrically and clamped at
+`EVOLVE_JEV_COOLDOWN_MAX_MS` (default 15 minutes):
+
+```text
+first exhausted transient run   ->  60s
+second                          -> 120s
+third                           -> 240s   (… clamped at 15 minutes, never indefinite)
+```
+
+While a cooldown is active the call **fails safely** with an explicit `JEV_COOLDOWN` and makes **zero**
+network attempts — the provider is never touched merely to rediscover that it is still rate limited. Only
+an explicit `--override-cooldown` bypasses it. A successful `JEV_OK` resets the streak and clears the
+cooldown; auth/config/invalid-response failures are recorded but never create one.
+
+### Optional same-Jev transport failover
+
+```bash
+EVOLVE_JEV_TRANSPORT_CHAIN=vercel-jev,typesafe-jev
+```
+
+Empty (the default) means the single selected provider only. When enabled — and only when **both** routes
+have their **own** real credential (`AI_GATEWAY_API_KEY` for `vercel-jev`, `EVOLVE_JEV_API_KEY` for
+`typesafe-jev`) — Vercel Jev is tried first under the bounded transient policy, and if it exhausts its
+attempts the DIRECT TypeSafe Jev route is tried. This is allowed because it stays **Jev → Jev**.
+`mock-jev` may never appear in the chain, and no other decision model (GPT, Claude, Gemini, DeepSeek, …)
+is reachable — `EVOLVE_JEV_TRANSPORT_CHAIN` rejects anything that is not a registered same-Jev route as a
+configuration error.
+
+Credentials are never borrowed: the gateway key is never sent to `api.typesafe.ai`, the direct key is
+never sent to the AI Gateway, and a chain entry whose own credential is missing is **skipped** (and
+reported), never substituted.
+
+Provider and transport are part of the provenance of every attempt (`provider`, `model`, `transport`), so
+a decision obtained through the Gateway is never mistaken for a byte-identical DIRECT TypeSafe decision,
+and calibration can stratify by transport later.
+
+The offline `mock-jev` and any fail-closed config-error provider are returned **unwrapped** — no network
+to protect, no retry that could help — so their Phase 5D/5F.0 behaviour is byte-for-byte unchanged.
+
+### Attempt provenance
+
+Each physical attempt is persisted in `providerAttempts` with **only** these bounded fields:
+
+```json
+{ "attemptNumber", "provider", "model", "transport", "startedAt", "completedAt",
+  "latencyMs", "status", "httpStatus", "retryable", "retryAfterMs", "backoffMs",
+  "generationId", "successful" }
+```
+
+Never an API key, Authorization header, cookie, raw state, raw questions, raw response or raw headers.
+The run also reports `providerAttemptCount` (actual physical attempts: `1` for an ordinary
+single-attempt call, `0` for a cache hit / disabled provider / exhausted budget), and the immutable
+decision record carries the same attempts so a later offline calibration can see exactly which transport
+produced it.
+
+The `vercel-jev` request itself still sends **`maxRetries: 0`**: EVOLVE owns all retry behaviour, and SDK
+retries are never enabled at the same time — otherwise attempt accounting would become opaque.
+
+### Validation
+
+```bash
+npm run validate:phase5f1   # 64 offline cases: classification, Retry-After, backoff, cooldown, chain, identity
+```
+
 ## Validation
 
 ```bash
@@ -2827,6 +3091,56 @@ Phase 5E.2 adds `npm run validate:phase5e2` (36 offline cases):
   explicit note, on a checkout that does not contain that workspace artifact)
 - **Determinism** — V1 and V2 feature and replay digests are deterministic, clock-derived fields stay
   out of both digests, and the packet still audits while containing no raw text and no URL
+
+Phase 5F.1 adds `npm run validate:phase5f1` (64 offline cases):
+
+- **Retry classification** — 429/5xx/timeout/network retried; 400/401/402/403/404/422, malformed
+  responses, config/auth errors and packet-audit failures never retried
+- **Budgets** — `EVOLVE_JEV_MAX_CALLS` stays a LOGICAL count while `EVOLVE_JEV_MAX_ATTEMPTS` bounds
+  PHYSICAL attempts; one retried decision is still one decision
+- **Retry-After** — integer seconds and HTTP-date parsed, malformed values ignored, values clamped,
+  and only a bounded `retryAfterMs` number persisted (never raw headers)
+- **Backoff/jitter** — exponential, bounded, jittered; injected `sleepImpl`/`randomImpl` mean zero real
+  delay and fully deterministic tests
+- **Provenance** — `providerAttemptCount` exact, every attempt persisted, failed attempts retained after
+  an eventual success, strict absence of credentials/headers/raw payloads
+- **Cooldown** — created only by exhausted transient decisions, blocks all network calls while active,
+  survives expiry, resets on success, escalates geometrically and clamps, and is never triggered by an
+  auth or config error
+- **Same-Jev chain** — disabled by default, requires each route's OWN credential, never crosses
+  credentials, recovers when the first route exhausts transient failures, and never falls back to a
+  non-Jev model
+- **Identity barriers** — the real V2 capture, the legacy V1 capture, Wave 1, Wave 2, the six datasets,
+  the frozen cohorts and the evaluation contract digest are all unchanged
+
+Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
+
+- **Packet kind/version** — the new kind is explicit and distinct from candidate/market, the new version
+  constant is `1`, and the existing candidate/market packet version is proven un-bumped
+- **Projection whitelist** — the Jev projection has only the allowed top-level keys; raw records, text,
+  URLs, author ids and repository names cannot enter it (including a packet that tries to smuggle raw
+  content under an innocuous nested name), and the audit flags forbidden keys/values when injected
+- **Withheld label** — `captureAgeMs` and the deterministic `evidenceQuality` label are absent from the
+  whole Jev state, while `evidenceQuality` is allowed only as post-build comparator metadata
+- **Refusals** — a packet that fails its own audit, a routing-active packet, and non-shadow/non-paper/
+  non-read-only packets are each refused before projection
+- **Question set** — the id/version are pinned, all five question names/types are fixed, the
+  `primaryConcern` and `researchDisposition` vocabularies are exact, and repeated builds are byte-identical
+- **Provider reuse** — the registered provider set, the disabled default, the unknown-name failure, and
+  the mock/typesafe/vercel adapters (with an injected `fetch`/`evaluateImpl` stub) are all exercised offline
+- **Budget/cache/state** — the budget is checked before the provider is called, one live call consumes one
+  slot, cache identity depends on the packet version + question-set identity + state/question digests, and
+  the same capture + packet + questions produce a stable state digest (a different capture does not)
+- **Persistence** — a shadow decision lands in the existing Jev experiment storage, the decision references
+  the source packet digest and stores no raw capture records, a second identical run is a cache hit with
+  zero extra provider calls, and calibration is not attempted
+- **Behavioural isolation** — an injected provider returning `escalate_to_deep_research` is proven to invoke
+  NOTHING: it is recorded verbatim while no Agent-Reach/research/Arena/DeepSeek code is reachable from the
+  bridge or CLI, no repository `.evolve` artifact changes, and the routing constants stay `false`
+- **Identity barriers** — the real V2 capture stays byte-identical with pinned manifest/records/replay/
+  packet digests (and `evidenceQuality: WEAK`), the legacy V1 capture replays to `b3904fe2…`, Wave 1,
+  Wave 2, the six datasets and the frozen cohorts stay byte-identical, and the evaluation contract digest
+  remains exactly `4cf8ac1f…`
 - **Barriers** — Wave 1, Wave 2, the six replication datasets and the two frozen cohorts are verified
   byte-identical, the evaluation contract digest is exactly `4cf8ac1f…`, nothing under `.evolve/` changes
   while the suite runs, and no Jev call, DeepSeek call, Arena run, provider call or network call is
@@ -3040,8 +3354,31 @@ Phase 5E.2 adds `npm run validate:phase5e2` (36 offline cases):
 - [x] Replay resolves the transform from the frozen manifest (`external-intelligence-replay-v2`), reports `featureVersion` + `captureSchemaVersion`, and keeps `external-intelligence-packet-v1` (the packet already carried `featureVersion`)
 - [x] Committed schema-1 compatibility fixture (`scripts/intelligence/fixtures/legacy-capture-schema1/`) with a frozen expected V1 vector, digest and replay digest
 - [x] `npm run validate:phase5e2` — 36 offline cases
-- [ ] A NEW one-channel GitHub capture under V2, replayed twice offline and integrity-verified, before any External Intelligence → Jev shadow experiment
-- [ ] One External Intelligence → Jev **shadow** experiment — operator-run, Jev routing still inactive until explicitly enabled
+- [x] A NEW one-channel GitHub capture under V2, replayed twice offline and integrity-verified — `capture-20260919T130756Z`, one record, replay digest `14f8a36c…`, packet digest `8997cde2…`, `evidenceQuality: WEAK` (**infrastructure evidence only**)
+
+### Phase 5F.0 — external intelligence → Jev shadow experiment bridge
+- [x] Dedicated packet kind `JEV_EXTERNAL_INTELLIGENCE_DECISION_PACKET` (+ separate version `1`) so the candidate/market packets are neither overloaded nor bumped
+- [x] `buildExternalIntelligenceJevPacket(...)` — mandatory `assertPacketAllowed` first, routing flags/`shadowOnly`/`paperOnly`/`readOnly` re-checked, then a SECOND whitelist projection (no raw records/text/URLs/author ids/`captureAgeMs`; coordination indicator ids only, never prose rules)
+- [x] The deterministic `evidenceQuality` label is withheld from the Jev state and recorded afterwards as a deterministic comparator (`externalEvidenceQuality`, `coordinationIndicatorCount`, `recordCount`, `sourceCount`, `queryCoverage`, `fetchFailureRate`)
+- [x] Fixed question set `jev-external-intelligence-v1` (evidenceSufficiency, primaryConcern, evidenceQuality, corroborationConfidence, researchDisposition) — never dynamic, never the candidate/market sets
+- [x] Explicit CLI `npm run jev:external -- --capture <id> --provider <name> [--save]`, reusing the existing providers/timeout/budget/cache/`jevDecide()`/experiment storage (no second provider subsystem, no second cache, no `.evolve/jev-external` tree); fail-closed provider selection, `EVOLVE_JEV_MAX_CALLS=1` default checked before the call
+- [x] Decision record uses the new packet kind, the source packet digest as `subjectDigest`, `questionSetId: jev-external-intelligence-v1`, and the six deterministic comparators; no raw capture is duplicated into Jev storage
+- [x] `escalate_to_deep_research` is proven a pure SHADOW ANSWER: zero DeepSeek, zero Agent-Reach, zero capture, zero Arena, zero routing-constant change, zero filesystem mutation outside the temporary Jev experiment root
+- [x] Calibration of external-intelligence decisions is OUT OF SCOPE for Phase 5F.0 (no Arena outcome contract); missing Arena outcomes are never a failure
+- [x] `npm run validate:phase5f` — 49 offline cases
+
+### Phase 5F.1 checklist
+
+- [x] Explicit EVOLVE-owned transport resilience below one logical decision: bounded `EVOLVE_JEV_MAX_ATTEMPTS` (1..5) PHYSICAL attempts per LOGICAL decision, with `providerAttemptCount` and `providerAttempts` provenance on the run and the immutable decision
+- [x] Retry ONLY transient failures (429 / 502 / 503 / 504 / retryable 5xx / timeout / network); 400/401/402/403/404/422, malformed responses, invalid question schemas, config/auth errors, unknown provider/model and packet-audit failures are never retried
+- [x] Exponential backoff with bounded jitter, injectable `sleepImpl`/`randomImpl`, and a bounded `Retry-After` (seconds or HTTP-date) that is clamped and persisted only as a number — never raw headers
+- [x] SDK `maxRetries` remains `0`; EVOLVE owns all retries and never runs them alongside SDK retries
+- [x] Bounded provider-health cooldown under `.evolve/jev/provider-health/` with geometric escalation clamped at 15 minutes, safe `JEV_COOLDOWN` failure with zero network calls, and success reset
+- [x] Optional same-Jev transport chain, disabled by default, credential-gated per route, never crossing credentials and never reaching a non-Jev model
+- [x] External-intelligence bridge semantics unchanged: one logical decision, `escalate_to_deep_research` still invokes nothing, and zero Agent-Reach/DeepSeek/Arena/trading activity
+- [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, the six datasets, the frozen cohorts and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5f1` — 64 offline cases
+- [ ] First real resilience test on `capture-20260919T130756Z` — operator-run AFTER this commit, 1 logical call / up to 3 transport attempts, `vercel-jev`, `typesafe-ai/jev`, `--save`; its disposition is **not** evidence that external intelligence adds value
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

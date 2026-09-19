@@ -26,6 +26,7 @@ import path from "node:path";
 
 import { digestOf } from "../lib/hash.mjs";
 import { sanitizeForPublic } from "../lib/sanitize.mjs";
+import { boundedProviderAttempts } from "./transport.mjs";
 
 export const JEV_EXPERIMENT_VERSION = 1;
 export const JEV_ROOT_DIR = path.join(".evolve", "jev");
@@ -185,7 +186,14 @@ export function buildJevDecisionRecord({
   syntheticDecision = false,
   deterministicComparators = {},
   predictedAt,
+  providerAttempts = null,
+  providerAttemptCount = null,
 }) {
+  // Transport provenance travels WITH the decision, so a later offline
+  // calibration can stratify by transport ("Vercel Gateway → TypeSafe Jev" is
+  // NOT byte-identical provenance to "direct TypeSafe API → Jev") without ever
+  // re-reading the provider run logs.
+  const attempts = Array.isArray(providerAttempts) ? boundedProviderAttempts(providerAttempts) : null;
   return {
     schemaVersion: JEV_EXPERIMENT_VERSION,
     decisionId,
@@ -208,6 +216,12 @@ export function buildJevDecisionRecord({
     // NEVER anything that depends on an outcome that has not happened yet.
     deterministicComparators: { ...deterministicComparators },
     predictedAt,
+    providerAttemptCount: attempts
+      ? attempts.length
+      : Number.isFinite(providerAttemptCount)
+        ? Math.max(0, Math.round(providerAttemptCount))
+        : null,
+    providerAttempts: attempts,
     immutable: true,
   };
 }
