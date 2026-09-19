@@ -282,8 +282,13 @@ export function createFreeze(options = {}) {
  * Persistence
  * ==========================================================================*/
 
-export function freezePath(root = REPLICATION_DIR) {
-  return path.join(root, FREEZE_FILE);
+/**
+ * Path of a freeze artifact. `file` defaults to the historical root freeze
+ * (`phase5c-freeze.json`); Phase 5C.3 per-wave freezes pass their own relative
+ * path (for example `freezes/wave-2.json`) through `./waves.mjs`.
+ */
+export function freezePath(root = REPLICATION_DIR, file = FREEZE_FILE) {
+  return path.join(root, file);
 }
 
 async function writeJsonAtomic(target, value) {
@@ -294,15 +299,15 @@ async function writeJsonAtomic(target, value) {
   await rename(tmp, target);
 }
 
-export async function writeFreeze(freeze, { root = REPLICATION_DIR } = {}) {
+export async function writeFreeze(freeze, { root = REPLICATION_DIR, file = FREEZE_FILE } = {}) {
   const record = withFreezeDigest(freeze);
-  await writeJsonAtomic(freezePath(root), record);
+  await writeJsonAtomic(freezePath(root, file), record);
   return record;
 }
 
-export async function readFreeze({ root = REPLICATION_DIR } = {}) {
+export async function readFreeze({ root = REPLICATION_DIR, file = FREEZE_FILE } = {}) {
   try {
-    return JSON.parse(await readFile(freezePath(root), "utf8"));
+    return JSON.parse(await readFile(freezePath(root, file), "utf8"));
   } catch {
     return null;
   }

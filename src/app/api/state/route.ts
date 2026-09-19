@@ -19,6 +19,10 @@ export const revalidate = 0;
  *   hall of fame            -> .evolve/hall-of-fame/index.json (read-only, summarized)
  *   live shadow league      -> .evolve/shadow/*.json (read-only, summarized, PAPER ONLY)
  *   research swarm memory   -> .evolve/research/ (read-only via the live state summary)
+ *   Jev shadow supervisor   -> .evolve/jev/ (read-only, summarized, SHADOW ONLY, Phase 5D)
+ *   Agent-Reach observations -> .evolve/intelligence/ (read-only, summarized,
+ *                              SHADOW ONLY, Phase 5E — identity/health/counts
+ *                              only; never raw social text, URLs or cookies)
  *
  * Two research concepts are exposed as two distinct fields and are never
  * merged (Phase 5A.1):

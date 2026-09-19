@@ -19,7 +19,7 @@
  * Run with: npm run validate:phase5c
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -43,6 +43,8 @@ const { DATASET_ROLE, ELIGIBILITY_CRITERIA } = constants;
 import {
   buildFreezeConfig,
   freezeDigest,
+  freezeDigestSubject,
+  readGitCommit,
   verifyFreeze,
   createFreeze,
   canonicalityVerdict,
@@ -1437,6 +1439,11 @@ test("78. the dashboard replication state is bounded and reads the frozen artifa
 const CLI_SCRIPT = path.resolve("scripts", "replicate-research.mjs");
 const CANONICAL_REPLICATION_ID = "rep-66884de4e460";
 const CANONICAL_FREEZE_DIGEST = "4959974d1b78635e63c0d9038c582c9ceb5a7411366d9c95c82e7ee3bac3f500";
+const CANONICAL_FROZEN_COMMIT = "e7940e0ee3596cd4752de462d9bcd1d8096d1509";
+const CANONICAL_COHORT_DIGESTS = Object.freeze({
+  mock: "b26d63a2a0787e954ed7e4e63e668fe4664e58059508145345214facc4e12858",
+  deepseek: "13c7c93d707b26f8b92042d488ff0a63f5de3f9f81b8145be4eac7a70cc550a8",
+});
 const CANONICAL_FREEZE_FILE = path.join(".evolve", "replication", "phase5c-freeze.json");
 const CANONICAL_REPLICATION_DIR = path.join(".evolve", "replication", CANONICAL_REPLICATION_ID);
 const CANONICAL_COHORTS_DIR = path.join(".evolve", "replication", "cohorts");
@@ -1666,34 +1673,135 @@ test("82. --write-freeze writes the freeze artifact and stops (zero replicas)", 
   assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
 });
 
-test("83. --write-freeze reproduces the canonical freeze digest", async () => {
+/*
+ * Tests 83, 83b and 83c replace the old "current checkout reproduces the
+ * canonical digest" assertion. The freeze records the git commit as a CRITICAL
+ * field, so once HEAD moved past the frozen commit the current checkout could
+ * never legitimately regenerate the historical digest. The canonical freeze is
+ * immutable evidence; current code must DETECT that it differs, not pretend to
+ * reproduce the old experiment.
+ */
+test("83. the stored canonical freeze is internally valid and its evidence is immutable", async () => {
+  const before = await canonicalSnapshot();
+  assertDeepEqual(before, canonicalBaseline, "the canonical artifacts are byte-identical to the suite-start baseline");
+
+  const stored = await readFreeze({ root: path.join(".evolve", "replication") });
+  assert(stored, "the canonical freeze artifact exists");
+  assertEqual(stored.freezeDigest, CANONICAL_FREEZE_DIGEST, "the stored freeze digest is the canonical digest");
+  assertEqual(stored.commit, CANONICAL_FROZEN_COMMIT, "the stored freeze commit is the canonical frozen commit");
+  assertEqual(freezeDigest(stored), CANONICAL_FREEZE_DIGEST, "recomputing the digest from the STORED content reproduces it");
+  assert(
+    Object.hasOwn(freezeDigestSubject(stored), "commit"),
+    "the commit is part of the digested subject (integrity is not weakened)",
+  );
+
+  for (const key of COHORT_KEYS) {
+    const frozen = await readFrozenCohort(path.join(".evolve", "replication"), key);
+    assertEqual(frozen.cohortDigest, CANONICAL_COHORT_DIGESTS[key], `the frozen ${key} cohort digest is unchanged`);
+    assertEqual((await verifyFrozenCohort(path.join(".evolve", "replication"), key)).ok, true, `the ${key} cohort payload still matches its digest`);
+  }
+  const manifest = JSON.parse(await readFile(path.join(CANONICAL_REPLICATION_DIR, "manifest.json"), "utf8"));
+  assertEqual(manifest.freezeDigest, CANONICAL_FREEZE_DIGEST, "the canonical replication still records the canonical freeze digest");
+  assertEqual(manifest.cohorts.mock.cohortDigest, CANONICAL_COHORT_DIGESTS.mock, "the replication binds the canonical Mock cohort");
+  assertEqual(manifest.cohorts.deepseek.cohortDigest, CANONICAL_COHORT_DIGESTS.deepseek, "the replication binds the canonical DeepSeek cohort");
+});
+
+test("83b. current-code drift from the canonical freeze is detected as critical commit drift", async () => {
   await resetArenaSpawns();
-  const out = cliOut("write-canonical-digest");
-  // Run from the checkout root so the CLI records the same commit the live
-  // config does. The tripwire history root keeps this safe even if a regression
-  // ever tried to continue past the write: discovery would fail loudly before
-  // any Arena could be reached.
+  const head = readGitCommit();
+  const stored = await readFreeze({ root: path.join(".evolve", "replication") });
+
+  // The canonical freeze is only ever READ; the CLI verifies a byte-copy in a temp root.
+  const out = cliOut("verify-canonical-copy");
+  await mkdir(out, { recursive: true });
+  await copyFile(CANONICAL_FREEZE_FILE, path.join(out, "phase5c-freeze.json"));
+  assertEqual(
+    await readFile(path.join(out, "phase5c-freeze.json"), "utf8"),
+    await readFile(CANONICAL_FREEZE_FILE, "utf8"),
+    "the verified copy is byte-identical to the canonical freeze",
+  );
+
+  // No --dev: drift is reported honestly, never disguised.
   const run = runCli({
-    actionArgs: ["--write-freeze", "--json"],
+    actionArgs: ["--verify-freeze", "--json"],
     out,
     cwd: process.cwd(),
-    env: {
-      EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire,
-      EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire,
-      EVOLVE_CLI_STUB_LOG: ctx.cliLog,
-    },
+    env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire, EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire },
   });
-  assertEqual(run.status, 0, `--write-freeze exits 0 (stderr: ${run.stderr})`);
-  const payload = JSON.parse(run.stdout);
-  assertEqual(payload.freezeDigest, createFreeze().freezeDigest, "the written freeze matches the live config digest");
-  assertEqual(
-    payload.freezeDigest,
-    CANONICAL_FREEZE_DIGEST,
-    "the freeze digest is the recorded canonical digest (same commit, same pinned config)",
-  );
-  const stored = await readFreeze({ root: out });
-  assertEqual(freezeDigest(stored), CANONICAL_FREEZE_DIGEST, "recomputing the digest reproduces it");
+  const report = JSON.parse(run.stdout);
+  assertEqual(report.action, ACTION.VERIFY_FREEZE, "the JSON names the verify-freeze action");
+  assertEqual(report.unitsExecuted, 0, "zero units executed");
+  assertEqual(report.frozenCommit, CANONICAL_FROZEN_COMMIT, "the report names the frozen commit");
+  assertEqual(report.freezeDigest, CANONICAL_FREEZE_DIGEST, "the report names the canonical freeze digest");
+
+  if (head !== CANONICAL_FROZEN_COMMIT) {
+    // Expected steady state: HEAD moved on, so canonical verification must FAIL.
+    assertEqual(run.status, 1, "canonical verification exits 1 when HEAD is not the frozen commit");
+    assertEqual(report.ok, false, "verification is not ok");
+    assertEqual(report.commitChanged, true, "commit drift is reported");
+    assertEqual(report.currentCommit, head, "the report names the current commit");
+    assertEqual(report.digestMatches, false, "the current digest does not match the frozen one");
+    const commitDrift = report.criticalDrift.find((row) => row.path === "commit");
+    assert(commitDrift, "the commit is reported as CRITICAL drift");
+    assertEqual(commitDrift.critical, true, "the commit drift row is marked critical");
+    assertEqual(commitDrift.frozen, CANONICAL_FROZEN_COMMIT, "the drift row carries the frozen commit");
+    assertEqual(commitDrift.current, head, "the drift row carries the current commit");
+
+    const verdict = canonicalityVerdict({ frozen: stored, commit: head, dirty: false });
+    assertEqual(verdict.canonical, false, "a run from the current commit is NOT canonical against this freeze");
+    assertEqual(verdict.label, "NON_CANONICAL", "it is labelled NON_CANONICAL");
+    assert(verdict.reasons.some((reason) => /differs from the frozen commit/.test(reason)), "the reason names the commit difference");
+  } else {
+    assertEqual(report.commitChanged, false, "at the frozen commit no commit drift exists");
+  }
   assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  assertDeepEqual(await canonicalSnapshot(), canonicalBaseline, "verification did not touch any canonical artifact");
+});
+
+test("83c. a NEW freeze from current code is deterministic, differs from the canonical digest, and stays in a temp root", async () => {
+  await resetArenaSpawns();
+  const head = readGitCommit();
+  const spawnEnv = {
+    EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire,
+    EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire,
+    EVOLVE_CLI_STUB_LOG: ctx.cliLog,
+  };
+
+  // Two independent temp roots, written at different times, same commit/config.
+  const first = runCli({ actionArgs: ["--write-freeze", "--json"], out: cliOut("new-freeze-a"), cwd: process.cwd(), env: spawnEnv });
+  const second = runCli({ actionArgs: ["--write-freeze", "--json"], out: cliOut("new-freeze-b"), cwd: process.cwd(), env: spawnEnv });
+  assertEqual(first.status, 0, `--write-freeze exits 0 (stderr: ${first.stderr})`);
+  assertEqual(second.status, 0, `a second --write-freeze exits 0 (stderr: ${second.stderr})`);
+  const a = JSON.parse(first.stdout);
+  const b = JSON.parse(second.stdout);
+  assertEqual(a.action, ACTION.WRITE_FREEZE, "the JSON names the write-freeze action");
+  assertEqual(a.unitsExecuted, 0, "zero units executed");
+  assertEqual(a.freezeDigest, b.freezeDigest, "the same commit/config yields the same digest (deterministic)");
+  assertEqual(a.freezeDigest, createFreeze().freezeDigest, "the written freeze matches the live-config digest");
+  assert(/^[0-9a-f]{64}$/.test(a.freezeDigest), "the digest is a SHA-256 string");
+
+  const written = await readFreeze({ root: cliOut("new-freeze-a") });
+  assertEqual(written.commit, head, "the new freeze records the CURRENT commit");
+  assertEqual(freezeDigest(written), a.freezeDigest, "recomputing the new freeze's digest reproduces it");
+  assertEqual(a.path, path.join(cliOut("new-freeze-a"), "phase5c-freeze.json"), "the new freeze was written under the temp root");
+  assert(!path.resolve(a.path).startsWith(path.resolve(".evolve")), "nothing was written under .evolve");
+
+  // Determinism is clock-independent; the commit is a critical, digested field.
+  const fixed = createFreeze({ commit: "c0ffee", createdAt: 1 });
+  assertEqual(createFreeze({ commit: "c0ffee", createdAt: 999 }).freezeDigest, fixed.freezeDigest, "the digest ignores the clock");
+  assert(createFreeze({ commit: "c0ffef", createdAt: 1 }).freezeDigest !== fixed.freezeDigest, "a different commit changes the digest");
+
+  if (head !== CANONICAL_FROZEN_COMMIT) {
+    assert(a.freezeDigest !== CANONICAL_FREEZE_DIGEST, "a new freeze from a different commit differs from the canonical digest");
+  }
+
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  assertDeepEqual(await canonicalSnapshot(), canonicalBaseline, "the canonical fixture was never overwritten");
+  assertEqual(
+    (await readFreeze({ root: path.join(".evolve", "replication") })).freezeDigest,
+    CANONICAL_FREEZE_DIGEST,
+    "the canonical freeze still carries the canonical digest",
+  );
 });
 
 test("84. --verify-freeze verifies only (read-only, zero Arena subprocesses)", async () => {

@@ -102,6 +102,28 @@ export function formatCohortInspection(manifests = {}) {
 }
 
 /* ============================================================================
+ * Replication wave (Phase 5C.2)
+ * ==========================================================================*/
+
+/** Header for a wave-scoped plan/summary. Pure renderer of a stored manifest. */
+export function formatWaveHeader(manifest) {
+  const out = [];
+  out.push(line("="));
+  out.push(`PHASE 5C.2 REPLICATION WAVE — ${manifest.waveId}`);
+  out.push(line("="));
+  out.push(`manifestDigest: ${manifest.manifestDigest}`);
+  out.push(`status: ${manifest.status} · identity: ${manifest.identityMode}${manifest.historical ? " (historical — never re-run)" : ""}`);
+  out.push(`replicationId: ${manifest.replicationId ?? "(computed from this wave's manifest digest)"}`);
+  out.push(`freezePath: ${manifest.freezePath ?? "(none)"}`);
+  out.push(`freezeDigest: ${manifest.freezeDigest ?? "(not bound yet — run --write-freeze --wave " + manifest.waveId + ")"}`);
+  out.push(`evaluationContractDigest: ${manifest.evaluationContractDigest ?? "(none)"}`);
+  out.push(`cohorts: mock ${String(manifest.mockCohortDigest ?? "n/a").slice(0, 12)}… · deepseek ${String(manifest.deepseekCohortDigest ?? "n/a").slice(0, 12)}…`);
+  out.push(`prior waves: ${(manifest.priorWaveIds ?? []).join(", ") || "(none)"} · excluded datasets: ${(manifest.excludedDatasetIds ?? []).join(", ") || "(none)"}`);
+  out.push("PAPER ONLY. Membership is predeclared and performance-blind; no research provider is called.");
+  return out.join("\n");
+}
+
+/* ============================================================================
  * Dataset registry
  * ==========================================================================*/
 

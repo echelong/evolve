@@ -36,8 +36,16 @@ export function evaluationKey(freeze) {
   };
 }
 
-/** Deterministic id of the whole replication experiment (`rep-<12hex>`). */
-export function replicationIdFor({ freezeDigest, cohortDigests = {}, providers = [], evaluation = {} } = {}) {
+/**
+ * Deterministic id of the whole replication experiment (`rep-<12hex>`).
+ *
+ * `wave` is OPTIONAL (Phase 5C.2). When it is omitted the digest subject is
+ * byte-identical to the pre-5C.2 subject, so the historical canonical
+ * replication id is reproduced exactly. When it is supplied, the wave's
+ * manifest digest joins the identity — a dataset-level fingerprint/cohort pin
+ * that a wave-less run cannot have.
+ */
+export function replicationIdFor({ freezeDigest, cohortDigests = {}, providers = [], evaluation = {}, wave = null } = {}) {
   const subject = {
     freezeDigest: freezeDigest ?? null,
     cohorts: Object.fromEntries(
@@ -48,7 +56,28 @@ export function replicationIdFor({ freezeDigest, cohortDigests = {}, providers =
     providers: [...providers].filter(Boolean).sort(),
     evaluation,
   };
+  if (wave) {
+    subject.wave = { waveId: wave.waveId ?? null, manifestDigest: wave.manifestDigest ?? null };
+  }
   return `rep-${digestOf(subject).slice(0, 12)}`;
+}
+
+/**
+ * Deterministic id of a WAVE-BOUND replication experiment (Phase 5C.2).
+ *
+ * The wave manifest digest already pins freeze identity, cohort digests, the
+ * dataset ids and their fingerprints, so the id distinguishes a wave from every
+ * other wave and from the canonical Wave 1 replication. A stable rerun of the
+ * same wave definition reproduces the same id.
+ */
+export function waveReplicationIdFor({ freezeDigest, cohortDigests = {}, providers = [], evaluation = {}, waveId, manifestDigest } = {}) {
+  return replicationIdFor({
+    freezeDigest,
+    cohortDigests,
+    providers,
+    evaluation,
+    wave: { waveId: waveId ?? null, manifestDigest: manifestDigest ?? null },
+  });
 }
 
 /** Deterministic id of one (provider × dataset) experiment (`unit-<12hex>`). */

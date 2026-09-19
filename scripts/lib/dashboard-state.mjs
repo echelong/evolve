@@ -35,6 +35,9 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { loadJevShadowState } from "../jev/dashboard.mjs";
+import { loadExternalIntelligenceState } from "../intelligence/dashboard.mjs";
+
 export const DASHBOARD_STATE_CONTRACT_VERSION = 2;
 
 export const STATE_FILES = Object.freeze({
@@ -659,6 +662,11 @@ export async function readDashboardState({ root = path.join(process.cwd(), ".evo
     const hallOfFame = await loadHallOfFame(path.join(root, "hall-of-fame"));
     const shadow = await loadShadowLeague(path.join(root, "shadow"));
     const replication = await loadReplicationState(root);
+    const jevShadow = await loadJevShadowState(root);
+    // Phase 5E: SHADOW-ONLY external-intelligence status — identity, health and
+    // counts only. No raw social content, no URLs, no credentials, and nothing
+    // that can influence trading, evolution, scoring, gates or replication.
+    const externalIntelligence = await loadExternalIntelligenceState(root, { now });
 
     const researchState = buildResearchState({
       document,
@@ -693,6 +701,12 @@ export async function readDashboardState({ root = path.join(process.cwd(), ".evo
           historicalResearch: researchState.historicalResearch,
           // Phase 5C: compact, read-only multi-dataset replication status.
           replication,
+          // Phase 5D: SHADOW ONLY Jev decision-supervisor state — counts and
+          // identity only. Jev has zero authority over anything above.
+          jevShadow,
+          // Phase 5E: SHADOW ONLY external-intelligence status. Read-only, no
+          // routing, and zero authority over anything above.
+          externalIntelligence,
         }
       : {
           error: "Unreadable engine state.",

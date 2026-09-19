@@ -329,6 +329,14 @@ type EvolveState = {
   // Phase 5C: compact, read-only multi-dataset replication status. Counts and
   // a freeze digest only — never the full per-dataset metric tables.
   replication?: ReplicationState | null;
+  // Phase 5D: SHADOW ONLY Jev decision-supervisor state. Jev has zero
+  // authority over trading, evolution, Arena, gates, or deployment — this
+  // panel is counts/identity/health only, never prompts or raw state.
+  jevShadow?: JevShadowState | null;
+  // Phase 5E: SHADOW ONLY external-intelligence state (Agent-Reach). Read-only
+  // observations that are captured, frozen and replayed — never live internet
+  // inside the Arena, and zero authority over anything above.
+  externalIntelligence?: ExternalIntelligenceState | null;
   stateContractVersion?: number;
   stateStale?: boolean;
   genealogy?: { nodes: number; lineages: number; prunedNodes: number; activeLineages: number; extinctLineages: number; maxGeneration: number };
@@ -368,6 +376,65 @@ type ReplicationState = {
   units?: { total: number; completed: number; pending: number; failed: number; skipped: number } | null;
   significance: null;
   verdict: null;
+  note?: string;
+};
+
+type JevShadowState = {
+  available: boolean;
+  provider?: string | null;
+  model?: string | null;
+  mode?: string;
+  health?: string;
+  experimentId?: string | null;
+  cacheEnabled?: boolean;
+  calls?: number;
+  failures?: number;
+  cacheHits?: number;
+  decisionCount?: number;
+  meanLatencyMs?: number | null;
+  byStatus?: Record<string, number>;
+  lastStatus?: string | null;
+  lastDecisionAt?: string | null;
+  calibrationCount?: number | null;
+  brierScore?: number | null;
+  questionSetVersion?: number | null;
+  decisionPacketVersion?: number | null;
+  paperOnly?: boolean;
+  note?: string;
+};
+
+// Phase 5E: SHADOW ONLY external-intelligence status. Identity, health and
+// counts only — no raw social content, no URLs, no credentials.
+type ExternalIntelligenceState = {
+  available: boolean;
+  phase?: string;
+  provider?: string | null;
+  providerEnabled?: boolean;
+  providerRegistered?: boolean;
+  providerError?: string | null;
+  mode?: string;
+  modeIsShadowOnly?: boolean;
+  agentReachVersion?: string | null;
+  agentReachCommit?: string | null;
+  agentReachLicense?: string | null;
+  health?: string;
+  enabledChannels?: string[];
+  disabledChannels?: string[];
+  captures?: number;
+  records?: number;
+  calls?: number;
+  failures?: number;
+  timeouts?: number;
+  lastCaptureAt?: string | null;
+  latestCaptureId?: string | null;
+  latestCaptureDigest?: string | null;
+  latestCaptureSynthetic?: boolean;
+  evidenceQuality?: string | null;
+  replayMode?: string;
+  network?: { liveInternetInsideArena?: boolean; replayIsOffline?: boolean };
+  channels?: { channel: string; status: string; records: number; failures: number; timeouts: number }[];
+  routing?: { jevRoutingActive?: boolean; deepseekRoutingActive?: boolean };
+  paperOnly?: boolean;
   note?: string;
 };
 
@@ -1353,6 +1420,204 @@ function ReplicationPanel({ state }: { state: EvolveState }) {
         <p className="health-note">
           {replication.note ??
             "No Phase 5C replication run has been prepared yet — run npm run replicate:research -- --cohorts to freeze the research cohorts."}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function JevShadowPanel({ state }: { state: EvolveState }) {
+  const jev = state.jevShadow ?? null;
+  if (!jev) return null;
+
+  return (
+    <div className="panel jev-shadow-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">
+            SHADOW SUPERVISOR <span className="paper-tag">PAPER</span>
+          </p>
+          <h2>Jev shadow decisions (Phase 5D)</h2>
+        </div>
+        <FlaskConical size={20} />
+      </div>
+
+      {jev.available ? (
+        <>
+          <div className="health-grid">
+            <div className="health-item">
+              <span>Provider</span>
+              <strong>{jev.provider ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Model</span>
+              <strong className="mono">{jev.model ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Mode</span>
+              <strong>{jev.mode ?? "shadow"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Health</span>
+              <strong>{jev.health ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Question-set version</span>
+              <strong>{jev.questionSetVersion ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Decision packet version</span>
+              <strong>{jev.decisionPacketVersion ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Calls / failures</span>
+              <strong>
+                {jev.calls ?? 0} / {jev.failures ?? 0}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Cache hits</span>
+              <strong>{jev.cacheHits ?? 0}</strong>
+            </div>
+            <div className="health-item">
+              <span>Mean latency</span>
+              <strong>{jev.meanLatencyMs != null ? `${jev.meanLatencyMs}ms` : "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Decisions recorded</span>
+              <strong>{jev.decisionCount ?? 0}</strong>
+            </div>
+            <div className="health-item">
+              <span>Calibration count</span>
+              <strong>{jev.calibrationCount ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Brier score</span>
+              <strong>{jev.brierScore != null ? jev.brierScore.toFixed(4) : "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Last decision</span>
+              <strong>{jev.lastDecisionAt ?? "—"}</strong>
+            </div>
+          </div>
+          <p className="health-note">
+            Jev is a SHADOW decision supervisor: it observes bounded TRAIN-safe evidence and returns typed
+            probabilities/choices/scores that EVOLVE records. It has zero authority over trading, genome
+            construction, research compilation, evolution, Arena scoring, gates, species matching, DeepSeek calls,
+            deployment eligibility, or replication. A bad Jev result is acceptable; no threshold is promoted from one
+            experiment.
+          </p>
+        </>
+      ) : (
+        <p className="health-note">
+          {jev.note ?? "No Jev shadow experiment has been run in this workspace yet."}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ExternalIntelligencePanel({ state }: { state: EvolveState }) {
+  const intelligence = state.externalIntelligence ?? null;
+  if (!intelligence) return null;
+
+  const channels = intelligence.channels ?? [];
+
+  return (
+    <div className="panel intelligence-shadow-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">
+            EXTERNAL INTELLIGENCE <span className="paper-tag">PAPER</span>
+          </p>
+          <h2>Agent-Reach shadow observations (Phase 5E)</h2>
+        </div>
+        <RadioTower size={20} />
+      </div>
+
+      {intelligence.available ? (
+        <>
+          <div className="health-grid">
+            <div className="health-item">
+              <span>Provider</span>
+              <strong>
+                {intelligence.provider ?? "disabled"}
+                {intelligence.providerEnabled ? "" : " (disabled)"}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Mode</span>
+              <strong>{intelligence.mode ?? "shadow"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Health</span>
+              <strong>{intelligence.health ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Agent-Reach version</span>
+              <strong className="mono">{intelligence.agentReachVersion ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>License</span>
+              <strong>{intelligence.agentReachLicense ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Enabled channels</span>
+              <strong>{(intelligence.enabledChannels ?? []).join(", ") || "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Captures</span>
+              <strong>{intelligence.captures ?? 0}</strong>
+            </div>
+            <div className="health-item">
+              <span>Records</span>
+              <strong>
+                {intelligence.records ?? 0}
+                {intelligence.latestCaptureSynthetic ? " (synthetic)" : ""}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Failures / timeouts</span>
+              <strong>
+                {intelligence.failures ?? 0} / {intelligence.timeouts ?? 0}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Evidence quality</span>
+              <strong>{intelligence.evidenceQuality ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Replay mode</span>
+              <strong>{intelligence.replayMode ?? "replay-only"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Last capture</span>
+              <strong>{intelligence.lastCaptureAt ?? "—"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Latest capture digest</span>
+              <strong className="mono">
+                {intelligence.latestCaptureDigest ? `${intelligence.latestCaptureDigest.slice(0, 16)}…` : "—"}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Channel statuses</span>
+              <strong>{channels.length > 0 ? channels.map((row) => `${row.channel}:${row.status}`).join(" ") : "—"}</strong>
+            </div>
+          </div>
+          <p className="health-note">
+            External intelligence is READ-ONLY and SHADOW ONLY. Agent-Reach observations are captured, frozen,
+            fingerprinted and replayed from disk — the live internet is never read inside the Arena, and no capture can
+            trade, post, sign, write, or change Arena scoring, gates, species matching, cohorts or replication. Jev and
+            DeepSeek routing for external intelligence remain inactive, and social observations may be noisy or
+            manipulated: external intelligence has to prove its value experimentally. Raw social text, URLs and
+            credentials are never shown here.
+          </p>
+        </>
+      ) : (
+        <p className="health-note">
+          {intelligence.note ??
+            "No external-intelligence capture exists in this workspace yet; the provider is disabled by default."}
         </p>
       )}
     </div>
@@ -2363,6 +2628,18 @@ function Dashboard({
       {state.replication ? (
         <section className="dashboard-grid research-grid">
           <ReplicationPanel state={state} />
+        </section>
+      ) : null}
+
+      {state.jevShadow ? (
+        <section className="dashboard-grid research-grid">
+          <JevShadowPanel state={state} />
+        </section>
+      ) : null}
+
+      {state.externalIntelligence ? (
+        <section className="dashboard-grid research-grid">
+          <ExternalIntelligencePanel state={state} />
         </section>
       ) : null}
 

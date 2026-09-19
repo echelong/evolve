@@ -765,6 +765,32 @@ test("12. No real transaction-execution path exists in the codebase", async () =
   const extensions = new Set([".mjs", ".ts", ".tsx", ".js", ".jsx"]);
   const findings = [];
 
+  // A line that DECLARES a deny/allow vocabulary is not an execution capability:
+  // it is the guard that forbids one (e.g. `FORBIDDEN_ENV_PATTERN`, the packet's
+  // forbidden-key list, the sanitizer's sensitive-key list). Only the declaration
+  // and the literal lines that belong to it are exempt; every other line in the
+  // same file is still scanned, and `findings` now reports file:line.
+  const SAFETY_VOCABULARY_DECLARATION = /\b(FORBIDDEN|DENIED|DISALLOWED|BLOCKED)[A-Z_]*\s*=|\bSENSITIVE_KEY\s*=/;
+
+  function scanLineForbidden(file, text) {
+    let depthInsideVocabulary = 0;
+    const lines = text.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (SAFETY_VOCABULARY_DECLARATION.test(line)) depthInsideVocabulary += 1;
+      const exempt = depthInsideVocabulary > 0;
+      if (depthInsideVocabulary > 0) {
+        const opens = (line.match(/[([]/g) ?? []).length;
+        const closes = (line.match(/[)\]]/g) ?? []).length;
+        depthInsideVocabulary = Math.max(0, depthInsideVocabulary + opens - closes);
+      }
+      if (exempt) continue;
+      for (const pattern of FORBIDDEN_PATTERNS) {
+        if (pattern.test(line)) findings.push(`${file}:${index + 1} matched ${pattern}`);
+      }
+    }
+  }
+
   async function walk(dir) {
     const entries = await readdir(path.join(PROJECT_ROOT, dir), { withFileTypes: true });
     for (const entry of entries) {
@@ -780,9 +806,7 @@ test("12. No real transaction-execution path exists in the codebase", async () =
       if (/^validate-.+\.mjs$/.test(entry.name)) continue;
 
       const text = await readFile(path.join(PROJECT_ROOT, relative), "utf8");
-      for (const pattern of FORBIDDEN_PATTERNS) {
-        if (pattern.test(text)) findings.push(`${relative} matched ${pattern}`);
-      }
+      scanLineForbidden(relative, text);
     }
   }
 

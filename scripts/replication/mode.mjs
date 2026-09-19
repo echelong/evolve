@@ -1,5 +1,14 @@
 /**
- * Phase 5C — CLI command-mode resolution (PAPER ONLY).
+ * Phase 5C/5C.3 — CLI command-mode resolution (PAPER ONLY).
+ *
+ * Phase 5C.3 extends the wave selectors to the freeze lifecycle:
+ *
+ *   `--write-freeze --wave wave-2`  write THAT wave's own canonical freeze
+ *   `--verify-freeze --wave wave-2` verify THAT wave's own freeze (read-only)
+ *
+ * while keeping a wave-scoped command unable to reach any other wave's or the
+ * historical freeze artifact. A wave-less `--write-freeze` still writes the
+ * historical root freeze, byte-for-byte as before.
  *
  * Phase 5C is an action-per-invocation CLI, but the original implementation
  * treated `--write-freeze`, `--verify-freeze`, `--cohorts`, `--plan` and
@@ -34,6 +43,7 @@ export const ACTION = Object.freeze({
   COHORTS: "cohorts",
   PLAN: "plan",
   SUMMARY: "summary",
+  META_SUMMARY: "meta-summary",
 });
 
 /** Action flags in declaration order (order only shapes the error message). */
@@ -43,7 +53,20 @@ export const ACTION_FLAGS = Object.freeze([
   Object.freeze({ flag: "cohorts", action: ACTION.COHORTS }),
   Object.freeze({ flag: "plan", action: ACTION.PLAN }),
   Object.freeze({ flag: "summary", action: ACTION.SUMMARY }),
+  Object.freeze({ flag: "meta-summary", action: ACTION.META_SUMMARY }),
 ]);
+
+/** Actions that may be scoped to a single wave by `--wave <id>`. */
+export const WAVE_SCOPED_ACTIONS = Object.freeze([
+  ACTION.PLAN,
+  ACTION.SUMMARY,
+  ACTION.RUN,
+  ACTION.WRITE_FREEZE,
+  ACTION.VERIFY_FREEZE,
+]);
+
+/** Actions that may be scoped to a list of waves by `--waves <ids>`. */
+export const MULTI_WAVE_SCOPED_ACTIONS = Object.freeze([ACTION.META_SUMMARY]);
 
 /** Flags that only mean something for an actual replication run. */
 export const EXECUTION_ONLY_FLAGS = Object.freeze(["rerun", "dev"]);
@@ -100,6 +123,61 @@ export function resolveAction(args = {}) {
   }
 
   return { ok: true, action, requested, executionOnly, error: null };
+}
+
+/**
+ * Resolve the optional Phase 5C.2 wave selectors from parsed arguments.
+ *
+ * Pure: it touches no filesystem and executes nothing. It only rejects
+ * impossible combinations, so the caller can fail closed before any handler
+ * runs:
+ *
+ *   `--wave <id>`   scopes --plan, --summary and the normal run to ONE wave.
+ *   `--waves <ids>` scopes --meta-summary to a subset of waves.
+ *
+ * A wave's membership is PREDECLARED, so combining `--wave` with `--datasets`
+ * is rejected rather than silently preferring one.
+ *
+ * @param {{ [key: string]: unknown }} [args]
+ * @param {string} action one of ACTION
+ */
+export function resolveWaveOptions(args = {}, action = ACTION.RUN) {
+  const source = args ?? {};
+  const waveProvided = Object.hasOwn(source, "wave") && source.wave !== false;
+  const wavesProvided = Object.hasOwn(source, "waves") && source.waves !== false;
+  const waveRaw = source.wave;
+  const wavesRaw = source.waves;
+  const waveId = typeof waveRaw === "string" && waveRaw.trim().length > 0 ? waveRaw.trim() : null;
+  const waveIds = typeof wavesRaw === "string"
+    ? wavesRaw.split(",").map((value) => value.trim()).filter(Boolean)
+    : null;
+  const errors = [];
+
+  if (waveProvided && !waveId) {
+    errors.push("--wave requires a wave id (for example `--wave wave-2`)");
+  }
+  if (waveProvided && !WAVE_SCOPED_ACTIONS.includes(action)) {
+    errors.push(
+      `--wave only applies to --plan, --summary, the normal run, --write-freeze and --verify-freeze (not --${action}); ` +
+        (action === ACTION.META_SUMMARY ? "use --waves <list> for a cross-wave summary" : "drop it"),
+    );
+  }
+  if (waveId && source.datasets !== undefined) {
+    errors.push(
+      "--wave and --datasets are mutually exclusive: a wave's membership is predeclared, so it is never discovered with `auto`",
+    );
+  }
+  if (wavesProvided && action !== ACTION.META_SUMMARY) {
+    errors.push(`--waves only applies to --meta-summary (not --${action})`);
+  }
+  if (wavesProvided && (!waveIds || waveIds.length === 0)) {
+    errors.push("--waves was given no wave ids");
+  }
+  if (waveId && wavesProvided) {
+    errors.push("--wave and --waves are mutually exclusive: use --waves <list> for --meta-summary");
+  }
+
+  return { ok: errors.length === 0, waveId, waveIds, waveProvided, wavesProvided, errors };
 }
 
 export default resolveAction;

@@ -46,3 +46,7 @@ yarn-error.log*
 next-env.d.ts
 
 .evolve/
+
+# project-local, isolated external tooling (e.g. the pinned Agent-Reach venv).
+# Installed per-checkout by the operator, never committed and never global.
+.tools/

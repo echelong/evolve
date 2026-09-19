@@ -79,8 +79,10 @@ npm run validate:phase5a2# Phase 5A.2 research-cohort checks (offline)
 npm run validate:phase5a3# Phase 5A.3 matched research-vs-conventional A/B checks (offline)
 npm run validate:phase5b # Phase 5B DeepSeek-provider checks (offline, stub Cline)
 npm run validate:phase5c # Phase 5C multi-dataset replication checks (offline)
+npm run validate:phase5c2# Phase 5C.2 replication-wave checks (offline)
 npm run datasets:research # Phase 5C dataset registry (classification, overlap, eligibility)
 npm run replicate:research -- --cohorts  # freeze/inspect the frozen research cohorts
+npm run replicate:research -- --wave wave-2 --plan  # predeclared wave plan (zero Arena)
 npm run smoke:engine     # deterministic synthetic-mode evolution smoke run
 npm run smoke:replay     # offline record → replay → walk-forward smoke run
 npm run smoke:arena      # tiny offline Champion Arena funnel
@@ -1723,6 +1725,469 @@ replication datasets, frozen cohort counts, completed/pending/failed units, curr
 status) and a small Phase 5C panel. It reads only tiny artifacts — never the full per-dataset metric
 tables — and exposes no credentials.
 
+## Phase 5C.2 — Replication Waves
+
+Still **PAPER ONLY**. Phase 5C.1 made the replication CLI an exclusive action-per-invocation tool.
+Phase 5C.2 adds **waves**: a prospective set of datasets is declared by name, with pinned
+fingerprints, *before* anything is evaluated — so a new wave is never silently mixed with an
+already-completed one by `--datasets auto`.
+
+### Why waves exist
+
+Once a second wave of captures exists, `--datasets auto` would select the first wave's datasets
+too, silently turning a prospective replication into a rerun of already-published evidence. A wave
+manifest fixes membership up front and fails closed on anything else.
+
+### Wave manifest
+
+```text
+.evolve/replication/waves/wave-2.json
+```
+
+| field | meaning |
+|---|---|
+| `version` / `waveId` / `phase` | versioned wave identity (`5C.2`) |
+| `freezeDigest` | the frozen experiment the wave runs under |
+| `mockCohortDigest` / `deepseekCohortDigest` | the two **frozen** research cohorts |
+| `datasetIds` | the **predeclared** membership, in order |
+| `datasetFingerprints` | each member's pinned SHA-256 capture fingerprint |
+| `priorWaveIds` | waves that must not be reused |
+| `excludedDatasetIds` | explicitly excluded ids (Wave 1) |
+| `status` / `notes` / `createdAt` | lifecycle + prose (never digested) |
+| `replicationId` | the derived wave-bound replication id (never digested) |
+| `manifestDigest` | deterministic digest of the definition |
+
+The digest is computed over every definition field with the clock and lifecycle removed, so
+rebuilding the same logical wave at a different second — or after its status flips — yields the
+**same** digest, while changing membership or a fingerprint changes it.
+
+### Waves
+
+* **Wave 1** (`wave-1`) is **HISTORICAL**: it points at the already-evaluated canonical replication
+  `rep-66884de4e460`. It is derived read-only from existing facts and is never re-run or rewritten.
+* **Wave 2** (`wave-2`) is **PROSPECTIVE**: exactly three untouched REAL captures
+  (`session-20260919T040641Z-live`, `session-20260919T051349Z-live`, `session-20260919T062122Z-live`),
+  with pinned fingerprints, evaluated against the **same** frozen Mock and frozen DeepSeek cohorts.
+  Wave 1 ids are explicitly excluded. Membership is predeclared and performance-blind: no outcome,
+  Arena result or metric informed the list.
+
+Wave 2's replication identity binds the wave manifest digest, so it is deterministic
+(`rep-6198716691c8`) and can never equal the canonical Wave 1 id.
+
+### Wave validation (fail closed)
+
+Before a wave plan/run/summary runs, every declared dataset must exist, match its pinned fingerprint,
+be REAL, be `CLEAN_REPLICATION`, satisfy the existing Phase 5C eligibility criteria, carry a unique
+fingerprint, and not overlap another member in time. Membership must not reuse any dataset from a
+completed prior wave, must explicitly exclude prior-wave ids, must match the frozen cohort digests and
+the stored freeze, must declare no Jev participation and no required provider call. Any failure aborts
+the command before a plan is built.
+
+### Wave plan
+
+`--wave wave-2 --plan` yields exactly `3 datasets × 2 frozen cohorts = 6 units` — dataset × Mock and
+dataset × DeepSeek for each of the three Wave 2 captures. No Wave 1 dataset appears, and no provider
+is called (the frozen cohorts already exist as compiled genomes).
+
+### Wave and cross-wave summaries
+
+Each completed wave has its own summary, aggregated at the **dataset** level (never pooling genomes,
+never counting walk-forward windows as independent). Delta-of-deltas are paired `DeepSeek − Mock` on
+the same dataset; medians/means/min/max/q1/q3, +/-/0 counts, direction consistency, a deterministic
+dataset-level bootstrap and leave-one-dataset-out sensitivity are reported, with `significance: null`
+and `verdict: null`.
+
+The **meta-summary** is a read-only roll-up across named waves. It reads already-completed wave
+manifests and summaries, never re-runs a dataset, and reports total clean datasets, datasets per wave,
+wave-level and combined dataset-level statistics, per-dataset delta-of-deltas, between-wave descriptive
+differences, and optional leave-one-wave-out sensitivity. **It is not cross-validation** and makes no
+profitability claim. Phase 5D / Jev does not participate in any wave.
+
+### Commands
+
+```bash
+npm run replicate:research -- --wave wave-2 --plan        # plan the predeclared wave (zero Arena)
+npm run replicate:research -- --wave wave-2 --summary     # summarize the wave's own run artifacts
+npm run replicate:research -- --wave wave-2 --dev         # run the wave (the ONLY execution path)
+npm run replicate:research -- --meta-summary              # read-only Wave 1 + Wave 2 meta-summary
+npm run validate:phase5c2
+```
+
+### Isolation
+
+Wave support does not touch Wave 1, the historical freeze, the frozen Mock/DeepSeek cohorts, the
+Wave 2 captures, or any Phase 5D / Jev state. The canonical `rep-66884de4e460`, the freeze digest and
+the cohort digests stay byte-identical; the wave-less replication identity is reproduced exactly.
+
+## Phase 5C.3 — Canonical Per-Wave Freezes
+
+Phase 5C.2 introduced waves, but a wave was still expected to run against the **historical root freeze**.
+Because the full freeze digest digests the git commit, running a NEW wave against the OLD freeze could
+only be done with `--dev`, which made that wave `NON_CANONICAL`. Phase 5C.3 fixes that properly, without
+weakening freeze integrity and without rewriting Wave 1.
+
+### Per-wave freezes
+
+| | Wave 1 | Wave 2 |
+| --- | --- | --- |
+| freeze path | `.evolve/replication/phase5c-freeze.json` (historical, frozen) | `.evolve/replication/freezes/wave-2.json` |
+| freeze digest | `4959974d1b78635e63c0d9038c582c9ceb5a7411366d9c95c82e7ee3bac3f500` | generated after the source commit lands |
+| full freeze canonicality | canonical against freeze A | canonical against freeze B |
+| evaluation contract | `evaluationContractDigest` (clock- and commit-independent) | must EQUAL Wave 1's |
+
+The wave manifest records `freezePath`, `freezeDigest` and `evaluationContractDigest`, so every run is
+tied to the exact freeze it was canonical against. Wave 1 keeps referencing its historical evidence: its
+freeze, its replication `rep-66884de4e460`, its frozen Mock/DeepSeek cohort digests, and its three
+datasets stay byte-identical forever, and Wave 1 is never re-run.
+
+A wave freeze is **generated, not inferred**:
+
+```bash
+npm run replicate:research -- --write-freeze --wave wave-2   # clean tree required; writes ONLY that freeze
+npm run replicate:research -- --verify-freeze --wave wave-2  # fail-closed verification
+npm run replicate:research -- --wave wave-2 --plan           # inspect the plan (zero Arena)
+npm run replicate:research -- --wave wave-2                  # canonical run (NO --dev)
+```
+
+`--write-freeze` captures the current `HEAD`, uses the wave's own evaluation configuration and the SAME
+frozen Mock/DeepSeek cohorts, binds the manifest to the new freeze digest and evaluation contract,
+recomputes the manifest digest and replication id, executes **zero** Arena units, **zero** Jev calls and
+**zero** DeepSeek calls, and returns immediately. A normal `RUN` never auto-creates a freeze: a missing or
+stale freeze fails closed.
+
+### Full freeze canonicality vs. cross-wave comparability
+
+These are deliberately two different questions:
+
+- **FULL FREEZE CANONICALITY** — "was this run executed by the exact commit/config its freeze pins?" This
+  uses the complete freeze digest, which continues to include the git commit and all canonical
+  provenance. Wave 1 is canonical against freeze A; Wave 2 is canonical against freeze B; A ≠ B is
+  expected and fine.
+- **CROSS-WAVE COMPARABILITY** — "may these two waves be aggregated?" This is decided by the
+  **evaluation contract digest** plus both frozen cohort digests. Different evaluator semantics can
+  never be combined.
+
+The evaluation contract digest is a deterministic digest of the experiment/evaluator semantics only:
+Arena scoring version/config, gate definitions, population/generations/seeds, worker and equivalence
+semantics, stress profiles, survivor fraction, breeder/mutation/crossover/immigration settings, strict
+species matching, no-cloning semantics, cross-cohort crossover behaviour, normalized bankroll semantics,
+cost model, drawdown and concentration definitions, evidence thresholds, regime handling, bootstrap
+configuration, dataset-as-unit aggregation, the PAPER-only setting, frozen-provider evaluation
+semantics, and A/B comparison semantics.
+
+**Excluded** (orchestration/provenance only, nothing that can change an evaluation result): the git
+commit, `createdAt`, `waveId`, artifact paths and the manifest path. Including or excluding these is
+enforced as explicit lists (`CONTRACT_EXCLUDED_FIELDS`) and proven by test: a commit-only change moves
+the full freeze digest while leaving the evaluation contract digest untouched, and adding/changing
+intelligence or Jev orchestration code does exactly the same — while a change to Arena scoring, a gate,
+population, generations, control flow, the cost model or the cohort identity DOES move the contract.
+
+### Incomparable waves are refused
+
+`--meta-summary` compares the evaluation contract digests (and both cohort digests) before aggregating
+anything. If they differ it returns:
+
+```
+INCOMPARABLE_WAVES
+```
+
+with the explicit differing fields, and aggregates **nothing** — it never silently combines waves.
+
+### Noncanonical evidence
+
+`--dev` still exists for forensic/debug work, but `--dev` runs are `NON_CANONICAL`, are excluded from the
+canonical meta-summary by default, and are never the documented way to run a wave.
+
+## Phase 5D — Jev Shadow Supervisor
+
+Jev ("TypeSafe AI"'s System One model) is integrated as a **SHADOW DECISION SUPERVISOR**: a fast,
+typed-judgment API that observes bounded TRAIN-safe evidence and returns typed
+probabilities/choices/scores. Jev **THINKS FAST**; **EVOLVE still DECIDES**.
+
+**Jev does not trade. Jev does not generate strategies. Jev does not alter Arena outcomes.** It has
+ZERO authority over trading, genome construction, research compilation, evolution, Arena scoring,
+gates, species matching, DeepSeek calls, deployment eligibility, or replication. Every prediction is
+recorded and timestamped *before* any outcome exists; calibration against real deterministic outcomes
+happens later, offline, without ever calling Jev again. A bad Jev result is an acceptable, expected
+outcome — no threshold is promoted to an operational gate from one experiment.
+
+Architecture:
+
+```
+deterministic EVOLVE state
+  -> bounded TRAIN-safe decision packet   (scripts/jev/decision-packet.mjs)
+  -> Jev typed questions                  (scripts/jev/questions.mjs)
+  -> shadow prediction                    (scripts/jev/decide.mjs)
+  -> persisted immutable prediction       (scripts/jev/experiment.mjs)
+  -> normal deterministic EVOLVE proceeds UNCHANGED
+  -> (later) outcomes occur
+  -> calibration comparison               (scripts/jev/calibration.mjs, offline, no provider call)
+```
+
+### Provider (`scripts/jev/`)
+
+A dedicated provider subsystem, entirely separate from the research-provider abstraction in
+`scripts/research/`. Jev is **not** a research proposal provider, and neither namespace can select
+the other's provider.
+
+| Provider | Selected by | Behavior |
+| --- | --- | --- |
+| *(unset)* | default | **DISABLED** — every call records `JEV_DISABLED` / `NO_JEV_DECISION`, zero network calls are ever possible |
+| `mock-jev` | `EVOLVE_JEV_PROVIDER=mock-jev` | deterministic, offline, no network — the offline test baseline |
+| `typesafe-jev` | `EVOLVE_JEV_PROVIDER=typesafe-jev` | the real TypeSafe AI HTTP provider, through the official `@typesafe-ai/sdk` |
+
+Selection is fail-closed: an unrecognized explicit name throws `UnknownJevProviderError` — there is no
+fallback to `mock-jev` and no silent disabled state for a typo. `EVOLVE_JEV_MODE` must be `shadow`
+(the only supported operational mode in Phase 5D); `active`/`enforce`/`trade`/`route` do not exist yet.
+
+Environment variables:
+
+```
+EVOLVE_JEV_PROVIDER        mock-jev | typesafe-jev (unset = disabled)
+EVOLVE_JEV_MODE            shadow (default and only supported value)
+EVOLVE_JEV_API_KEY         never persisted, never logged
+EVOLVE_JEV_MODEL           default: the pinned jev-1.13.0 (never the moving `jev-latest` alias)
+EVOLVE_JEV_BASE_URL        default: https://api.typesafe.ai
+EVOLVE_JEV_TIMEOUT_MS      default: 20000, clamped to [1000, 120000]
+EVOLVE_JEV_MAX_CALLS       default: 20, clamped to [1, 500]
+EVOLVE_JEV_MIN_CONFIDENCE  offline confidence-gating analysis only — never an operational threshold
+EVOLVE_JEV_CACHE           default: true
+```
+
+### SDK verification
+
+Verified against the official `@typesafe-ai/sdk@0.6.0` (installed dependency) and the published docs
+at `docs.typesafe.ai`: `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`,
+`client.systemOne({ state, questions, model })` returning `{ model, answers, usage }`. The pinned model
+`jev-1.13.0` is the versioned id behind the `jev-latest`/`jev-preview` aliases at the time of
+verification — canonical Phase 5D evidence always requests the versioned id, never an alias that can
+move underneath a repeated experiment. The real provider is exercised in tests exclusively through the
+SDK's own `fetch` override, so no live network call is required to validate this subsystem.
+
+### Decision packet (`jev-decision-packet-v1`) and question sets
+
+The decision packet is a versioned, WHITELIST-ONLY projection (`scripts/jev/decision-packet.mjs`):
+bounded genome parameters, TRAIN paper metrics, TRAIN trade/observation counts, mint diversity,
+concentration, cost drag, drawdown, TRAIN regime composition, watchdog-visible TRAIN evidence, and the
+deterministic research lifecycle state. It explicitly EXCLUDES VALIDATE/TEST/OOS results, Arena ranking
+and score, gate results, Champion League and deployment status, future observations, Shadow League
+outcomes, and future replication results — and `auditJevDecisionPacket` walks every packet for a
+forbidden key or a credential-shaped value, the same structural guarantee Phase 5B's evidence packet
+uses.
+
+Two fixed, versioned question sets — never dynamically invented:
+
+- **`jev-question-set-v1`** (candidate-level): `gateFailureRisk` (noul — elevated risk of failing an
+  unchanged Arena gate on unseen data; the raw probability is persisted, never thresholded into a real
+  gate), `primaryRisk` (choice over 8 bounded labels), `evidenceQuality` (score, 5-level fixed rubric),
+  `generalizationConfidence` (noul — a prediction to calibrate later, **never** a profitability
+  probability), `researchDisposition` (choice, SHADOW ONLY — Jev does not route the candidate).
+- **`jev-market-v1`** (market window): Jev classifies a completed past TRAIN window into EVOLVE's
+  EXISTING regime vocabulary. The deterministic regime label is intentionally withheld from the packet
+  so Jev classifies blind; EVOLVE compares Jev's choice against the deterministic classifier afterward.
+  The deterministic classifier is never modified or bypassed.
+
+### Fail-closed statuses
+
+`JEV_OK`, `JEV_DISABLED`, `JEV_UNAVAILABLE`, `JEV_TIMEOUT`, `JEV_HTTP_ERROR`, `JEV_INVALID_RESPONSE`,
+`JEV_BUDGET_EXCEEDED`, `JEV_CONFIG_ERROR`. A Jev failure never changes an EVOLVE strategy, never
+switches to another provider silently, never fabricates a decision, and never blocks deterministic
+EVOLVE operation — shadow mode records `NO_JEV_DECISION` and EVOLVE continues unchanged.
+
+### Cache, budget, and storage
+
+Cache identity is `provider + model + decisionPacketVersion + questionSetId/Version + stateDigest +
+questionDigest`; a cache hit replays the persisted answer with zero network calls and records
+`cacheHit: true` plus the original run id. A run-level call budget bounds live attempts; failures
+consume attempted-call budget, cache hits do not, and an exhausted budget refuses further calls without
+ever reaching the provider.
+
+Storage is fully isolated under `.evolve/jev/experiments/<experiment-id>/` (`experiment.json`,
+`decisions/*.json`, `outcomes/*.json`, `calibration.json`, `provider/runs|cache/*.json`) — Jev never
+writes into `.evolve/research/` and never mutates a prior Arena artifact.
+
+### Calibration — offline, post-outcome, no provider call
+
+`scripts/jev/calibration.mjs` is a pure evaluator: it joins a previously timestamped Jev decision to a
+LATER deterministic Arena gate result by id only, and NEVER calls Jev again. `gateFailureRisk` and
+`generalizationConfidence` are scored with Brier score, absolute calibration error, and reliability
+bins against pre-registered target definitions (`GATE_FAILURE_TARGET_DEFINITION_V1`,
+`GENERALIZATION_TARGET_DEFINITION_V1`) that are versioned and never re-chosen after seeing results.
+`primaryRisk` is evaluated as MULTI-LABEL membership (does the selected risk appear in the actual
+failed-gate set?) rather than a forced single-label accuracy. An OFFLINE confidence-threshold analysis
+(`0.50`–`0.90`) reports coverage/accuracy/abstention for each threshold — **analysis only; no threshold
+is promoted to an operational gate in Phase 5D.**
+
+### CLI
+
+```bash
+npm run jev -- --provider mock-jev --fixture synthetic
+npm run jev -- --provider mock-jev --fixture synthetic --market --save
+npm run jev -- --stats --experiment <id>
+npm run calibrate:jev -- --experiment <id> --arena <arena-id>
+npm run probe:jev -- --provider mock-jev
+```
+
+The live provider is never called automatically. To probe the real provider once, with an explicit key
+already configured in the environment:
+
+```bash
+EVOLVE_JEV_PROVIDER=typesafe-jev EVOLVE_JEV_API_KEY=<key> npm run probe:jev -- --provider typesafe-jev
+```
+
+The probe makes exactly one bounded call against synthetic, non-market state, prints provider/model/
+status/latency/typed-answer validity, and writes nothing unless `--save` is given.
+
+### Dashboard
+
+A compact `jevShadow` panel (provider, model, `mode: SHADOW`, health, question-set/decision-packet
+version, calls/failures/cache hits, mean latency, decision count, calibration count, Brier score, last
+decision timestamp) — counts and identity only, never prompts, raw state, or the API key.
+
+### Tests
+
+`npm run validate:phase5d` (98 offline cases) covers the provider registry and fail-closed selection,
+typed-answer normalization for both providers, the decision packet's leakage audit, both fixed
+question sets, deterministic state/question digests, cache identity and no-call replay, run-budget
+accounting, timeout/HTTP-error/connection-error classification, secret hygiene, mock determinism, the
+shadow-only invariant (byte-identical deterministic Arena scoring/gates whether Jev is disabled or a
+shadow prediction runs alongside), prediction persistence before any outcome exists, the pure
+calibration layer (Brier score, reliability bins, multi-label `primaryRisk` agreement, regime-shadow
+comparison, threshold-coverage analysis with no promoted threshold), the absence of any Jev reference
+inside Arena/compiler/watchdog/simulation code, the absence of any wallet/signing/execution capability,
+and non-interference with Phase 5B, the canonical Phase 5C replication (`rep-66884de4e460`), its frozen
+cohort digests, and the untouched Wave 2 dataset.
+
+## Phase 5E — External Intelligence Shadow Layer
+
+Phase 5E adds an **isolated, read-only, SHADOW external-intelligence capability** on top of
+[Agent-Reach](https://github.com/Panniantong/Agent-Reach) (pinned `v1.5.0`, tag commit
+`f65526cbaaad3879473acc1ba6dbefd195caf2be`, MIT, Python ≥ 3.10, verified 2026-09-19).
+
+Agent-Reach is an **external intelligence acquisition** layer. It is **not** a strategy generator, not a
+trading agent, not an Arena scorer, not a gate, not a wallet tool, not an execution engine, and not a
+replacement for Jev or DeepSeek:
+
+```
+market data + external intelligence → bounded evidence → Jev shadow judgment
+   → optional future DeepSeek escalation → deterministic compiler → Arena
+```
+
+Only the **capture** layer is active in Phase 5E. No Agent-Reach result can affect trading, evolution,
+Arena scoring, gates, species matching, cohorts or replication.
+
+### Live internet is never used inside the Arena
+
+Observations are **captured, frozen, fingerprinted and replayed from disk**:
+
+```
+.evolve/intelligence/<YYYY-MM-DD>/<captureId>/
+  manifest.json   immutable, written LAST (finalization record)
+  records.ndjson  normalized evidence
+  queries.json    the exact deterministic query plan that was executed
+  health.json     per-channel statuses/counts/failures/timeouts
+  x.ndjson · web.ndjson · exa.ndjson · reddit.ndjson · rss.ndjson · github.ndjson
+```
+
+Every normalized record carries `captureId`, `capturedAt`, `channel`, `backend`, `queryId`, `query`,
+`canonicalId`, `canonicalUrl`, `publishedAt`, `authorId`, `title`, a **bounded** text excerpt, numeric
+`engagement`, `sourceVersion`, `agentReachVersion`, `backendVersion`, `rawDigest` and
+`normalizedDigest`. A capture is written once and never overwritten; replaying the same capture is
+byte-equivalent and performs **zero** network calls. Tampered evidence is refused (`CaptureIntegrityError`)
+instead of being replayed with silently different bytes.
+
+### Provider configuration (fail closed)
+
+```bash
+EVOLVE_INTELLIGENCE_PROVIDER=disabled|mock|agent-reach   # default: disabled
+EVOLVE_INTELLIGENCE_MODE=shadow                          # the ONLY mode Phase 5E allows
+EVOLVE_REACH_BIN / EVOLVE_REACH_TIMEOUT_MS / EVOLVE_REACH_MAX_CALLS
+EVOLVE_REACH_CHANNELS / EVOLVE_REACH_MAX_RESULTS / EVOLVE_REACH_MAX_BYTES
+```
+
+An unknown provider or mode is a hard error — there is **no automatic fallback**, and the mock provider is
+never selected implicitly.
+
+### Channels (narrow allowlist)
+
+Enabled: `x`, `web`, `exa`, `reddit`, `rss`, `github`.
+
+Disabled for canonical Phase 5E: `facebook`, `instagram`, `linkedin`, `xiaohongshu`, `bilibili`, `boss`,
+`xueqiu`, `xiaoyuzhou`, `youtube`, `v2ex`, `opencli` — browser-login and write-capable channels are
+refused outright, and a request for one fails closed instead of being silently skipped.
+
+### Read-only policy
+
+EVOLVE may only ever request `search`, `read`, `fetch`, `list`, `metadata`. Posting, replying, commenting,
+liking, following, forking, opening issues/PRs, pushing, writing, deleting or modifying account state are
+rejected **before any call**. GitHub writes, X posts and browser-cookie loading are refused by explicit
+guards (action allowlist, argv allowlist, executable allowlist, `shell: false`, sanitized environment).
+
+### Isolation and sandboxing
+
+Agent-Reach's Python package is never imported into Arena/evolution code. A dedicated adapter
+(`scripts/intelligence/agent-reach.mjs`) launches the pinned CLI as a bounded subprocess with an argument
+array, `shell: false`, a hard timeout, an output byte limit, a per-capture call budget, a frozen command
+map (no arbitrary command pass-through) and a sanitized environment that can never inherit wallet,
+signer, seed, key, token, cookie or credential variables. Cookie/credential values are never persisted.
+
+Installation is **project-local** (`.tools/agent-reach/`, gitignored) and user-run: no global/system
+changes, no browser extensions, no cookie import, no account login, and canonical tests never require
+Agent-Reach to be installed at all.
+
+### Deterministic query sets
+
+Canonical Phase 5E never lets an LLM invent web queries. `reach-query-set-v1` renders queries from fixed
+templates over whitelisted token metadata only (`symbol`, `name`, `domain`, `mint`, `handle`); every
+template declares its read-only operation, so `rss` (a read channel) renders one deterministic feed URL.
+Arbitrary free-form queries are rejected (`ArbitraryQueryError`).
+
+### Bounded features, not raw social text
+
+Raw social text never reaches a strategy. A capture is reduced to a versioned, deterministic feature
+vector: `mentionCount`, `uniqueAuthors`, `postsPerMinute`, `engagementTotal`, `engagementMedian`,
+`duplicateTextRatio`, `repeatedAuthorRatio`, `linkDomainConcentration`, `accountConcentration`,
+`sourceCount`, `sourceDiversity`, `queryCoverage`, `captureAgeMs` (presentation-only, excluded from the
+digest), `fetchFailureRate`, and `coordinationIndicators`. Suspicious patterns are reported as
+`coordinationIndicators` — deterministic observations over the captured bytes, explicitly **not** a bot
+probability.
+
+### Jev / DeepSeek boundaries
+
+A whitelist-only `external-intelligence-packet-v1` exists as a **future** handoff to Phase 5D Jev (which
+could later decide `ignore` / `observe` / `escalate_to_deep_research`). Nothing is routed today:
+`jevRoutingActive: false`, `deepseekRoutingActive: false`, no live Jev call, and no DeepSeek call. The
+packet carries identity, counts, health and bounded features — never raw text, URLs or credentials.
+
+### Commands
+
+```bash
+npm run intelligence -- --provider mock --fixture synthetic   # offline fixture capture
+npm run intelligence:capture -- --query-set reach-query-set-v1 --candidates candidates.json
+npm run intelligence:replay -- --capture <id>                 # offline, byte-equivalent
+npm run intelligence:stats -- --capture <id>                  # read-only inventory
+npm run intelligence:doctor                                   # provider/health report
+npm run probe:reach                                           # Agent-Reach doctor/probe
+npm run intelligence:doctor -- --probe                        # side-effect-free version + doctor --json
+```
+
+Nothing is persisted by the doctor/probe unless `--save` is passed, no login is ever performed, and the
+probe is never run automatically. The probe deliberately uses `doctor --json` (the text `doctor` path
+installs skill files upstream, the JSON path does not).
+
+### Dashboard
+
+A compact `externalIntelligence` panel (provider, `mode: SHADOW`, Agent-Reach version/license, health,
+enabled channels, captures, records, failures, timeouts, evidence quality, replay mode, last capture
+timestamp, latest capture digest, per-channel statuses). Counts and identity only — raw social content,
+URLs, cookies and tokens are never sent to the browser.
+
+### Caveat
+
+Social evidence may be noisy, duplicated or manipulated. External intelligence is **unproven** inside
+EVOLVE: it has to demonstrate value experimentally before any future use, and it can never bypass the
+deterministic evaluator.
+
 ## Validation
 
 ```bash
@@ -1897,7 +2362,7 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
   evidence accounting is preserved; evaluated candidates keep species-specific gene bounds; no Phase 5A.2
   module contains a wallet, signing, or transaction-execution path
 
-Phase 5C adds `npm run validate:phase5c` (87 offline cases):
+Phase 5C adds `npm run validate:phase5c` (89 offline cases):
 
 - **CLI dispatch** — every command mode is exclusive (a table resolves exactly one action per
   invocation, and conflicting or impossible combinations fail loudly instead of silently choosing one);
@@ -1938,6 +2403,118 @@ Phase 5C adds `npm run validate:phase5c` (87 offline cases):
   byte-identical, `compare:research` still declares no winner, the Phase 5B and strict A/B invariants
   still hold, no Phase 5C module contains a wallet/signing/execution path, and replication shells out
   only to the project's own Arena CLI with the deterministic provider pinned
+
+Phase 5C.2 adds `npm run validate:phase5c2` (40 offline cases):
+
+- **Predeclared definitions** — Wave 2 holds exactly the three declared dataset ids in order with
+exactly the pinned fingerprints; Wave 1 ids are explicitly excluded; the manifest digest is
+deterministic, ignores the clock and lifecycle, and changes with membership or any fingerprint
+- **Stored manifests** — the on-disk `wave-1`/`wave-2` manifests equal the predeclared definitions;
+Wave 1 is historical and points at `rep-66884de4e460`; the real Wave 2 captures still match the pins;
+the wave-less replication identity is reproduced exactly and the Wave 2 id is deterministic and
+distinct
+- **Fail-closed validation** — duplicate ids/fingerprints, prior-wave reuse, Wave 1 inclusion,
+contamination, the development dataset, synthetic/incomplete captures, altered fingerprints, unknown
+datasets, temporal overlap, wrong cohort digests, freeze mismatch, Jev participation and provider
+dependence are each rejected with a named reason
+- **Plan & execution boundaries** — the wave plan is exactly six units with both providers per dataset
+and no Wave 1 unit; it is deterministic; `--plan`, `--summary` and `--meta-summary` execute zero Arena
+subprocesses; only the normal wave run executes units (six spawns against a stub Arena, never the real
+`scripts/arena.mjs`)
+- **Meta-summary** — dataset-level only, six observations across two waves, per-wave and combined
+statistics, +/-/0 counts, dataset bootstrap, leave-one-dataset-out, leave-one-wave-out and between-wave
+differences, `significance: null` and `verdict: null`; unfinished waves are reported as pending, never
+fabricated; unknown wave ids fail closed
+- **Isolation & byte-identity** — no Jev import/call, no network/provider, no wallet/signing/write path;
+the canonical Wave 1 replication, the historical freeze, the frozen cohorts, both wave manifests and
+all three Wave 2 captures stay byte-identical throughout the suite
+
+Phase 5D adds `npm run validate:phase5d` (98 offline cases):
+
+- **Registry & fail-closed selection** — Jev is disabled by default (zero network calls ever possible),
+  `mock-jev`/`typesafe-jev` are selected by name only, an unregistered name throws
+  `UnknownJevProviderError`, an unsupported `EVOLVE_JEV_MODE` is a configuration error, and Jev
+  configuration is completely independent from `EVOLVE_RESEARCH_PROVIDER`
+- **Provider factories** — both providers answer with the same normalized typed shape; `mock-jev` is
+  deterministic and marks every answer `syntheticDecision: true`; `typesafe-jev` calls the documented
+  endpoint with the pinned model and a Bearer header (verified through an injected `fetch`, never a
+  live network call) and classifies HTTP 401/403, 429/5xx, connection failures, and timeouts into
+  distinct explicit statuses; a missing API key never even constructs the SDK client
+- **Decision packet** — non-whitelisted genome parameters and invented regime labels are dropped,
+  every excluded evidence class is declared, `auditJevDecisionPacket` flags every forbidden key (however
+  deeply nested) and credential-shaped value, the market packet never carries the deterministic regime
+  label, and `jevDecide` refuses to send a packet that fails the leakage audit
+- **Question sets** — the fixed candidate and market question sets, their bounded vocabularies, and the
+  5-level evidence-quality rubric match the specification exactly and are never dynamically regenerated
+- **Cache & budget** — cache identity is sensitive to every one of its six components, a cache hit makes
+  zero provider calls, a corrupted cache entry is never reused, an exhausted budget refuses a call
+  without ever reaching the provider, and a failed live call still consumes attempted-call budget
+- **Shadow-only invariant** — no Arena/compiler/watchdog/simulation/genome source file references Jev in
+  any way, and deterministic Arena scoring and gate evaluation are byte-identical whether Jev is
+  disabled or a shadow prediction runs alongside
+- **Calibration** — a pure, offline, post-outcome evaluator with correct Brier score / reliability bins
+  / calibration error on crafted fixtures, pre-registered versioned target definitions, multi-label
+  `primaryRisk` agreement (never a forced single-label ground truth), regime-shadow agreement computed
+  without waiting for a later outcome, fixed threshold-coverage analysis with `noThresholdPromoted: true`
+  always reported, and no import of the provider/runtime/decide path anywhere in the calibration module
+  or CLI
+- **Secrets & safety** — no Jev module contains a wallet/signing/shell-execution path, the real provider
+  is only an HTTPS decision-API client with no filesystem/process access, and no dashboard/run-record
+  field ever carries the API key
+- **Regression & isolation** — Phase 5B stays fully green, the canonical Phase 5C replication
+  (`rep-66884de4e460`), its freeze digest, and both frozen cohort digests stay byte-identical, no Jev
+  source file references the untouched Wave 2 dataset, and exercising the Jev subsystem never touches
+  `.evolve/datasets`, `.evolve/history`, or any Phase 5C artifact
+
+Phase 5C.3 adds `npm run validate:phase5c3` (30 offline cases):
+
+- **Byte identity** — Wave 1's freeze, its replication `rep-66884de4e460`, its frozen Mock/DeepSeek
+  cohort digests and its three datasets stay byte-identical, and the historical freeze digest is
+  unchanged
+- **Evaluation contract** — deterministic, clock- and commit-independent, with the exact include/exclude
+  lists declared in code; it is derived from the STORED historical freeze for Wave 1 (never regenerated
+  from the current tree)
+- **Isolation proofs** — a commit-only change alters the full freeze digest but NOT the evaluation
+  contract digest; adding/changing intelligence or Jev orchestration code changes the git commit/full
+  freeze but NOT the contract (proven through the contract's real import graph); an Arena scoring change,
+  a gate change and a population/generation change each DO alter the contract; a cohort change blocks
+  comparability
+- **Freeze lifecycle** — `--write-freeze --wave` requires a clean tree, writes only that wave's freeze,
+  binds the manifest to it, recomputes the manifest digest and replication id, and executes zero Arena
+  units / zero Jev calls / zero DeepSeek calls; missing or stale wave freezes block a canonical run;
+  `--dev` remains `NON_CANONICAL` and is excluded from the canonical meta-summary by default
+- **Comparability** — the meta-summary accepts different full freeze digests when the evaluation
+  contracts and both cohort digests match, and refuses with `INCOMPARABLE_WAVES` plus the explicit
+  differing fields when they do not
+- **Wave 2 barriers** — Wave 2 membership and fingerprints are asserted from registry metadata only,
+  and Wave 1 stays excluded from Wave 2
+
+Phase 5E adds `npm run validate:phase5e` (52 offline cases):
+
+- **Fail-closed provider** — disabled by default and refuses every call, an unknown provider throws
+  instead of falling back to the mock, and `shadow` is the only accepted mode
+- **Mock parity** — the deterministic offline provider returns the exact same normalized record schema
+  as the real adapter, and marks every observation `syntheticIntelligence: true`
+- **Subprocess security** — `shell: false`, non-interactive stdio, executable allowlist, read-only
+  action allowlist, write actions refused before any spawn, timeout, call budget, output byte limit, and
+  a sanitized environment that can never inherit wallet/signer/key/token/cookie variables
+- **Query sets** — versioned, deterministic, metadata-only rendering; order-independent; a non-whitelisted
+  candidate field never reaches a query; arbitrary free-form queries are refused (unit and CLI)
+- **Capture/replay** — manifests deterministic apart from their clock fields, normalized and raw digests
+  deterministic, captures immutable and never overwritten, replay byte-equivalent with zero network
+  calls, tampering detected and refused (`CaptureIntegrityError`), the whole CLI pipeline exercised
+  offline
+- **Features** — exact source count, unique-author count, duplicate-text ratio, source diversity,
+  link-domain concentration, engagement and failure-rate arithmetic, with clock fields excluded from the
+  feature digest
+- **Packet & routing** — whitelist-only `external-intelligence-packet-v1`, forbidden keys rejected at any
+  depth, `jevRoutingActive`/`deepseekRoutingActive` hard-coded false, no Jev/DeepSeek call reachable
+- **Isolation** — nothing in the intelligence layer imports Arena, evolution, Jev or replication code;
+  nothing in Arena/Jev/replication imports the intelligence layer; the dashboard is the only consumer and
+  exposes counts/identity only; the Wave 2 dataset ids and fingerprints never appear in the layer, and
+  the three Wave 2 captures stay byte-untouched (metadata + pinned fingerprints) across the whole suite
+- **No Agent-Reach required** — every adapter test injects a `spawn` stub, no binary is installed or
+  launched, and nothing needs a system-wide install
 
 ## Roadmap
 
@@ -2104,6 +2681,38 @@ Phase 5C adds `npm run validate:phase5c` (87 offline cases):
 - [x] Dashboard/provider state: provider, model, reasoning, health, experiment id, calls, failures, cache hits, rejects, watchdog counts
 - [x] `npm run validate:phase5b` — 96 offline cases (stub Cline, no network, no key)
 - [ ] First real DeepSeek cohort + strict species-matched A/B (commands documented in `## Phase 5B`)
+
+### Phase 5D — Jev shadow decision supervisor
+- [x] Dedicated `scripts/jev/` provider subsystem, fully independent from `scripts/research/`
+- [x] Fail-closed provider selection: disabled by default, `mock-jev`/`typesafe-jev` by explicit name only, any other name is a configuration error, `EVOLVE_JEV_MODE` restricted to `shadow`
+- [x] Real provider verified against the official `@typesafe-ai/sdk@0.6.0` and docs.typesafe.ai; pinned model `jev-1.13.0`, never the moving `jev-latest` alias
+- [x] Versioned, whitelist-only decision packet (`jev-decision-packet-v1`) with a leakage audit excluding every VALIDATE/TEST/OOS/Arena/gate/deployment/champion/shadow-league/replication field
+- [x] Fixed candidate question set (`jev-question-set-v1`: gateFailureRisk, primaryRisk, evidenceQuality, generalizationConfidence, researchDisposition) and market question set (`jev-market-v1`, blind regime classification into EVOLVE's existing vocabulary)
+- [x] Cache keyed on provider/model/packet-version/question-set-version/state-digest/question-digest; run-level call budget; explicit `JEV_*` fail-closed statuses
+- [x] Zero authority: no Jev reference anywhere in Arena/compiler/watchdog/simulation code; deterministic Arena scoring/gates proven byte-identical with Jev disabled vs. shadow
+- [x] Predictions persisted and timestamped BEFORE any outcome exists; pure offline post-outcome calibration (Brier score, reliability bins, multi-label `primaryRisk` agreement, regime-shadow comparison, threshold-coverage analysis) that never calls Jev again and promotes no operational threshold
+- [x] `npm run jev`, `npm run calibrate:jev`, `npm run probe:jev`, and a bounded `jevShadow` dashboard panel
+- [x] `npm run validate:phase5d` — 98 offline cases
+- [ ] First real Jev shadow experiment against real candidates — recommended AFTER Wave 2 replication completes (see `## Phase 5D`)
+
+### Phase 5C.3 — canonical per-wave freezes
+- [x] Per-wave freeze architecture (`freezePath` + `freezeDigest` + `evaluationContractDigest` on every wave manifest); Wave 1 keeps its historical freeze and evidence untouched
+- [x] Deterministic `evaluationContractDigest` over experiment/evaluator semantics only, with documented include/exclude lists
+- [x] `--write-freeze --wave <wave>` / `--verify-freeze --wave <wave>`; clean tree required, zero Arena units, zero Jev/DeepSeek calls, no auto-freeze during a normal run
+- [x] Missing/stale freeze fails closed; canonical runs need no `--dev`; `--dev` evidence stays `NON_CANONICAL` and is excluded by default
+- [x] Cross-wave comparability decided by the evaluation contract + both frozen cohort digests; `INCOMPARABLE_WAVES` with explicit differing fields instead of silent aggregation
+- [x] `npm run validate:phase5c3` — 30 offline cases
+- [ ] Canonical Wave 2 freeze + canonical Wave 2 run — after the implementation source is committed (see `## Phase 5C.3`)
+
+### Phase 5E — external intelligence shadow layer
+- [x] Isolated, read-only Agent-Reach adapter pinned to `v1.5.0` (commit `f65526c…`, MIT, Python ≥3.10): no upstream package import, `shell: false`, executable/action/argv allowlists, timeout, call budget, byte limit, sanitized environment
+- [x] Narrow channel allowlist (`x`, `web`, `exa`, `reddit`, `rss`, `github`); browser-login/write-capable channels refused; GitHub writes and X posts rejected before any call
+- [x] Capture → freeze → verify → **offline replay** storage with immutable manifests, per-record raw/normalized digests and tamper detection; live internet is never read inside the Arena
+- [x] Versioned deterministic query sets (`reach-query-set-v1`, metadata-only, arbitrary queries refused) and a bounded deterministic feature vector with `coordinationIndicators` (never a bot probability)
+- [x] `external-intelligence-packet-v1` interface only: `jevRoutingActive: false`, `deepseekRoutingActive: false`, no Jev/DeepSeek calls
+- [x] Mock provider, `intelligence:doctor`/`probe:reach` (nothing persisted without `--save`), and a compact shadow dashboard panel with counts/identity only
+- [x] `npm run validate:phase5e` — 52 offline cases
+- [ ] One real, bounded, read-only public-data probe and any experiment that tests whether external intelligence has value — operator-run, after Wave 2
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.
