@@ -397,6 +397,28 @@ const RAW_SEED = Object.freeze({
   cookie: SENTINELS.cookie,
 });
 
+/**
+ * The ACTIVE (Phase 5G.1c) MCPorter/Exa rendering is `--output text`, so the
+ * MCPorter-backed queries of the real-provider fixture are fed Exa's textual
+ * result shape. The credential sentinel is carried on an UNKNOWN heading
+ * (`Cookie:`), which the dedicated parser deliberately ignores — so it can never
+ * reach a normalized record. Everything else keeps the historical JSON shape.
+ */
+const EXA_TEXT_SEED = [
+  "Title: Seed title",
+  "URL: https://example.test/seed-1",
+  "Published: 2026-09-19T09:00:00.000Z",
+  "Author: seed-author",
+  `Cookie: ${SENTINELS.cookie}`,
+  "Highlights:",
+  "Seed body text",
+].join("\n");
+
+/** One bounded fixture record per query, in whichever shape the capability uses. */
+function realProviderStdout(binary) {
+  return path.basename(binary) === "mcporter" ? EXA_TEXT_SEED : JSON.stringify([{ ...RAW_SEED }]);
+}
+
 async function buildFixtures() {
   ctx.tmp = await mkdtemp(path.join(tmpdir(), "evolve-phase5e-"));
   ctx.captureRoot = path.join(ctx.tmp, "captures");
@@ -430,9 +452,9 @@ async function buildFixtures() {
   });
 
   const realRoot = path.join(ctx.tmp, "captures-real");
-  const spawn = stubSpawn(() => ({
+  const spawn = stubSpawn(({ binary }) => ({
     status: 0,
-    stdout: JSON.stringify([{ ...RAW_SEED }]),
+    stdout: realProviderStdout(binary),
     stderr: "",
   }));
   ctx.realCapture = await runCapture({
@@ -1442,7 +1464,7 @@ test("73. a real-provider capture normalizes raw payloads and never stores them"
 test("74. the call budget bounds a whole real-provider capture", async () => {
   const budgeted = reachConfig({ EVOLVE_REACH_MAX_CALLS: "2" });
   const root = path.join(ctx.tmp, "budgeted-capture");
-  const spawn = stubSpawn(() => ({ status: 0, stdout: JSON.stringify([{ ...RAW_SEED }]), stderr: "" }));
+  const spawn = stubSpawn(({ binary }) => ({ status: 0, stdout: realProviderStdout(binary), stderr: "" }));
   const result = await runCapture({
     root,
     config: budgeted,

@@ -9,12 +9,19 @@
  * as a failure, never silently replaced by the mock (the same rule the research
  * providers follow). A disabled provider refuses every call.
  *
- * Phase 5G.1b: the Agent-Reach provider is bounded by the EXPLICIT, versioned
- * successor capability contract (`reach-capability-map-v2`) and parses a raw MCP
- * tool response with a bounded, envelope-aware parser. A successful call whose
- * MCP CallResult envelope cannot be understood FAILS CLOSED
- * (`ReachResponseParseError`) instead of quietly reporting `records: 0` — a
- * genuine structured empty result array stays a valid zero-record call.
+ * Phase 5G.1b: the Agent-Reach provider is bounded by an EXPLICIT, versioned
+ * successor capability contract and parses a raw MCP tool response with a
+ * bounded, envelope-aware parser. A successful call whose MCP CallResult envelope
+ * cannot be understood FAILS CLOSED (`ReachResponseParseError`) instead of
+ * quietly reporting `records: 0` — a genuine structured empty result array stays
+ * a valid zero-record call.
+ *
+ * Phase 5G.1c: `reach-capability-map-v3` renders the MCPorter/Exa search with
+ * `--output text` (Exa's deterministic textual results) instead of `--output
+ * raw` (a Node/JavaScript inspection dump). Provider dispatch therefore selects
+ * a DEDICATED bounded parser for exactly the capabilities that pin
+ * `exa-text-v1`; every other capability keeps the generic parser contract, and
+ * the generic fail-closed behavior is NOT weakened.
  *
  * PAPER ONLY, READ-ONLY. No provider here can write, post, sign or transact.
  */
@@ -27,13 +34,17 @@ import {
   requireIntelligenceProvider,
 } from "./config.mjs";
 import { MOCK_INTELLIGENCE } from "./providers/mock-intelligence.mjs";
-import { REACH_ACTIVE_CAPABILITY_MAP, runReachCall } from "./agent-reach.mjs";
+import { EXA_TEXT_PARSE_FORMAT, parseExaSearchText } from "./providers/exa-text.mjs";
+import { REACH_ACTIVE_CAPABILITY_MAP, REACH_EXA_TEXT_PARSE_FORMAT, runReachCall } from "./agent-reach.mjs";
 
 /**
- * The capability contract NEW Agent-Reach captures are bounded by (Phase 5G.1b).
- * `reach-capability-map-v1` stays frozen for historical captures.
+ * The capability contract NEW Agent-Reach captures are bounded by (Phase 5G.1c).
+ * `reach-capability-map-v1` and `-v2` stay frozen for historical captures.
  */
 export const REACH_ACTIVE_CAPABILITY_MAP_VERSION = REACH_ACTIVE_CAPABILITY_MAP.version;
+
+/** Re-exported so a caller can pin the V3 parse format by name. */
+export { EXA_TEXT_PARSE_FORMAT };
 
 export const DISABLED_INTELLIGENCE_PROVIDER = Object.freeze({
   name: INTELLIGENCE_PROVIDER.DISABLED,
@@ -82,17 +93,24 @@ export function createAgentReachIntelligenceProvider({ config, env = process.env
         env,
         projectRoot,
         // NEW captures use the explicit, versioned successor contract. The
-        // frozen V1 map stays the default of the low-level helpers (historical
+        // frozen V1/V2 maps stay the default of the low-level helpers (historical
         // identity), so this opt-in is never implicit.
         capabilityMap: REACH_ACTIVE_CAPABILITY_MAP,
         ...(spawn ? { spawn } : {}),
       });
+      // PARSER DISPATCH: the capability this exact call was launched under pins
+      // the parse format (V3 Exa/Web → `exa-text-v1`). Everything else keeps the
+      // generic contract. The decision is never made by sniffing the payload, so
+      // no accidental global text parser can appear.
+      const expectsExaText = result.parseFormat === REACH_EXA_TEXT_PARSE_FORMAT;
       const parsed = result.ok
-        ? parseReachStdout(result.stdout)
-        : { records: [], format: "not-run", mcp: false, explicitEmpty: false, contentBlocks: 0, blocksIgnored: 0 };
-      // FAIL CLOSED: a successful call whose MCP CallResult envelope could not be
-      // understood is a PARSE FAILURE, never a silent `records: 0`.
-      const parseError = result.ok ? reachParseFailure(parsed) : null;
+        ? expectsExaText
+          ? parseExaSearchText(result.stdout)
+          : parseReachStdout(result.stdout)
+        : { records: [], format: "not-run", mcp: false, explicitEmpty: false, contentBlocks: 0, blocksIgnored: 0, blocksSeen: 0, blocksDiscarded: 0, outputBytes: 0 };
+      // FAIL CLOSED: a successful call whose response could not be understood is
+      // a PARSE FAILURE, never a silent `records: 0`.
+      const parseError = result.ok ? (expectsExaText ? exaTextParseFailure(parsed) : reachParseFailure(parsed)) : null;
       const parseFailed = parseError !== null;
       return {
         ok: result.ok && !parseFailed,
@@ -108,13 +126,20 @@ export function createAgentReachIntelligenceProvider({ config, env = process.env
           commandPreview: result.commandPreview,
           capabilityMapVersion: result.capabilityMapVersion ?? null,
           boundedArguments: result.boundedArguments ?? [],
+          // Bounded parser provenance: identifiers and COUNTS only. No raw text,
+          // no URL, no title, no author and no excerpt is ever recorded here.
           parse: {
             format: parsed.format,
+            parseFormat: result.parseFormat ?? null,
             mcpCallResult: parsed.mcp === true,
             extractedRecords: parsed.records.length,
+            recordsExtracted: parsed.records.length,
             explicitEmptyResult: parsed.explicitEmpty === true,
             contentBlocks: parsed.contentBlocks ?? 0,
             blocksIgnored: parsed.blocksIgnored ?? 0,
+            blocksSeen: parsed.blocksSeen ?? parsed.contentBlocks ?? 0,
+            blocksDiscarded: parsed.blocksDiscarded ?? parsed.blocksIgnored ?? 0,
+            outputBytes: parsed.outputBytes ?? result.bytes ?? 0,
           },
           // Which executable this bounded read actually ran, and where it came
           // from: the pinned Agent-Reach CLI for health, or the frozen
@@ -393,6 +418,26 @@ export function parseReachStdout(stdout) {
     return { records: [parsed], format: "json-object", mcp: false, explicitEmpty: false, contentBlocks: 0, blocksIgnored: 0 };
   }
   return { records: [], format: "json-scalar", mcp: false, explicitEmpty: false, contentBlocks: 0, blocksIgnored: 0 };
+}
+
+/**
+ * Decide whether a parsed Exa TEXT response must FAIL CLOSED.
+ *
+ * Returns a `ReachResponseParseError` when the DEDICATED `exa-text-v1` parser
+ * recognized the format but extracted no recognizable result block — otherwise
+ * null. Truly empty stdout and an explicit zero-block text stay valid zero-record
+ * calls, exactly like the generic parser's explicit-empty semantics.
+ */
+export function exaTextParseFailure(parsed) {
+  if (parsed?.format !== EXA_TEXT_PARSE_FORMAT) return null;
+  if (Array.isArray(parsed.records) && parsed.records.length > 0) return null;
+  if (parsed.explicitEmpty === true) return null;
+  return new ReachResponseParseError(
+    "the MCPorter Exa TEXT output was recognised (format=exa-text-v1) but no recognizable Exa result block could be " +
+      `extracted from it (blocksSeen=${parsed.blocksSeen ?? 0}, blocksDiscarded=${parsed.blocksDiscarded ?? 0}, ` +
+      `outputBytes=${parsed.outputBytes ?? 0}) — EVOLVE reports a bounded PARSE FAILURE instead of claiming zero ` +
+      "evidence. Nothing was executed and no result URL was followed.",
+  );
 }
 
 /**

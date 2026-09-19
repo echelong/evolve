@@ -23,8 +23,11 @@
  *   A. V1 IS FROZEN      `reach-capability-map-v1` keeps its version, its twelve
  *                        entries, its exact argv and its semantics, byte for byte.
  *   B. V2 IS EXPLICIT    `reach-capability-map-v2` is a published successor that
- *                        changes ONLY the MCPorter/Exa search invocation, and new
- *                        captures select it (and persist it as provenance).
+ *                        changes ONLY the MCPorter/Exa search invocation. It is
+ *                        FROZEN historical evidence now: Phase 5G.1c publishes
+ *                        `reach-capability-map-v3` (output rendering only) as the
+ *                        ACTIVE contract, so the ACTIVE assertions here pin V3 and
+ *                        V2 is re-verified as a published, readable map.
  *   C. ARGV CONTRACT     the runtime argv is
  *                          ["call","exa.web_search_exa","query=<query>",
  *                           "numResults=<limit>","objective=<frozen objective>",
@@ -38,9 +41,11 @@
  *                        proposal can write or influence.
  *   E. BOUNDED COUNT     EVOLVE's generic `limit` is untouched; the Exa transport
  *                        request is clamped to `numResults <= 25`.
- *   F. RAW OUTPUT        `--output raw` is explicit, so the COMPLETE MCP
- *                        CallResult reaches the bounded parser and multiple
- *                        results can never be silently collapsed.
+ *   F. OUTPUT RENDERING  V2 pinned `--output raw` (the COMPLETE MCP CallResult
+ *                        reaches the bounded parser); the active V3 pins
+ *                        `--output text` (Exa's deterministic textual results).
+ *                        Both are explicit, so multiple results can never be
+ *                        silently collapsed.
  *   G. PARSER + FAIL     a bounded CallResult parser (structuredContent.result /
  *      CLOSED            .results, content[] text JSON, top-level results/items,
  *                        JSON array, ndjson) that NEVER executes, NEVER follows a
@@ -85,12 +90,15 @@ import {
   REACH_ACTIVE_CAPABILITY_MAP_VERSION,
   REACH_CAPABILITY_MAP_V1,
   REACH_CAPABILITY_MAP_V2,
+  REACH_CAPABILITY_MAP_V3,
   REACH_CAPABILITY_MAP_VERSION,
   REACH_CAPABILITY_MAP_VERSION_V2,
+  REACH_CAPABILITY_MAP_VERSION_V3,
   REACH_MCPORTER_ARGUMENT_KEYS,
   REACH_MCPORTER_ARGUMENT_TEMPLATES,
   REACH_MCPORTER_OUTPUT_FLAG,
   REACH_MCPORTER_OUTPUT_FORMATS,
+  REACH_MCPORTER_OUTPUT_FORMATS_V3,
   REACH_NAMED_ARGUMENT_PATTERN,
   REACH_NAMED_ARGUMENT_PLACEHOLDERS,
   ReachCommandError,
@@ -371,14 +379,27 @@ const HOSTILE_CANDIDATE = Object.freeze({
   handle: "@solana",
 });
 
-const MCP_RESULT = Object.freeze({
-  structuredContent: {
-    result: [
-      { url: "https://solana.com/docs", title: "Solana documentation", text: "Solana is a high-performance blockchain." },
-      { url: "https://solana.com/validators", title: "Validator docs", text: "Running a validator." },
-    ],
-  },
-});
+// The ACTIVE (V3) MCPorter/Exa rendering is `--output text`, so the fixture is
+// the exact textual result shape Exa emits (`exa-text-v1`). The generic parser's
+// own structured shapes are still exercised separately (see tests 25-35).
+const EXA_TEXT_RESULT =
+  [
+    "Title: Solana documentation",
+    "URL: https://solana.com/docs",
+    "Published: N/A",
+    "Author: N/A",
+    "Highlights:",
+    "Solana is a high-performance blockchain.",
+    "",
+    "---",
+    "",
+    "Title: Validator docs",
+    "URL: https://solana.com/validators",
+    "Published: N/A",
+    "Author: N/A",
+    "Highlights:",
+    "Running a validator.",
+  ].join("\n");
 
 function agentConfig(overrides = {}) {
   return resolveIntelligenceConfig({
@@ -388,6 +409,10 @@ function agentConfig(overrides = {}) {
   });
 }
 function v2Entry(channel) {
+  // The FROZEN V2 contract (historical identity) — never the active map.
+  return capabilityFor("search", channel, REACH_CAPABILITY_MAP_V2);
+}
+function activeEntry(channel) {
   return capabilityFor("search", channel, REACH_ACTIVE_CAPABILITY_MAP);
 }
 function v2Values(overrides = {}) {
@@ -406,7 +431,7 @@ function mcpSpawn(handler = null) {
   return stubSpawn(({ binary }) => {
     if (handler) return handler({ binary });
     if (path.basename(binary) === "mcporter") {
-      return { status: 0, stdout: JSON.stringify(MCP_RESULT), stderr: "" };
+      return { status: 0, stdout: EXA_TEXT_RESULT, stderr: "" };
     }
     return { status: 0, stdout: "[]", stderr: "" };
   });
@@ -520,7 +545,9 @@ async function buildFixtures() {
     now: NOW + 3_000,
     env: { PATH: ctx.binAll },
     projectRoot: REPO,
-    spawn: stubSpawn(() => ({ status: 0, stdout: JSON.stringify({ structuredContent: { result: [] } }), stderr: "" })),
+    // The V3 Exa/Web rendering: MCPorter exits 0 with EMPTY text output, which
+    // is the explicit empty semantics of the active contract.
+    spawn: stubSpawn(() => ({ status: 0, stdout: "", stderr: "" })),
   });
 }
 
@@ -565,8 +592,12 @@ test("2. reach-capability-map-v2 exists explicitly and extends V1", async () => 
   assertEqual(REACH_CAPABILITY_MAP_VERSION_V2, "reach-capability-map-v2", "the V2 version string is explicit");
   assertEqual(REACH_CAPABILITY_MAP_V2.version, REACH_CAPABILITY_MAP_VERSION_V2, "the published V2 map declares its version");
   assertEqual(REACH_CAPABILITY_MAP_V2.extendsVersion, REACH_CAPABILITY_MAP_VERSION, "V2 names the V1 map it succeeded");
-  assertEqual(REACH_ACTIVE_CAPABILITY_MAP, REACH_CAPABILITY_MAP_V2, "the active contract is the V2 map");
-  assertEqual(REACH_ACTIVE_CAPABILITY_MAP_VERSION, REACH_CAPABILITY_MAP_VERSION_V2, "the active version is reported");
+  // Phase 5G.1c: V2 stays published and frozen, but V3 (output rendering) is now
+  // the ACTIVE contract for NEW captures. V2 itself is re-verified here.
+  assertEqual(REACH_CAPABILITY_MAP_V2.version, REACH_CAPABILITY_MAP_VERSION_V2, "V2 keeps its own version string");
+  assertEqual(REACH_ACTIVE_CAPABILITY_MAP, REACH_CAPABILITY_MAP_V3, "the active contract is the V3 map");
+  assertEqual(REACH_ACTIVE_CAPABILITY_MAP_VERSION, REACH_CAPABILITY_MAP_VERSION_V3, "the active version is reported");
+  assertEqual(REACH_CAPABILITY_MAP_V3.extendsVersion, REACH_CAPABILITY_MAP_VERSION_V2, "V3 extends V2 explicitly");
   assertEqual(REACH_CAPABILITY_MAP_V2.entries.length, 12, "V2 keeps twelve entries");
   assertDeepEqual(
     REACH_CAPABILITY_MAP_V2.entries.map((entry) => `${entry.op}:${entry.channel ?? "-"}:${entry.binary}`),
@@ -583,15 +614,14 @@ test("2. reach-capability-map-v2 exists explicitly and extends V1", async () => 
 
 test("3. new captures select V2 and persist it as provenance", async () => {
   const manifest = ctx.captures.web.manifest;
-  assertEqual(manifest.capabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V2, "the capture persists the V2 contract");
-  assertEqual(manifest.capabilityMapVersion, REACH_ACTIVE_CAPABILITY_MAP_VERSION, "and it is the ACTIVE contract");
+  assertEqual(manifest.capabilityMapVersion, REACH_ACTIVE_CAPABILITY_MAP_VERSION, "the capture persists the ACTIVE (V3) contract");
   assertEqual(manifest.schemaVersion, 2, "the provenance is additive on capture schema 2 (no silent schema change)");
   assertEqual(manifest.featureVersion, "external-intelligence-features-v2", "the feature pin is untouched");
   const onDisk = await readCaptureManifest(ctx.roots.capture, ctx.captures.web.captureId);
-  assertEqual(onDisk.capabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V2, "the frozen manifest on disk carries it");
+  assertEqual(onDisk.capabilityMapVersion, REACH_ACTIVE_CAPABILITY_MAP_VERSION, "the frozen manifest on disk carries it");
   assertEqual((await verifyCapture(ctx.roots.capture, ctx.captures.web.captureId)).ok, true, "the new capture verifies");
   const provider = createAgentReachIntelligenceProvider({ config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn: mcpSpawn() });
-  assertEqual(provider.capabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V2, "the provider declares its contract");
+  assertEqual(provider.capabilityMapVersion, REACH_ACTIVE_CAPABILITY_MAP_VERSION, "the provider declares its contract");
 });
 
 test("4. V2 web search runs `mcporter`", async () => {
@@ -722,7 +752,7 @@ test("13. the objective can never come from a candidate", async () => {
     const result = runReachCall({ op: query.op, channel: query.channel, values: { query: query.query, limit: 5 }, config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn, capabilityMap: REACH_ACTIVE_CAPABILITY_MAP });
     assertEqual(result.argv[4], `objective=${EXA_SEARCH_OBJECTIVE_V1}`, "every rendered hostile query still carries the frozen objective");
   }
-  assertEqual(ctx.captures.hostile.manifest.capabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V2, "the hostile-candidate capture used V2");
+  assertEqual(ctx.captures.hostile.manifest.capabilityMapVersion, REACH_ACTIVE_CAPABILITY_MAP_VERSION, "the hostile-candidate capture used the active contract");
 });
 
 test("14. the objective can never come from an LLM or research state", async () => {
@@ -765,14 +795,16 @@ test("14. the objective can never come from an LLM or research state", async () 
   );
 });
 
-test("15. `--output raw` is requested explicitly", async () => {
+test("15. the output rendering is explicit: V2 `raw`, active V3 `text`", async () => {
   assertEqual(REACH_MCPORTER_OUTPUT_FLAG, "--output", "the output flag is explicit");
-  assertDeepEqual([...REACH_MCPORTER_OUTPUT_FORMATS], ["raw"], "the approved output format is `raw`");
-  assertDeepEqual([...v2Entry("web").argv].slice(-2), ["--output", "raw"], "the V2 template ends with --output raw");
+  assertDeepEqual([...REACH_MCPORTER_OUTPUT_FORMATS], ["raw"], "the frozen V2 output format is `raw`");
+  assertDeepEqual([...REACH_MCPORTER_OUTPUT_FORMATS_V3], ["text"], "the V3 output format is `text`");
+  assertDeepEqual([...v2Entry("web").argv].slice(-2), ["--output", "raw"], "the frozen V2 template ends with --output raw");
+  assertDeepEqual([...activeEntry("web").argv].slice(-2), ["--output", "text"], "the active V3 template ends with --output text");
   const spawn = mcpSpawn();
   const result = runReachCall({ op: "search", channel: "web", values: v2Values(), config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn, capabilityMap: REACH_ACTIVE_CAPABILITY_MAP });
-  assertDeepEqual(spawn.calls[0].argv.slice(-2), ["--output", "raw"], "the launched argv requests raw output");
-  assertDeepEqual(result.argv.slice(-2), ["--output", "raw"], "the reported argv requests raw output");
+  assertDeepEqual(spawn.calls[0].argv.slice(-2), ["--output", "text"], "the launched argv requests text output");
+  assertDeepEqual(result.argv.slice(-2), ["--output", "text"], "the reported argv requests text output");
   // The exception must stay bounded: any other format (or any other tool) is refused.
   assertThrows(() => assertReadOnlyArgv(["--output", "json"], { binary: "mcporter" }), ReachCommandError, "an unapproved output format is refused");
   assertThrows(() => assertReadOnlyArgv(["--output", "raw"], { binary: "curl" }), ReachCommandError, "the format flag is refused for curl (file-writing)");
@@ -1081,7 +1113,8 @@ test("33. a malformed MCP envelope fails closed", async () => {
   }
   const spawn = stubSpawn(() => ({ status: 0, stdout: JSON.stringify({ structuredContent: {} }), stderr: "" }));
   const provider = createAgentReachIntelligenceProvider({ config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn });
-  const outcome = provider.execute({ op: "search", channel: "web", query: "q", limit: 5 });
+  // `github` still uses the GENERIC parser (only V3 Exa/Web pins `exa-text-v1`).
+  const outcome = provider.execute({ op: "search", channel: "github", query: "q", limit: 5 });
   assertEqual(outcome.ok, false, "the provider reports a failure, not a success with zero records");
   assertEqual(outcome.errorName, "ReachResponseParseError", "the failure is named");
   assertEqual(outcome.parseFailed, true, "the parse failure flag is set");
@@ -1092,7 +1125,7 @@ test("33. a malformed MCP envelope fails closed", async () => {
 test("34. a successful, non-empty, unparseable MCP response fails closed", async () => {
   const spawn = stubSpawn(() => ({ status: 0, stdout: JSON.stringify({ content: [{ type: "text", text: "prose only" }] }), stderr: "" }));
   const provider = createAgentReachIntelligenceProvider({ config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn });
-  const outcome = provider.execute({ op: "search", channel: "web", query: "q", limit: 5 });
+  const outcome = provider.execute({ op: "search", channel: "github", query: "q", limit: 5 });
   assertEqual(spawn.calls.length, 1, "the call really was placed");
   assertEqual(outcome.ok, false, "exit 0 is NOT enough: the parse failure wins");
   assertEqual(outcome.errorName, "ReachResponseParseError", "the status is the bounded parse error");
@@ -1120,7 +1153,7 @@ test("35. an explicit structured empty result is a valid zero records", async ()
   const alsoEmpty = parseReachStdout(JSON.stringify({ content: [{ type: "text", text: "[]" }] }));
   assertEqual(reachParseFailure(alsoEmpty), null, "an explicit empty JSON array block is valid too");
   const provider = createAgentReachIntelligenceProvider({ config: agentConfig(), env: { PATH: ctx.binAll }, projectRoot: REPO, spawn: stubSpawn(() => ({ status: 0, stdout: JSON.stringify({ structuredContent: { result: [] } }), stderr: "" })) });
-  const outcome = provider.execute({ op: "search", channel: "web", query: "q", limit: 5 });
+  const outcome = provider.execute({ op: "search", channel: "github", query: "q", limit: 5 });
   assertEqual(outcome.ok, true, "the call is a SUCCESS");
   assertEqual(outcome.records.length, 0, "with zero records");
   assertEqual(outcome.error, null, "and no error");
@@ -1187,8 +1220,8 @@ test("38. the doctor is unchanged in behavior and stays zero-network", async () 
   assertEqual(payload.capabilityReadiness.networkCalls, 0, "the doctor reports zero network calls");
   assertEqual(payload.capabilityReadiness.subprocessesSpawned, 0, "the doctor spawned nothing");
   assertEqual(payload.capabilityReadiness.capabilityMapVersion, REACH_CAPABILITY_MAP_VERSION, "the historical readiness basis stays reported");
-  assertEqual(payload.capabilityReadiness.activeCapabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V2, "the ACTIVE contract is named");
-  assertDeepEqual(payload.capabilityMaps, { active: REACH_CAPABILITY_MAP_VERSION_V2, historical: REACH_CAPABILITY_MAP_VERSION }, "both capability maps are reported");
+  assertEqual(payload.capabilityReadiness.activeCapabilityMapVersion, REACH_CAPABILITY_MAP_VERSION_V3, "the ACTIVE contract is named");
+  assertDeepEqual(payload.capabilityMaps, { active: REACH_CAPABILITY_MAP_VERSION_V3, historical: REACH_CAPABILITY_MAP_VERSION }, "both capability maps are reported");
   assertEqual(payload.captureSchemaVersion, 2, "the capture schema is unchanged");
   assertEqual(await exists(ctx.marker), false, "no fixture stub was executed by the doctor");
   assertDeepEqual(await listDirSafe(out), [], "the doctor wrote nothing (no --save)");
@@ -1213,7 +1246,7 @@ test("39. operation readiness still works and reports web/search: ready (mcporte
   const run = runNode(["scripts/intelligence.mjs", "doctor", "--out", ctx.roots.doctor], { env: { PATH: ctx.binAll } });
   assertEqual(run.status, 0, "the doctor text run exits 0");
   assertIncludes(run.stdout, "search: ready (mcporter)", "the doctor still reports web/search: ready (mcporter)");
-  assertIncludes(run.stdout, `capability map:  ${REACH_CAPABILITY_MAP_VERSION_V2}`, "and names the active capability map");
+  assertIncludes(run.stdout, `capability map:  ${REACH_CAPABILITY_MAP_VERSION_V3}`, "and names the active capability map");
   assertIncludes(run.stdout, REACH_CAPABILITY_MAP_VERSION, "while keeping the frozen one visible");
   assertEqual(await exists(ctx.marker), false, "the doctor executed nothing");
 });
@@ -1458,10 +1491,11 @@ async function run() {
     for (const failure of failures) console.log(`  - ${failure.name}`);
     process.exitCode = 1;
   } else {
-    console.log("All Phase 5G.1b checks passed. `reach-capability-map-v1` is byte/semantic frozen; `reach-capability-map-v2`");
-    console.log("bounds every NEW capture and invokes `mcporter call exa.web_search_exa query=<q> numResults=<limit>");
-    console.log("objective=<frozen objective> --output raw` as an ARRAY with shell:false — no --limit, no --query, no");
-    console.log("interpolation, no caller-defined argument names, and an Exa result count clamped to 25.");
+    console.log("All Phase 5G.1b checks passed. `reach-capability-map-v1` and `reach-capability-map-v2` are byte/semantic");
+    console.log("frozen; the ACTIVE contract (`reach-capability-map-v3`, Phase 5G.1c) invokes `mcporter call");
+    console.log("exa.web_search_exa query=<q> numResults=<limit> objective=<frozen objective> --output text` as an ARRAY");
+    console.log("with shell:false — no --limit, no --query, no interpolation, no caller-defined argument names, and an Exa");
+    console.log("result count clamped to 25.");
   }
 }
 

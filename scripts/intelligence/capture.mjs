@@ -116,6 +116,36 @@ export function buildCaptureId(now = Date.now()) {
 }
 
 /**
+ * Bounded, content-free provider-call provenance for ONE capture call.
+ *
+ * Records WHICH contract ran, which executable served it, and the parser's
+ * COUNTS — never the payload: no raw text, no result URL, no title, no author,
+ * no excerpt and no command preview (which would echo the query). Returns `null`
+ * when a provider places no external provider call at all (the offline mock).
+ */
+export function boundedCallProvenance(query, call) {
+  if (!call || typeof call !== "object") return null;
+  const parse = call.parse ?? {};
+  const count = (value) => (Number.isFinite(value) ? value : null);
+  return {
+    queryId: query?.queryId ?? null,
+    channel: query?.channel ?? null,
+    operation: query?.op ?? "search",
+    capabilityMapVersion: call.capabilityMapVersion ?? null,
+    binary: call.executable?.basename ?? null,
+    parse: {
+      format: typeof parse.format === "string" ? parse.format : null,
+      blocksSeen: count(parse.blocksSeen),
+      recordsExtracted: count(parse.recordsExtracted ?? parse.extractedRecords),
+      blocksDiscarded: count(parse.blocksDiscarded),
+      outputBytes: count(parse.outputBytes ?? call.bytes),
+    },
+    spawned: call.spawned === true,
+    unavailable: call.unavailable === true,
+  };
+}
+
+/**
  * Capture-id shape, newest first: millisecond (`...SSmmmZ`) or legacy second
  * (`...SSZ`). Both parse; nothing older is ever rewritten.
  */
@@ -290,6 +320,10 @@ export async function runCapture({
   const health = {};
   const failures = [];
   const timeouts = [];
+  // PROVIDER-CALL PROVENANCE (Phase 5G.1c): bounded parser diagnostics per call.
+  // Counts, identifiers and flags only — never raw text, a URL, a title, an
+  // author or an excerpt (see `boundedCallProvenance`).
+  const providerCalls = [];
   let calls = 0;
 
   for (const query of plan.queries) {
@@ -321,6 +355,9 @@ export async function runCapture({
     } catch (error) {
       outcome = { ok: false, records: [], error: String(error?.message ?? error) };
     }
+
+    const provenance = boundedCallProvenance(query, outcome?.call ?? null);
+    if (provenance) providerCalls.push(provenance);
 
     if (!outcome?.ok) {
       const message = String(outcome?.error ?? "provider call failed");
@@ -418,6 +455,7 @@ export async function runCapture({
     },
     failures,
     timeouts,
+    providerCalls,
     startedAt: capturedAt,
     endedAt: new Date(Date.now()).toISOString(),
     finalizedAt: new Date(Date.now()).toISOString(),

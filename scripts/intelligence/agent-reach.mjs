@@ -76,12 +76,34 @@ export const REACH_CAPABILITY_MAP_VERSION = "reach-capability-map-v1";
  * installed `mcporter 0.13.13` no longer accepts `--query`/`--limit` on `call`
  * (it wants `key=<value>` tool arguments and the Exa schema names the bounded
  * result count `numResults`, with a REQUIRED `objective`). V1 remains readable
- * forever; every NEW Agent-Reach capture is bounded by V2.
+ * forever. V2 was, in turn, superseded by V3 (Phase 5G.1c) for OUTPUT RENDERING
+ * only; V1 and V2 both stay frozen and readable.
  */
 export const REACH_CAPABILITY_MAP_VERSION_V2 = "reach-capability-map-v2";
 
+/**
+ * VERSIONED SUCCESSOR (Phase 5G.1c) — `reach-capability-map-v3`.
+ *
+ * `reach-capability-map-v1` AND `reach-capability-map-v2` are FROZEN: real
+ * captures (and every replay identity derived from them) were bounded by their
+ * EXACT argv, so silently mutating either would rewrite the meaning of
+ * already-frozen evidence. V3 is therefore an explicit, published successor — it
+ * never redefines V1 or V2.
+ *
+ * V3 changes ONE thing: the MCPorter/Exa OUTPUT RENDERING. The V2 contract was
+ * proven at runtime (`mcporter 0.13.13` / `exa.web_search_exa`, status 0, 37422
+ * bytes of genuine Exa results), but `--output raw` renders a Node/JavaScript
+ * INSPECTION representation (`{ content: [ { type: 'text', text: 'Title: …' } ]`)
+ * that is not strict JSON. Rather than parse (or worse, evaluate) that dump, V3
+ * asks MCPorter for `--output text` — the deterministic textual search-result
+ * representation Exa already emits — and a dedicated bounded parser reads it.
+ * Every other V2 semantic (tool, named arguments, frozen objective, numResults
+ * clamp, shell:false, read-only argv discipline) is inherited unchanged.
+ */
+export const REACH_CAPABILITY_MAP_VERSION_V3 = "reach-capability-map-v3";
+
 /** The capability map NEW captures are bounded by (see `REACH_ACTIVE_CAPABILITY_MAP`). */
-export const REACH_ACTIVE_CAPABILITY_MAP_VERSION = REACH_CAPABILITY_MAP_VERSION_V2;
+export const REACH_ACTIVE_CAPABILITY_MAP_VERSION = REACH_CAPABILITY_MAP_VERSION_V3;
 
 /* ----------------------------------------------------------------------------
  * The frozen Exa / MCPorter web-search contract (V2)
@@ -167,16 +189,34 @@ export const EXA_RESULT_COUNT_ARGUMENT = "numResults";
 /**
  * MCPorter's explicit output-format flag.
  *
- * `--output <format>` writes no file: it selects MCPorter's OUTPUT FORMAT, and
- * EVOLVE always asks for `raw` so the COMPLETE MCP CallResult is available to
- * the bounded parser (a JSON convenience mode must never decide how many
- * results exist). The flag is only ever accepted for MCPorter and only ever
- * followed by an approved format — the file-writing flag list stays closed for
- * every other tool (+ everything else MCPorter could be asked to do).
+ * `--output <format>` writes no file: it selects MCPorter's OUTPUT FORMAT.
+ *
+ * FROZEN FOREVER: `REACH_MCPORTER_OUTPUT_FORMATS` is the V1/V2-era format list
+ * (`raw`), the value the historical captures were bounded by — it is never
+ * mutated. Phase 5G.1c publishes the V3 format (`text`) SEPARATELY, and the argv
+ * guard accepts the UNION (see `REACH_MCPORTER_APPROVED_OUTPUT_FORMATS`): the
+ * file-writing flag list stays closed for every other tool (+ everything else
+ * MCPorter could be asked to do).
  */
 export const REACH_MCPORTER_OUTPUT_FLAG = "--output";
 export const REACH_MCPORTER_OUTPUT_FORMATS = Object.freeze(["raw"]);
+/** V3 Exa/Web rendering: deterministic TEXT, the boundary the V3 parser reads. */
+export const REACH_MCPORTER_OUTPUT_FORMAT_TEXT = "text";
+export const REACH_MCPORTER_OUTPUT_FORMATS_V3 = Object.freeze([REACH_MCPORTER_OUTPUT_FORMAT_TEXT]);
+/** The formats the `--output` exception may ever be followed by (frozen union). */
+export const REACH_MCPORTER_APPROVED_OUTPUT_FORMATS = Object.freeze([
+  ...REACH_MCPORTER_OUTPUT_FORMATS,
+  REACH_MCPORTER_OUTPUT_FORMAT_TEXT,
+]);
 export const REACH_MCPORTER_OUTPUT_BINARIES = Object.freeze(["mcporter"]);
+
+/**
+ * The parse-format identifier the V3 Exa/Web contract pins on its entries.
+ *
+ * Provider dispatch reads it to select the DEDICATED Exa text parser — never a
+ * global text parser, and never by sniffing the payload.
+ */
+export const REACH_EXA_TEXT_PARSE_FORMAT = "exa-text-v1";
 
 /**
  * Side-effect-free health operations. These are INTERNAL ONLY: they exist for the
@@ -475,7 +515,7 @@ export const REACH_CAPABILITY_MAP_V1 = Object.freeze({
  * but it is NEVER a string: it is an argv ARRAY handed to `spawn` with
  * `shell: false`, exactly like every V1 entry.
  */
-function withMcpSearchInvocation(entry) {
+function withMcpSearchInvocation(entry, { outputFormat = REACH_MCPORTER_OUTPUT_FORMATS[0], parseFormat = null } = {}) {
   if (entry.op !== "search" || (entry.channel !== "exa" && entry.channel !== "web")) return entry;
   return Object.freeze({
     op: "search",
@@ -490,9 +530,11 @@ function withMcpSearchInvocation(entry) {
       `${EXA_RESULT_COUNT_ARGUMENT}={limit}`,
       `objective={objective}`,
       REACH_MCPORTER_OUTPUT_FLAG,
-      REACH_MCPORTER_OUTPUT_FORMATS[0],
+      outputFormat,
     ]),
     namedArguments: REACH_MCPORTER_ARGUMENT_KEYS,
+    // V3 pins the DEDICATED parser; V2 (rendering `raw`) pins none.
+    ...(parseFormat ? { parseFormat } : {}),
   });
 }
 
@@ -502,8 +544,13 @@ function withMcpSearchInvocation(entry) {
  * Identical to V1 — same twelve entries, in the same order, with the same
  * `(operation, channel, executable)` triples, the same allowlists, the same
  * `shell: false` launch and the same read-only discipline — EXCEPT the two
- * MCPorter search entries (`search:exa` and `search:web`), which now use the
+ * MCPorter search entries (`search:exa` and `search:web`), which use the
  * named-tool-argument contract above and explicitly request `--output raw`.
+ *
+ * FROZEN: V2 bounded the real canary `capture-20260919T160610944Z` (and its
+ * replay identity), so it is never mutated. Phase 5G.1c publishes V3 as the
+ * successor for NEW captures; V2 remains the default of the low-level helpers so
+ * historical identity is never silently re-pointed.
  *
  * Nothing about V1 is redefined here: `extendsVersion` records the parent the
  * successor was derived from.
@@ -512,7 +559,7 @@ export const REACH_CAPABILITY_MAP_V2 = Object.freeze({
   version: REACH_CAPABILITY_MAP_VERSION_V2,
   extendsVersion: REACH_CAPABILITY_MAP_VERSION,
   pinned: AGENT_REACH_PIN,
-  entries: Object.freeze(REACH_CAPABILITY_MAP_V1.entries.map(withMcpSearchInvocation)),
+  entries: Object.freeze(REACH_CAPABILITY_MAP_V1.entries.map((entry) => withMcpSearchInvocation(entry))),
   mcpSearch: Object.freeze({
     binary: "mcporter",
     tool: EXA_WEB_SEARCH_TOOL,
@@ -529,11 +576,49 @@ export const REACH_CAPABILITY_MAP_V2 = Object.freeze({
     "Read-only capability map successor. Only the MCPorter/Exa search invocation changed: named tool arguments " +
     "(`query=`, `numResults=`, `objective=`) plus an explicit `--output raw`, so MCPorter 0.13.13's `call` contract and " +
     "Exa's installed `web_search_exa` schema are both satisfied without any shell interpolation. `reach-capability-map-v1` " +
-    "stays frozen and readable for historical captures; this map bounds every NEW capture.",
+    "stays frozen and readable for historical captures; V3 (not this map) bounds every NEW capture.",
+});
+
+/**
+ * FROZEN successor capability map (Phase 5G.1c).
+ *
+ * Identical to V2 — same twelve entries, same order, same `(operation, channel,
+ * executable)` triples, same named tool arguments, same frozen objective, same
+ * `numResults <= 25` clamp, same `shell: false` launch — EXCEPT that the two
+ * MCPorter search entries (`search:exa` and `search:web`) now request
+ * `--output text` and pin the dedicated `exa-text-v1` parser.
+ *
+ * Nothing about V1 or V2 is redefined here: `extendsVersion` records the parent
+ * this successor was derived from.
+ */
+export const REACH_CAPABILITY_MAP_V3 = Object.freeze({
+  version: REACH_CAPABILITY_MAP_VERSION_V3,
+  extendsVersion: REACH_CAPABILITY_MAP_VERSION_V2,
+  pinned: AGENT_REACH_PIN,
+  entries: Object.freeze(
+    REACH_CAPABILITY_MAP_V2.entries.map((entry) =>
+      withMcpSearchInvocation(entry, {
+        outputFormat: REACH_MCPORTER_OUTPUT_FORMAT_TEXT,
+        parseFormat: REACH_EXA_TEXT_PARSE_FORMAT,
+      }),
+    ),
+  ),
+  mcpSearch: Object.freeze({
+    ...REACH_CAPABILITY_MAP_V2.mcpSearch,
+    outputFormat: REACH_MCPORTER_OUTPUT_FORMAT_TEXT,
+    parseFormat: REACH_EXA_TEXT_PARSE_FORMAT,
+  }),
+  note:
+    "Read-only capability map successor. Only the MCPorter/Exa search RENDERING changed: the named tool arguments " +
+    "(`query=`, `numResults=`, `objective=`) and the frozen objective are exactly V2's, but the renderer is `--output text` " +
+    "instead of `--output raw`. V2's `raw` mode was proven at runtime to emit a Node/JavaScript inspection dump rather than " +
+    "strict JSON, so EVOLVE reads Exa's deterministic TEXT search-result representation through a dedicated bounded parser " +
+    "(`exa-text-v1`). `reach-capability-map-v1` and `reach-capability-map-v2` stay frozen and readable for historical captures; " +
+    "this map bounds every NEW capture.",
 });
 
 /** The capability map new captures are bounded by (an explicit, versioned successor). */
-export const REACH_ACTIVE_CAPABILITY_MAP = REACH_CAPABILITY_MAP_V2;
+export const REACH_ACTIVE_CAPABILITY_MAP = REACH_CAPABILITY_MAP_V3;
 
 /** Look up the frozen entry for (op, channel). */
 export function capabilityFor(op, channel = null, capabilityMap = REACH_CAPABILITY_MAP_V1) {
@@ -586,7 +671,7 @@ export function validateUrl(value) {
 function isApprovedOutputFlag({ text, next, basename }) {
   if (text !== REACH_MCPORTER_OUTPUT_FLAG) return false;
   if (basename === null || !REACH_MCPORTER_OUTPUT_BINARIES.includes(basename)) return false;
-  return REACH_MCPORTER_OUTPUT_FORMATS.includes(String(next ?? ""));
+  return REACH_MCPORTER_APPROVED_OUTPUT_FORMATS.includes(String(next ?? ""));
 }
 
 /** Reject a write-capable argv before anything is spawned. */
@@ -1201,6 +1286,9 @@ export function runReachCall({
     // clamp that was applied at the provider boundary (requested vs effective).
     capabilityMapVersion: capabilityMap?.version ?? REACH_CAPABILITY_MAP_VERSION,
     tool: capability.tool ?? null,
+    // The DEDICATED parse format this capability pins (V3 Exa/Web only), so the
+    // provider can select a parser without sniffing the payload.
+    parseFormat: capability.parseFormat ?? null,
     boundedArguments,
     binary: executable.basename,
     executable: {
