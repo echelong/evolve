@@ -2007,7 +2007,7 @@ EVOLVE_JEV_BASE_URL        default: https://api.typesafe.ai
 EVOLVE_VERCEL_JEV_MODEL    default: typesafe-ai/jev (never `jev-latest` unless explicitly requested)
 EVOLVE_JEV_TIMEOUT_MS      default: 20000, clamped to [1000, 120000]; applies to BOTH real routes
 EVOLVE_JEV_MAX_CALLS       default: 20, clamped to [1, 500]; applies identically to vercel-jev
-EVOLVE_JEV_MIN_CONFIDENCE  offline confidence-gating analysis only — never an operational threshold
+Jev has no runtime confidence threshold. All valid shadow predictions are retained; confidence thresholds are evaluated only retrospectively during offline calibration and are never promoted automatically to an operational gate.
 EVOLVE_JEV_CACHE           default: true
 EVOLVE_JEV_MAX_ATTEMPTS    default: 3, clamped to [1, 5]; PHYSICAL attempts per LOGICAL decision
 EVOLVE_JEV_BACKOFF_BASE_MS default: 1000; exponential backoff base (attempt 1 ~base, attempt 2 ~2x)
@@ -3238,16 +3238,51 @@ flags and `networkCalls: 0`. There is **no verdict, no ranking, no gate and no p
 ### Validation
 
 ```bash
-npm run validate:phase5h   # 130 offline checks: definition pin + 19-feature order, identity/digest exclusions,
+npm run validate:phase5h   # 139 offline checks: definition pin + 19-feature order, identity/digest exclusions,
                            # record-weighted aggregation (50-record vs 5-record proof), every formula and boundary,
                            # null semantics, every refusal, the artifact audit, replay tamper cases, stats/CLI,
-                           # timeline, existing barriers and a canonical 5G.1 cross-check
+                           # timeline, existing barriers, a canonical 5G.1 cross-check and the canonical 5H.0 barrier
 ```
 
 The suite also cross-checks the real frozen 5G.1 evidence when it exists locally: it recomputes the 5H.0 values
 from the canonical cohort **without writing anything** and proves that all nine label fractions, the entropy
 (`labelDiversity`), the largest-label concentration, the confidence mean/median/`<0.50`/`>=0.90` fractions, the
 margin mean/median/`<0.10` fraction and both aliases agree **exactly** with the frozen evaluation.
+
+### Canonical Phase 5H.0 barrier
+
+The operator froze exactly **ONE** canonical 5H.0 artifact and replayed it successfully. It is the permanent
+research barrier for the phase, pinned in `scripts/validate-phase5h.mjs`:
+
+```text
+feature id         clfeat-20260919T173844Z-7a9193bb
+feature digest     65218b38f80a344a99f12f8a98784a49250d0ec0b88cd88ea9cd795fab39312b
+
+definition version classifier-feature-definition-v1
+definition digest  9227c8ef12414951bd48fe4c4c2a9ea2d1b69f4485f1019157912e32bc0093bd
+
+source cohort      clcohort-20260919T163609Z-4d7c6dd9
+cohort digest      2a8b9ca38f6f1f9dad7a46426c9a42cece2ca9fa3722815c430d42098b9e1a04
+evidence class     DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES
+source class       DEVELOPMENT_CLASSIFIER_EVIDENCE
+evidenceAsOf       2026-09-19T16:34:12.867Z
+```
+
+When the artifact is present locally the suite inspects it **READ-ONLY** (it never creates, rewrites or
+reclassifies anything) and verifies the exact id/digest, both recomputations, the definition version/digest, the
+source cohort id/digest, the evidence classes, `evidenceAsOf`, `100 / 100 / 0` records / classified / skipped,
+`100` distinct and `0` duplicate record digests, `100` complete and `0` incomplete score vectors, `0` null
+features, the exact 19 canonical values, record-weighted aggregation with `experimentsAveraged === false`, all
+four routing flags strictly false, every frozen flag true, a clean artifact audit, and an offline replay whose
+integrity is OK and whose reproduced feature digest is the pinned one with **zero network calls**. When the
+artifact is absent (e.g. fresh CI without the operator's local evidence) those cases **skip cleanly** rather
+than failing; all other barriers still run.
+
+This is **DEVELOPMENT evidence**, and it is **descriptive only**. It **proves no predictive edge**, has **no
+routing authority** (Jev, DeepSeek, Arena and trading all stay false), and **any future clean replication
+requires entirely new data** — the label is never reusable. The canonical `.evolve` artifact itself **remains
+local and gitignored** (`.evolve/` is never committed) and is **never copied into source control**; only this
+documented barrier — the ids and digests above — is tracked in Git.
 
 ### Phase 5H.0 checklist
 
@@ -3264,8 +3299,8 @@ margin mean/median/`<0.10` fraction and both aliases agree **exactly** with the 
 - [x] Duplicate record digests reported (distinct + duplicate counts), never refused or reinterpreted
 - [x] Routing stays false (Jev/DeepSeek/Arena/Trading); no Jev packet and no dashboard change in 5H.0
 - [x] Canonical 5G.1 cohort/evaluation/experiments/captures, Wave 1, Wave 2, the frozen cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
-- [x] `npm run validate:phase5h` — 130 offline checks
-- [ ] Canonical `clfeat-*` artifact — operator-run AFTER review/commit (see the command below); it is **not** evidence about profitability or market usefulness
+- [x] `npm run validate:phase5h` — 139 offline checks
+- [x] Canonical `clfeat-20260919T173844Z-7a9193bb` artifact — operator-frozen and successfully replayed, now a permanent READ-ONLY research barrier (see **Canonical Phase 5H.0 barrier** above); it is **not** evidence about profitability or market usefulness
 
 ```bash
 npm run intelligence:classify-features -- --cohort clcohort-20260919T163609Z-4d7c6dd9
@@ -4032,8 +4067,8 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Offline `--replay` / `--stats` / `--definition` CLI with `networkCalls: 0`, no provider/network/routing/classification option and no latest
 - [x] Routing stays false; no Jev packet and no dashboard change in 5H.0
 - [x] Canonical 5G.1 evidence, Wave 1, Wave 2, the frozen cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
-- [x] `npm run validate:phase5h` — 130 offline checks, plus a canonical 5G.1 cross-check that agrees exactly
-- [ ] Canonical `clfeat-*` artifact — operator-run AFTER review/commit (`npm run intelligence:classify-features -- --cohort clcohort-20260919T163609Z-4d7c6dd9`), then `--replay` and `--stats`; its values are **not** evidence about profitability or market usefulness
+- [x] `npm run validate:phase5h` — 139 offline checks, plus a canonical 5G.1 cross-check that agrees exactly and a READ-ONLY canonical 5H.0 barrier (`clfeat-20260919T173844Z-7a9193bb`)
+- [x] Canonical `clfeat-20260919T173844Z-7a9193bb` artifact — operator-frozen from `clcohort-20260919T163609Z-4d7c6dd9` and successfully replayed, pinned as a permanent barrier; the artifact stays local/gitignored and its values are **not** evidence about profitability or market usefulness
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

@@ -207,7 +207,6 @@ export const JEV_DEFAULTS = Object.freeze({
   timeoutMs: 20_000,
   maxCallsPerRun: 20,
   cacheEnabled: true,
-  minConfidence: null,
 });
 
 /**
@@ -317,13 +316,6 @@ export function readIntEnv(env, key, fallback, { min = 0, max = Number.MAX_SAFE_
   return Math.min(max, Math.max(min, parsed));
 }
 
-export function readFloatEnv(env, key, fallback) {
-  const raw = env?.[key];
-  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
-  const parsed = Number.parseFloat(String(raw));
-  if (!Number.isFinite(parsed)) return fallback;
-  return parsed;
-}
 
 export function readBoolEnv(env, key, fallback) {
   const raw = env?.[key];
@@ -417,9 +409,6 @@ export function resolveJevConfig(env = process.env) {
     max: JEV_MAX_CALLS_BOUNDS.max,
   });
 
-  const minConfidenceRaw = readFloatEnv(env, "EVOLVE_JEV_MIN_CONFIDENCE", JEV_DEFAULTS.minConfidence);
-  const minConfidence =
-    Number.isFinite(minConfidenceRaw) ? Math.min(1, Math.max(0, minConfidenceRaw)) : null;
 
   return {
     formatVersion: JEV_CONFIG_FORMAT_VERSION,
@@ -469,7 +458,6 @@ export function resolveJevConfig(env = process.env) {
     gatewayApiKeyConfigured: readStringEnv(env, "AI_GATEWAY_API_KEY", "").length > 0,
     timeoutMs: timeoutRaw,
     maxCallsPerRun: maxCallsRaw,
-    minConfidence,
     cacheEnabled: readBoolEnv(env, "EVOLVE_JEV_CACHE", JEV_DEFAULTS.cacheEnabled),
     // ---- Phase 5F.1 transport resilience ---------------------------------
     // PHYSICAL attempts per LOGICAL decision. Bounded, never unbounded.

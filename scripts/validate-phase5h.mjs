@@ -14,6 +14,10 @@
  * are built in a temp directory with the deterministic mock provider and a
  * scripted classifier fetch; nothing under `.evolve/` is ever written.
  *
+ * PART N pins the ONE canonical operator-approved 5H.0 artifact
+ * (`clfeat-20260919T173844Z-7a9193bb`) as a READ-ONLY research barrier when it
+ * is present locally and skips those cases cleanly when it is absent.
+ *
  * The derived features are DESCRIPTIVE ONLY. They are never alpha, signal
  * strength, sentiment, trading direction, project quality, legitimacy, fraud
  * probability, profitability, expected return, market health or buy/sell
@@ -143,6 +147,46 @@ const CANONICAL_INFRASTRUCTURE_RESULT_DIGEST = "69170f5375168f9cadc2243fc50b74e2
 const FROZEN_COHORT_DIGESTS = Object.freeze({
   mock: "b26d63a2a0787e954ed7e4e63e668fe4664e58059508145345214facc4e12858",
   deepseek: "13c7c93d707b26f8b92042d488ff0a63f5de3f9f81b8145be4eac7a70cc550a8",
+});
+
+/**
+ * Canonical Phase 5H.0 research barrier: the ONE operator-approved feature
+ * artifact. These are PINNED identities (never rewritten). The artifact itself
+ * stays under the gitignored `.evolve/classifier/features/` tree and is NEVER
+ * copied into Git; the cases in PART N inspect it READ-ONLY when it is present
+ * locally and skip cleanly when it is not.
+ */
+const CANONICAL_FEATURE_ID = "clfeat-20260919T173844Z-7a9193bb";
+const CANONICAL_FEATURE_DIGEST = "65218b38f80a344a99f12f8a98784a49250d0ec0b88cd88ea9cd795fab39312b";
+const CANONICAL_FEATURE_DEFINITION_VERSION = "classifier-feature-definition-v1";
+const CANONICAL_FEATURE_DEFINITION_DIGEST = "9227c8ef12414951bd48fe4c4c2a9ea2d1b69f4485f1019157912e32bc0093bd";
+const CANONICAL_FEATURE_SOURCE_COHORT_ID = "clcohort-20260919T163609Z-4d7c6dd9";
+const CANONICAL_FEATURE_SOURCE_COHORT_DIGEST = "2a8b9ca38f6f1f9dad7a46426c9a42cece2ca9fa3722815c430d42098b9e1a04";
+const CANONICAL_FEATURE_EVIDENCE_CLASS = "DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES";
+const CANONICAL_FEATURE_SOURCE_EVIDENCE_CLASS = "DEVELOPMENT_CLASSIFIER_EVIDENCE";
+const CANONICAL_FEATURE_EVIDENCE_AS_OF = "2026-09-19T16:34:12.867Z";
+
+/** The exact 19 canonical values of the canonical artifact, typed independently. */
+const CANONICAL_FEATURE_VALUES = Object.freeze({
+  label_fraction_technical_activity: 0.15,
+  label_fraction_project_announcement: 0.11,
+  label_fraction_exchange_or_listing: 0.04,
+  label_fraction_liquidity_or_market_structure: 0.25,
+  label_fraction_security_or_risk: 0,
+  label_fraction_governance_or_admin: 0.24,
+  label_fraction_community_attention: 0,
+  label_fraction_promotion_or_marketing: 0.14,
+  label_fraction_unrelated_or_noise: 0.07,
+  observed_label_count: 7,
+  label_entropy_normalized: 0.822223,
+  largest_label_fraction: 0.25,
+  confidence_mean: 0.6304,
+  confidence_median: 0.62,
+  confidence_low_fraction: 0.33,
+  confidence_high_fraction: 0.19,
+  score_margin_mean: 0.4897,
+  score_margin_median: 0.455,
+  score_margin_ambiguous_fraction: 0.11,
 });
 
 /** EVERY sealed 5G.0 / 5G.1 (and adjacent) source: byte-identical forever. */
@@ -719,6 +763,13 @@ async function buildFixtures() {
   ctx.canonical.capturesPresent = await exists(path.join(REAL_CAPTURE_ROOT, CAPTURE_DAY));
   ctx.canonical.replicationPresent = await exists(path.join(REPO, ".evolve", "replication"));
   ctx.canonical.featuresAbsent = !(await exists(path.join(REAL_CLASSIFIER_ROOT, "features")));
+  // The canonical Phase 5H.0 barrier artifact is detected READ-ONLY. Its presence
+  // is recorded (together with the exact clfeat directory set) so PART N can pin
+  // it and K10 can prove this suite created nothing new.
+  ctx.canonical.featurePresent = await exists(path.join(REAL_CLASSIFIER_ROOT, "features", CANONICAL_FEATURE_ID, "feature.json"));
+  ctx.canonical.clfeatDirs = (await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []))
+    .filter((name) => name.startsWith("clfeat-"))
+    .sort();
   ctx.baseline.classifier = await metadataSnapshot(REAL_CLASSIFIER_ROOT);
   ctx.baseline.intelligence = await metadataSnapshot(REAL_CAPTURE_ROOT);
   ctx.baseline.replication = await metadataSnapshot(path.join(REPO, ".evolve", "replication"));
@@ -2228,9 +2279,15 @@ test("K10. nothing under .evolve/ changed during this suite", async () => {
   assertDeepEqual(await metadataSnapshot(REAL_CLASSIFIER_ROOT), ctx.baseline.classifier, "the canonical classifier tree is byte-identical");
   assertDeepEqual(await metadataSnapshot(REAL_CAPTURE_ROOT), ctx.baseline.intelligence, "the canonical capture tree is byte-identical");
   assertDeepEqual(await metadataSnapshot(path.join(REPO, ".evolve", "replication")), ctx.baseline.replication, "the replication tree is byte-identical");
-  assertTrue(!(await exists(path.join(REAL_CLASSIFIER_ROOT, "features"))), "NO canonical feature artifact was created");
-  const clfeatDirs = ctx.canonical.featuresAbsent ? [] : await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []);
-  assertTrue(!clfeatDirs.some((name) => name.startsWith("clfeat-")), "no clfeat-* directory exists under the canonical root");
+  // The suite must create NO new feature artifact. The exact clfeat directory set
+  // is captured before the suite runs (empty when the operator has not frozen one)
+  // and must be byte-for-byte unchanged afterwards — the canonical barrier
+  // artifact, when present, is inspected READ-ONLY and never rewritten.
+  const clfeatDirs = (await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []))
+    .filter((name) => name.startsWith("clfeat-"))
+    .sort();
+  assertDeepEqual(clfeatDirs, ctx.canonical.clfeatDirs, "the canonical clfeat-* directory set is unchanged (this suite wrote nothing)");
+  if (ctx.canonical.featuresAbsent) assertEqual(clfeatDirs.length, 0, "no canonical feature artifact exists here and none was created");
 });
 
 /* ============================================================================
@@ -2290,7 +2347,15 @@ test("M1. the canonical 5G.1 evidence is available for a cross-check", async () 
   const cohort = await readCohort(REAL_CLASSIFIER_ROOT, CANONICAL_COHORT_ID);
   assertEqual(cohort.cohortId, CANONICAL_COHORT_ID, "the cross-check targets the pinned cohort");
   assertEqual(cohort.cohortDigest, CANONICAL_COHORT_DIGEST, "and its pinned digest");
-  assertTrue(ctx.canonical.featuresAbsent, "no canonical feature artifact exists before the cross-check");
+  // The cross-check derives 5H values WITHOUT saving. The canonical feature tree is
+  // captured before the cross-check (whatever its state: absent, or the ONE pinned
+  // operator artifact) and must be byte-for-byte unchanged afterwards.
+  ctx.crossCheckFeatureDirsBefore = (await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []))
+    .filter((name) => name.startsWith("clfeat-"))
+    .sort();
+  if (ctx.canonical.featurePresent) {
+    assertDeepEqual(ctx.crossCheckFeatureDirsBefore, [CANONICAL_FEATURE_ID], "only the pinned canonical artifact exists under the canonical root");
+  }
   ctx.crossCheckReady = true;
 });
 
@@ -2316,7 +2381,10 @@ test("M2. computing 5H values from the real frozen evidence writes NOTHING", asy
   assertTrue(result.audit.ok, `the derived artifact audits clean: ${result.audit.problems.join("; ")}`);
   assertDeepEqual(await metadataSnapshot(REAL_CLASSIFIER_ROOT), beforeClassifier, "the canonical classifier tree did not move");
   assertDeepEqual(await metadataSnapshot(REAL_CAPTURE_ROOT), beforeCaptures, "nor the capture tree");
-  assertTrue(!(await exists(path.join(REAL_CLASSIFIER_ROOT, "features"))), "no features directory was created");
+  const afterDirs = (await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []))
+    .filter((name) => name.startsWith("clfeat-"))
+    .sort();
+  assertDeepEqual(afterDirs, ctx.crossCheckFeatureDirsBefore, "the cross-check created NO feature artifact");
 });
 
 test("M3. every 5H label fraction, entropy, concentration and confidence value equals the frozen 5G.1 evaluation", async () => {
@@ -2374,6 +2442,201 @@ test("M4. every 5H margin value and both aliases equal the frozen 5G.1 evaluatio
 });
 
 /* ============================================================================
+ * PART N — canonical Phase 5H.0 barrier (the ONE operator-approved artifact)
+ * ==========================================================================*
+ * The operator froze exactly ONE canonical 5H.0 artifact locally:
+ *
+ *   clfeat-20260919T173844Z-7a9193bb
+ *   65218b38f80a344a99f12f8a98784a49250d0ec0b88cd88ea9cd795fab39312b
+ *
+ * It lives under the gitignored `.evolve/classifier/features/` tree and is NEVER
+ * copied into Git. Every case here is READ ONLY: it inspects the artifact when it
+ * is present locally and skips cleanly (rather than failing CI) when it is not.
+ * Nothing is ever created, rewritten or reclassified.
+ * ==========================================================================*/
+
+const CANONICAL_FEATURE_FILE = path.join(REAL_CLASSIFIER_ROOT, "features", CANONICAL_FEATURE_ID, "feature.json");
+
+function skipCanonical(reason) {
+  skip(reason);
+}
+
+async function readCanonicalFeature() {
+  return readFeatureArtifact(REAL_CLASSIFIER_ROOT, CANONICAL_FEATURE_ID);
+}
+
+test("N1. the canonical barrier constants are internally consistent with the frozen 5H.0 pins", async () => {
+  assertEqual(CANONICAL_FEATURE_DEFINITION_VERSION, FEATURE_DEFINITION_VERSION, "the barrier pins the published definition version");
+  assertEqual(CANONICAL_FEATURE_DEFINITION_DIGEST, FEATURE_DEFINITION_DIGEST, "the barrier pins the ACTUAL computed definition digest");
+  assertEqual(CANONICAL_FEATURE_SOURCE_COHORT_ID, CANONICAL_COHORT_ID, "the barrier's cohort id is the canonical 5G.1 cohort");
+  assertEqual(CANONICAL_FEATURE_SOURCE_COHORT_DIGEST, CANONICAL_COHORT_DIGEST, "the barrier's cohort digest is the canonical 5G.1 cohort digest");
+  assertEqual(CANONICAL_FEATURE_EVIDENCE_CLASS, DERIVED_EVIDENCE_CLASS, "the barrier derives DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES");
+  assertEqual(CANONICAL_FEATURE_SOURCE_EVIDENCE_CLASS, SOURCE_EVIDENCE_CLASS, "from DEVELOPMENT_CLASSIFIER_EVIDENCE");
+  assertEqual(CANONICAL_FEATURE_EVIDENCE_AS_OF, "2026-09-19T16:34:12.867Z", "the barrier pins the exact evidenceAsOf");
+  assertTrue(isValidFeatureId(CANONICAL_FEATURE_ID), "the barrier feature id is a valid clfeat id");
+  assertTrue(/^[0-9a-f]{64}$/.test(CANONICAL_FEATURE_DIGEST), "the barrier feature digest is a sha256 hex string");
+  assertDeepEqual(Object.keys(CANONICAL_FEATURE_VALUES), EXPECTED_FEATURE_NAMES, "the barrier pins exactly the 19 canonical values in canonical order");
+});
+
+test("N2. the canonical feature artifact is DETECTED locally (or skipped cleanly)", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical Phase 5H.0 feature artifact is absent here — the canonical barrier cases were skipped cleanly");
+    return;
+  }
+  assertTrue(await exists(CANONICAL_FEATURE_FILE), "the canonical feature.json exists on disk");
+  const raw = JSON.parse(await readFile(CANONICAL_FEATURE_FILE, "utf8"));
+  assertEqual(raw.featureId, CANONICAL_FEATURE_ID, "the file names the pinned canonical feature id");
+  assertEqual(raw.featureDigest, CANONICAL_FEATURE_DIGEST, "and carries the pinned canonical feature digest");
+  assertEqual(CANONICAL_FEATURE_ID, buildFeatureId({ now: Date.parse(raw.createdAt), identityDigest: featureIdentityDigest(raw) }), "its id rederives from the stored clock + identity");
+  assertEqual(featureDigestOf(raw), CANONICAL_FEATURE_DIGEST, "its featureDigest recomputes from the artifact body");
+});
+
+test("N3. the canonical artifact pins its exact identity, definition and source cohort", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the identity barrier case was skipped");
+    return;
+  }
+  const feature = await readCanonicalFeature();
+  assertEqual(feature.phase, "5H.0", "the artifact is a Phase 5H.0 artifact");
+  assertEqual(feature.featureId, CANONICAL_FEATURE_ID, "exact feature id");
+  assertEqual(feature.featureDigest, CANONICAL_FEATURE_DIGEST, "exact feature digest");
+  assertEqual(featureDigestOf(feature), CANONICAL_FEATURE_DIGEST, "the feature digest recomputes");
+  const identitySubject = featureIdentitySubject(feature);
+  assertTrue(!Object.hasOwn(identitySubject, "featureId") && !Object.hasOwn(identitySubject, "featureDigest"), "the identity subject excludes featureId + featureDigest");
+  assertTrue(/^[0-9a-f]{64}$/.test(featureIdentityDigest(feature)), "the identity digest is a sha256 hex string");
+  assertEqual(feature.featureId, buildFeatureId({ now: Date.parse(feature.createdAt), identityDigest: featureIdentityDigest(feature) }), "the feature identity recomputes");
+  assertEqual(feature.featureDefinitionVersion, CANONICAL_FEATURE_DEFINITION_VERSION, "exact feature-definition version");
+  assertEqual(feature.featureDefinitionDigest, CANONICAL_FEATURE_DEFINITION_DIGEST, "exact feature-definition digest");
+  assertEqual(feature.cohortId, CANONICAL_FEATURE_SOURCE_COHORT_ID, "exact source cohort id");
+  assertEqual(feature.cohortDigest, CANONICAL_FEATURE_SOURCE_COHORT_DIGEST, "exact source cohort digest");
+  assertEqual(feature.evidenceClass, CANONICAL_FEATURE_EVIDENCE_CLASS, "evidence class is DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES");
+  assertEqual(feature.sourceEvidenceClass, CANONICAL_FEATURE_SOURCE_EVIDENCE_CLASS, "source evidence class is DEVELOPMENT_CLASSIFIER_EVIDENCE");
+  assertEqual(feature.timeline.evidenceAsOf, CANONICAL_FEATURE_EVIDENCE_AS_OF, "exact evidenceAsOf");
+  assertEqual(feature.createdAt, feature.timeline.featureCreatedAt, "createdAt mirrors the timeline");
+  assertTrue(Date.parse(feature.timeline.featureCreatedAt) >= Date.parse(feature.timeline.evidenceAsOf), "the build clock never precedes the evidence");
+});
+
+test("N4. the canonical artifact pins the exact records, digests, vectors and null counts", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the counts barrier case was skipped");
+    return;
+  }
+  const feature = await readCanonicalFeature();
+  assertEqual(feature.recordCount, 100, "100 records");
+  assertEqual(feature.classifiedCount, 100, "100 classified");
+  assertEqual(feature.skippedEmptyCount, 0, "zero skipped");
+  assertEqual(feature.distinctRecordDigestCount, 100, "100 distinct record digests");
+  assertEqual(feature.duplicateRecordDigestCount, 0, "zero duplicate record digests");
+  assertEqual(feature.scoreVectorCompleteCount, 100, "100 complete score vectors");
+  assertEqual(feature.scoreVectorIncompleteCount, 0, "zero incomplete score vectors");
+  assertEqual(feature.nullFeatureCount, 0, "zero null features");
+  assertEqual(feature.recordCount, feature.classifiedCount + feature.skippedEmptyCount, "recordCount = classified + skipped");
+  assertEqual(feature.distinctRecordDigestCount + feature.duplicateRecordDigestCount, feature.recordCount, "distinct + duplicate = recordCount");
+  assertEqual(feature.scoreVectorCompleteCount + feature.scoreVectorIncompleteCount, feature.classifiedCount, "complete + incomplete = classified");
+  assertEqual(feature.experimentCount, 2, "two frozen classifier experiments");
+  assertEqual(feature.captureCount, 2, "two frozen source captures");
+  assertEqual(feature.infrastructureExperimentPresent, false, "the one-record infrastructure experiment is absent");
+  assertDeepEqual(feature.counts.labelCounts, {
+    technical_activity: 15,
+    project_announcement: 11,
+    exchange_or_listing: 4,
+    liquidity_or_market_structure: 25,
+    security_or_risk: 0,
+    governance_or_admin: 24,
+    community_attention: 0,
+    promotion_or_marketing: 14,
+    unrelated_or_noise: 7,
+  }, "the exact pooled label counts");
+  assertEqual(feature.counts.largestLabel, "liquidity_or_market_structure", "the modal label");
+  assertEqual(feature.counts.largestLabelCount, 25, "with count 25");
+});
+
+test("N5. the canonical artifact pins the exact 19 canonical feature values", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the feature-value barrier case was skipped");
+    return;
+  }
+  const feature = await readCanonicalFeature();
+  assertDeepEqual(Object.keys(feature.features), EXPECTED_FEATURE_NAMES, "exactly the 19 canonical keys in canonical order");
+  assertDeepEqual(feature.features, CANONICAL_FEATURE_VALUES, "the exact canonical feature values");
+  assertEqual(feature.features.observed_label_count, 7, "observed_label_count is 7");
+  assertEqual(feature.features.label_entropy_normalized, 0.822223, "label_entropy_normalized is 0.822223");
+  assertEqual(feature.features.score_margin_mean, 0.4897, "score_margin_mean is 0.4897");
+  assertEqual(feature.features.score_margin_median, 0.455, "score_margin_median is 0.455");
+  assertEqual(feature.features.score_margin_ambiguous_fraction, 0.11, "score_margin_ambiguous_fraction is 0.11");
+  for (const [name, value] of Object.entries(CANONICAL_FEATURE_VALUES)) assertEqual(feature.features[name], value, `${name} equals the pinned canonical value`);
+});
+
+test("N6. the canonical artifact is record-weighted, non-averaged, routing-free and descriptive only", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the aggregation/routing barrier case was skipped");
+    return;
+  }
+  const feature = await readCanonicalFeature();
+  assertDeepEqual(feature.aggregation, { mode: "record-weighted", unit: "cohort", experimentsAveraged: false }, "record-weighted cohort aggregation, experimentsAveraged === false");
+  const experimentIds = Object.values(feature.experimentRecordCounts ?? {});
+  assertEqual(experimentIds.reduce((sum, count) => sum + count, 0), feature.classifiedCount, "the per-experiment record counts pool to the classified count");
+  for (const flag of ["jevRoutingActive", "deepseekRoutingActive", "arenaRoutingActive", "tradingRoutingActive"]) {
+    assertEqual(feature.routing[flag], false, `routing flag ${flag} is strictly false`);
+  }
+  for (const flag of ["immutable", "finalized", "descriptiveOnly", "developmentOnly", "noGroundTruth", "noProfitabilityInference"]) {
+    assertEqual(feature[flag], true, `frozen flag '${flag}' is true`);
+  }
+  assertTrue(feature.descriptiveOnly === true && feature.developmentOnly === true, "descriptiveOnly and developmentOnly are strictly true");
+  assertTrue(feature.noGroundTruth === true && feature.noProfitabilityInference === true, "noGroundTruth and noProfitabilityInference are strictly true");
+});
+
+test("N7. the canonical artifact audits clean", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the audit barrier case was skipped");
+    return;
+  }
+  const audit = auditClassifierFeatureArtifact(await readCanonicalFeature());
+  assertTrue(audit.ok, `the canonical artifact audits clean: ${audit.problems.join("; ")}`);
+  assertDeepEqual(audit.problems, [], "no audit problems");
+});
+
+test("N8. offline replay of the canonical artifact returns integrity OK and the exact feature digest", async () => {
+  if (!ctx.canonical.featurePresent) {
+    skipCanonical("the canonical feature artifact is absent here — the replay barrier case was skipped");
+    return;
+  }
+  if (!ctx.canonical.cohortPresent || !ctx.canonical.experimentsPresent || !ctx.canonical.capturesPresent) {
+    skipCanonical("the canonical cohort/experiments/captures are absent here — the canonical replay was skipped cleanly");
+    return;
+  }
+  const before = await metadataSnapshot(REAL_CLASSIFIER_ROOT);
+  const beforeCaptures = await metadataSnapshot(REAL_CAPTURE_ROOT);
+  const report = await replayClassifierFeature({ classifierRoot: REAL_CLASSIFIER_ROOT, captureRoot: REAL_CAPTURE_ROOT, featureId: CANONICAL_FEATURE_ID });
+  assertTrue(report.ok, `the canonical replay reports integrity OK: ${report.problems.join(" | ")}`);
+  assertEqual(report.featureId, CANONICAL_FEATURE_ID, "the replay targets the canonical feature id");
+  assertEqual(report.featureDigest, CANONICAL_FEATURE_DIGEST, "the replay reports the exact canonical feature digest");
+  assertEqual(report.recomputedFeatureDigest, CANONICAL_FEATURE_DIGEST, "and reproduces the exact feature digest");
+  assertEqual(report.checks.featureDigestReproduced, true, "the featureDigestReproduced check passes");
+  assertEqual(report.evidenceClass, CANONICAL_FEATURE_EVIDENCE_CLASS, "the replay reports the derived evidence class");
+  assertEqual(report.classifiedCount, 100, "the replay reports 100 classified records");
+  assertEqual(report.networkCalls, 0, "zero network calls during the canonical replay");
+  assertTrue(!/https?:\/\//.test(JSON.stringify(report)), "no URL appears in the replay report");
+  assertDeepEqual(await metadataSnapshot(REAL_CLASSIFIER_ROOT), before, "the canonical replay REWROTE nothing (READ ONLY)");
+  assertDeepEqual(await metadataSnapshot(REAL_CAPTURE_ROOT), beforeCaptures, "and touched no capture byte");
+});
+
+test("N9. the canonical artifact was never rewritten or duplicated during this suite", async () => {
+  const clfeatDirs = (await readdir(path.join(REAL_CLASSIFIER_ROOT, "features")).catch(() => []))
+    .filter((name) => name.startsWith("clfeat-"))
+    .sort();
+  assertDeepEqual(clfeatDirs, ctx.canonical.clfeatDirs, "the canonical clfeat-* directory set is byte-for-byte unchanged");
+  if (!ctx.canonical.featurePresent) {
+    assertEqual(clfeatDirs.length, 0, "no canonical feature artifact exists here and none was created");
+    return;
+  }
+  assertDeepEqual(clfeatDirs, [CANONICAL_FEATURE_ID], "the ONE canonical artifact is exactly the pinned id");
+  const raw = JSON.parse(await readFile(CANONICAL_FEATURE_FILE, "utf8"));
+  assertEqual(raw.featureDigest, CANONICAL_FEATURE_DIGEST, "the on-disk feature digest is still the canonical barrier digest");
+  assertEqual(featureDigestOf(raw), CANONICAL_FEATURE_DIGEST, "and the artifact bytes still recompute to it");
+});
+
+/* ============================================================================
  * Runner
  * ==========================================================================*/
 
@@ -2423,6 +2686,7 @@ async function run() {
     console.log("All Phase 5H.0 checks passed. `classifier-feature-definition-v1` is frozen, the 19 canonical features are");
     console.log("extracted record-by-record from ONE frozen cohort, every artifact is audited before write and reproduced on");
     console.log("replay, `0` never stands for unknown, and all four routing flags stay false.");
+    console.log(`canonical barrier: ${CANONICAL_FEATURE_ID} (${CANONICAL_FEATURE_DIGEST}) — ${ctx.canonical.featurePresent ? "detected locally and verified READ-ONLY" : "absent here (barrier cases skipped cleanly)"}`);
   }
 }
 

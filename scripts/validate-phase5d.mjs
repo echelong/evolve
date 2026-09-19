@@ -48,7 +48,6 @@ import {
   UnknownJevProviderError,
   UnsupportedJevModeError,
   readBoolEnv,
-  readFloatEnv,
   readIntEnv,
   requireJevProviderName,
   resolveJevConfig,
@@ -354,11 +353,9 @@ test("14. EVOLVE_JEV_TIMEOUT_MS / EVOLVE_JEV_MAX_CALLS are bounds-clamped, never
   assert(tooFewCalls.maxCallsPerRun >= 1, "max calls is clamped to at least one");
 });
 
-test("15. EVOLVE_JEV_MIN_CONFIDENCE parses and clamps to [0,1], and is null when unset", () => {
-  assertEqual(resolveJevConfig({}).minConfidence, null, "no default confidence threshold is configured");
-  assertEqual(resolveJevConfig({ EVOLVE_JEV_MIN_CONFIDENCE: "0.8" }).minConfidence, 0.8, "a valid value is parsed");
-  assertEqual(resolveJevConfig({ EVOLVE_JEV_MIN_CONFIDENCE: "5" }).minConfidence, 1, "an out-of-range value is clamped to 1");
-  assertEqual(resolveJevConfig({ EVOLVE_JEV_MIN_CONFIDENCE: "-5" }).minConfidence, 0, "an out-of-range value is clamped to 0");
+test("15. Jev has no runtime confidence threshold", () => {
+  const config = resolveJevConfig({});
+  assert(!Object.prototype.hasOwnProperty.call(config, "minConfidence"), "resolved Jev config has no minConfidence field");
 });
 
 test("16. EVOLVE_JEV_API_KEY is read into config but never echoed anywhere except the explicit `apiKey` field", () => {
@@ -369,11 +366,10 @@ test("16. EVOLVE_JEV_API_KEY is read into config but never echoed anywhere excep
   assert(!sanitized.includes("sk-super-secret"), "sanitizeForPublic strips the credential-named field before display");
 });
 
-test("17. `readBoolEnv` / `readIntEnv` / `readFloatEnv` never throw on garbage input and fall back cleanly", () => {
+test("17. `readBoolEnv` / `readIntEnv` never throw on garbage input and fall back cleanly", () => {
   assertEqual(readBoolEnv({ X: "yes" }, "X", false), true, "yes parses true");
   assertEqual(readBoolEnv({ X: "nope" }, "X", false), false, "an unrecognized value falls back");
   assertEqual(readIntEnv({ X: "abc" }, "X", 7, { min: 0, max: 10 }), 7, "non-numeric falls back to the default");
-  assertEqual(readFloatEnv({ X: "abc" }, "X", 0.5), 0.5, "non-numeric float falls back to the default");
 });
 
 test("18. `resolveJevProvider` with the disabled resolution returns a provider whose every call is JEV_DISABLED, with zero network capability", async () => {
@@ -1328,7 +1324,7 @@ test("80. `runJevCalibration` ALWAYS reports `noThresholdPromoted: true` — no 
   assert(/OFFLINE ANALYSIS ONLY/.test(calibration.note), "the report states it is analysis-only");
 });
 
-test("81. `decide.mjs` never references EVOLVE_JEV_MIN_CONFIDENCE — it is analysis-only, never an operational gate", async () => {
+test("81. `decide.mjs` has no runtime confidence threshold", async () => {
   const text = await readFile("scripts/jev/decide.mjs", "utf8");
   assert(!/minConfidence/.test(text), "the decision path never applies a confidence threshold operationally");
 });
