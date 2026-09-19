@@ -1629,14 +1629,24 @@ Only `CLEAN_REPLICATION` pairs may support a cross-dataset generalization statem
 
 ### Running replication
 
+Exactly **one action runs per invocation**. `--write-freeze`, `--verify-freeze`, `--cohorts`, `--plan`
+and `--summary` are actions, not additive flags; combining two of them is a hard error rather than a
+silent pick, and `--rerun`/`--dev` only apply to the normal replication run.
+
 ```bash
-npm run replicate:research -- --cohorts            # freeze/print the frozen cohort manifests
-npm run replicate:research -- --verify-freeze      # FAIL on critical config drift
+npm run replicate:research -- --write-freeze       # write/update the freeze, print its digest, and STOP
+npm run replicate:research -- --verify-freeze      # verify only: FAIL on critical config drift
+npm run replicate:research -- --cohorts            # freeze/print the frozen cohort manifests (inspect only)
+npm run replicate:research -- --plan               # deterministic plan, no Arena is run
+npm run replicate:research -- --summary            # cross-dataset summary, read from existing artifacts
 npm run replicate:research -- --freeze phase5c --datasets auto
 npm run replicate:research -- --datasets session-A,session-B
-npm run replicate:research -- --plan               # deterministic plan, no Arena is run
-npm run replicate:research -- --summary            # cross-dataset summary
 ```
+
+`--write-freeze` writes the freeze artifact and nothing else: no cohorts are frozen, no dataset is
+discovered, no plan is built, no Arena subprocess is started, and zero replication units execute. Only
+the normal run (no action flag) may plan or execute replication, and it requires a freeze artifact to
+already exist — a run can never certify itself against a freeze it just created.
 
 For each eligible dataset the runner executes the same strict species-matched A/B experiment twice —
 once with the frozen Mock cohort, once with the frozen DeepSeek cohort — each against its own freshly
@@ -1887,8 +1897,16 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
   evidence accounting is preserved; evaluated candidates keep species-specific gene bounds; no Phase 5A.2
   module contains a wallet, signing, or transaction-execution path
 
-Phase 5C adds `npm run validate:phase5c` (73 offline cases):
+Phase 5C adds `npm run validate:phase5c` (87 offline cases):
 
+- **CLI dispatch** — every command mode is exclusive (a table resolves exactly one action per
+  invocation, and conflicting or impossible combinations fail loudly instead of silently choosing one);
+  `--write-freeze` writes the freeze artifact and stops, with zero cohorts frozen, zero dataset
+  discovery (proven with a non-directory history root that would fail loudly), zero plans, zero Arena
+  subprocesses and zero unit artifacts; `--verify-freeze`, `--cohorts`, `--plan` and `--summary` each
+  execute zero Arena subprocesses and write nothing; only the normal run executes units (proven against
+  a stub Arena that records its own invocation); the canonical `rep-66884de4e460`, its freeze digest and
+  the frozen cohort digests stay byte-identical throughout the suite
 - **Freeze** — the artifact is clock-independent and deterministic; the digest is stable for identical
   config and changes when anything does; the critical Arena/runner/cache/evaluator versions, population,
   generations, seeds, stress profiles, survivor/breeder/mutation values, the gate table, evidence

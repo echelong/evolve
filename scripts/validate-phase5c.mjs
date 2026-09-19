@@ -72,6 +72,7 @@ import {
   temporalOverlap,
 } from "./replication/datasets.mjs";
 import { evaluationKey, replicationIdFor, unitIdFor, describeIdentity } from "./replication/identity.mjs";
+import { ACTION, ACTION_FLAGS, EXECUTION_ONLY_FLAGS, actionExecutesUnits, resolveAction } from "./replication/mode.mjs";
 import {
   aggregateReplication,
   datasetBootstrap,
@@ -128,7 +129,7 @@ const REAL_FINGERPRINT_B = "b".repeat(64);
 const REAL_FINGERPRINT_C = "c".repeat(64);
 const REAL_FINGERPRINT_D = "d".repeat(64);
 
-const ctx = { root: null, historyRoot: null, arenasDir: null, baseDir: null };
+const ctx = { root: null, historyRoot: null, arenasDir: null, baseDir: null, cliRoot: null, cliLog: null, cliHistoryTripwire: null };
 
 function manifestFor({
   datasetId,
@@ -211,6 +212,29 @@ async function buildFixtures() {
   // Structurally invalid: a session directory with no manifest.
   await mkdir(path.join(ctx.historyRoot, "2026-09-17", "ds-manifest-missing"), { recursive: true });
   await writeFile(path.join(ctx.historyRoot, "2026-09-17", "ds-manifest-missing", "snapshots.ndjson"), "{}\n", "utf8");
+
+  // --- CLI-dispatch fixtures (offline; the only "Arena" is a STUB) -----------
+  // Every CLI dispatch test runs with this directory as its cwd, so if any mode
+  // ever did spawn an Arena it would spawn THIS stub (never the real
+  // scripts/arena.mjs) and record the spawn instead of executing anything.
+  ctx.cliRoot = path.join(ctx.root, "cli-cwd");
+  ctx.cliLog = path.join(ctx.root, "cli-arena-spawns.log");
+  await mkdir(path.join(ctx.cliRoot, "scripts"), { recursive: true });
+  await writeFile(
+    path.join(ctx.cliRoot, "scripts", "arena.mjs"),
+    [
+      'import { appendFileSync } from "node:fs";',
+      "appendFileSync(process.env.EVOLVE_CLI_STUB_LOG, `spawn ${process.env.EVOLVE_ARENA_DIR ?? \"n/a\"}\\n`);",
+      "process.exit(0);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  // A FILE used as the history root tripwire: `--write-freeze` and `--cohorts`
+  // must not discover datasets, so pointing them at a non-directory root would
+  // fail loudly (ENOTDIR) if they did.
+  ctx.cliHistoryTripwire = path.join(ctx.root, "history-tripwire");
+  await writeFile(ctx.cliHistoryTripwire, "not a directory\n", "utf8");
 
   // A prior (non-replication) arena evaluated ds-contaminated.
   const arenaDir = path.join(ctx.arenasDir, "arena-historical-0001");
@@ -1145,6 +1169,7 @@ test("66. no wallet, signing, or write-RPC path exists in any Phase 5C module", 
     "replication/report.mjs",
     "replication/guidance.mjs",
     "replicate-research.mjs",
+    "replication/mode.mjs",
     "datasets-research.mjs",
   ];
   const forbidden = [
@@ -1400,6 +1425,490 @@ test("78. the dashboard replication state is bounded and reads the frozen artifa
 });
 
 /* ============================================================================
+ * CLI command-mode dispatch (offline; never runs the real Arena)
+ *
+ * The bug these cases pin down: `--write-freeze` used to be treated as an
+ * additive flag, so it wrote the freeze and then FELL THROUGH into a full
+ * replication run (6 Arena units). These cases prove that every command mode is
+ * exclusive, that only the normal run executes replication, and that the
+ * canonical artifacts are never touched.
+ * ==========================================================================*/
+
+const CLI_SCRIPT = path.resolve("scripts", "replicate-research.mjs");
+const CANONICAL_REPLICATION_ID = "rep-66884de4e460";
+const CANONICAL_FREEZE_DIGEST = "4959974d1b78635e63c0d9038c582c9ceb5a7411366d9c95c82e7ee3bac3f500";
+const CANONICAL_FREEZE_FILE = path.join(".evolve", "replication", "phase5c-freeze.json");
+const CANONICAL_REPLICATION_DIR = path.join(".evolve", "replication", CANONICAL_REPLICATION_ID);
+const CANONICAL_COHORTS_DIR = path.join(".evolve", "replication", "cohorts");
+const COHORT_KEYS = ["mock", "deepseek"];
+
+let canonicalBaseline = null;
+
+/** Digest of every file under a directory (null when it does not exist). */
+async function dirDigest(dir) {
+  try {
+    const names = (await readdir(dir, { recursive: true })).map((name) => String(name)).sort();
+    const out = [];
+    for (const name of names) {
+      try {
+        out.push([name, digestOf(await readFile(path.join(dir, name), "utf8"))]);
+      } catch {
+        out.push([name, "dir"]);
+      }
+    }
+    return digestOf(out);
+  } catch {
+    return null;
+  }
+}
+
+/** The canonical evidence that must never change. */
+async function canonicalSnapshot() {
+  return {
+    replication: await dirDigest(CANONICAL_REPLICATION_DIR),
+    freeze: await readFile(CANONICAL_FREEZE_FILE, "utf8").then((text) => digestOf(text)).catch(() => null),
+    cohorts: await dirDigest(CANONICAL_COHORTS_DIR),
+  };
+}
+
+/** One CLI invocation. `cwd` defaults to the harness root whose scripts/arena.mjs is a stub. */
+function runCli({ actionArgs = [], out, cwd = ctx.cliRoot, env = {} }) {
+  const result = spawnSync(process.execPath, [CLI_SCRIPT, ...actionArgs, "--out", out], {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      EVOLVE_HISTORY_ROOT: ctx.historyRoot,
+      EVOLVE_ARENAS_DIR: ctx.arenasDir,
+      EVOLVE_CLI_STUB_LOG: ctx.cliLog,
+      ...env,
+    },
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+async function arenaSpawns() {
+  try {
+    return (await readFile(ctx.cliLog, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function resetArenaSpawns() {
+  await rm(ctx.cliLog, { force: true });
+}
+
+/** A fresh replication root for one CLI invocation. */
+function cliOut(name) {
+  return path.join(ctx.root, `cli-out-${name}`);
+}
+
+/** Write a freeze artifact directly into a fresh root. */
+async function seedFreeze(name, { commit = "deadbeef", freezeVersion = "phase5c" } = {}) {
+  const out = cliOut(name);
+  const freeze = await writeFreeze(buildFreezeConfig({ freezeVersion, commit, createdAt: 1 }), { root: out });
+  return { out, freeze };
+}
+
+/** Replication artifacts (run manifest / summary / status / units) under a root. */
+async function runArtifacts(dir) {
+  const names = (await readdir(dir, { recursive: true }).catch(() => [])).map((name) =>
+    String(name).split(path.sep).join("/"),
+  );
+  return names
+    .filter(
+      (name) =>
+        /(^|\/)(manifest\.json|summary\.json|status\.json)$/.test(name) || /(^|\/)units(\/|$)/.test(name),
+    )
+    .sort();
+}
+
+function actionConstant(action) {
+  return `ACTION.${action.toUpperCase().replace(/-/g, "_")}`;
+}
+
+function handlerSource(source, name) {
+  const start = source.indexOf(`async function ${name}(`);
+  if (start < 0) fail(`the CLI has no ${name} handler`);
+  const end = source.indexOf("\nasync function ", start + 1);
+  return source.slice(start, end === -1 ? undefined : end);
+}
+
+test("79. the action table is exclusive and only the run mode executes units", () => {
+  const resolvedRun = resolveAction({});
+  assertEqual(resolvedRun.ok, true, "no action flag is valid");
+  assertEqual(resolvedRun.action, ACTION.RUN, "no action flag is the normal run");
+  assertDeepEqual(resolvedRun.requested, [], "no action was requested");
+  assertEqual(actionExecutesUnits(ACTION.RUN), true, "the run mode executes units");
+
+  for (const entry of ACTION_FLAGS) {
+    const resolved = resolveAction({ [entry.flag]: true });
+    assertEqual(resolved.ok, true, `--${entry.flag} resolves`);
+    assertEqual(resolved.action, entry.action, `--${entry.flag} maps to ${entry.action}`);
+    assertDeepEqual(resolved.requested, [entry.flag], `--${entry.flag} requests exactly one action`);
+    assertEqual(actionExecutesUnits(entry.action), false, `--${entry.flag} never executes units`);
+  }
+
+  for (const action of Object.values(ACTION)) {
+    assertEqual(actionExecutesUnits(action), action === ACTION.RUN, `${action} executes units only when it is the run`);
+  }
+  assertDeepEqual(EXECUTION_ONLY_FLAGS, ["rerun", "dev"], "only rerun/dev are execution-only modifiers");
+});
+
+test("80. conflicting action flags fail loudly instead of silently choosing one", () => {
+  const pairs = [
+    ["write-freeze", "verify-freeze"],
+    ["write-freeze", "cohorts"],
+    ["verify-freeze", "plan"],
+    ["plan", "summary"],
+    ["cohorts", "summary"],
+  ];
+  for (const [first, second] of pairs) {
+    const resolved = resolveAction({ [first]: true, [second]: true });
+    assertEqual(resolved.ok, false, `--${first} --${second} is rejected`);
+    assertEqual(resolved.action, null, "no action is chosen");
+    assert(/mutually exclusive/.test(resolved.error), "the conflict is named in plain language");
+    assert(resolved.error.includes(`--${first}`) && resolved.error.includes(`--${second}`), "both flags are named");
+  }
+  const triple = resolveAction({ summary: true, cohorts: true, plan: true });
+  assertEqual(triple.ok, false, "three actions are rejected too");
+  assertDeepEqual(triple.requested, ["cohorts", "plan", "summary"], "all requested actions are reported");
+
+  for (const flag of EXECUTION_ONLY_FLAGS) {
+    for (const action of ACTION_FLAGS) {
+      const resolved = resolveAction({ [action.flag]: true, [flag]: true });
+      assertEqual(resolved.ok, false, `--${flag} with --${action.flag} is rejected`);
+      assert(/run-only/.test(resolved.error), `the failure explains that --${flag} is run-only`);
+    }
+    assertEqual(resolveAction({ [flag]: true }).ok, true, `--${flag} alone is a normal run`);
+  }
+});
+
+test("81. the CLI dispatches one action through an exclusive switch with no fallthrough", async () => {
+  const source = await readFile("scripts/replicate-research.mjs", "utf8");
+  assert(source.includes("switch (resolved.action)"), "dispatch is a single exclusive switch");
+  for (const entry of ACTION_FLAGS) {
+    assert(source.includes(`case ${actionConstant(entry.action)}:`), `case ${actionConstant(entry.action)} is dispatched`);
+  }
+  assert(source.includes("case ACTION.RUN:"), "the run mode is dispatched explicitly");
+  assert(!/child_process/.test(source), "the CLI itself never shells out");
+  assertEqual((source.match(/await runReplication\(/g) ?? []).length, 1, "exactly one replication execution site exists");
+  assert(
+    source.indexOf("await runReplication(") > source.indexOf("async function runReplicationCommand"),
+    "replication is executed only inside the run handler",
+  );
+
+  // `main` resolves the action and dispatches through the switch BEFORE any
+  // handler runs, and no handler body is inlined into it.
+  const mainSource = source.slice(source.indexOf("async function main("));
+  assert(mainSource.length > 0, "main is present");
+  assert(mainSource.indexOf("resolveAction(args)") >= 0, "main resolves the action");
+  assert(
+    mainSource.indexOf("resolveAction(args)") < mainSource.indexOf("switch (resolved.action)"),
+    "the action is resolved before dispatch",
+  );
+  assert(
+    mainSource.indexOf("switch (resolved.action)") < mainSource.indexOf("writeFreezeOnly(context)"),
+    "the write-freeze handler is only reachable through the switch",
+  );
+  assert(!/await writeFreeze\(/.test(mainSource), "no handler body is inlined into main");
+
+  for (const name of ["writeFreezeOnly", "verifyFreezeOnly", "cohortsOnly", "summaryOnly"]) {
+    const body = handlerSource(source, name);
+    assert(!/runReplication\(/.test(body), `${name} never executes a replication unit`);
+    assert(!/planReplication\(/.test(body), `${name} never builds a replication plan`);
+    assert(!/discoverDatasetRecords|collectArenaDatasetUsage/.test(body), `${name} never discovers datasets`);
+    assert(/return;/.test(body), `${name} terminates explicitly`);
+  }
+  const writeHandler = handlerSource(source, "writeFreezeOnly");
+  assert(!/freezeCohorts\(/.test(writeHandler), "--write-freeze never freezes cohorts");
+  assert(
+    writeHandler.indexOf("return;") > writeHandler.indexOf("await writeFreeze("),
+    "--write-freeze returns immediately after writing the artifact",
+  );
+});
+
+test("82. --write-freeze writes the freeze artifact and stops (zero replicas)", async () => {
+  await resetArenaSpawns();
+  const out = cliOut("write");
+  const run = runCli({
+    actionArgs: ["--write-freeze", "--json"],
+    out,
+    // A non-directory history root: dataset discovery would fail loudly (ENOTDIR).
+    env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire, EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire },
+  });
+  assertEqual(run.status, 0, `--write-freeze exits 0 (stderr: ${run.stderr})`);
+  const payload = JSON.parse(run.stdout);
+  assertEqual(payload.action, ACTION.WRITE_FREEZE, "the JSON names the write-freeze action");
+  assertEqual(payload.unitsExecuted, 0, "zero units executed");
+  assertEqual(payload.path, path.join(out, "phase5c-freeze.json"), "the printed path is the freeze artifact");
+
+  const written = await readFreeze({ root: out });
+  assert(written, "the freeze artifact was written");
+  assertEqual(written.freezeDigest, payload.freezeDigest, "the printed digest matches the persisted artifact");
+  assert(/^[0-9a-f]{64}$/.test(written.freezeDigest), "the digest is a SHA-256 string");
+
+  const names = (await readdir(out, { recursive: true })).sort();
+  assertDeepEqual(names, ["phase5c-freeze.json"], "ONLY the freeze artifact was written");
+  assertEqual(await dirDigest(path.join(out, "cohorts")), null, "no cohorts were frozen");
+  assertDeepEqual(await runArtifacts(out), [], "zero replication manifests and zero unit artifacts");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+
+  // Idempotent: writing again yields the same digest and still stops.
+  const second = runCli({ actionArgs: ["--write-freeze", "--json"], out, env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire } });
+  assertEqual(second.status, 0, "a second --write-freeze exits 0");
+  assertEqual(JSON.parse(second.stdout).digestChanged, false, "the digest is unchanged");
+  assertDeepEqual((await readdir(out, { recursive: true })).sort(), ["phase5c-freeze.json"], "still only the freeze artifact");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
+});
+
+test("83. --write-freeze reproduces the canonical freeze digest", async () => {
+  await resetArenaSpawns();
+  const out = cliOut("write-canonical-digest");
+  // Run from the checkout root so the CLI records the same commit the live
+  // config does. The tripwire history root keeps this safe even if a regression
+  // ever tried to continue past the write: discovery would fail loudly before
+  // any Arena could be reached.
+  const run = runCli({
+    actionArgs: ["--write-freeze", "--json"],
+    out,
+    cwd: process.cwd(),
+    env: {
+      EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire,
+      EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire,
+      EVOLVE_CLI_STUB_LOG: ctx.cliLog,
+    },
+  });
+  assertEqual(run.status, 0, `--write-freeze exits 0 (stderr: ${run.stderr})`);
+  const payload = JSON.parse(run.stdout);
+  assertEqual(payload.freezeDigest, createFreeze().freezeDigest, "the written freeze matches the live config digest");
+  assertEqual(
+    payload.freezeDigest,
+    CANONICAL_FREEZE_DIGEST,
+    "the freeze digest is the recorded canonical digest (same commit, same pinned config)",
+  );
+  const stored = await readFreeze({ root: out });
+  assertEqual(freezeDigest(stored), CANONICAL_FREEZE_DIGEST, "recomputing the digest reproduces it");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+});
+
+test("84. --verify-freeze verifies only (read-only, zero Arena subprocesses)", async () => {
+  await resetArenaSpawns();
+  const out = cliOut("verify");
+  // Built from the live config with no commit recorded, so the subprocess (whose
+  // cwd is not a git repository) sees no critical drift.
+  await writeFreeze(buildFreezeConfig({ commit: null, createdAt: 1 }), { root: out });
+  const before = await dirDigest(out);
+
+  const run = runCli({
+    actionArgs: ["--verify-freeze"],
+    out,
+    env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire, EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire },
+  });
+  assertEqual(run.status, 0, `--verify-freeze exits 0 (stderr: ${run.stderr})`);
+  assert(run.stdout.includes("RESULT: PASS"), "the verification report passes");
+  assertEqual(await dirDigest(out), before, "verification wrote nothing");
+  assertDeepEqual(await runArtifacts(out), [], "no replication manifests or unit artifacts");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+
+  const missing = runCli({ actionArgs: ["--verify-freeze"], out: cliOut("verify-missing") });
+  assertEqual(missing.status, 1, "verifying without a freeze artifact fails");
+  assert(/no freeze artifact/.test(missing.stderr), "the failure explains what is missing");
+  assertEqual(await dirDigest(cliOut("verify-missing")), null, "nothing was created");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
+});
+
+test("85. --cohorts inspects only (zero dataset discovery, zero Arena subprocesses)", async () => {
+  await resetArenaSpawns();
+  const { out, freeze } = await seedFreeze("cohorts");
+  const run = runCli({
+    actionArgs: ["--cohorts"],
+    out,
+    // The tripwire proves no dataset discovery happens in this mode.
+    env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire, EVOLVE_ARENAS_DIR: ctx.cliHistoryTripwire },
+  });
+  assertEqual(run.status, 0, `--cohorts exits 0 (stderr: ${run.stderr})`);
+  assert(run.stdout.includes("genome(s)"), "the cohort inspection renders");
+  assertEqual(await readFrozenCohort(out, "mock") !== null, true, "the mock cohort is frozen/idempotent");
+  assertDeepEqual(await runArtifacts(out), [], "zero replication manifests and zero unit artifacts");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  const jsonRun = runCli({
+    actionArgs: ["--cohorts", "--json"],
+    out,
+    env: { EVOLVE_HISTORY_ROOT: ctx.cliHistoryTripwire },
+  });
+  const payload = JSON.parse(jsonRun.stdout);
+  assertEqual(payload.action, ACTION.COHORTS, "the JSON names the cohorts action");
+  assertEqual(payload.unitsExecuted, 0, "zero units executed");
+  assert(payload.replicationId.startsWith("rep-"), "the replication id is reported");
+  assertEqual(payload.cohorts.mock.freezeDigest, freeze.freezeDigest, "the frozen cohort records the freeze digest");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
+});
+
+test("86. --plan prints the deterministic plan and executes nothing", async () => {
+  await resetArenaSpawns();
+  const { out } = await seedFreeze("plan");
+  const run = runCli({ actionArgs: ["--plan"], out });
+  assertEqual(run.status, 0, `--plan exits 0 (stderr: ${run.stderr})`);
+  assert(run.stdout.includes("Planned replication rep-"), "the plan is printed");
+  assert(run.stdout.includes("plan only"), "the output states nothing was executed");
+  for (const id of ["ds-real-a", "ds-real-b", "ds-real-c"]) {
+    assert(run.stdout.includes(id), `the plan names ${id}`);
+  }
+  assertEqual((run.stdout.match(/^\s+unit-[0-9a-f]{12}\s/gm) ?? []).length, 6, "three datasets x two providers are planned");
+  assertDeepEqual(await runArtifacts(out), [], "zero replication manifests and zero unit artifacts");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+
+  const jsonRun = runCli({ actionArgs: ["--plan", "--json"], out });
+  const payload = JSON.parse(jsonRun.stdout);
+  assertEqual(payload.action, ACTION.PLAN, "the JSON names the plan action");
+  assertEqual(payload.unitsExecuted, 0, "zero units executed");
+  assertDeepEqual(payload.datasetIds, ["ds-real-a", "ds-real-b", "ds-real-c"], "the deterministic selection is reported");
+  assertEqual(payload.units.length, 6, "six units are planned");
+  assert(payload.units.every((unit) => unit.status === "PENDING"), "every planned unit is still PENDING");
+  assertDeepEqual(await runArtifacts(out), [], "the JSON mode wrote nothing either");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
+});
+
+test("87. --summary reads existing artifacts only and executes nothing", async () => {
+  await resetArenaSpawns();
+  const { out, freeze } = await seedFreeze("summary");
+  await freezeCohorts({ baseDir: out, freezeDigest: freeze.freezeDigest, keys: COHORT_KEYS, createdAt: 1 });
+  const before = await dirDigest(out);
+  const run = runCli({ actionArgs: ["--summary"], out });
+  assertEqual(run.status, 0, `--summary exits 0 (stderr: ${run.stderr})`);
+  assert(run.stdout.includes("Replication status"), "the summary renders");
+  assert(run.stdout.includes("summary only"), "the output states nothing was executed");
+  assertEqual(await dirDigest(out), before, "--summary wrote nothing");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+
+  const empty = cliOut("summary-empty");
+  const withoutCohorts = runCli({ actionArgs: ["--summary"], out: empty });
+  assertEqual(withoutCohorts.status, 1, "a summary with no artifacts fails clearly");
+  assert(/no freeze artifact/.test(withoutCohorts.stderr), "the failure names what is missing");
+  assertEqual(await dirDigest(empty), null, "nothing was created");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
+});
+
+test("88. only the normal run mode executes replication units", async () => {
+  await resetArenaSpawns();
+  const { out } = await seedFreeze("run");
+  const run = runCli({ actionArgs: ["--datasets", "auto", "--dev"], out });
+  assertEqual(run.status, 0, `the run exits 0 (stderr: ${run.stderr})`);
+
+  const spawns = await arenaSpawns();
+  assertEqual(spawns.length, 6, "three eligible datasets x two providers were executed");
+  assert(spawns.every((line) => line.startsWith("spawn ")), "every spawn came from the harness stub Arena");
+  assert(spawns.every((line) => line.includes("cli-out-run")), "every unit ran inside the temp replication root");
+  assert(!spawns.some((line) => line.includes(`${path.sep}scripts${path.sep}arena.mjs`)), "the real Arena subprocess never ran");
+
+  const [repDir] = (await readdir(out)).filter((name) => name.startsWith("rep-"));
+  assert(repDir, "a replication run directory was created");
+  const manifest = JSON.parse(await readFile(path.join(out, repDir, "manifest.json"), "utf8"));
+  assertEqual(manifest.units.length, 6, "the run manifest records six units");
+  assertEqual(manifest.replicationId, repDir, "the manifest belongs to this replication id");
+  assertEqual(manifest.canonicality.label, "NON_CANONICAL", "an unbacked dev run is labelled NON_CANONICAL");
+  const unitDirs = await readdir(path.join(out, repDir, "units"));
+  assertEqual(unitDirs.length, 6, "six unit artifact directories exist");
+  for (const unit of manifest.units) {
+    assertEqual(unit.status.startsWith("FAILED") || unit.status === "COMPLETED", true, `${unit.unitId} reached a terminal status`);
+  }
+
+  // The same run without a freeze artifact refuses to execute anything.
+  await resetArenaSpawns();
+  const noFreeze = cliOut("run-no-freeze");
+  const refused = runCli({ actionArgs: ["--datasets", "auto", "--dev"], out: noFreeze });
+  assertEqual(refused.status, 1, "a run without a freeze fails");
+  assert(/no freeze artifact/.test(refused.stderr), "the failure explains that --write-freeze comes first");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  assertEqual(await dirDigest(noFreeze), null, "nothing was written");
+});
+
+test("89. impossible CLI combinations fail clearly and write nothing", async () => {
+  await resetArenaSpawns();
+  const combinations = [
+    { args: ["--write-freeze", "--verify-freeze"], expect: /mutually exclusive/ },
+    { args: ["--plan", "--summary"], expect: /mutually exclusive/ },
+    { args: ["--cohorts", "--plan"], expect: /mutually exclusive/ },
+    { args: ["--write-freeze", "--cohorts", "--summary"], expect: /mutually exclusive/ },
+    { args: ["--summary", "--rerun"], expect: /run-only/ },
+    { args: ["--verify-freeze", "--dev"], expect: /run-only/ },
+    { args: ["--write-freeze", "--dev"], expect: /run-only/ },
+  ];
+  for (const [index, entry] of combinations.entries()) {
+    const out = cliOut(`invalid-${index}`);
+    const run = runCli({ actionArgs: entry.args, out });
+    assertEqual(run.status, 1, `${entry.args.join(" ")} exits 1`);
+    assert(entry.expect.test(run.stderr), `${entry.args.join(" ")} names the problem`);
+    assert(run.stderr.includes("conflicting command modes") || run.stderr.includes("run-only"), "the diagnostic is explicit");
+    assertEqual(await dirDigest(out), null, "no artifact was written");
+    assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  }
+});
+
+test("90. the canonical replication, freeze and cohorts stay byte-identical", async () => {
+  const now = await canonicalSnapshot();
+  assert(canonicalBaseline, "the canonical baseline was captured at suite start");
+  assertDeepEqual(now, canonicalBaseline, "no canonical artifact changed while this suite ran");
+  assert(now.replication && now.freeze && now.cohorts, "the canonical artifacts are present");
+
+  const stored = await readFreeze({ root: path.join(".evolve", "replication") });
+  assertEqual(stored.freezeDigest, CANONICAL_FREEZE_DIGEST, "the canonical freeze digest is unchanged");
+  assertEqual(freezeDigest(stored), CANONICAL_FREEZE_DIGEST, "recomputing it reproduces the recorded digest");
+
+  const manifest = JSON.parse(await readFile(path.join(CANONICAL_REPLICATION_DIR, "manifest.json"), "utf8"));
+  assertEqual(manifest.replicationId, CANONICAL_REPLICATION_ID, "the canonical replication id is unchanged");
+  assertEqual(manifest.units.length, 6, "the canonical run still has six units");
+  assertEqual(manifest.units.every((unit) => unit.status === "COMPLETED"), true, "all six units are still COMPLETED");
+  assertEqual(manifest.freezeDigest, CANONICAL_FREEZE_DIGEST, "the run records the canonical freeze digest");
+  assertEqual(manifest.status, "COMPLETED", "the canonical run is still COMPLETED");
+  assertEqual(manifest.canonicality.label, "CANONICAL", "the canonical run is still labelled CANONICAL");
+});
+
+test("91. the frozen cohort digests are unchanged and still bound to the canonical run", async () => {
+  const root = path.join(".evolve", "replication");
+  const manifest = JSON.parse(await readFile(path.join(CANONICAL_REPLICATION_DIR, "manifest.json"), "utf8"));
+  const cohorts = {};
+  for (const key of COHORT_KEYS) {
+    const frozen = await readFrozenCohort(root, key);
+    assert(frozen, `the ${key} cohort manifest exists`);
+    const verified = await verifyFrozenCohort(root, key);
+    assertEqual(verified.ok, true, `the ${key} cohort payload still matches its digest`);
+    assertEqual(verified.recomputedDigest, frozen.cohortDigest, `the ${key} cohort digest is unchanged`);
+    cohorts[key] = frozen;
+  }
+  assertEqual(cohorts.mock.count, 13, "the mock cohort still holds 13 unique genomes");
+  assertEqual(cohorts.deepseek.count, 12, "the DeepSeek cohort still holds 12 unique genomes");
+  for (const unit of manifest.units) {
+    assertEqual(unit.cohortDigest, cohorts[unit.provider].cohortDigest, `${unit.unitId} still names the frozen cohort digest`);
+  }
+  assertEqual(await dirDigest(CANONICAL_COHORTS_DIR), (await canonicalSnapshot()).cohorts, "the cohort directories are byte-identical");
+});
+
+test("92. no Phase 5C CLI mode can reach a research provider", async () => {
+  const sources = [
+    ["replicate-research.mjs", await readFile("scripts/replicate-research.mjs", "utf8")],
+    ["replication/mode.mjs", await readFile("scripts/replication/mode.mjs", "utf8")],
+  ];
+  for (const [name, source] of sources) {
+    assert(!/cline/i.test(source), `${name} never references the Cline CLI`);
+    assert(!/child_process|spawnSync|spawn\(|execSync|execFile/.test(source), `${name} cannot start a subprocess`);
+    assert(/PAPER ONLY|paper-only|paper only/i.test(source), `${name} states the paper-only guarantee`);
+  }
+  const runner = await readFile("scripts/replication/runner.mjs", "utf8");
+  assert(runner.includes('EVOLVE_RESEARCH_PROVIDER: "mock"'), "the unit environment still pins the deterministic provider");
+  assertEqual((runner.match(/spawn\(/g) ?? []).length, 1, "the runner has exactly one spawn, for its own Arena CLI");
+
+  const pkg = JSON.parse(await readFile("package.json", "utf8"));
+  assert(pkg.scripts.validate.includes("validate:phase5c"), "the Phase 5C suite is still wired into npm run validate");
+  assert(pkg.scripts.validate.includes("validate:phase5b"), "the Phase 5B regression suite is still wired in");
+});
+
+/* ============================================================================
  * Runner
  * ==========================================================================*/
 
@@ -1410,6 +1919,8 @@ async function run() {
 
   try {
     await buildFixtures();
+    // Captured BEFORE any case runs, so a later case can prove nothing moved.
+    canonicalBaseline = await canonicalSnapshot();
   } catch (error) {
     console.error("could not build Phase 5C fixtures:", error?.stack ?? error);
     process.exitCode = 1;
