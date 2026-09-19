@@ -82,6 +82,7 @@ import {
   ReachBudgetExceededError,
   ReachCommandError,
   ReachExecutableUnavailableError,
+  ReachPlanUnavailableError,
   assertReadOnlyArgv,
   buildReachArgv,
   capabilityFor,
@@ -323,7 +324,7 @@ const ctx = {
   binDir: null,
   emptyBinDir: null,
   missingToolRoot: null,
-  missingToolCapture: null,
+  missingToolError: null,
   missingToolSpawn: null,
 };
 
@@ -445,11 +446,12 @@ async function buildFixtures() {
     spawn,
   });
   ctx.realSpawn = spawn;
-  // A capture on a machine where NO approved upstream tool is installed: every
-  // query must fail closed as UNAVAILABLE, with nothing spawned at all.
+  // A capture on a machine where NO approved upstream tool is installed: the
+  // operation-aware preflight must fail the whole plan closed BEFORE any call or
+  // artifact, with nothing spawned at all.
   ctx.missingToolRoot = path.join(ctx.tmp, "captures-missing-tool");
   const missingSpawn = stubSpawn(() => ({ status: 0, stdout: JSON.stringify([{ ...RAW_SEED }]), stderr: "" }));
-  ctx.missingToolCapture = await runCapture({
+  ctx.missingToolError = await runCapture({
     root: ctx.missingToolRoot,
     config: ctx.reachConfig,
     candidates: [CANDIDATE],
@@ -458,7 +460,7 @@ async function buildFixtures() {
     env: emptyReachEnv(),
     projectRoot: ctx.tmp,
     spawn: missingSpawn,
-  });
+  }).catch((error) => error);
   ctx.missingToolSpawn = missingSpawn;
 
   ctx.tamperRoot = path.join(ctx.tmp, "captures-tamper");
@@ -1802,30 +1804,24 @@ test("83. a missing upstream tool is a bounded UNAVAILABLE failure (no install, 
   assertEqual(REACH_HEALTH_EXECUTABLE, "agent-reach", "the router is never the fallback executable");
 });
 
-test("84. a capture on a machine with no approved tool fails every channel closed", async () => {
-  const capture = ctx.missingToolCapture;
+test("84. a capture on a machine with no approved tool fails closed BEFORE any call or artifact", async () => {
+  const error = ctx.missingToolError;
+  assertTrue(error instanceof ReachPlanUnavailableError, `the plan is refused with ReachPlanUnavailableError (got ${error?.name ?? error})`);
   assertEqual(ctx.missingToolSpawn.calls.length, 0, "not a single subprocess was created");
-  assertEqual(capture.manifest.counts.calls, 7, "every planned query was attempted");
-  assertEqual(capture.manifest.counts.failures, 7, "every query failed closed");
-  assertEqual(capture.manifest.counts.records, 0, "no evidence was invented");
-  assertEqual(capture.manifest.counts.timeouts, 0, "a missing tool is not a timeout");
-  assertEqual(capture.manifest.health.github.status, "error", "the channel is reported as an error");
-  assertTrue(/upstream executable 'gh'/.test(capture.manifest.health.github.lastError), "the GitHub failure names `gh`");
-  assertTrue(/upstream executable 'twitter'/.test(capture.manifest.health.x.lastError), "the X failure names `twitter`");
-  assertTrue(/upstream executable 'curl'/.test(capture.manifest.health.rss.lastError), "the RSS failure names `curl`");
-  for (const failure of capture.manifest.failures) {
-    assertTrue(/is not available on the sanitized PATH/.test(failure.error), "each failure is an availability failure");
+  assertEqual(error.queryCount, 7, "all seven rendered queries were evaluated offline");
+  assertEqual(error.unavailable.length, 7, "every query is reported unavailable");
+  assertEqual(error.capabilities.length, 6, "six distinct (operation, channel) capabilities were inspected");
+  for (const row of error.unavailable) {
+    assertEqual(row.available, false, "each unavailable row reports available: false");
+    assertTrue(typeof row.channel === "string" && typeof row.operation === "string", "each row names a channel and an operation");
+    assertTrue(typeof row.binary === "string" && row.binary.length > 0, "each row names the required executable basename");
   }
-  assertEqual(capture.manifest.agentReach.commit, AGENT_REACH_PIN.commit, "the pinned Agent-Reach identity is still recorded");
-  assertEqual(capture.manifest.provider, "agent-reach", "the provider is unchanged");
-  assertEqual(capture.manifest.readOnly, true, "the capture is still read-only");
-  for (const failure of capture.manifest.failures) {
-    assertTrue(!/(pip|npm|brew|apt|choco|apt-get)\s+install|agent-reach\s+install/i.test(failure.error), "no failure ever proposes an install command");
-    assertTrue(/never installs/.test(failure.error), "each failure states explicitly that nothing was installed");
-  }
-  assertEqual(capture.manifest.failures.some((row) => /agent-reach/.test(row.error)), false, "the router is never proposed as a fallback");
-  assertTrue(!ctx.missingToolSpawn.calls.some((call) => path.basename(call.binary) === "agent-reach"), "the router was never used as a fallback");
-  assertDeepEqual(capture.records, [], "no records were produced");
+  const missingBinaries = [...new Set(error.unavailable.map((row) => row.binary))].sort();
+  assertDeepEqual(missingBinaries, ["curl", "gh", "mcporter", "rdt", "twitter"], "the missing executables are named exactly");
+  assertTrue(/never installs/.test(error.message), "the refusal states explicitly that nothing was installed");
+  assertTrue(/never falls back/.test(error.message), "the refusal states that no fallback backend was used");
+  assertTrue(!/(pip|npm|brew|apt|choco|apt-get)\s+install|agent-reach\s+install/i.test(error.message), "no failure ever proposes an install command");
+  assertDeepEqual(await listDirSafe(ctx.missingToolRoot), [], "NO capture artifact was written — the plan failed before capture");
 });
 
 test("85. an upstream call inherits no credential, key or signer material", async () => {

@@ -261,6 +261,47 @@ export class ReachBudgetExceededError extends Error {
   }
 }
 
+/**
+ * Raised BEFORE a capture places any upstream call when the exact rendered query
+ * plan needs an executable that is not present on the sanitized PATH.
+ *
+ * This is deliberately finer-grained than the missing-executable runtime failure:
+ * every query is inspected offline first, so a plan that cannot run locally fails
+ * closed with ZERO upstream calls and WITHOUT writing a partial capture artifact.
+ * Nothing is installed, nothing is routed through the pinned Agent-Reach CLI, and
+ * no other backend is substituted.
+ *
+ * Diagnostics are bounded and carry no environment dump: channel, operation,
+ * executable basename and the availability flag only.
+ */
+export class ReachPlanUnavailableError extends Error {
+  constructor(readiness = {}) {
+    const rows = Array.isArray(readiness?.unavailableQueries) ? readiness.unavailableQueries : [];
+    const total = Number.isFinite(readiness?.queryCount) ? readiness.queryCount : rows.length;
+    const summary = rows
+      .slice(0, 8)
+      .map((row) => `${row.channel ?? "-"}/${row.operation ?? "-"} -> ${row.binary ?? "(no capability)"} unavailable`)
+      .join("; ");
+    super(
+      `the rendered query plan is UNAVAILABLE locally: ${rows.length} of ${total} rendered quer(y/ies) require an ` +
+        `executable that is not present on the sanitized PATH (${summary}). EVOLVE never installs it, never routes it through ` +
+        "the pinned Agent-Reach CLI, and never falls back to another backend. No upstream call was placed and no capture " +
+        "artifact was written.",
+    );
+    this.name = "ReachPlanUnavailableError";
+    this.queryCount = total;
+    // Bounded, environment-free diagnostics: one row per unavailable query.
+    this.unavailable = rows.map((row) => ({
+      channel: row.channel ?? null,
+      operation: row.operation ?? null,
+      binary: row.binary ?? null,
+      available: false,
+    }));
+    this.unavailableReasons = [...(readiness?.unavailableReasons ?? [])];
+    this.capabilities = [...(readiness?.capabilities ?? [])];
+  }
+}
+
 /* ============================================================================
  * The frozen command map
  * ==========================================================================*/
@@ -590,6 +631,169 @@ export function resolveCapabilityExecutable(capability, { reachBin = null, proje
     realPath: found.realPath,
     available: found.path !== null,
     searched: Object.freeze([...found.searched]),
+  });
+}
+
+/* ----------------------------------------------------------------------------
+ * Operation-aware capability health (offline, read-only)
+ *
+ * Channel-level health is too coarse: `web` search needs `mcporter` while
+ * `web` read needs `curl`, and an upstream doctor that only knows `web` is
+ * reachable cannot tell the two apart. These helpers expose health at the exact
+ * (channel, operation) capability level the frozen map defines.
+ *
+ * NOTHING here is spawned, installed or fetched: executable availability is
+ * resolved with the bounded sanitized-PATH walk above (`stat`/`access` only), so
+ * an inspection is pure and can run during a doctor without an upstream query.
+ * --------------------------------------------------------------------------*/
+
+/** The frozen DATA capability entries (every entry that names a channel). */
+export function reachDataCapabilityEntries(capabilityMap = REACH_CAPABILITY_MAP_V1) {
+  return (capabilityMap?.entries ?? []).filter((entry) => entry.channel !== null && entry.channel !== undefined);
+}
+
+/**
+ * Inspect EVERY frozen data capability for local executable availability.
+ *
+ * @returns {{ capabilityMapVersion: string, health: object, capabilities: object[],
+ *   byChannel: object, channels: string[], networkCalls: number, subprocessesSpawned: number }}
+ */
+export function inspectReachCapabilities({
+  reachBin = null,
+  projectRoot = process.cwd(),
+  path: pathValue = null,
+  env = null,
+  capabilityMap = REACH_CAPABILITY_MAP_V1,
+} = {}) {
+  const resolveOptions = { reachBin, projectRoot, path: pathValue, env };
+  const health = resolveCapabilityExecutable(capabilityFor("health"), resolveOptions);
+  const byChannel = {};
+  const capabilities = [];
+  for (const entry of reachDataCapabilityEntries(capabilityMap)) {
+    const resolved = resolveCapabilityExecutable(entry, resolveOptions);
+    const row = Object.freeze({
+      channel: entry.channel,
+      operation: entry.op,
+      binary: resolved.basename,
+      executablePath: resolved.path,
+      available: resolved.available,
+      source: resolved.source,
+      role: resolved.role,
+    });
+    capabilities.push(row);
+    (byChannel[row.channel] ??= {})[row.operation] = row;
+  }
+  return Object.freeze({
+    capabilityMapVersion: capabilityMap?.version ?? REACH_CAPABILITY_MAP_VERSION,
+    health: Object.freeze({
+      binary: health.basename,
+      executablePath: health.path,
+      available: health.available,
+      source: health.source,
+      role: health.role,
+    }),
+    capabilities: Object.freeze(capabilities),
+    byChannel: Object.freeze(byChannel),
+    channels: Object.freeze(Object.keys(byChannel).sort()),
+    // Proven purity: an inspection executes nothing and reads no network.
+    networkCalls: 0,
+    subprocessesSpawned: 0,
+    note:
+      "Offline capability inspection: executable availability is resolved with a bounded sanitized-PATH walk (stat/access " +
+      "only). Local availability does NOT claim the external source is healthy — it only establishes that EVOLVE has the " +
+      "executable the frozen (channel, operation) requires.",
+  });
+}
+
+/**
+ * Evaluate a DETERMINISTIC rendered query plan against the frozen capability map.
+ *
+ * Every query is resolved to its (operation, channel) capability, then to the
+ * executable that capability names, and finally to local availability. No network
+ * call and no subprocess is made.
+ *
+ * @returns {{ queryCount: number, readyQueries: object[], unavailableQueries: object[],
+ *   ready: boolean, capabilities: object[], unavailableReasons: string[], counts: object }}
+ */
+export function evaluateReachPlanReadiness(plan, {
+  reachBin = null,
+  projectRoot = process.cwd(),
+  path: pathValue = null,
+  env = null,
+  capabilityMap = REACH_CAPABILITY_MAP_V1,
+} = {}) {
+  const queries = Array.isArray(plan?.queries) ? plan.queries : [];
+  const resolveOptions = { reachBin, projectRoot, path: pathValue, env };
+  const cache = new Map();
+
+  const capabilityOf = (op, channel) => {
+    const key = `${op}:${channel}`;
+    if (cache.has(key)) return cache.get(key);
+    const entry = reachDataCapabilityEntries(capabilityMap).find(
+      (candidate) => candidate.op === op && candidate.channel === channel,
+    );
+    let row = null;
+    if (entry) {
+      const resolved = resolveCapabilityExecutable(entry, resolveOptions);
+      row = Object.freeze({
+        channel: entry.channel,
+        operation: entry.op,
+        binary: resolved.basename,
+        executablePath: resolved.path,
+        available: resolved.available,
+        source: resolved.source,
+        role: resolved.role,
+      });
+    }
+    cache.set(key, row);
+    return row;
+  };
+
+  const readyQueries = [];
+  const unavailableQueries = [];
+  for (const query of queries) {
+    const operation = String(query?.op ?? "search").trim().toLowerCase();
+    const channel = query?.channel ?? null;
+    const queryId = query?.queryId ?? null;
+    const capability = capabilityOf(operation, channel);
+    if (!capability) {
+      unavailableQueries.push({
+        queryId,
+        operation,
+        channel,
+        binary: null,
+        available: false,
+        reason: `no frozen capability exists for ${channel ?? "-"}/${operation}`,
+      });
+      continue;
+    }
+    if (capability.available) {
+      readyQueries.push({ queryId, operation, channel, binary: capability.binary });
+    } else {
+      unavailableQueries.push({
+        queryId,
+        operation,
+        channel,
+        binary: capability.binary,
+        available: false,
+        reason: `${channel ?? "-"}/${operation} requires '${capability.binary}', which is not available on the sanitized PATH`,
+      });
+    }
+  }
+
+  return Object.freeze({
+    querySetId: plan?.querySetId ?? null,
+    queryCount: queries.length,
+    readyQueries,
+    unavailableQueries,
+    ready: unavailableQueries.length === 0,
+    capabilities: [...cache.values()].filter(Boolean),
+    unavailableReasons: unavailableQueries.map((row) => row.reason),
+    counts: { total: queries.length, ready: readyQueries.length, unavailable: unavailableQueries.length },
+    networkCalls: 0,
+    note:
+      "Offline plan readiness: the exact rendered query plan is resolved against the frozen capability map. A ready plan " +
+      "only means EVOLVE has the required local executable — it does not claim the external source is healthy.",
   });
 }
 

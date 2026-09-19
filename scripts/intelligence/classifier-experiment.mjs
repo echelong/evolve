@@ -142,7 +142,9 @@ export class ClassifierExperimentExistsError extends Error {
  * Identity helpers
  * ==========================================================================*/
 
-const CAPTURE_ID_PATTERN = /^capture-\d{8}T\d{6}Z$/;
+// Newest captures carry millisecond precision (`...SSmmmZ`); legacy captures
+// (`...SSZ`) remain valid forever. Both parse.
+const CAPTURE_ID_PATTERN = /^capture-\d{8}T\d{6}(?:\d{3})?Z$/;
 
 export function isValidCaptureId(captureId) {
   return typeof captureId === "string" && CAPTURE_ID_PATTERN.test(captureId);
@@ -212,7 +214,12 @@ export function experimentDigestOf(experiment) {
  */
 export async function prepareClassification({ captureRoot, captureId, classifierId = CLASSIFIER_ID } = {}) {
   classifierDefinitionFor(classifierId);
-  if (!isValidCaptureId(captureId)) throw new ClassifierCaptureRefusedError(String(captureId), "not a valid capture id (expected capture-YYYYMMDDTHHMMSSZ)");
+  if (!isValidCaptureId(captureId)) {
+    throw new ClassifierCaptureRefusedError(
+      String(captureId),
+      "not a valid capture id (expected capture-YYYYMMDDTHHMMSSmmmZ, or the legacy capture-YYYYMMDDTHHMMSSZ)",
+    );
+  }
 
   const manifest = await readCaptureManifest(captureRoot, captureId);
   if (!manifest) throw new ClassifierCaptureRefusedError(captureId, "no capture manifest exists");

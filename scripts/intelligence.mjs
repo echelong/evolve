@@ -46,7 +46,7 @@ import { CAPTURE_SCHEMA_VERSION, listCaptures, runCapture, verifyCapture } from 
 import { DEFAULT_FEATURE_VERSION, REGISTERED_FEATURE_VERSIONS } from "./intelligence/features.mjs";
 import { captureStats, replayCapture, verifyReplayDeterminism } from "./intelligence/replay.mjs";
 import { buildExternalIntelligencePacket, auditExternalIntelligencePacket } from "./intelligence/packet.mjs";
-import { probeReachHealth, resolveReachBinary } from "./intelligence/agent-reach.mjs";
+import { inspectReachCapabilities, probeReachHealth, resolveReachBinary } from "./intelligence/agent-reach.mjs";
 import { REACH_QUERY_SET_ID } from "./intelligence/query-sets.mjs";
 
 const BOOLEAN_FLAGS = ["json", "probe", "save", "help", "verify"];
@@ -116,6 +116,31 @@ function fail(message) {
 
 function printJson(value) {
   console.log(JSON.stringify(value, null, 2));
+}
+
+/**
+ * Render operation-aware capability readiness for the doctor.
+ *
+ * Channel health is NEVER collapsed into a single status: `web` search (mcporter)
+ * and `web` read (curl) are genuinely different capabilities, and the upstream
+ * Agent-Reach doctor (which only knows a channel is reachable) is reported
+ * SEPARATELY from EVOLVE's frozen local executable readiness.
+ */
+function formatCapabilityReadiness(readiness, upstreamDoctor) {
+  const lines = [];
+  for (const channel of readiness.channels) {
+    lines.push(`${channel}:`);
+    lines.push(`  upstream doctor: ${upstreamDoctor}`);
+    for (const operation of Object.keys(readiness.byChannel[channel]).sort()) {
+      const row = readiness.byChannel[channel][operation];
+      lines.push(
+        row.available
+          ? `  ${operation}: ready (${row.binary})`
+          : `  ${operation}: unavailable (${row.binary} missing)`,
+      );
+    }
+  }
+  return lines;
 }
 
 /**
@@ -257,6 +282,15 @@ async function replayAction({ args, root }) {
   console.log(`[intelligence] replay ${captureId}`);
   console.log(`[intelligence]   records:   ${replay.recordCount}`);
   console.log(`[intelligence]   provider:  ${replay.provider}${replay.syntheticIntelligence ? " (SYNTHETIC)" : ""}`);
+  if (replay.provenance?.legacyProvenanceMismatch) {
+    // Distinguish immutable stored provenance from current corrected behavior:
+    // the historical artifact bytes are never rewritten.
+    console.log(
+      `[intelligence]   provenance: stored manifest says ${replay.provenance.storedSyntheticIntelligence ? "SYNTHETIC" : "real"} ` +
+        `(legacy empty-capture rule) — corrected provider provenance is ${replay.provenance.correctedSyntheticIntelligence ? "SYNTHETIC" : "real"} ` +
+        "(the frozen artifact is unchanged)",
+    );
+  }
   console.log(
     `[intelligence]   versions:  capture schema ${replay.captureSchemaVersion ?? "unknown"} · feature ${replay.featureVersion} · replay ${replay.replayVersion}`,
   );
@@ -305,6 +339,17 @@ async function doctorAction({ args, config, root }) {
     binaryExists = await access(binary).then(() => true).catch(() => false);
   }
 
+  // Operation-aware capability readiness. Purely offline: it resolves each frozen
+  // (channel, operation) capability against the bounded sanitized-PATH walk and
+  // spawns NOTHING. This is the distinction the coarse channel health could not
+  // make — e.g. `web` read ready via `curl` while `web` search is unavailable
+  // because `mcporter` is missing.
+  const capabilityReadiness = inspectReachCapabilities({
+    reachBin: config.reachBin ?? null,
+    projectRoot: process.cwd(),
+    env: process.env,
+  });
+
   const report = {
     action: ACTION.DOCTOR,
     phase: "5E",
@@ -327,6 +372,17 @@ async function doctorAction({ args, config, root }) {
     binary: typeof binary === "string" ? binary : null,
     binaryError: typeof binary === "string" ? null : binary.error ?? null,
     binaryExists,
+    capabilityReadiness: {
+      capabilityMapVersion: capabilityReadiness.capabilityMapVersion,
+      // The upstream Agent-Reach doctor health is reported separately from the
+      // frozen EVOLVE capability readiness; they are never collapsed.
+      health: capabilityReadiness.health,
+      channels: capabilityReadiness.channels,
+      capabilities: capabilityReadiness.capabilities,
+      byChannel: capabilityReadiness.byChannel,
+      networkCalls: 0,
+      subprocessesSpawned: 0,
+    },
     limits: { timeoutMs: config.timeoutMs, maxCalls: config.maxCalls, maxResults: config.maxResults, maxBytes: config.maxBytes },
     probe: null,
     saved: null,
@@ -364,6 +420,13 @@ async function doctorAction({ args, config, root }) {
     console.log(`[intelligence]   limits:          timeout ${config.timeoutMs}ms · max calls ${config.maxCalls} · max results ${config.maxResults} · max bytes ${config.maxBytes}`);
     console.log(`[intelligence]   capture schema:  ${CAPTURE_SCHEMA_VERSION} · new captures pin ${DEFAULT_FEATURE_VERSION}`);
     console.log(`[intelligence]   feature versions:${REGISTERED_FEATURE_VERSIONS.join(", ")}`);
+    const upstreamDoctor = report.probe
+      ? report.probe.skipped
+        ? `not run (${report.probe.reason})`
+        : `ok=${report.probe.doctor.ok}`
+      : "not run (pass --probe)";
+    console.log("[intelligence] EVOLVE frozen capability readiness (local executable only; not a claim the source is healthy):");
+    for (const line of formatCapabilityReadiness(capabilityReadiness, upstreamDoctor)) console.log(`[intelligence]   ${line}`);
     if (report.probe) {
       console.log(`[intelligence]   probe:           ${report.probe.skipped ? `SKIPPED (${report.probe.reason})` : `version=${report.probe.version.stdout || "n/a"} doctorOk=${report.probe.doctor.ok}`}`);
     } else {

@@ -16,7 +16,7 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { INTELLIGENCE_DIR, resolveIntelligenceConfig } from "./config.mjs";
-import { listCaptures, readCaptureManifest } from "./capture.mjs";
+import { listCaptures, readCaptureManifest, resolveCaptureSyntheticProvenance } from "./capture.mjs";
 
 export const INTELLIGENCE_DASHBOARD_VERSION = 1;
 
@@ -80,7 +80,9 @@ export async function loadExternalIntelligenceState(root = path.join(process.cwd
     lastCaptureAgeMs,
     latestCaptureId: manifest?.captureId ?? null,
     latestCaptureDigest: manifest?.manifestDigest ?? null,
-    latestCaptureSynthetic: manifest?.syntheticIntelligence === true,
+    // Corrected provenance (provider-derived), so a legacy zero-record real
+    // capture is not displayed as synthetic. Immutable stored bytes are untouched.
+    latestCaptureSynthetic: resolveCaptureSyntheticProvenance(manifest).effective,
     evidenceQuality: null,
     replayMode: "replay-only",
     network: { liveInternetInsideArena: false, replayIsOffline: true },
@@ -133,7 +135,8 @@ export async function listCaptureSummaries(captureRoot, { limit = 20 } = {}) {
     rows.push({
       captureId: entry.captureId,
       provider: manifest.provider ?? null,
-      syntheticIntelligence: manifest.syntheticIntelligence === true,
+      syntheticIntelligence: resolveCaptureSyntheticProvenance(manifest).effective,
+      storedSyntheticIntelligence: manifest.syntheticIntelligence === true,
       records: manifest.counts?.records ?? 0,
       failures: manifest.counts?.failures ?? 0,
       timeouts: manifest.counts?.timeouts ?? 0,

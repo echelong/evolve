@@ -36,7 +36,7 @@ import {
   INTELLIGENCE_PHASE,
   INTELLIGENCE_PROVIDER,
 } from "./config.mjs";
-import { createReachBudget } from "./agent-reach.mjs";
+import { createReachBudget, evaluateReachPlanReadiness, ReachPlanUnavailableError, sanitizeReachEnv } from "./agent-reach.mjs";
 import { DEFAULT_FEATURE_VERSION } from "./features.mjs";
 import { normalizeRecord, verifyRecord } from "./records.mjs";
 import { assertCanonicalQueryPlan, buildQueryPlan, REACH_QUERY_SET_ID, REACH_QUERY_SET_VERSION } from "./query-sets.mjs";
@@ -74,16 +74,97 @@ export class CaptureExistsError extends Error {
   }
 }
 
-/** `capture-<UTC stamp>` — deterministic given the clock it is created with. */
-export function buildCaptureId(now = Date.now()) {
-  const iso = new Date(now).toISOString();
-  return `capture-${iso.replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}`;
+/**
+ * Raised when a capture's normalized records contradict the provenance its
+ * provider declares (e.g. a real provider emitting records flagged synthetic).
+ * Provenance is resolved from the provider, never inferred from record flags, so
+ * a contradiction is a hard error rather than a silent relabelling.
+ */
+export class IntelligenceProvenanceError extends Error {
+  constructor(provider, providerSyntheticIntelligence, contradictoryCount) {
+    super(
+      `capture refused: provider '${provider}' declares syntheticIntelligence=${providerSyntheticIntelligence} but ` +
+        `${contradictoryCount} normalized record(s) disagree. Provenance is taken from the provider — a mixed or ` +
+        "impossible provenance is never silently relabelled.",
+    );
+    this.name = "IntelligenceProvenanceError";
+    this.provider = provider;
+    this.providerSyntheticIntelligence = providerSyntheticIntelligence;
+    this.contradictoryCount = contradictoryCount;
+  }
 }
 
-/** The day bucket a capture id belongs to (UTC). */
+/**
+ * `capture-YYYYMMDDTHHMMSSmmmZ` — second AND millisecond UTC precision.
+ *
+ * Millisecond precision makes the id collision-proof for two independent captures
+ * that start within the same second, while remaining lexicographically
+ * time-sortable and filesystem-safe. Deterministic: the exact same injected clock
+ * always yields the exact same id (randomness is never added to hide a collision).
+ *
+ * Legacy second-resolution ids (`capture-YYYYMMDDTHHMMSSZ`) stay readable forever.
+ */
+export function buildCaptureId(now = Date.now()) {
+  const iso = new Date(now).toISOString();
+  return `capture-${iso.replace(/[-:.]/g, "")}`;
+}
+
+/**
+ * Capture-id shape, newest first: millisecond (`...SSmmmZ`) or legacy second
+ * (`...SSZ`). Both parse; nothing older is ever rewritten.
+ */
+export const CAPTURE_ID_PATTERN = /^capture-\d{8}T\d{6}(?:\d{3})?Z$/;
+
+/** A syntactically valid capture id (millisecond or legacy second resolution). */
+export function isValidCaptureId(captureId) {
+  return typeof captureId === "string" && CAPTURE_ID_PATTERN.test(captureId);
+}
+
+/** The day bucket a capture id belongs to (UTC). Works for ms and second ids. */
 export function captureDayOf(captureId) {
   const match = /^capture-(\d{4})(\d{2})(\d{2})T/.exec(String(captureId ?? ""));
   return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+/* ----------------------------------------------------------------------------
+ * Provenance (authoritative = the provider, never the record array)
+ * --------------------------------------------------------------------------*/
+
+/**
+ * Synthetic provenance declared by a provider name.
+ *
+ *   mock          -> true  (the deterministic synthetic fixture provider)
+ *   any real one  -> false (e.g. `agent-reach`)
+ *   unknown/empty -> null  (caller must fall back to the stored manifest value)
+ *
+ * Returned as a value so `[].every(...)` can never stand in for provider truth:
+ * an EMPTY real capture is still real (`false`), and an empty mock capture is
+ * still synthetic (`true`).
+ */
+export function syntheticIntelligenceForProvider(provider) {
+  if (provider === null || provider === undefined || String(provider).trim().length === 0) return null;
+  return String(provider) === INTELLIGENCE_PROVIDER.MOCK;
+}
+
+/**
+ * Resolve the synthetic provenance of a frozen manifest.
+ *
+ * `stored` is the value written at capture time (historical provenance, never
+ * rewritten). `corrected` is what the provider implies. `effective` prefers the
+ * provider and falls back to the stored value only when the provider is unknown,
+ * so a legacy zero-record real capture is no longer displayed as SYNTHETIC while
+ * its immutable bytes keep their original value.
+ */
+export function resolveCaptureSyntheticProvenance(manifest) {
+  const stored = manifest?.syntheticIntelligence === true;
+  const corrected = syntheticIntelligenceForProvider(manifest?.provider);
+  return Object.freeze({
+    stored,
+    corrected,
+    effective: corrected === null ? stored : corrected,
+    source: corrected === null ? "manifest" : "provider",
+    legacyMismatch: corrected !== null && corrected !== stored,
+  });
 }
 
 export function captureDirFor(root, captureId) {
@@ -161,6 +242,23 @@ export async function runCapture({
     buildQueryPlan({ candidates, querySetId, channels: config?.channels ?? null }),
     { requestedQuery },
   );
+
+  // OPERATION-AWARE PREFLIGHT. Before a single upstream call is placed (and
+  // before any capture directory is created), the EXACT rendered query plan is
+  // resolved against the frozen capability map at (operation, channel) precision.
+  // A plan that needs a locally-missing executable fails closed here: zero
+  // upstream calls, no partial capture artifact, no install, no fallback backend.
+  // Runtime failures AFTER a successful preflight remain legitimate capture
+  // failures.
+  if (providerName === INTELLIGENCE_PROVIDER.AGENT_REACH) {
+    const readiness = evaluateReachPlanReadiness(plan, {
+      reachBin: config?.reachBin ?? null,
+      projectRoot,
+      env: sanitizeReachEnv(env),
+    });
+    if (!readiness.ready) throw new ReachPlanUnavailableError(readiness);
+  }
+
   const resolved = executor
     ? { name: providerName, deterministic: providerName === INTELLIGENCE_PROVIDER.MOCK, execute: executor, syntheticIntelligence: providerName === INTELLIGENCE_PROVIDER.MOCK }
     : resolveIntelligenceProvider({ provider: providerName, config, env, projectRoot, spawn });
@@ -254,6 +352,19 @@ export async function runCapture({
   }
   const recordsDigest = digestOf(records.map((record) => record.normalizedDigest).sort());
 
+  // Provenance comes from the PROVIDER, never from the record array. `.every()`
+  // over an empty array is `true`, which is exactly how a zero-record real
+  // capture used to be mislabelled synthetic. When records DO exist, their flags
+  // may never contradict the provider: an impossible/mixed provenance fails
+  // closed instead of being silently relabelled.
+  const providerSyntheticIntelligence = resolved.syntheticIntelligence === true;
+  const contradictoryRecords = records.filter(
+    (record) => record.syntheticIntelligence !== providerSyntheticIntelligence,
+  );
+  if (contradictoryRecords.length > 0) {
+    throw new IntelligenceProvenanceError(providerName, providerSyntheticIntelligence, contradictoryRecords.length);
+  }
+
   const manifest = withCaptureManifestDigest({
     schemaVersion: CAPTURE_SCHEMA_VERSION,
     phase: INTELLIGENCE_PHASE,
@@ -270,7 +381,7 @@ export async function runCapture({
     immutable: true,
     provider: providerName,
     providerDeterministic: resolved.deterministic === true,
-    syntheticIntelligence: records.every((record) => record.syntheticIntelligence === true),
+    syntheticIntelligence: providerSyntheticIntelligence,
     agentReach: { ...AGENT_REACH_PIN },
     evolveCommit: readEvolveCommit(),
     mode: config?.mode ?? "shadow",

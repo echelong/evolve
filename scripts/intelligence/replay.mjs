@@ -34,7 +34,13 @@
  */
 
 import { digestOf } from "../lib/hash.mjs";
-import { LEGACY_CAPTURE_SCHEMA_VERSION, loadCaptureRecords, readCaptureManifest, verifyCapture } from "./capture.mjs";
+import {
+  LEGACY_CAPTURE_SCHEMA_VERSION,
+  loadCaptureRecords,
+  readCaptureManifest,
+  resolveCaptureSyntheticProvenance,
+  verifyCapture,
+} from "./capture.mjs";
 import {
   INTELLIGENCE_FEATURE_VERSION,
   UnknownFeatureVersionError,
@@ -118,6 +124,13 @@ export async function replayCapture({ root, captureId, asOf = null, verify = tru
     featuresDigest: featuresDigest(features),
   });
 
+  // Provenance is derived from the PROVIDER, not from `records.every(...)`. A
+  // legacy manifest whose stored value disagrees with its provider (the
+  // zero-record real capture that `.every()` mislabelled) is reported as BOTH:
+  // its immutable stored provenance is never rewritten, and the corrected
+  // behavior is stated explicitly so the two can be told apart.
+  const provenance = resolveCaptureSyntheticProvenance(manifest);
+
   return {
     phase: "5E",
     replayVersion: INTELLIGENCE_REPLAY_VERSION,
@@ -135,7 +148,14 @@ export async function replayCapture({ root, captureId, asOf = null, verify = tru
     live: false,
     networkCalls: 0,
     provider: manifest.provider,
-    syntheticIntelligence: manifest.syntheticIntelligence === true,
+    syntheticIntelligence: provenance.effective,
+    provenance: {
+      storedSyntheticIntelligence: provenance.stored,
+      correctedSyntheticIntelligence: provenance.corrected,
+      effectiveSyntheticIntelligence: provenance.effective,
+      source: provenance.source,
+      legacyProvenanceMismatch: provenance.legacyMismatch,
+    },
     capturedAt: manifest.startedAt ?? null,
     channels: [...(manifest.queries?.channels ?? [])],
     querySetId: manifest.queries?.querySetId ?? null,
