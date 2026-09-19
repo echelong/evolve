@@ -285,6 +285,43 @@ export async function readFrozenCohort(baseDir, key) {
 }
 
 /**
+ * READ-ONLY load of the frozen cohorts that already exist.
+ *
+ * Never creates and never refreshes a cohort artifact. A frozen cohort is
+ * IMMUTABLE evidence: `--plan`, `--summary`, `--cohorts`, `--verify-freeze` and
+ * the normal run must all load it without ever writing to it, and a wave that
+ * only REFERENCES the frozen Mock / DeepSeek cohorts must not rewrite their
+ * manifests. The `freezeDigest` field recorded at creation time is a provenance
+ * back-reference ("which freeze existed when this cohort was frozen"), not a
+ * per-wave mutable slot, so it is deliberately never updated here.
+ *
+ * @returns {{ manifests: Record<string, object>, missing: string[] }}
+ *   `missing` lists the requested keys with no frozen manifest on disk; the
+ *   caller decides whether that is fatal (it always is for a canonical command).
+ */
+export async function loadFrozenCohorts({ baseDir, keys = Object.keys(FROZEN_COHORT_SOURCES) } = {}) {
+  const manifests = {};
+  const missing = [];
+  for (const key of keys) {
+    const manifest = await readFrozenCohort(baseDir, key);
+    if (manifest) manifests[key] = manifest;
+    else missing.push(key);
+  }
+  return { manifests, missing };
+}
+
+/**
+ * READ-ONLY verification of the frozen cohorts' payloads (genomes unchanged).
+ * Compared with `freezeCohorts`, this can only ever READ: it is the verifier a
+ * read-only command or a normal run uses.
+ */
+export async function verifyFrozenCohorts({ baseDir, keys = Object.keys(FROZEN_COHORT_SOURCES) } = {}) {
+  const results = {};
+  for (const key of keys) results[key] = await verifyFrozenCohort(baseDir, key);
+  return { ok: keys.every((key) => results[key]?.ok === true), results };
+}
+
+/**
  * Verify a frozen cohort's payload still matches its manifest digest — i.e.
  * "frozen genomes unchanged". Read-only.
  */
@@ -331,8 +368,19 @@ export async function verifyFrozenCohort(baseDir, key) {
 }
 
 /**
- * Freeze (or load) every requested cohort. Idempotent: re-freezing the same
- * sources yields the same cohort digests and rewrites nothing that differs.
+ * EXPLICIT freeze creation: freeze (or load) every requested cohort.
+ *
+ * This is the ONLY cohort helper that may write, and it is reached by an
+ * explicit freeze-creation lifecycle step — never by `--plan`, `--summary`,
+ * `--cohorts`, `--verify-freeze` or a normal run (all of which use the
+ * read-only `loadFrozenCohorts` / `verifyFrozenCohorts`).
+ *
+ * Idempotent and IMMUTABLE: an existing cohort whose genomes still match is
+ * returned VERBATIM — including the `freezeDigest` provenance back-reference
+ * recorded when it was first frozen — and nothing is written. Re-freezing the
+ * same sources with a different freeze digest therefore never rewrites the
+ * original frozen research cohort identity. A genuinely different cohort still
+ * fails closed unless `overwrite` is passed explicitly.
  */
 export async function freezeCohorts({
   baseDir,
@@ -346,15 +394,11 @@ export async function freezeCohorts({
     const existing = await readFrozenCohort(baseDir, key);
     const built = await buildCohortManifest({ key, freezeDigest, createdAt });
     if (existing && existing.cohortDigest === built.cohortDigest && overwrite !== true) {
-      // The GENOMES are unchanged, so the frozen payload is never rewritten.
-      // Only the freeze-digest back-reference is refreshed when it was recorded
-      // before a freeze artifact existed.
-      if (existing.freezeDigest !== freezeDigest && freezeDigest) {
-        const refreshed = { ...existing, freezeDigest };
-        await writeJsonAtomic(cohortManifestPath(baseDir, key), refreshed);
-        manifests[key] = refreshed;
-        continue;
-      }
+      // The GENOMES are unchanged and the frozen cohort is immutable evidence:
+      // return the EXISTING manifest untouched. In particular the recorded
+      // `freezeDigest` is a historical provenance fact, never refreshed to a
+      // later wave's freeze digest (that refresh was the mutation a wave plan
+      // used to cause).
       manifests[key] = existing;
       continue;
     }

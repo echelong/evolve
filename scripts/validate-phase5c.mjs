@@ -87,10 +87,18 @@ import {
 import { buildArenaUnitInvocation, planReplication, runReplication, loadRunManifest, runStatusFromUnits } from "./replication/runner.mjs";
 import { formatCaptureGuidance, CAPTURE_COMMANDS } from "./replication/guidance.mjs";
 import {
+  EXECUTION_STATUS,
+  buildPlanStatus,
+  datasetReadinessFor,
+  executionStatusFor,
+  unitCounts,
+} from "./replication/plan-status.mjs";
+import {
   buildStatusArtifact,
   formatCohortInspection,
   formatDatasetRegistry,
   formatFreezeVerification,
+  formatPlanStatus,
   formatReplicationSummary,
 } from "./replication/report.mjs";
 import { loadReplicationState } from "./lib/dashboard-state.mjs";
@@ -176,13 +184,28 @@ function manifestFor({
   };
 }
 
-async function writeDataset({ day = "2026-09-17", id, ...manifest }) {
-  const dir = path.join(ctx.historyRoot, day, id);
+async function writeDatasetInto(root, { day = "2026-09-17", id, ...manifest }) {
+  const dir = path.join(root, day, id);
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "manifest.json"), `${JSON.stringify(manifestFor({ datasetId: id, ...manifest }), null, 2)}\n`, "utf8");
   await writeFile(path.join(dir, "snapshots.ndjson"), "{}\n{}\n", "utf8");
   await writeFile(path.join(dir, "events.ndjson"), "{}\n", "utf8");
   return dir;
+}
+
+async function writeDataset(entry) {
+  return writeDatasetInto(ctx.historyRoot, entry);
+}
+
+/**
+ * An ISOLATED history root holding exactly the given captures, so a plan's
+ * SELECTED eligible dataset count (0, 1, 3, …) can be exercised offline.
+ */
+async function isolatedHistory(name, entries) {
+  const root = path.join(ctx.root, `history-${name}`);
+  await mkdir(root, { recursive: true });
+  for (const entry of entries) await writeDatasetInto(root, entry);
+  return root;
 }
 
 async function buildFixtures() {
@@ -1514,10 +1537,19 @@ function cliOut(name) {
   return path.join(ctx.root, `cli-out-${name}`);
 }
 
-/** Write a freeze artifact directly into a fresh root. */
+/**
+ * Write a freeze artifact — and the frozen cohorts it pins — directly into a
+ * fresh root.
+ *
+ * The frozen cohorts are IMMUTABLE evidence created by the explicit
+ * freeze-creation lifecycle (never by `--plan`/`--summary`/`--cohorts`/a run),
+ * so every CLI case seeds them here and starts from a realistic, already-frozen
+ * root.
+ */
 async function seedFreeze(name, { commit = "deadbeef", freezeVersion = "phase5c" } = {}) {
   const out = cliOut(name);
   const freeze = await writeFreeze(buildFreezeConfig({ freezeVersion, commit, createdAt: 1 }), { root: out });
+  await freezeCohorts({ baseDir: out, freezeDigest: freeze.freezeDigest, keys: COHORT_KEYS, createdAt: 1 });
   return { out, freeze };
 }
 
@@ -1830,9 +1862,12 @@ test("84. --verify-freeze verifies only (read-only, zero Arena subprocesses)", a
   assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
 });
 
-test("85. --cohorts inspects only (zero dataset discovery, zero Arena subprocesses)", async () => {
+test("85. --cohorts inspects only (READ-ONLY, zero dataset discovery, zero Arena subprocesses)", async () => {
   await resetArenaSpawns();
   const { out, freeze } = await seedFreeze("cohorts");
+  // `--cohorts` must never create or rewrite a frozen cohort, so the whole root
+  // (including cohort-manifest.json) is byte-identical afterwards.
+  const before = await dirDigest(out);
   const run = runCli({
     actionArgs: ["--cohorts"],
     out,
@@ -1841,7 +1876,8 @@ test("85. --cohorts inspects only (zero dataset discovery, zero Arena subprocess
   });
   assertEqual(run.status, 0, `--cohorts exits 0 (stderr: ${run.stderr})`);
   assert(run.stdout.includes("genome(s)"), "the cohort inspection renders");
-  assertEqual(await readFrozenCohort(out, "mock") !== null, true, "the mock cohort is frozen/idempotent");
+  assertEqual(await readFrozenCohort(out, "mock") !== null, true, "the mock cohort exists (seeded, immutable)");
+  assertEqual(await dirDigest(out), before, "--cohorts wrote NOTHING: the frozen cohorts are byte-identical");
   assertDeepEqual(await runArtifacts(out), [], "zero replication manifests and zero unit artifacts");
   assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
   const jsonRun = runCli({
@@ -1853,7 +1889,8 @@ test("85. --cohorts inspects only (zero dataset discovery, zero Arena subprocess
   assertEqual(payload.action, ACTION.COHORTS, "the JSON names the cohorts action");
   assertEqual(payload.unitsExecuted, 0, "zero units executed");
   assert(payload.replicationId.startsWith("rep-"), "the replication id is reported");
-  assertEqual(payload.cohorts.mock.freezeDigest, freeze.freezeDigest, "the frozen cohort records the freeze digest");
+  assertEqual(payload.cohorts.mock.freezeDigest, freeze.freezeDigest, "the frozen cohort records its creation-time freeze digest");
+  assertEqual(await dirDigest(out), before, "--cohorts --json wrote nothing either");
   assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses");
 });
 
@@ -2014,6 +2051,302 @@ test("92. no Phase 5C CLI mode can reach a research provider", async () => {
   const pkg = JSON.parse(await readFile("package.json", "utf8"));
   assert(pkg.scripts.validate.includes("validate:phase5c"), "the Phase 5C suite is still wired into npm run validate");
   assert(pkg.scripts.validate.includes("validate:phase5b"), "the Phase 5B regression suite is still wired in");
+});
+
+/* ============================================================================
+ * 93-98: plan/status semantics — READINESS vs EXECUTION vs EVIDENCE
+ *
+ * Regression: PLAN mode derives replication readiness/status from its SELECTED
+ * eligible CLEAN datasets, never from completed unit results. `--plan` executes
+ * zero units, so a completed-units-derived status can only ever say
+ * INSUFFICIENT_INDEPENDENT_REAL_DATASETS — while the same command correctly
+ * reported how many eligible datasets exist. A three-dataset plan with zero
+ * executed units is PLANNED and READY, not insufficient.
+ * ==========================================================================*/
+
+test("93. a three-dataset plan is PLANNED and ready, never 'insufficient'", () => {
+  const units = [1, 2, 3].flatMap((index) => [
+    { unitId: `unit-mock-${index}`, status: "PENDING" },
+    { unitId: `unit-deepseek-${index}`, status: "PENDING" },
+  ]);
+  const status = buildPlanStatus({
+    selectedDatasetIds: ["ds-real-a", "ds-real-b", "ds-real-c"],
+    units,
+    recordedUnits: [],
+    completedCleanDatasets: 0,
+  });
+  assertEqual(status.replicationStatus, EXECUTION_STATUS.PLANNED, "a plan that executed nothing is PLANNED");
+  assertEqual(status.executionStatus, EXECUTION_STATUS.PLANNED, "and its execution status is PLANNED too");
+  assertEqual(status.datasetReadiness, "MULTI_DATASET_REPLICATION", "three selected datasets are multi-dataset READY");
+  assertEqual(status.selectedCleanDatasets, 3, "three selected eligible CLEAN datasets");
+  assertEqual(status.minimumRequired, 2, "the unchanged minimum-to-run is reported");
+  assertEqual(status.multiDatasetThreshold, 3, "the unchanged multi-dataset threshold is reported");
+  assertEqual(status.completedDatasets, 0, "zero datasets have both providers complete");
+  assertEqual(status.evidenceStatus, "NO_REPLICATION_EVIDENCE", "zero completed datasets is NO evidence, not INSUFFICIENT data");
+  assertEqual(status.sufficientSelectedDatasets, true, "the selection is sufficient");
+  assertEqual(status.execution.plannedUnits, 6, "six units are planned");
+  assertEqual(status.execution.executedUnits, 0, "zero units executed");
+  assertEqual(status.execution.pendingUnits, 6, "all six are pending");
+  assert(
+    !canonicalJson(status).includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
+    "a plan with three eligible datasets must never claim insufficient independent datasets",
+  );
+  assert(
+    !Object.hasOwn(status, "datasetAvailability"),
+    "a plan reports readiness/execution/evidence, not the completed-run availability block",
+  );
+  const text = formatPlanStatus(status, { waveId: "wave-2" });
+  assert(text.includes("Replication status: PLANNED"), "the rendered plan names PLANNED");
+  assert(text.includes("Dataset readiness: MULTI_DATASET_REPLICATION"), "the rendered plan names the readiness");
+  assert(text.includes("Evidence status: NO_REPLICATION_EVIDENCE"), "the rendered plan separates evidence");
+  assert(!text.includes("INSUFFICIENT"), "the rendered plan never claims insufficient");
+});
+
+test("94. dataset readiness is short only when the SELECTION is short (0/1/2/3)", () => {
+  const zero = datasetReadinessFor({ selectedCleanDatasets: 0 });
+  assertEqual(zero.selectedCleanDatasets, 0, "zero selected");
+  assertEqual(zero.sufficient, false, "zero is insufficient");
+  assertEqual(zero.status, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "zero selected reports insufficient");
+  assertEqual(zero.minimumRequired, 2, "the minimum is unchanged");
+  assertEqual(zero.multiDatasetThreshold, 3, "the multi-dataset threshold is unchanged");
+
+  const one = datasetReadinessFor({ selectedCleanDatasets: 1 });
+  assertEqual(one.sufficient, false, "a single dataset is insufficient");
+  assertEqual(one.status, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "one selected reports insufficient (unchanged gate)");
+  assertEqual(one.multiDatasetReady, false, "one dataset is not multi-dataset ready");
+
+  const two = datasetReadinessFor({ selectedCleanDatasets: 2 });
+  assertEqual(two.sufficient, true, "two datasets are enough to run");
+  assertEqual(two.status, "LIMITED_REPLICATION", "two selected datasets are a limited replication, not a multi-dataset claim");
+  assertEqual(two.multiDatasetReady, false, "two datasets cannot support the multi-dataset claim");
+
+  const three = datasetReadinessFor({ selectedCleanDatasets: 3 });
+  assertEqual(three.sufficient, true, "three datasets are enough to run");
+  assertEqual(three.status, "MULTI_DATASET_REPLICATION", "three selected datasets are multi-dataset ready");
+  assertEqual(three.multiDatasetReady, true, "three datasets support the multi-dataset claim");
+
+  // A genuinely short selection keeps the INSUFFICIENT message even when the
+  // registry as a whole holds more datasets: readiness is about the SELECTION.
+  const shortPlan = buildPlanStatus({
+    selectedDatasetIds: ["ds-real-a"],
+    units: [{ unitId: "unit-1", status: "PENDING" }, { unitId: "unit-2", status: "PENDING" }],
+    recordedUnits: [],
+    completedCleanDatasets: 0,
+  });
+  assertEqual(shortPlan.selectedCleanDatasets, 1, "one dataset was selected");
+  assertEqual(shortPlan.datasetReadiness, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "one selected dataset is insufficient");
+  assertEqual(shortPlan.evidenceStatus, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "and so is the evidence");
+  assertEqual(shortPlan.sufficientSelectedDatasets, false, "the plan is not runnable");
+});
+
+test("95. execution status follows the recorded unit counts, not the plan", () => {
+  const pending = [{ unitId: "a", status: "PENDING" }, { unitId: "b", status: "PENDING" }];
+  assertEqual(executionStatusFor([]), EXECUTION_STATUS.NO_UNITS_PLANNED, "no planned units");
+  assertEqual(executionStatusFor(pending), EXECUTION_STATUS.PLANNED, "nothing started yet");
+  assertEqual(
+    executionStatusFor([{ unitId: "a", status: "RUNNING" }, { unitId: "b", status: "PENDING" }]),
+    "RUNNING",
+    "a running unit is RUNNING, not PLANNED",
+  );
+  assertEqual(
+    executionStatusFor([{ unitId: "a", status: "COMPLETED" }, { unitId: "b", status: "PENDING" }]),
+    "PARTIAL_RUNNING",
+    "one completed unit with one pending is partial",
+  );
+  assertEqual(
+    executionStatusFor([{ unitId: "a", status: "COMPLETED" }, { unitId: "b", status: "COMPLETED" }]),
+    "COMPLETED",
+    "every unit completed",
+  );
+  assertEqual(
+    executionStatusFor([{ unitId: "a", status: "FAILED" }, { unitId: "b", status: "FAILED" }]),
+    "FAILED",
+    "every unit failed",
+  );
+
+  const counts = unitCounts([
+    { unitId: "a", status: "COMPLETED" },
+    { unitId: "b", status: "FAILED" },
+    { unitId: "c", status: "RUNNING" },
+    { unitId: "d", status: "PENDING" },
+    { unitId: "e", status: "SKIPPED" },
+  ]);
+  assertDeepEqual(
+    counts,
+    { plannedUnits: 5, executedUnits: 3, completedUnits: 1, failedUnits: 1, skippedUnits: 1, runningUnits: 1, pendingUnits: 1, unknownUnits: 0 },
+    "every unit status is counted exactly once",
+  );
+
+  // A plan against an id that already ran reports the RECORDED counts.
+  const resumed = buildPlanStatus({
+    selectedDatasetIds: ["ds-real-a", "ds-real-b", "ds-real-c"],
+    units: [
+      { unitId: "a", status: "PENDING" },
+      { unitId: "b", status: "PENDING" },
+      { unitId: "c", status: "PENDING" },
+      { unitId: "d", status: "PENDING" },
+    ],
+    recordedUnits: [
+      { unitId: "a", status: "COMPLETED" },
+      { unitId: "b", status: "COMPLETED" },
+      { unitId: "c", status: "FAILED" },
+    ],
+    completedCleanDatasets: 2,
+  });
+  assertEqual(resumed.executionStatus, "PARTIAL_RUNNING", "recorded unit statuses drive the execution status (a pending unit is still running)");
+  assertEqual(resumed.execution.completedUnits, 2, "two units are recorded completed");
+  assertEqual(resumed.execution.executedUnits, 3, "three terminal units are recorded");
+  assertEqual(resumed.executionStatus === EXECUTION_STATUS.PLANNED, false, "a resumed plan is not reported as un-started");
+  assertEqual(
+    executionStatusFor([
+      { unitId: "a", status: "COMPLETED" },
+      { unitId: "b", status: "FAILED" },
+    ]),
+    "PARTIAL_FAILED",
+    "a terminal mix of completed and failed units is partial-failed (the existing run vocabulary)",
+  );
+});
+
+test("96. the completed-run aggregation semantics are unchanged by the plan fix", async () => {
+  const registry = await buildFixtureRegistry();
+  const empty = aggregateReplication({ replicationId: "rep-plan-97", freezeDigest: null, units: [], registry, providers: ["mock", "deepseek"] });
+  // The summary shape is FROZEN: the plan fix adds a plan projection, it does
+  // not add, remove or rename a single summary field.
+  assertDeepEqual(
+    Object.keys(empty).sort(),
+    [
+      "cleanDatasets", "datasetAvailability", "datasetCoverage", "freezeDigest", "generatedAt", "limitations",
+      "metrics", "noTuningFromOutcomes", "note", "paperOnly", "perDataset", "phase", "providers", "regimeContext",
+      "replicationId", "replicationStatus", "schemaVersion", "significance", "statistics", "unitOfReplication", "verdict",
+    ],
+    "the aggregation output shape is unchanged",
+  );
+  assertDeepEqual(
+    Object.keys(empty.datasetCoverage).sort(),
+    [
+      "cleanCompletedDatasets", "completedUnits", "contaminated", "development", "duplicateFingerprints",
+      "eligibleReplication", "failedUnits", "invalid", "mixed", "pendingUnits", "real", "registryTotal", "selected",
+      "skippedUnits", "synthetic", "unknownLeakage",
+    ],
+    "the dataset coverage block is unchanged",
+  );
+  assertDeepEqual(
+    Object.keys(empty.datasetAvailability).sort(),
+    ["completedCleanDatasets", "eligibleCleanDatasets", "minimumForMultiDatasetClaim", "minimumRequiredToRun", "note", "status", "sufficient"],
+    "the completed-run availability block is unchanged",
+  );
+  // An EMPTY run is the case the availability block exists for: no eligible
+  // dataset has been selected AND nothing completed, so it is insufficient.
+  assertEqual(empty.datasetAvailability.status, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "an empty run stays insufficient");
+  assertEqual(empty.replicationStatus, "NO_REPLICATION_EVIDENCE", "and still reports no replication evidence");
+  assertEqual(empty.datasetAvailability.eligibleCleanDatasets, 3, "the fixture registry still holds its three eligible datasets");
+
+  // A COMPLETED run keeps its descriptive status, and the plan projection of the
+  // same selection never contradicts it.
+  const { summary } = await getSharedRun();
+  assertEqual(summary.datasetAvailability.status, "MULTI_DATASET_REPLICATION", "a three-dataset completed run stays multi-dataset");
+  assertEqual(summary.replicationStatus, "MULTI_DATASET_REPLICATION", "its descriptive status is unchanged");
+  assertEqual(summary.datasetAvailability.completedCleanDatasets, 3, "three datasets completed on both providers");
+});
+
+test("97. --plan reports PLANNED readiness from its datasets and runs zero Arena units", async () => {
+  await resetArenaSpawns();
+  const { out } = await seedFreeze("plan-readiness");
+  // ZERO-WRITE: the whole root (freeze + frozen cohorts + no artifacts) must be
+  // byte-identical after every plan invocation.
+  const before = await dirDigest(out);
+  const run = runCli({ actionArgs: ["--plan", "--json"], out });
+  assertEqual(run.status, 0, `--plan exits 0 (stderr: ${run.stderr})`);
+  const payload = JSON.parse(run.stdout);
+  assertEqual(payload.action, ACTION.PLAN, "the JSON names the plan action");
+  assertDeepEqual(payload.datasetIds, ["ds-real-a", "ds-real-b", "ds-real-c"], "the deterministic selection is reported");
+  assertEqual(payload.units.length, 6, "six units are planned");
+  assert(payload.units.every((unit) => unit.status === "PENDING"), "every planned unit is still PENDING");
+
+  // The regression: 3 eligible datasets + 0 executed units must be READY and
+  // PLANNED, never "insufficient independent datasets".
+  assertEqual(payload.replicationStatus, "PLANNED", "the plan is PLANNED");
+  assertEqual(payload.executionStatus, "PLANNED", "its execution status is PLANNED (zero units executed)");
+  assertEqual(payload.datasetReadiness, "MULTI_DATASET_REPLICATION", "readiness comes from the three selected datasets");
+  assertEqual(payload.selectedCleanDatasets, 3, "three clean datasets were selected");
+  assertEqual(payload.minimumRequired, 2, "the minimum-to-run is reported");
+  assertEqual(payload.multiDatasetThreshold, 3, "the multi-dataset threshold is reported");
+  assertEqual(payload.completedDatasets, 0, "zero completed datasets");
+  assertEqual(payload.evidenceStatus, "NO_REPLICATION_EVIDENCE", "zero completed datasets is no evidence, not insufficient data");
+  assertEqual(payload.unitsExecuted, 0, "the plan executed zero units");
+  assert(
+    !run.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
+    "the plan JSON never claims insufficient independent datasets",
+  );
+  assert(!run.stdout.includes("Capture additional REAL market history"), "no capture guidance is printed for a ready plan");
+
+  const text = runCli({ actionArgs: ["--plan"], out });
+  assertEqual(text.status, 0, `text --plan exits 0 (stderr: ${text.stderr})`);
+  assert(text.stdout.includes("Replication status: PLANNED"), "the text plan names PLANNED");
+  assert(text.stdout.includes("Dataset readiness: MULTI_DATASET_REPLICATION"), "the text plan names the readiness");
+  assert(text.stdout.includes("Evidence status: NO_REPLICATION_EVIDENCE"), "the text plan separates evidence from readiness");
+  assert(!text.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"), "the text plan never claims insufficient");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses for both plan invocations");
+  assertDeepEqual(await runArtifacts(out), [], "the plan wrote no replication artifacts");
+  assertEqual(await dirDigest(out), before, "--plan mutated NOTHING on disk (freeze and cohort manifests byte-identical)");
+});
+
+test("99. --plan never creates the frozen cohorts it needs; a missing cohort fails closed with zero writes", async () => {
+  await resetArenaSpawns();
+  const { out } = await seedFreeze("plan-no-cohorts");
+  // Remove the frozen cohorts: a read-only plan must NOT recreate them.
+  await rm(path.join(out, "cohorts"), { recursive: true, force: true });
+  const before = await dirDigest(out);
+  const run = runCli({ actionArgs: ["--plan", "--json"], out });
+  assertEqual(run.status, 1, "a plan without frozen cohorts fails closed");
+  assert(/no frozen cohort manifest/.test(run.stderr), `the failure names the missing cohorts (stderr: ${run.stderr.slice(0, 240)})`);
+  assertEqual(await dirDigest(out), before, "the failed plan created NOTHING (the cohorts were not silently re-frozen)");
+  assertEqual(await readFrozenCohort(out, "mock"), null, "no Mock cohort was created");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+});
+
+test("98. a genuinely short SELECTION still reports INSUFFICIENT (1 and 0 datasets)", async () => {
+  // Exactly one eligible CLEAN capture: below the unchanged minimum of two.
+  const oneRoot = await isolatedHistory("one-dataset", [
+    { id: "ds-only-real", startMs: BASE_MS, durationMinutes: 60, fingerprint: REAL_FINGERPRINT_A },
+  ]);
+  await resetArenaSpawns();
+  const one = await seedFreeze("plan-one-dataset");
+  const oneRun = runCli({ actionArgs: ["--plan", "--json"], out: one.out, env: { EVOLVE_HISTORY_ROOT: oneRoot } });
+  assertEqual(oneRun.status, 0, `--plan exits 0 (stderr: ${oneRun.stderr})`);
+  const onePayload = JSON.parse(oneRun.stdout);
+  assertDeepEqual(onePayload.datasetIds, ["ds-only-real"], "only the single eligible dataset is selected");
+  assertEqual(onePayload.units.length, 2, "one dataset x two providers is planned");
+  assertEqual(onePayload.selectedCleanDatasets, 1, "one clean dataset was selected");
+  assertEqual(onePayload.datasetReadiness, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "one selected dataset is insufficient");
+  assertEqual(onePayload.evidenceStatus, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "and so is the evidence");
+  assertEqual(onePayload.sufficientSelectedDatasets, false, "the selection is below the required minimum");
+  assertEqual(onePayload.completedDatasets, 0, "nothing has completed");
+
+  const oneText = runCli({ actionArgs: ["--plan"], out: one.out, env: { EVOLVE_HISTORY_ROOT: oneRoot } });
+  assert(oneText.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"), "the shortfall is still reported");
+  assert(
+    oneText.stdout.includes("SELECTED for this command: 1"),
+    "the guidance counts THIS command's selection, not the whole registry",
+  );
+  assert(oneText.stdout.includes(CAPTURE_COMMANDS[0]), "the capture guidance is still actionable");
+  assertEqual((await arenaSpawns()).length, 0, "no Arena subprocess for a short selection");
+
+  // Zero eligible captures: only a synthetic dataset, which never counts as real.
+  const noneRoot = await isolatedHistory("no-dataset", [
+    { id: "ds-only-synthetic", startMs: BASE_MS, durationMinutes: 60, containsSynthetic: true, usableForRealMarketReplay: false, fingerprint: "1".repeat(64) },
+  ]);
+  const none = await seedFreeze("plan-no-dataset");
+  const noneRun = runCli({ actionArgs: ["--plan", "--json"], out: none.out, env: { EVOLVE_HISTORY_ROOT: noneRoot } });
+  assertEqual(noneRun.status, 0, `--plan exits 0 (stderr: ${noneRun.stderr})`);
+  const nonePayload = JSON.parse(noneRun.stdout);
+  assertDeepEqual(nonePayload.datasetIds, [], "no dataset is selected");
+  assertEqual(nonePayload.units.length, 0, "no unit is planned");
+  assertEqual(nonePayload.selectedCleanDatasets, 0, "zero clean datasets were selected");
+  assertEqual(nonePayload.datasetReadiness, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "zero selected datasets is insufficient");
+  assertEqual(nonePayload.evidenceStatus, "INSUFFICIENT_INDEPENDENT_REAL_DATASETS", "and so is the evidence");
+  assertEqual(nonePayload.executionStatus, EXECUTION_STATUS.NO_UNITS_PLANNED, "an empty plan plans no units");
+  assertEqual((await arenaSpawns()).length, 0, "no Arena subprocess for an empty selection");
 });
 
 /* ============================================================================

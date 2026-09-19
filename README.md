@@ -81,7 +81,7 @@ npm run validate:phase5b # Phase 5B DeepSeek-provider checks (offline, stub Clin
 npm run validate:phase5c # Phase 5C multi-dataset replication checks (offline)
 npm run validate:phase5c2# Phase 5C.2 replication-wave checks (offline)
 npm run datasets:research # Phase 5C dataset registry (classification, overlap, eligibility)
-npm run replicate:research -- --cohorts  # freeze/inspect the frozen research cohorts
+npm run replicate:research -- --cohorts  # inspect the frozen research cohorts (read-only)
 npm run replicate:research -- --wave wave-2 --plan  # predeclared wave plan (zero Arena)
 npm run smoke:engine     # deterministic synthetic-mode evolution smoke run
 npm run smoke:replay     # offline record → replay → walk-forward smoke run
@@ -1638,7 +1638,7 @@ silent pick, and `--rerun`/`--dev` only apply to the normal replication run.
 ```bash
 npm run replicate:research -- --write-freeze       # write/update the freeze, print its digest, and STOP
 npm run replicate:research -- --verify-freeze      # verify only: FAIL on critical config drift
-npm run replicate:research -- --cohorts            # freeze/print the frozen cohort manifests (inspect only)
+npm run replicate:research -- --cohorts            # print the frozen cohort manifests (read-only; nothing is created or rewritten)
 npm run replicate:research -- --plan               # deterministic plan, no Arena is run
 npm run replicate:research -- --summary            # cross-dataset summary, read from existing artifacts
 npm run replicate:research -- --freeze phase5c --datasets auto
@@ -1649,6 +1649,15 @@ npm run replicate:research -- --datasets session-A,session-B
 discovered, no plan is built, no Arena subprocess is started, and zero replication units execute. Only
 the normal run (no action flag) may plan or execute replication, and it requires a freeze artifact to
 already exist — a run can never certify itself against a freeze it just created.
+
+Every command is **read-only with respect to the frozen cohorts**. `--plan`, `--summary`,
+`--meta-summary`, `--verify-freeze`, `--cohorts` and the normal run all load the immutable frozen
+cohorts through a non-mutating loader (`loadFrozenCohorts`) and never create or rewrite a
+`cohort-manifest.json`; a missing cohort fails closed instead of being silently created. The
+`freezeDigest` recorded in a cohort manifest is a creation-time provenance back-reference, not a
+per-wave mutable slot, so a wave that only *references* the frozen Mock/DeepSeek cohorts leaves their
+manifests byte-identical. Only the explicit freeze-creation lifecycle (`--write-freeze`,
+`--write-freeze --wave <id>`) writes freeze/cohort bindings.
 
 For each eligible dataset the runner executes the same strict species-matched A/B experiment twice —
 once with the frozen Mock cohort, once with the frozen DeepSeek cohort — each against its own freshly
@@ -1682,13 +1691,13 @@ context from the existing classifier; no threshold is fitted.
 
 Replication status vocabulary (descriptive, not a rating):
 
-| CLEAN datasets | Status |
+| CLEAN datasets with both providers COMPLETED | Status |
 | --- | --- |
 | 0 | `NO_REPLICATION_EVIDENCE` |
 | 1 | `SINGLE_REPLICATION` |
 | 2 | `LIMITED_REPLICATION` |
 | 3+ | `MULTI_DATASET_REPLICATION` |
-| fewer than 2 clean datasets exist | `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` |
+| fewer than 2 eligible CLEAN datasets SELECTED | `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` |
 
 ### Minimum-dataset policy
 
@@ -1705,6 +1714,28 @@ EVOLVE_MARKET_MODE=live npm run record:market -- --minutes 60 --interval 5000
 Capture separate sessions at different times and regimes, let each run finalize (`complete`, with a
 fingerprint), and do not change capture behavior, endpoints, or filters to influence how a strategy
 scores. Observation remains strictly read-only.
+
+### Readiness, execution and evidence
+
+Three different questions used to be answered by one field, which made `--plan` contradict itself:
+a plan executes **zero** units, so a completed-units-derived status could only ever say
+`INSUFFICIENT_INDEPENDENT_REAL_DATASETS` — even for a plan that had selected three eligible CLEAN
+datasets and printed "Clean independent real replication datasets available: 3". Plan reporting now
+keeps the three questions separate, and no gate is weakened by it:
+
+| Statement | Derived from | Values |
+| --- | --- | --- |
+| `datasetReadiness` | the **SELECTED** eligible `CLEAN_REPLICATION` datasets | `MULTI_DATASET_REPLICATION` (3+), `LIMITED_REPLICATION` (2), else `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` |
+| `executionStatus` | the planned units' own recorded statuses | `PLANNED` while every unit is still `PENDING`, then `RUNNING` / `PARTIAL_RUNNING` / `COMPLETED` / `PARTIAL_FAILED` / `FAILED` / `SKIPPED` |
+| `evidenceStatus` | datasets with **both providers COMPLETED** | `NO_REPLICATION_EVIDENCE`, `SINGLE_REPLICATION`, `LIMITED_REPLICATION`, `MULTI_DATASET_REPLICATION` — or `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` when the SELECTION itself was short |
+
+So a plan with three eligible datasets, six planned units and zero executed units reports
+`replicationStatus: PLANNED`, `datasetReadiness: MULTI_DATASET_REPLICATION`, `executionStatus: PLANNED`,
+`evidenceStatus: NO_REPLICATION_EVIDENCE` and `completedDatasets: 0` — never "insufficient independent
+datasets". `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` still means exactly one thing everywhere: not enough
+ELIGIBLE independent datasets were selected/available (0 or 1 clean dataset), which is also when the
+capture guidance is printed. A completed run keeps reporting exactly what it reported before — the plan
+projection is additive reporting, never a replacement for the summary.
 
 ### Commands
 
@@ -2399,6 +2430,13 @@ Phase 5C adds `npm run validate:phase5c` (89 offline cases):
   medians/means/quantiles, a deterministic dataset-level bootstrap, leave-one-out sensitivity (disabled
   below three datasets), read-only regime context, `significance: null`, `verdict: null`, the status
   vocabulary, and the `INSUFFICIENT_INDEPENDENT_REAL_DATASETS` message
+- **Plan status semantics** — a plan derives READINESS from its SELECTED eligible CLEAN datasets,
+  EXECUTION from the units' own recorded statuses, and EVIDENCE from datasets with both providers
+  complete: three datasets × two providers with zero executed units is `PLANNED` +
+  `MULTI_DATASET_REPLICATION` and never `INSUFFICIENT_INDEPENDENT_REAL_DATASETS`, a 0/1-dataset selection
+  still reports insufficient with the capture guidance (counting THIS command's selection), the plan
+  writes nothing and spawns no Arena, and the completed-run aggregation/status vocabulary is frozen
+  byte-for-byte
 - **Integrity & safety** — the canonical Phase 5B arenas and the DeepSeek research experiment stay
   byte-identical, `compare:research` still declares no winner, the Phase 5B and strict A/B invariants
   still hold, no Phase 5C module contains a wallet/signing/execution path, and replication shells out

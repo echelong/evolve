@@ -32,16 +32,24 @@ export const CAPTURE_RULES = Object.freeze([
 
 /**
  * @param {object|null} registry a Phase 5C replication registry (optional)
+ * @param {{
+ *   selection?: { datasetIds?: string[], datasets?: object[] }|null,
+ * }} [options] the CURRENT command's selection, when it has one. A wave-scoped
+ *   command's shortfall is about the datasets ITS plan selected, not about the
+ *   registry as a whole, so the count must never be borrowed from the registry.
  */
-export function formatCaptureGuidance(registry = null) {
+export function formatCaptureGuidance(registry = null, { selection = null } = {}) {
   const out = [];
   const selected = registry?.selectedIds ?? [];
   const counts = registry?.counts ?? {};
+  const commandSelection = selection ? selection.datasetIds ?? selection.datasets ?? [] : null;
   out.push("-".repeat(72));
   out.push("PHASE 5C — INSUFFICIENT_INDEPENDENT_REAL_DATASETS");
   out.push("-".repeat(72));
   out.push(
-    `Clean independent real replication datasets available: ${selected.length} (need at least ${MIN_CLEAN_TO_RUN} to run; 3+ to describe multi-dataset replication).`,
+    commandSelection
+      ? `Clean independent real replication datasets SELECTED for this command: ${commandSelection.length} (need at least ${MIN_CLEAN_TO_RUN} to run; 3+ to describe multi-dataset replication).`
+      : `Clean independent real replication datasets available: ${selected.length} (need at least ${MIN_CLEAN_TO_RUN} to run; 3+ to describe multi-dataset replication).`,
   );
   if (registry) {
     out.push(

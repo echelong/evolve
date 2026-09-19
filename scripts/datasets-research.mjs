@@ -18,7 +18,7 @@ import path from "node:path";
 
 import { parseArgs } from "./lib/args.mjs";
 import { REPLICATION_DIR } from "./replication/constants.mjs";
-import { freezeCohorts } from "./replication/cohorts.mjs";
+import { loadFrozenCohorts } from "./replication/cohorts.mjs";
 import { readFreeze } from "./replication/freeze.mjs";
 import {
   buildReplicationRegistry,
@@ -55,7 +55,9 @@ async function main() {
 
   const baseDir = path.resolve(process.env.EVOLVE_REPLICATION_DIR ?? REPLICATION_DIR);
   const freeze = await readFreeze({ root: baseDir });
-  const cohorts = await freezeCohorts({ baseDir, freezeDigest: freeze?.freezeDigest ?? null, keys: ["mock", "deepseek"] });
+  // READ-ONLY: this report never creates or refreshes a frozen cohort. The
+  // frozen cohorts are immutable evidence, loaded (not written) here.
+  const { manifests: cohorts } = await loadFrozenCohorts({ baseDir, keys: ["mock", "deepseek"] });
   const historyRoot = process.env.EVOLVE_HISTORY_ROOT ?? path.join(".evolve", "history");
   const arenasDir = process.env.EVOLVE_ARENAS_DIR ?? path.join(".evolve", "arenas");
 

@@ -30,7 +30,8 @@
  *                    and STOP. No cohort work, no dataset discovery, no plan,
  *                    no Arena subprocess, no replication unit.
  *   --verify-freeze  verify the stored freeze against the live code (read-only).
- *   --cohorts        inspect the frozen research cohorts (read-only once frozen).
+ *   --cohorts        inspect the frozen research cohorts (READ-ONLY: it never
+ *                    creates or rewrites a frozen cohort artifact).
  *   --plan           discover/select datasets and print the deterministic plan.
  *   --summary        print the summary of existing artifacts (read-only).
  *   (no action flag) NORMAL RUN — the ONLY mode that may execute replication
@@ -85,7 +86,7 @@ import {
   compareEvaluationContracts,
   evaluationContractDigest,
 } from "./replication/contract.mjs";
-import { cohortDirFor, freezeCohorts, inspectCohort, readFrozenCohort } from "./replication/cohorts.mjs";
+import { cohortDirFor, inspectCohort, loadFrozenCohorts, readFrozenCohort } from "./replication/cohorts.mjs";
 import {
   buildReplicationRegistry,
   collectArenaDatasetUsage,
@@ -113,11 +114,13 @@ import {
   WAVE_STATUS,
 } from "./replication/waves.mjs";
 import { formatMetaSummary, loadMetaSummary } from "./replication/meta-summary.mjs";
+import { buildPlanStatus, datasetReadinessFor } from "./replication/plan-status.mjs";
 import {
   buildStatusArtifact,
   formatCohortInspection,
   formatDatasetRegistry,
   formatFreezeVerification,
+  formatPlanStatus,
   formatReplicationSummary,
   formatWaveHeader,
 } from "./replication/report.mjs";
@@ -147,7 +150,7 @@ function usage() {
     "  npm run replicate:research -- --write-freeze --wave wave-2   write ONLY that wave's own canonical freeze, bind its manifest, and STOP",
     "  npm run replicate:research -- --verify-freeze    verify the stored freeze against the live code (read-only)",
     "  npm run replicate:research -- --verify-freeze --wave wave-2  verify THAT wave's own freeze (read-only)",
-    "  npm run replicate:research -- --cohorts          inspect the frozen research cohorts",
+    "  npm run replicate:research -- --cohorts          inspect the frozen research cohorts (read-only)",
     "  npm run replicate:research -- --plan             discover datasets, print the deterministic plan (no execution)",
     "  npm run replicate:research -- --summary          print the summary of existing artifacts (read-only)",
     "  npm run replicate:research -- --meta-summary     read-only cross-wave meta-summary (no execution, NOT cross-validation)",
@@ -224,16 +227,15 @@ async function requireFreeze({ baseDir, freezeVersion, action }) {
   return freeze;
 }
 
-/** Freeze (idempotently) or load the frozen research cohorts. */
-async function loadCohorts({ baseDir, freezeDigest }) {
-  return freezeCohorts({ baseDir, freezeDigest, keys: [...FROZEN_COHORT_KEYS] });
-}
-
-/** READ-ONLY cohort load: never creates and never refreshes a cohort artifact. */
-async function readCohorts(baseDir) {
-  const manifests = {};
-  for (const key of FROZEN_COHORT_KEYS) manifests[key] = await readFrozenCohort(baseDir, key);
-  return manifests;
+/**
+ * READ-ONLY frozen-cohort load, shared by EVERY command (including the normal
+ * run). None of them can create or rewrite a frozen cohort: a frozen cohort is
+ * immutable evidence, and a wave that only REFERENCES the frozen Mock/DeepSeek
+ * cohorts never rewrites their manifests. Returns the manifests that exist plus
+ * the missing keys, so the caller fails closed with an explicit reason.
+ */
+async function loadCohorts(baseDir) {
+  return loadFrozenCohorts({ baseDir, keys: [...FROZEN_COHORT_KEYS] });
 }
 
 function cohortDigestsOf(cohorts) {
@@ -323,7 +325,7 @@ async function loadWaveFreeze({ baseDir, waveId, manifest, freezeVersion }) {
  * Phase 5C.3: for a wave-scoped command the freeze is the WAVE'S OWN artifact
  * (loaded fail-closed above), never the historical root freeze.
  */
-async function resolveContext({ baseDir, freezeVersion, providers, action, ensureCohorts = true, waveId = null }) {
+async function resolveContext({ baseDir, freezeVersion, providers, action, waveId = null }) {
   const waveManifest = waveId ? await readWaveManifest(baseDir, waveId) : null;
   if (waveId && !waveManifest) {
     fail(
@@ -338,19 +340,17 @@ async function resolveContext({ baseDir, freezeVersion, providers, action, ensur
     : await requireFreeze({ baseDir, freezeVersion, action });
   if (!freeze) return null;
 
-  const cohorts = ensureCohorts
-    ? await loadCohorts({ baseDir, freezeDigest: freeze.freezeDigest })
-    : await readCohorts(baseDir);
-
-  if (!ensureCohorts) {
-    const missing = FROZEN_COHORT_KEYS.filter((key) => !cohorts[key]);
-    if (missing.length > 0) {
-      fail(
-        `no frozen cohort manifest for ${missing.join(", ")} under ${path.join(baseDir, "cohorts")} — ` +
-          `--${action} only reads existing artifacts; run \`--cohorts\` first.`,
-      );
-      return null;
-    }
+  // READ-ONLY. A frozen cohort is immutable evidence, so no command — not even
+  // the normal run — may create or refresh one here. Missing cohorts fail closed
+  // rather than being silently created by a read-only command.
+  const { manifests: cohorts, missing } = await loadCohorts(baseDir);
+  if (missing.length > 0) {
+    fail(
+      `no frozen cohort manifest for ${missing.join(", ")} under ${path.join(baseDir, "cohorts")} — ` +
+        `--${action} only READS the immutable frozen cohorts; they are created once by the explicit freeze-creation lifecycle ` +
+        `(\`freezeCohorts\`), never by a plan/summary/run.`,
+    );
+    return null;
   }
 
   const cohortDigests = cohortDigestsOf(cohorts);
@@ -589,7 +589,7 @@ async function writeWaveFreezeOnly({ args, baseDir, freezeVersion, waveId }) {
     if (!frozen || frozen.cohortDigest !== pinned) {
       fail(
         `the frozen ${key} cohort does not match the wave pin (${frozen?.cohortDigest ?? "none"} vs ${pinned ?? "none"}) — ` +
-          "freeze the cohorts first (`--cohorts`); a per-wave freeze never rewrites them. Nothing was written.",
+          "the frozen cohorts are created once by the explicit freeze-creation lifecycle and are never rewritten by a per-wave freeze. Nothing was written.",
       );
       return;
     }
@@ -739,7 +739,11 @@ async function verifyWaveFreezeOnly({ args, baseDir, waveId }) {
   return;
 }
 
-/** `--cohorts`: inspect the frozen cohorts. Never plans or executes a unit. */
+/**
+ * `--cohorts`: inspect the frozen cohorts. READ-ONLY: it loads the immutable
+ * frozen cohorts and never creates or rewrites one, never plans a unit and
+ * never executes a unit.
+ */
 async function cohortsOnly({ args, baseDir, freezeVersion, providers }) {
   const context = await resolveContext({ baseDir, freezeVersion, providers, action: ACTION.COHORTS });
   if (!context) return;
@@ -779,7 +783,20 @@ async function planOnly({ args, baseDir, freezeVersion, providers, waveId }) {
     datasets: selection.datasets,
     providers,
   });
-  const { summary } = await summarizeExisting({ baseDir, context, registry, providers });
+  const { existingManifest, summary } = await summarizeExisting({ baseDir, context, registry, providers });
+
+  // Phase 5C: `--plan` executes NOTHING, so its status comes from the datasets
+  // this command SELECTED (readiness) and from the units already RECORDED for
+  // this replication id (execution). The number of completed clean datasets is
+  // reported as EVIDENCE — never as readiness — so a three-dataset plan can no
+  // longer be reported as "insufficient independent datasets" just because no
+  // unit has run yet.
+  const status = buildPlanStatus({
+    selectedDatasetIds: selection.datasetIds,
+    units: plan.units,
+    recordedUnits: existingManifest?.units ?? [],
+    completedCleanDatasets: summary.datasetCoverage?.cleanCompletedDatasets ?? 0,
+  });
 
   if (args.json === true) {
     printJson({
@@ -790,7 +807,7 @@ async function planOnly({ args, baseDir, freezeVersion, providers, waveId }) {
       waveValidation: wave ? wave.validation.checks : null,
       datasetIds: selection.datasetIds,
       units: plan.units,
-      datasetAvailability: summary.datasetAvailability,
+      ...status,
       unitsExecuted: 0,
     });
   } else {
@@ -803,13 +820,14 @@ async function planOnly({ args, baseDir, freezeVersion, providers, waveId }) {
     console.log(`Planned replication ${context.replicationId} — ${plan.units.length} unit(s):`);
     for (const unit of plan.units) console.log(`  ${unit.unitId}  ${unit.provider.padEnd(9)} ${unit.datasetId}`);
     console.log("");
-    console.log(`Replication status: ${summary.datasetAvailability.status}`);
-    console.log(`  ${summary.datasetAvailability.note}`);
+    console.log(formatPlanStatus(status, { waveId: wave?.manifest?.waveId ?? null }));
     console.log("");
     console.log("[replicate:research] plan only — no Arena subprocess was started and no unit was executed.");
-    if (summary.datasetAvailability.status === "INSUFFICIENT_INDEPENDENT_REAL_DATASETS") {
+    // The guidance is about a genuinely short SELECTION, not about a plan that
+    // has simply not executed yet.
+    if (status.sufficientSelectedDatasets !== true) {
       console.log("");
-      console.log(formatCaptureGuidance(registry));
+      console.log(formatCaptureGuidance(registry, { selection }));
     }
   }
   return;
@@ -822,7 +840,6 @@ async function summaryOnly({ args, baseDir, freezeVersion, providers, waveId }) 
     freezeVersion,
     providers,
     action: ACTION.SUMMARY,
-    ensureCohorts: false,
     waveId,
   });
   if (!context) return;
@@ -939,16 +956,26 @@ async function runReplicationCommand({ args, baseDir, freezeVersion, providers, 
 
   const plan = planReplication({ freeze, cohorts, datasets: selection.datasets, providers });
 
-  // Not enough independent evidence: report instead of executing anything.
+  // Not enough ELIGIBLE datasets selected: report instead of executing anything.
+  // The refusal is a READINESS statement (the selection is short), so it is
+  // derived from the selection — never from "zero units have completed yet".
   if (noEligible || selection.datasets.length < MIN_CLEAN_TO_RUN) {
     const { summary } = await summarizeExisting({ baseDir, context, registry, providers });
+    const readiness = datasetReadinessFor({ selectedCleanDatasets: selection.datasets.length });
     if (args.json === true) {
-      printJson({ ...summary, action: ACTION.RUN, ran: false, unitsExecuted: 0 });
+      printJson({
+        ...summary,
+        action: ACTION.RUN,
+        ran: false,
+        datasetReadiness: readiness.status,
+        sufficientSelectedDatasets: readiness.sufficient,
+        unitsExecuted: 0,
+      });
     } else {
       console.log(formatReplicationSummary(summary));
-      if (summary.datasetAvailability.status === "INSUFFICIENT_INDEPENDENT_REAL_DATASETS") {
+      if (readiness.sufficient !== true) {
         console.log("");
-        console.log(formatCaptureGuidance(registry));
+        console.log(formatCaptureGuidance(registry, { selection }));
       }
     }
     console.log("");

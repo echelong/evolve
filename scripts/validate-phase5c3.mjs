@@ -46,11 +46,18 @@ import {
   evaluationContractSubject,
 } from "./replication/contract.mjs";
 import { freezeCohorts, readFrozenCohort } from "./replication/cohorts.mjs";
+import {
+  buildReplicationRegistry,
+  collectArenaDatasetUsage,
+  discoverDatasetRecords,
+} from "./replication/datasets.mjs";
 import { evaluationKey, waveReplicationIdFor } from "./replication/identity.mjs";
+import { buildPlanStatus } from "./replication/plan-status.mjs";
 import { planReplication } from "./replication/runner.mjs";
 import { ACTION } from "./replication/mode.mjs";
 import {
   CANONICAL_EVALUATION_CONTRACT_DIGEST,
+  WAVE_1_DATASET_FINGERPRINTS,
   WAVE_1_DATASET_IDS,
   describeWaveManifest,
   WAVE_2_DATASET_FINGERPRINTS,
@@ -64,8 +71,10 @@ import {
   resolveWaveFreezePath,
   waveDefinitionFor,
   waveDefinitionMatch,
+  validateWaveManifest,
   waveFreezeBound,
   waveManifestDigest,
+  waveMembership,
   writeWaveManifest,
 } from "./replication/waves.mjs";
 import { loadMetaSummary, readRunCanonicality } from "./replication/meta-summary.mjs";
@@ -389,7 +398,11 @@ async function importGraph(entry) {
 test("1. the Wave 1 freeze is byte-identical, its full digest is unchanged, and the commit stays inside the digested subject", async () => {
   const now = await realSnapshot();
   assertEqual(now.freeze, realBaseline.freeze, "phase5c-freeze.json did not change while the suite ran");
-  assertEqual(now.wave2FreezePresent, null, "no real Wave 2 freeze was created in this session");
+  // LIFECYCLE-AWARE: Wave 2 may legitimately be unbound (no per-wave freeze yet)
+  // or bound (a legitimate `--write-freeze --wave wave-2` already ran). Either
+  // state is valid; what must hold is that THIS suite neither created nor
+  // modified that artifact, whatever state it was in at suite start.
+  assertEqual(now.wave2FreezePresent, realBaseline.wave2FreezePresent, "the Wave 2 freeze was not created or modified by this suite");
 
   const freeze = await readFreeze({ root: REAL_BASE });
   assert(freeze, "the historical freeze artifact exists");
@@ -714,18 +727,56 @@ test("13. the Wave 2 definition pins exactly the three captures, their fingerpri
   assertEqual(definition.jevInvolved, false, "no Jev participation");
 });
 
-test("14. the stored Wave 2 manifest is unbound, pins its own freeze path and is comparable by construction", async () => {
+test("14. the stored Wave 2 manifest is in a valid lifecycle state, pins its own freeze path and is comparable by construction", async () => {
   const stored = await readWaveManifest(REAL_BASE, "wave-2");
   assert(stored, "the stored manifest exists");
-  assertEqual(stored.manifestDigest, buildWaveManifest(WAVE_DEFINITIONS[1], { createdAt: CLOCK }).manifestDigest, "it matches the predeclared definition");
-  assertEqual(stored.freezeDigest, null, "its freeze digest is unbound (never borrowed from Wave 1)");
-  assertEqual(stored.replicationId, null, "its replication id is provisional until the freeze is bound");
+  const definition = WAVE_DEFINITIONS[1];
+  // Whatever its lifecycle state, the manifest must be self-consistent and
+  // still match the predeclared definition.
+  assertEqual(waveManifestDigest(stored), stored.manifestDigest, "the stored manifest digest matches its own definition");
+  assertEqual(waveDefinitionMatch({ manifest: stored, definition }).ok, true, "it still matches the predeclared definition");
   assertEqual(stored.evaluationContractDigest, CANONICAL_EVALUATION_CONTRACT_DIGEST, "its contract pin equals Wave 1's contract");
-  assertEqual(waveFreezeBound(stored), false, "the wave is reported as unbound");
   assertEqual(isSafeFreezePath(stored.freezePath), true, "the freeze path is safe");
   assertEqual(resolveWaveFreezePath(REAL_BASE, stored.freezePath), path.join(REAL_BASE, "freezes", "wave-2.json"), "it resolves under the replication root");
   assertEqual(isSafeFreezePath("../outside.json"), false, "a path escape is rejected");
   assertEqual(isSafeFreezePath("/etc/passwd"), false, "an absolute path is rejected");
+
+  // Half-bound (a freeze digest with no replication id, or the reverse) is a
+  // corrupt state and is rejected; the two slots move together.
+  const hasDigest = typeof stored.freezeDigest === "string" && stored.freezeDigest.length > 0;
+  const hasId = typeof stored.replicationId === "string" && stored.replicationId.length > 0;
+  assertEqual(hasDigest, hasId, "the freeze digest and replication id are present together or absent together (never half-bound)");
+  assertEqual(waveFreezeBound(stored), hasDigest && isSafeFreezePath(stored.freezePath), "waveFreezeBound agrees with the stored slots");
+
+  if (!hasDigest) {
+    // UNBOUND: valid before its own freeze exists.
+    assertEqual(stored.freezeDigest, null, "an UNBOUND manifest borrows no freeze digest");
+    assertEqual(stored.replicationId, null, "an UNBOUND manifest is provisional");
+    assertEqual(stored.manifestDigest, buildWaveManifest(definition, { createdAt: CLOCK }).manifestDigest, "an UNBOUND manifest equals the predeclared skeleton");
+    return;
+  }
+
+  // BOUND: the referenced freeze must exist and agree with every pin.
+  const freeze = await readFreeze({ root: REAL_BASE, file: stored.freezePath });
+  assert(freeze, "the referenced per-wave freeze exists");
+  assertEqual(freeze.freezeDigest, stored.freezeDigest, "the stored freeze digest equals the manifest pin");
+  assertEqual(evaluationContractDigest(freeze), stored.evaluationContractDigest, "the freeze's contract equals the manifest pin");
+  const cohorts = {
+    mock: await readFrozenCohort(REAL_BASE, "mock"),
+    deepseek: await readFrozenCohort(REAL_BASE, "deepseek"),
+  };
+  assertEqual(
+    stored.replicationId,
+    waveReplicationIdFor({
+      freezeDigest: freeze.freezeDigest,
+      cohortDigests: { mock: cohorts.mock.cohortDigest, deepseek: cohorts.deepseek.cohortDigest },
+      providers: ["mock", "deepseek"],
+      evaluation: evaluationKey(freeze),
+      waveId: stored.waveId,
+      manifestDigest: stored.manifestDigest,
+    }),
+    "a BOUND replication id is deterministically derived from the bound manifest + freeze",
+  );
 });
 
 test("15. a bound wave manifest is a different definition with a deterministic replication id", async () => {
@@ -1180,6 +1231,269 @@ test("30. the real artifacts and the Wave 2 captures are untouched by the whole 
     await fileDigest(path.join("scripts", "intelligence", ".phase5c3-import-probe.mjs")),
     null,
     "the temporary import-graph probe was removed",
+  );
+});
+
+/* ============================================================================
+ * 31-33: PLAN/STATUS SEMANTICS against the REAL canonical Wave 2 artifacts
+ *
+ * Regression: PLAN mode used to derive replication readiness/status from
+ * COMPLETED UNIT RESULTS. `--plan` executes zero units, so the canonical Wave 2
+ * plan reported INSUFFICIENT_INDEPENDENT_REAL_DATASETS ("only 0 CLEAN
+ * independent real dataset(s) completed") while the same command printed that
+ * three eligible Wave 2 captures were selected. Readiness must come from the
+ * SELECTED eligible CLEAN datasets; execution from the recorded unit counts;
+ * evidence from completed dataset pairs.
+ *
+ * READ-ONLY: these cases read the real manifests/history metadata and write
+ * nothing (no freeze, no cohort genome, no run artifact, no Arena).
+ * ==========================================================================*/
+
+async function realWave2PlanStatus() {
+  const manifest = await readWaveManifest(REAL_BASE, "wave-2");
+  const freeze = await readFreeze({ root: REAL_BASE, file: manifest.freezePath });
+  const cohorts = {
+    mock: await readFrozenCohort(REAL_BASE, "mock"),
+    deepseek: await readFrozenCohort(REAL_BASE, "deepseek"),
+  };
+  const [records, arenaUsage] = await Promise.all([
+    discoverDatasetRecords(path.join(".evolve", "history")),
+    collectArenaDatasetUsage(path.join(".evolve", "arenas")),
+  ]);
+  const registry = buildReplicationRegistry({ records, cohorts, arenaUsage });
+  const membership = waveMembership({ manifest, registry });
+  const plan = planReplication({
+    freeze: { ...freeze, replicationId: manifest.replicationId, cohortDigests: manifest.cohortDigests },
+    cohorts,
+    datasets: membership.datasets,
+    providers: ["mock", "deepseek"],
+  });
+  return { manifest, freeze, cohorts, registry, membership, plan };
+}
+
+test("31. the canonical Wave 2 plan is readiness-derived: 3 selected datasets, 6 units, PLANNED", async () => {
+  const { manifest, membership, registry, plan } = await realWave2PlanStatus();
+  assert(manifest, "the stored Wave 2 manifest exists");
+  assertEqual(manifest.datasetIds.length, 3, "Wave 2 declares exactly three datasets");
+  assertDeepEqual([...membership.datasetIds].sort(), [...WAVE_2_DATASET_IDS].sort(), "membership resolves to exactly the three Wave 2 captures");
+  assertDeepEqual(membership.unknown, [], "every declared dataset exists");
+  assertDeepEqual(membership.mismatched, [], "every pinned fingerprint still matches the capture");
+  for (const datasetId of WAVE_2_DATASET_IDS) {
+    assertEqual(registry.roles[datasetId], "REPLICATION", `${datasetId} is an eligible REPLICATION dataset`);
+    assertEqual(registry.eligibility[datasetId].eligible, true, `${datasetId} is eligible`);
+    assertEqual(registry.leakage[datasetId].overall, "CLEAN_REPLICATION", `${datasetId} is CLEAN_REPLICATION`);
+  }
+
+  assertEqual(plan.units.length, 6, "three datasets x two providers = six units");
+  assertEqual(plan.units.filter((unit) => unit.provider === "mock").length, 3, "three mock units");
+  assertEqual(plan.units.filter((unit) => unit.provider === "deepseek").length, 3, "three DeepSeek units");
+  for (const datasetId of WAVE_1_DATASET_IDS) {
+    assertEqual(plan.units.filter((unit) => unit.datasetId === datasetId).length, 0, `no Wave 1 unit for ${datasetId}`);
+  }
+
+  // The regression itself: readiness is the SELECTION (3), completed datasets
+  // are EVIDENCE (0 before execution), and the plan is PLANNED — never
+  // INSUFFICIENT_INDEPENDENT_REAL_DATASETS.
+  const status = buildPlanStatus({
+    selectedDatasetIds: membership.datasetIds,
+    units: plan.units,
+    recordedUnits: [],
+    completedCleanDatasets: 0,
+  });
+  assertEqual(status.replicationStatus, "PLANNED", "the canonical Wave 2 plan is PLANNED");
+  assertEqual(status.executionStatus, "PLANNED", "zero units have started");
+  assertEqual(status.datasetReadiness, "MULTI_DATASET_REPLICATION", "three selected datasets are multi-dataset ready");
+  assertEqual(status.selectedCleanDatasets, 3, "selectedCleanDatasets is 3");
+  assertEqual(status.minimumRequired, 2, "minimumRequired is 2");
+  assertEqual(status.multiDatasetThreshold, 3, "multiDatasetThreshold is 3");
+  assertEqual(status.completedDatasets, 0, "completedDatasets is 0");
+  assertEqual(status.evidenceStatus, "NO_REPLICATION_EVIDENCE", "zero completed datasets is NO evidence, not insufficient data");
+  assertEqual(status.execution.plannedUnits, 6, "six units are planned");
+  assertEqual(status.execution.executedUnits, 0, "zero units are executed");
+  assert(
+    !canonicalJson(status).includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
+    "the canonical Wave 2 plan must never claim insufficient independent datasets",
+  );
+});
+
+test("32. the plan/status fix leaves the contract, Wave 1 and the Wave 2 datasets untouched", async () => {
+  const wave1Freeze = await readFreeze({ root: REAL_BASE });
+  assertEqual(wave1Freeze.freezeDigest, CANONICAL_FREEZE_DIGEST, "the Wave 1 full freeze digest is unchanged");
+  assertEqual(evaluationContractDigest(wave1Freeze), CANONICAL_EVALUATION_CONTRACT_DIGEST, "the evaluation contract digest is unchanged");
+
+  const stored = await readWaveManifest(REAL_BASE, "wave-2");
+  const wave2Freeze = await readFreeze({ root: REAL_BASE, file: stored.freezePath });
+  assertEqual(evaluationContractDigest(wave2Freeze), CANONICAL_EVALUATION_CONTRACT_DIGEST, "Wave 2's own freeze carries the SAME contract");
+  assertEqual(stored.evaluationContractDigest, CANONICAL_EVALUATION_CONTRACT_DIGEST, "and the manifest still pins it");
+  assert(wave2Freeze.freezeDigest !== CANONICAL_FREEZE_DIGEST, "the two waves keep DIFFERENT full freeze digests (separate freezes)");
+
+  assertDeepEqual([...stored.datasetIds], [...WAVE_2_DATASET_IDS], "Wave 2 membership is unchanged");
+  assertDeepEqual({ ...stored.datasetFingerprints }, { ...WAVE_2_DATASET_FINGERPRINTS }, "Wave 2 fingerprints are unchanged");
+  assertDeepEqual([...stored.excludedDatasetIds], [...WAVE_1_DATASET_IDS], "Wave 1 ids are still explicitly excluded");
+  const wave1Cohorts = {
+    mock: await readFrozenCohort(REAL_BASE, "mock"),
+    deepseek: await readFrozenCohort(REAL_BASE, "deepseek"),
+  };
+  assertEqual(stored.mockCohortDigest, wave1Cohorts.mock.cohortDigest, "Wave 2 reuses the SAME frozen Mock cohort digest");
+  assertEqual(stored.deepseekCohortDigest, wave1Cohorts.deepseek.cohortDigest, "Wave 2 reuses the SAME frozen DeepSeek cohort digest");
+
+  const wave1 = await readWaveManifest(REAL_BASE, "wave-1");
+  assertEqual(wave1.manifestDigest, buildWaveManifest(WAVE_DEFINITIONS[0], { createdAt: CLOCK }).manifestDigest, "the Wave 1 manifest is still the predeclared historical definition");
+  assertDeepEqual([...wave1.datasetIds], [...WAVE_1_DATASET_IDS], "Wave 1 membership is unchanged");
+  assertDeepEqual({ ...wave1.datasetFingerprints }, { ...WAVE_1_DATASET_FINGERPRINTS }, "Wave 1 fingerprints are unchanged");
+  assertEqual(wave1.replicationId, CANONICAL_REPLICATION_ID, "Wave 1 still points at the canonical replication");
+
+  const canonicalRun = JSON.parse(await readFile(path.join(REAL_BASE, CANONICAL_REPLICATION_ID, "manifest.json"), "utf8"));
+  assertEqual(canonicalRun.replicationId, CANONICAL_REPLICATION_ID, "the canonical Wave 1 replication id is unchanged");
+  assertEqual(canonicalRun.units.length, 6, "Wave 1 still holds six units");
+  assertEqual(canonicalRun.units.every((unit) => unit.status === "COMPLETED"), true, "all six Wave 1 units are still COMPLETED");
+  assertEqual(canonicalRun.freezeDigest, CANONICAL_FREEZE_DIGEST, "Wave 1 still records its own freeze digest");
+});
+
+test("33. the plan path reaches no provider, Jev or external-tool module and executes zero units", async () => {
+  // The plan-status module (and everything it imports) must stay free of the
+  // provider, Jev and external-tool layers: planning is arithmetic over
+  // already-selected datasets.
+  const graph = await importGraph("scripts/replication/plan-status.mjs");
+  assert(graph.includes("scripts/replication/plan-status.mjs"), "the plan status module is in its own graph");
+  for (const file of graph) {
+    assert(!/(^|\/)(jev|intelligence)\//.test(file), `the plan path must not import ${file}`);
+    assert(!/(^|\/)research\/providers\//.test(file), `the plan path must not import the provider ${file}`);
+    assert(!/cline/i.test(file), `the plan path must not import ${file}`);
+  }
+  const source = await readFile("scripts/replication/plan-status.mjs", "utf8");
+  assert(!/child_process|\bspawn\b|\.exec\(|\.execFile|\.execSync|\bfetch\(|node:http|node:net/.test(source), "the plan status module cannot spawn or call out");
+  assert(!/process\.env/.test(source), "the plan status module reads no environment");
+  assert(!/require\(/.test(source), "the plan status module loads nothing dynamically");
+  // No import may reach the provider, Jev or external-intelligence layers.
+  const specifiers = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
+  for (const specifier of specifiers) {
+    assert(!/^(node:)?child_process$/.test(specifier), `the plan status module must not import ${specifier}`);
+    assert(!/(research\/providers|deepseek-cline|(^|\/)jev|intelligence)/i.test(specifier), `the plan status module must not import ${specifier}`);
+  }
+  assertDeepEqual([...new Set(specifiers)].sort(), ["./aggregate.mjs", "./constants.mjs", "./runner.mjs"], "the plan status module imports only replication code");
+  assert(source.includes("PAPER ONLY"), "the module states the paper-only guarantee");
+
+  // The real canonical plan command (Wave 2 membership, temp fixture root):
+  // six units, zero execution, zero Arena, and the cohorts are never re-frozen.
+  await resetArenaSpawns();
+  const bound = await readWaveManifest(ctx.repDir, "rc-wave-2");
+  const cohortsBefore = await Promise.all(["mock", "deepseek"].map(async (key) => (await readFrozenCohort(ctx.repDir, key)).cohortDigest));
+  const run = runCli({ actionArgs: ["--wave", "rc-wave-2", "--plan", "--json"], out: ctx.repDir });
+  assertEqual(run.status, 0, `the wave plan exits 0 (stderr: ${run.stderr})`);
+  const payload = JSON.parse(run.stdout);
+  assertEqual(payload.replicationId, bound.replicationId, "the plan belongs to the wave-bound replication id");
+  assertEqual(payload.units.length, 6, "the wave plan is exactly six units");
+  assertEqual(payload.datasetIds.length, 3, "exactly the three predeclared datasets");
+  assertEqual(payload.unitsExecuted, 0, "the plan executed zero units");
+  assertEqual(payload.replicationStatus, "PLANNED", "the wave plan reports PLANNED");
+  assertEqual(payload.datasetReadiness, "MULTI_DATASET_REPLICATION", "readiness follows the three selected datasets");
+  assertEqual(payload.selectedCleanDatasets, 3, "three eligible CLEAN datasets were selected");
+  assertEqual(payload.completedDatasets, 0, "nothing has completed yet");
+  assertEqual(payload.executionStatus, "PLANNED", "execution has not started");
+  assert(
+    !run.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
+    "a ready wave plan never claims insufficient independent datasets",
+  );
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+  const cohortsAfter = await Promise.all(["mock", "deepseek"].map(async (key) => (await readFrozenCohort(ctx.repDir, key)).cohortDigest));
+  assertDeepEqual(cohortsAfter, cohortsBefore, "planning never re-freezes the cohort genomes");
+});
+
+test("34. the canonical `--plan --wave wave-2` mutates NOTHING on disk and stays readiness-derived", async () => {
+  await resetArenaSpawns();
+  const absBase = path.resolve(REAL_BASE);
+  const realHistory = path.join(process.cwd(), ".evolve", "history");
+  const realArenas = path.join(process.cwd(), ".evolve", "arenas");
+  const wave2CaptureDirs = WAVE_2_DATASET_IDS.map((id) => {
+    const day = id.slice(8, 18).replace(/^(\d{4})(\d{2})(\d{2}).*$/, "$1-$2-$3");
+    return path.join(realHistory, day, id);
+  });
+  const snapshot = async () => ({
+    // The whole replication root: freeze, per-wave freeze, wave manifests, frozen
+    // cohorts (manifest AND compiled payloads) and any run artifact.
+    replication: await dirDigest(absBase),
+    // The three Wave 2 captures themselves (byte-identity of the inputs).
+    datasets: await Promise.all(wave2CaptureDirs.map((dir) => dirDigest(dir))),
+    wave2: await fileDigest(path.join(absBase, "waves", "wave-2.json")),
+    wave2Freeze: await fileDigest(path.join(absBase, "freezes", "wave-2.json")),
+    mockCohort: await fileDigest(path.join(absBase, "cohorts", "mock", "cohort-manifest.json")),
+    deepseekCohort: await fileDigest(path.join(absBase, "cohorts", "deepseek", "cohort-manifest.json")),
+  });
+
+  const before = await snapshot();
+  // Run from the stub-arena harness cwd, with the REAL replication root / history
+  // / arenas: a plan NEVER spawns, so the stub can only ever be a tripwire.
+  const run = runCli({
+    actionArgs: ["--wave", "wave-2", "--plan", "--json"],
+    out: absBase,
+    cwd: ctx.repoDir,
+    env: { EVOLVE_HISTORY_ROOT: realHistory, EVOLVE_ARENAS_DIR: realArenas },
+  });
+  const after = await snapshot();
+
+  assertDeepEqual(after, before, "the canonical replication root, history, cohorts, wave manifest and freeze are byte-identical after a plan");
+  assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
+
+  if (run.status !== 0) {
+    // A legitimately stale/unbound per-wave freeze fails CLOSED and still writes
+    // nothing. Which state is current is a lifecycle fact, not a test input.
+    assert(
+      /STALE|NO canonical per-wave freeze|no replication-wave manifest/.test(run.stderr),
+      `a non-zero plan exit is the documented fail-closed state (stderr: ${run.stderr.slice(0, 240)})`,
+    );
+    return;
+  }
+
+  const payload = JSON.parse(run.stdout);
+  assertEqual(payload.action, ACTION.PLAN, "the JSON names the plan action");
+  assertEqual(payload.unitsExecuted, 0, "the plan executed zero units");
+  assertEqual(payload.datasetIds.length, 3, "exactly the three predeclared Wave 2 datasets");
+  assertEqual(payload.units.length, 6, "three datasets x two providers = six pending units");
+  assert(payload.units.every((unit) => unit.status === "PENDING"), "every planned unit is still PENDING");
+  assertEqual(payload.replicationStatus, "PLANNED", "the canonical Wave 2 plan is PLANNED");
+  assertEqual(payload.executionStatus, "PLANNED", "its execution status is PLANNED (zero units executed)");
+  assertEqual(payload.datasetReadiness, "MULTI_DATASET_REPLICATION", "readiness comes from the three selected datasets");
+  assertEqual(payload.selectedCleanDatasets, 3, "selectedCleanDatasets is 3");
+  assertEqual(payload.completedDatasets, 0, "completedDatasets is 0");
+  assertEqual(payload.evidenceStatus, "NO_REPLICATION_EVIDENCE", "zero completed datasets is NO evidence, not insufficient data");
+  assert(
+    !run.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
+    "a ready plan never claims insufficient independent datasets",
+  );
+});
+
+test("35. the Wave 2 lifecycle invariant accepts UNBOUND and BOUND and rejects HALF-BOUND", async () => {
+  const definition = WAVE_DEFINITIONS[1];
+  const unbound = buildWaveManifest(definition, { createdAt: CLOCK });
+  assertEqual(unbound.freezeDigest, null, "an UNBOUND manifest records no freeze digest");
+  assertEqual(unbound.replicationId, null, "an UNBOUND manifest records no replication id");
+  assertEqual(waveFreezeBound(unbound), false, "an UNBOUND manifest is not freeze-bound");
+
+  const bound = bindWaveManifest({
+    manifest: unbound,
+    freezeDigest: CANONICAL_FREEZE_DIGEST,
+    evaluationContractDigest: CANONICAL_EVALUATION_CONTRACT_DIGEST,
+    replicationId: "rep-0123456789ab",
+  });
+  assertEqual(waveFreezeBound(bound), true, "a BOUND manifest is freeze-bound");
+  assert(bound.manifestDigest !== unbound.manifestDigest, "binding changes the manifest identity");
+  assertEqual(waveManifestDigest(bound), bound.manifestDigest, "the bound digest is self-consistent");
+
+  // The production validator's lifecycle check distinguishes the three states
+  // from the two slots alone (other invariants need a registry/freeze and are
+  // not what this case tests).
+  const lifecycleOf = (manifest) => validateWaveManifest({ manifest }).checks.lifecycleConsistent;
+  assertEqual(lifecycleOf(unbound), true, "UNBOUND is a valid lifecycle state");
+  assertEqual(lifecycleOf(bound), true, "BOUND is a valid lifecycle state");
+  assertEqual(lifecycleOf({ ...bound, replicationId: null }), false, "a freeze digest with no replication id is HALF-BOUND");
+  assertEqual(lifecycleOf({ ...unbound, replicationId: "rep-0123456789ab" }), false, "a replication id with no freeze digest is HALF-BOUND");
+
+  const halfBound = validateWaveManifest({ manifest: { ...bound, replicationId: null } });
+  assertEqual(halfBound.ok, false, "a half-bound manifest FAILS CLOSED");
+  assert(
+    halfBound.failures.some((row) => row.check === "lifecycleConsistent"),
+    `the half-bound failure is named explicitly (${JSON.stringify(halfBound.failures.map((row) => row.check))})`,
   );
 });
 

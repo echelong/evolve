@@ -180,6 +180,43 @@ export function formatDatasetRegistry(registry, { records = registry?.records ??
 }
 
 /* ============================================================================
+ * Plan status (Phase 5C)
+ * ==========================================================================*/
+
+/**
+ * Render the plan/status projection: DATASET READINESS (from the SELECTED
+ * eligible CLEAN datasets), EXECUTION STATUS (PLANNED until something runs) and
+ * EVIDENCE STATUS (what COMPLETED dataset pairs actually show) are printed as
+ * the three separate statements they are.
+ *
+ * Pure renderer of an already-computed `buildPlanStatus` object.
+ */
+export function formatPlanStatus(status, { waveId = null } = {}) {
+  const execution = status?.execution ?? {};
+  const out = [];
+  out.push(`Replication status: ${status.replicationStatus}`);
+  out.push(`Dataset readiness: ${status.datasetReadiness}`);
+  out.push(
+    `  ${status.selectedCleanDatasets} eligible CLEAN replication dataset(s) selected for this command ` +
+      `(minimum ${status.minimumRequired} to run; ${status.multiDatasetThreshold} for a multi-dataset claim)` +
+      (waveId ? ` — wave ${waveId} (predeclared membership)` : ""),
+  );
+  if ((status.datasetIds ?? []).length > 0) out.push(`  selected: ${status.datasetIds.join(", ")}`);
+  out.push(`Execution status: ${status.executionStatus}`);
+  out.push(
+    `  ${execution.plannedUnits ?? 0} unit(s) planned · ${execution.executedUnits ?? 0} executed ` +
+      `(${execution.completedUnits ?? 0} completed, ${execution.pendingUnits ?? 0} pending, ` +
+      `${execution.failedUnits ?? 0} failed, ${execution.skippedUnits ?? 0} skipped)`,
+  );
+  out.push(`Evidence status: ${status.evidenceStatus}`);
+  out.push(
+    `  ${status.completedDatasets} dataset(s) with BOTH providers complete ` +
+      "(completed RESULTS, never a statement about how many datasets were selected)",
+  );
+  return out.join("\n");
+}
+
+/* ============================================================================
  * Compact status (dashboard + CLI)
  * ==========================================================================*/
 

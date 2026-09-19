@@ -58,10 +58,13 @@ import {
   WAVE_STATUS,
   buildWaveManifest,
   describeWaveManifest,
+  isSafeFreezePath,
   listWaveManifests,
   priorWaveDatasetIds,
   readWaveManifest,
   validateWaveManifest,
+  waveDefinitionMatch,
+  waveFreezeBound,
   waveManifestDigest,
   waveManifestDigestSubject,
   waveManifestPath,
@@ -518,17 +521,84 @@ test("6. changing a fingerprint changes the digest", () => {
 
 /* ============================================================================
  * 7-11: stored Wave 1 / Wave 2 manifests
+ *
+ * LIFECYCLE-AWARE. A stored Wave 2 manifest legitimately exists in exactly ONE
+ * of two states, and both are valid:
+ *
+ *   UNBOUND / PLANNED BEFORE FREEZE — no freezeDigest and no replication id
+ *                                     (the predeclared skeleton);
+ *   BOUND   / PLANNED AFTER FREEZE  — its own per-wave freeze exists and every
+ *                                     pin agrees with it.
+ *
+ * The suite validates whichever legitimate state is present (internal
+ * consistency of that state) and rejects every half-bound combination. It never
+ * asserts that Wave 2 "must be unbound" or "must already be bound", and it
+ * never hard-codes a future freeze digest — so a later legitimate
+ * `--write-freeze --wave wave-2` requires NO test edit.
  * ==========================================================================*/
 
-test("7. the stored Wave 2 manifest matches the predeclared definition", async () => {
-  const stored = await readWaveManifest(REAL_BASE, "wave-2");
-  assert(stored, "the stored Wave 2 manifest exists");
-  assertEqual(stored.manifestDigest, buildWaveManifest(WAVE_2, { createdAt: 1 }).manifestDigest, "its digest equals the definition digest");
-  assertDeepEqual(stored.datasetIds, [...WAVE_2_DATASET_IDS], "its membership equals the predeclared list");
-  assertDeepEqual(stored.datasetFingerprints, { ...WAVE_2_DATASET_FINGERPRINTS }, "its fingerprints equal the pins");
-  assertDeepEqual(stored.excludedDatasetIds, [...WAVE_1_DATASET_IDS], "Wave 1 remains explicitly excluded");
-  assertEqual(stored.jevInvolved, false, "Wave 2 declares no Jev participation");
-  assertEqual(stored.providerCallsRequired, false, "Wave 2 declares no provider call is needed");
+/**
+ * Validate the CURRENT legitimate lifecycle state of the stored Wave 2 manifest.
+ *
+ * @returns {{ state: "UNBOUND" | "BOUND", manifest: object, freeze: object|null }}
+ */
+async function wave2Lifecycle() {
+  const manifest = await readWaveManifest(REAL_BASE, "wave-2");
+  assert(manifest, "the stored Wave 2 manifest exists");
+
+  // The manifest is internally consistent whatever its lifecycle state: its
+  // digest must match its own definition (a hand-edited manifest is caught).
+  assertEqual(manifest.manifestDigest, waveManifestDigest(manifest), "the stored manifest digest matches its own definition");
+  const match = waveDefinitionMatch({ manifest, definition: WAVE_2 });
+  assertEqual(match.ok, true, `the stored manifest still matches the predeclared definition (drifted: ${match.drifted.join(", ") || "none"})`);
+  assertEqual(isSafeFreezePath(manifest.freezePath), true, "the wave records a safe per-wave freeze path");
+  assertEqual(manifest.evaluationContractDigest, CANONICAL_EVALUATION_CONTRACT_DIGEST, "the wave pins the canonical evaluation contract in BOTH states");
+
+  const hasDigest = typeof manifest.freezeDigest === "string" && manifest.freezeDigest.length > 0;
+  const hasId = typeof manifest.replicationId === "string" && manifest.replicationId.length > 0;
+  // Half-bound is a corrupt state: the two slots are present together or absent together.
+  assertEqual(hasDigest, hasId, "the freeze digest and replication id are present together or absent together (never half-bound)");
+  assertEqual(waveFreezeBound(manifest), hasDigest && isSafeFreezePath(manifest.freezePath), "waveFreezeBound agrees with the stored slots");
+
+  if (!hasDigest) {
+    assertEqual(manifest.freezeDigest ?? null, null, "an UNBOUND wave records no freeze digest");
+    assertEqual(manifest.replicationId ?? null, null, "an UNBOUND wave records no replication id");
+    assertEqual(manifest.manifestDigest, buildWaveManifest(WAVE_2, { createdAt: 1 }).manifestDigest, "an UNBOUND manifest equals the predeclared skeleton");
+    return { state: "UNBOUND", manifest, freeze: null };
+  }
+
+  // Bound: every invariant must hold against the referenced freeze.
+  const freeze = await readFreeze({ root: REAL_BASE, file: manifest.freezePath });
+  assert(freeze, `the referenced per-wave freeze exists at ${manifest.freezePath}`);
+  assertEqual(freeze.freezeDigest, manifest.freezeDigest, "the stored freeze digest equals the manifest pin");
+  assertEqual(evaluationContractDigest(freeze), manifest.evaluationContractDigest, "the freeze's evaluation contract equals the manifest pin");
+  assertEqual(evaluationContractDigest(freeze), CANONICAL_EVALUATION_CONTRACT_DIGEST, "the wave's contract is the canonical one");
+  assertEqual(freeze.paperOnly, true, "the per-wave freeze is paper-only");
+  const cohorts = {
+    mock: await readFrozenCohort(REAL_BASE, "mock"),
+    deepseek: await readFrozenCohort(REAL_BASE, "deepseek"),
+  };
+  assertEqual(manifest.mockCohortDigest, cohorts.mock.cohortDigest, "the frozen Mock cohort matches the Wave 2 pin");
+  assertEqual(manifest.deepseekCohortDigest, cohorts.deepseek.cohortDigest, "the frozen DeepSeek cohort matches the Wave 2 pin");
+  const expectedId = waveReplicationIdFor({
+    freezeDigest: freeze.freezeDigest,
+    cohortDigests: { mock: cohorts.mock.cohortDigest, deepseek: cohorts.deepseek.cohortDigest },
+    providers: ["mock", "deepseek"],
+    evaluation: evaluationKey(freeze),
+    waveId: manifest.waveId,
+    manifestDigest: manifest.manifestDigest,
+  });
+  assertEqual(manifest.replicationId, expectedId, "the replication id is deterministically derived from the bound manifest + freeze");
+  return { state: "BOUND", manifest, freeze };
+}
+
+test("7. the stored Wave 2 manifest is in a valid lifecycle state and matches the predeclared definition", async () => {
+  const { manifest } = await wave2Lifecycle();
+  assertDeepEqual(manifest.datasetIds, [...WAVE_2_DATASET_IDS], "its membership equals the predeclared list");
+  assertDeepEqual(manifest.datasetFingerprints, { ...WAVE_2_DATASET_FINGERPRINTS }, "its fingerprints equal the pins");
+  assertDeepEqual(manifest.excludedDatasetIds, [...WAVE_1_DATASET_IDS], "Wave 1 remains explicitly excluded");
+  assertEqual(manifest.jevInvolved, false, "Wave 2 declares no Jev participation");
+  assertEqual(manifest.providerCallsRequired, false, "Wave 2 declares no provider call is needed");
 });
 
 test("8. the stored Wave 1 manifest is historical and points at the canonical replication", async () => {
@@ -571,58 +641,36 @@ test("10. the canonical wave-less replication identity is reproduced exactly", (
   );
 });
 
-test("11. the Wave 2 replication identity is explicitly provisional until its own freeze is bound", async () => {
-  const stored = await readWaveManifest(REAL_BASE, "wave-2");
-  // Phase 5C.3: Wave 2 is canonical against ITS OWN freeze, which cannot exist
-  // before the implementing commit is pushed. Until `--write-freeze --wave
-  // wave-2` binds it, both the freeze digest and the replication id are null —
-  // never borrowed from the historical Wave 1 freeze.
-  assertEqual(stored.freezeDigest, null, "Wave 2 does not borrow the historical Wave 1 freeze digest");
-  assertEqual(stored.replicationId, null, "Wave 2 has no replication id before its freeze is bound");
-  assertEqual(stored.freezePath, "freezes/wave-2.json", "Wave 2 points at its own per-wave freeze path");
+test("11. the Wave 2 replication identity is deterministic for the CURRENT lifecycle state", async () => {
+  const { state, manifest, freeze } = await wave2Lifecycle();
+  assertEqual(manifest.freezePath, "freezes/wave-2.json", "Wave 2 points at its own per-wave freeze path");
   assertEqual(
-    stored.evaluationContractDigest,
+    manifest.evaluationContractDigest,
     CANONICAL_EVALUATION_CONTRACT_DIGEST,
-    "Wave 2 pins the Wave 1 evaluation contract up front, so it will be cross-wave comparable",
+    "Wave 2 pins the Wave 1 evaluation contract up front, so it is cross-wave comparable",
   );
 
-  // The identity a BOUND wave would get is still deterministic and distinct.
-  const freeze = await readFreeze({ root: REAL_BASE });
-  const cohorts = { mock: await readFrozenCohort(REAL_BASE, "mock"), deepseek: await readFrozenCohort(REAL_BASE, "deepseek") };
-  const id = waveReplicationIdFor({
-    freezeDigest: freeze.freezeDigest,
-    cohortDigests: { mock: cohorts.mock.cohortDigest, deepseek: cohorts.deepseek.cohortDigest },
-    providers: ["mock", "deepseek"],
-    evaluation: evaluationKey(freeze),
-    waveId: stored.waveId,
-    manifestDigest: stored.manifestDigest,
-  });
-  assert(id !== CANONICAL_WAVE_1_REPLICATION_ID, "Wave 2 never reuses the canonical Wave 1 id");
-  assert(/^rep-[0-9a-f]{12}$/.test(id), "the wave id keeps the rep-<12hex> shape");
-  assertEqual(
-    id,
-    waveReplicationIdFor({
-      freezeDigest: freeze.freezeDigest,
-      cohortDigests: { mock: cohorts.mock.cohortDigest, deepseek: cohorts.deepseek.cohortDigest },
+  if (state === "UNBOUND") {
+    // Provisional identity: no per-wave freeze exists yet, so there is no
+    // replication id at all — and none is borrowed from the historical freeze.
+    assertEqual(manifest.freezeDigest, null, "an UNBOUND Wave 2 does not borrow the historical Wave 1 freeze digest");
+    assertEqual(manifest.replicationId, null, "an UNBOUND Wave 2 has no replication id before its freeze is bound");
+  } else {
+    // Bound: the id is a pure function of the bound manifest + its own freeze,
+    // so it is reproducible without executing anything.
+    const identityFor = (freezeDigest, manifestDigest) => waveReplicationIdFor({
+      freezeDigest,
+      cohortDigests: { mock: manifest.mockCohortDigest, deepseek: manifest.deepseekCohortDigest },
       providers: ["mock", "deepseek"],
       evaluation: evaluationKey(freeze),
-      waveId: stored.waveId,
-      manifestDigest: stored.manifestDigest,
-    }),
-    "the bound identity is reproducible without execution",
-  );
-  // A different manifest digest (a bound vs unbound wave) is a different identity.
-  assert(
-    waveReplicationIdFor({
-      freezeDigest: freeze.freezeDigest,
-      cohortDigests: { mock: cohorts.mock.cohortDigest, deepseek: cohorts.deepseek.cohortDigest },
-      providers: ["mock", "deepseek"],
-      evaluation: evaluationKey(freeze),
-      waveId: stored.waveId,
-      manifestDigest: "0".repeat(64),
-    }) !== id,
-    "a different wave digest yields a different id",
-  );
+      waveId: manifest.waveId,
+      manifestDigest,
+    });
+    assert(/^rep-[0-9a-f]{12}$/.test(manifest.replicationId), "a BOUND Wave 2 keeps the rep-<12hex> shape");
+    assertEqual(manifest.replicationId, identityFor(freeze.freezeDigest, manifest.manifestDigest), "a BOUND Wave 2 id is reproducible");
+    assert(identityFor(freeze.freezeDigest, "0".repeat(64)) !== identityFor(freeze.freezeDigest, "1".repeat(64)), "a different wave digest yields a different id");
+  }
+  assert(manifest.replicationId !== CANONICAL_WAVE_1_REPLICATION_ID, "Wave 2 never reuses the canonical Wave 1 id");
 });
 
 /* ============================================================================

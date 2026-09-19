@@ -516,6 +516,7 @@ export function validateWaveManifest({ manifest, registry, frozen = null, cohort
     manifestDigestStable: false,
     definitionMatches: false,
     freezePathSafe: false,
+    lifecycleConsistent: false,
     datasetsUnique: false,
     fingerprintsPinned: false,
     datasetsExist: false,
@@ -564,6 +565,19 @@ export function validateWaveManifest({ manifest, registry, frozen = null, cohort
     "freezePathSafe",
     isSafeFreezePath(manifest.freezePath),
     `the wave manifest records no safe per-wave freezePath (got ${JSON.stringify(manifest.freezePath ?? null)})`,
+  );
+
+  // 0d. Phase 5C.3 LIFECYCLE INVARIANT: a wave is either UNBOUND (no freeze yet)
+  // or BOUND (freeze digest + replication id together). A HALF-bound manifest —
+  // a freeze digest with no replication id, or a replication id with no freeze
+  // digest — is corrupt and fails closed.
+  const boundDigest = typeof manifest.freezeDigest === "string" && manifest.freezeDigest.length > 0;
+  const boundId = typeof manifest.replicationId === "string" && manifest.replicationId.length > 0;
+  checks.lifecycleConsistent = record(
+    "lifecycleConsistent",
+    boundDigest === boundId,
+    `the wave manifest is HALF-BOUND: freezeDigest ${boundDigest ? "is" : "is not"} set while replicationId ${boundId ? "is" : "is not"} set ` +
+      "(an unbound wave records neither; a bound wave records both)",
   );
 
   const datasetIds = manifest.datasetIds ?? [];
