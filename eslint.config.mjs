@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Project-local, gitignored tools (e.g. the pinned Agent-Reach install):
+    // vendored third-party code is never part of this project's lint surface.
+    ".tools/**",
   ]),
 ]);
 

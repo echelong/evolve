@@ -2238,17 +2238,72 @@ liking, following, forking, opening issues/PRs, pushing, writing, deleting or mo
 rejected **before any call**. GitHub writes, X posts and browser-cookie loading are refused by explicit
 guards (action allowlist, argv allowlist, executable allowlist, `shell: false`, sanitized environment).
 
+### Two-tier executable architecture (health/router vs. data acquisition)
+
+Agent-Reach is a **capability/install/doctor/router** layer: its CLI provides `version`, `doctor`,
+`install`, `configure`, `setup`, `skill`, … but **no generic `search …` / `read …` wrapper**. EVOLVE
+therefore uses it for exactly one purpose — health — and performs reads with the upstream tools it
+documents:
+
+```
+Agent-Reach (pinned, project-local)      → version · doctor --json     (health/router ONLY)
+EVOLVE frozen capability map             → chooses the approved read operation
+approved upstream CLI                    → performs the bounded read/search
+e.g. gh · twitter · rdt · mcporter · curl
+frozen EVOLVE capture                    → normalization / fingerprint / replay
+```
+
+| tier | executable | operations |
+| --- | --- | --- |
+| health | pinned `.tools/agent-reach/bin/agent-reach` | `version`, `doctor --json` |
+| data | `gh` | `github` search + repo read |
+| data | `twitter` | `x` search + tweet read |
+| data | `rdt` | `reddit` search + thread read |
+| data | `mcporter` | `exa` / `web` search |
+| data | `curl` | `web` (Jina Reader) + `rss` read |
+
+A read is never sent to `agent-reach`: `gh search repos …` runs `gh`, `curl -fsSL …` runs `curl`. The
+executable is chosen by the **frozen capability map**, never by a caller, a query, a candidate, a genome,
+a proposal or an LLM answer, and never by `EVOLVE_REACH_BIN` (which can only name the pinned CLI).
+
+### Executable resolution and PATH handling
+
+`resolveCapabilityExecutable(capability, options)` resolves a bare allowlisted basename against the
+**sanitized PATH** — the same environment the child receives — using a bounded, shell-free search
+implemented in Node: split the PATH, keep absolute de-duplicated directories (relative and empty entries
+are dropped), build `<dir>/<basename>`, check the executable bit (`X_OK`), and take the first legitimate
+match, recording the basename plus the resolved path/realpath as diagnostic metadata. `bash -c`,
+`sh -c`, `which` and command interpolation are never used.
+
+A missing approved tool is a **bounded, recorded failure** for that query/channel
+(`ReachExecutableUnavailableError`, `unavailable: true`, `spawned: false`): nothing is installed, the
+pinned `agent-reach` CLI is never used as a fallback, no other backend is substituted, and the capture
+continues with its normal failure accounting. There is no dynamic backend selection during a canonical
+capture.
+
 ### Isolation and sandboxing
 
 Agent-Reach's Python package is never imported into Arena/evolution code. A dedicated adapter
-(`scripts/intelligence/agent-reach.mjs`) launches the pinned CLI as a bounded subprocess with an argument
-array, `shell: false`, a hard timeout, an output byte limit, a per-capture call budget, a frozen command
-map (no arbitrary command pass-through) and a sanitized environment that can never inherit wallet,
-signer, seed, key, token, cookie or credential variables. Cookie/credential values are never persisted.
+(`scripts/intelligence/agent-reach.mjs`) launches the resolved executable as a bounded subprocess with an
+argument array, `shell: false`, a hard timeout, an output byte limit, a per-capture call budget, a frozen
+command map (no arbitrary command pass-through) and a sanitized environment that can never inherit wallet,
+signer, seed, key, token, cookie or credential variables. `assertReadOnlyArgv()` runs before every spawn,
+and `commandPreview` always names the executable that was actually launched. Cookie/credential values are
+never persisted.
 
 Installation is **project-local** (`.tools/agent-reach/`, gitignored) and user-run: no global/system
 changes, no browser extensions, no cookie import, no account login, and canonical tests never require
-Agent-Reach to be installed at all.
+Agent-Reach — or any upstream tool — to be installed at all (the suite resolves against a fixture PATH and
+never executes a stub).
+
+> **Build note (known environmental limitation).** Next 16 builds with Turbopack, which resolves every
+> symlink below the project root and fails with `Symlink [project]/.tools/agent-reach/venv/bin/python is
+> invalid, it points out of the filesystem root` on the venv's absolute interpreter symlink
+> (`venv/bin/python3 → /usr/bin/python3`). This is a Turbopack/venv interaction, **not** a defect in the
+> intelligence layer: `npm run build` fails identically at any commit while `.tools/` exists, and
+> `npx next build --webpack` succeeds with `.tools/` in place. Nothing in the repository is configured to
+> hide it; if a Turbopack production build is required together with the project-local install, run
+> `npx next build --webpack` (or install the venv with `python3 -m venv --copies`).
 
 ### Deterministic query sets
 
@@ -2622,12 +2677,21 @@ Phase 5C.3 adds `npm run validate:phase5c3` (36 offline cases):
 - **Wave 2 barriers** — Wave 2 membership and fingerprints are asserted from registry metadata only,
   and Wave 1 stays excluded from Wave 2
 
-Phase 5E adds `npm run validate:phase5e` (52 offline cases):
+Phase 5E adds `npm run validate:phase5e` (65 offline cases):
 
 - **Fail-closed provider** — disabled by default and refuses every call, an unknown provider throws
   instead of falling back to the mock, and `shadow` is the only accepted mode
 - **Mock parity** — the deterministic offline provider returns the exact same normalized record schema
   as the real adapter, and marks every observation `syntheticIntelligence: true`
+- **Two-tier executables** — `version`/`health` resolve the exact pinned project-local `agent-reach`
+  binary and nothing else; every data capability resolves the executable the frozen map declares
+  (`gh`/`twitter`/`rdt`/`mcporter`/`curl`); an **offline spawn-spy** asserts the executable handed to
+  `spawn` for all twelve capability entries (so `agent-reach search repos …` can never come back); an
+  arbitrary, path-qualified or non-allowlisted executable is refused; query/candidate metadata and
+  `EVOLVE_REACH_BIN` cannot change the executable; PATH handling is bounded, absolute-entry-only and
+  shell-free; `commandPreview` names the launched executable; a missing tool is a bounded UNAVAILABLE
+  failure with no install and no fallback, and a whole capture on such a machine fails every channel
+  closed; `doctor` runs no upstream query
 - **Subprocess security** — `shell: false`, non-interactive stdio, executable allowlist, read-only
   action allowlist, write actions refused before any spawn, timeout, call budget, output byte limit, and
   a sanitized environment that can never inherit wallet/signer/key/token/cookie variables
@@ -2646,8 +2710,9 @@ Phase 5E adds `npm run validate:phase5e` (52 offline cases):
   nothing in Arena/Jev/replication imports the intelligence layer; the dashboard is the only consumer and
   exposes counts/identity only; the Wave 2 dataset ids and fingerprints never appear in the layer, and
   the three Wave 2 captures stay byte-untouched (metadata + pinned fingerprints) across the whole suite
-- **No Agent-Reach required** — every adapter test injects a `spawn` stub, no binary is installed or
-  launched, and nothing needs a system-wide install
+- **No Agent-Reach required** — every adapter test injects a `spawn` stub and resolves against a fixture
+  PATH of non-executed stub files, no binary is installed or launched, no live intelligence capture is
+  taken, and nothing needs a system-wide install
 
 ## Roadmap
 
@@ -2840,13 +2905,13 @@ Phase 5E adds `npm run validate:phase5e` (52 offline cases):
 - [x] Canonical Wave 2 freeze + canonical Wave 2 run — `rep-ffe4b968e51a`, 6/6 units COMPLETED, 3 CLEAN datasets, `CANONICAL`, under the same evaluation contract as Wave 1 (see `## Phase 5C.3`)
 
 ### Phase 5E — external intelligence shadow layer
-- [x] Isolated, read-only Agent-Reach adapter pinned to `v1.5.0` (commit `f65526c…`, MIT, Python ≥3.10): no upstream package import, `shell: false`, executable/action/argv allowlists, timeout, call budget, byte limit, sanitized environment
+- [x] Isolated, read-only Agent-Reach adapter pinned to `v1.5.0` (commit `f65526c…`, MIT, Python ≥3.10): no upstream package import, `shell: false`, executable/action/argv allowlists, timeout, call budget, byte limit, sanitized environment; the pinned CLI is used for `version`/`doctor --json` health only, while data acquisition runs the upstream read tool (`gh`/`twitter`/`rdt`/`mcporter`/`curl`) the frozen capability map declares
 - [x] Narrow channel allowlist (`x`, `web`, `exa`, `reddit`, `rss`, `github`); browser-login/write-capable channels refused; GitHub writes and X posts rejected before any call
 - [x] Capture → freeze → verify → **offline replay** storage with immutable manifests, per-record raw/normalized digests and tamper detection; live internet is never read inside the Arena
 - [x] Versioned deterministic query sets (`reach-query-set-v1`, metadata-only, arbitrary queries refused) and a bounded deterministic feature vector with `coordinationIndicators` (never a bot probability)
 - [x] `external-intelligence-packet-v1` interface only: `jevRoutingActive: false`, `deepseekRoutingActive: false`, no Jev/DeepSeek calls
 - [x] Mock provider, `intelligence:doctor`/`probe:reach` (nothing persisted without `--save`), and a compact shadow dashboard panel with counts/identity only
-- [x] `npm run validate:phase5e` — 52 offline cases
+- [x] `npm run validate:phase5e` — 65 offline cases
 - [ ] One real, bounded, read-only public-data probe and any experiment that tests whether external intelligence has value — operator-run, after Wave 2
 
 ### Phase 5 — capped mainnet pilot

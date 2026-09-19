@@ -6,6 +6,24 @@
  * capabilities are delegated to documented upstream tools. EVOLVE therefore
  * treats it as an EXTERNAL, BOUNDED CAPABILITY, never as a library:
  *
+ * ARCHITECTURE — two tiers, deliberately separated:
+ *
+ *   Agent-Reach (pinned, project-local, `.tools/agent-reach/bin/agent-reach`)
+ *     → HEALTH/ROUTER VERIFICATION ONLY: `version` and `doctor --json`. It is a
+ *       capability router + installer/doctor layer, NOT a proxy executable: its
+ *       CLI has no generic `search`/`read` wrapper, so an upstream tool's argv is
+ *       NEVER handed to `agent-reach`.
+ *
+ *   The FROZEN capability map (authoritative)
+ *     → names the approved upstream READ executable for every (op, channel):
+ *       `gh`, `twitter`, `rdt`, `mcporter`, `curl`. EVOLVE resolves that bare
+ *       basename with a bounded, shell-free search over the SANITIZED PATH and
+ *       launches THAT executable with the capability's argv.
+ *
+ *   EVOLVE capture → normalization/fingerprint/replay over the bounded read.
+ *
+ * The remaining invariants apply to every tier:
+ *
  *   * no `import` of Agent-Reach's Python package anywhere in this repository;
  *   * EVOLVE launches a bounded subprocess/CLI call with an ARGUMENT ARRAY;
  *   * `shell: false` always (no shell interpolation, ever);
@@ -18,13 +36,21 @@
  *     a proposal, a genome, an LLM answer or a dataset can become an argv token
  *     except as a VALUE substituted into a frozen template.
  *
- * HEALTH (`doctor --json`) and `version` are side-effect-free. The text `doctor`
- * path is NEVER used: upstream Agent-Reach installs skill files in that path,
- * while the `--json` path returns before touching any file.
+ * HEALTH (`doctor --json`) and `version` are side-effect-free and are the ONLY
+ * two commands the pinned CLI is ever asked to run: no upstream intelligence
+ * query happens during a doctor. The text `doctor` path is NEVER used: upstream
+ * Agent-Reach installs skill files in that path, while the `--json` path returns
+ * before touching any file.
+ *
+ * A MISSING upstream tool is a bounded, recorded FAILURE for that query/channel.
+ * It never triggers an automatic install (Agent-Reach `install` is never
+ * invoked), never falls back to the pinned CLI, and never falls back to another
+ * backend: dynamic backend selection does not exist during a canonical capture.
  *
  * PAPER ONLY. No wallet, no signer, no write RPC, no posting, no GitHub writes.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -47,7 +73,11 @@ export const INTERNAL_REACH_HEALTH_ACTIONS = Object.freeze(["version", "health"]
 
 /**
  * Executables EVOLVE may ever launch for intelligence capture. Basenames only:
- * a caller can never point the adapter at an arbitrary binary.
+ * a caller can never point the adapter at an arbitrary binary, and a
+ * path-qualified name (e.g. `/usr/bin/gh`) is refused outright.
+ *
+ * `agent-reach` is the pinned HEALTH/router executable; every other entry is an
+ * approved upstream READ tool that the pinned capability map may select.
  */
 export const REACH_EXECUTABLE_ALLOWLIST = Object.freeze([
   "agent-reach",
@@ -57,6 +87,18 @@ export const REACH_EXECUTABLE_ALLOWLIST = Object.freeze([
   "mcporter",
   "curl",
 ]);
+
+/** The pinned health/router executable — the ONLY one used for a health probe. */
+export const REACH_HEALTH_EXECUTABLE = AGENT_REACH_PIN.cli;
+
+/**
+ * Approved UPSTREAM read executables (the allowlist minus the pinned router).
+ * Every entry here is resolved through `resolveCapabilityExecutable`; none of
+ * them is ever replaced by, or routed through, the pinned Agent-Reach CLI.
+ */
+export const REACH_UPSTREAM_EXECUTABLES = Object.freeze(
+  REACH_EXECUTABLE_ALLOWLIST.filter((basename) => basename !== REACH_HEALTH_EXECUTABLE),
+);
 
 /**
  * Extra argv tokens that are write-capable or file-writing and always refused.
@@ -186,6 +228,24 @@ export class ReachBinaryError extends Error {
   }
 }
 
+/**
+ * Raised when an approved upstream executable cannot be resolved on the
+ * SANITIZED PATH. It is deliberately NOT a fallback trigger: the caller records
+ * the query/channel as unavailable and moves on.
+ */
+export class ReachExecutableUnavailableError extends Error {
+  constructor(basename, searched = []) {
+    super(
+      `upstream executable '${basename}' is not available on the sanitized PATH (searched ${searched.length} ` +
+        "director(ies)) — the channel is reported UNAVAILABLE. EVOLVE never installs it, never routes it through " +
+        "the pinned Agent-Reach CLI, and never falls back to another backend.",
+    );
+    this.name = "ReachExecutableUnavailableError";
+    this.basename = basename;
+    this.searched = [...searched];
+  }
+}
+
 export class ReachCommandError extends Error {
   constructor(message) {
     super(message);
@@ -209,9 +269,13 @@ export class ReachBudgetExceededError extends Error {
  * FROZEN capability map. Placeholders (`{query}`, `{limit}`, `{url}`,
  * `{readerUrl}`, `{timeoutSeconds}`) are the ONLY substitution points, and each
  * is validated before it becomes its own argv element (never
- * string-interpolated). EVOLVE always launches the pinned `agent-reach` CLI; the
- * `binary` field on each entry names the upstream READ tool whose argv the entry
- * mirrors, and it must be on the executable allowlist.
+ * string-interpolated).
+ *
+ * The `binary` field names the executable each entry is launched WITH (see
+ * `resolveCapabilityExecutable`): `agent-reach` only for the two side-effect-free
+ * health entries, and the upstream READ tool Agent-Reach documents for every data
+ * entry. The argv of a data entry is NEVER handed to the pinned `agent-reach`
+ * CLI — it is a router/doctor layer, not a generic `search`/`read` proxy.
  *
  * Every entry is a documented Agent-Reach/upstream READ path for one of the six
  * enabled channels.
@@ -235,7 +299,8 @@ export const REACH_CAPABILITY_MAP_V1 = Object.freeze({
   ]),
   note:
     "Read-only capability map. `gh`/`twitter`/`rdt`/`mcporter` are the upstream tools Agent-Reach documents for the enabled channels; " +
-    "`curl` is its documented Jina-Reader/RSS read path. No write verb appears anywhere in this map.",
+    "`curl` is its documented Jina-Reader/RSS read path. Each entry is launched with the executable it names; the pinned " +
+    "`agent-reach` CLI only ever runs `version` and `doctor --json`. No write verb appears anywhere in this map.",
 });
 
 /** Look up the frozen entry for (op, channel). */
@@ -368,6 +433,166 @@ export function resolveReachBinary({ reachBin = null, projectRoot = process.cwd(
   return resolved;
 }
 
+/* ----------------------------------------------------------------------------
+ * Executable resolution (health vs upstream)
+ * --------------------------------------------------------------------------*/
+
+/** Bound on how much of PATH is ever walked. */
+const MAX_TRUSTED_PATH_ENTRIES = 256;
+/** Fallback executable extensions, Windows only (POSIX relies on the X bit). */
+const WINDOWS_EXECUTABLE_EXTENSIONS = Object.freeze([".exe", ".cmd", ".bat"]);
+
+function realpathOrNull(target) {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/** A regular file that this process may execute (best effort, never throws). */
+export function isExecutableFile(candidate) {
+  try {
+    if (!fs.statSync(candidate).isFile()) return false;
+  } catch {
+    return false;
+  }
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    // On Windows the execute bit is not meaningful: a readable regular file with
+    // a known executable extension is the closest equivalent.
+    if (process.platform === "win32") {
+      try {
+        fs.accessSync(candidate, fs.constants.R_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+}
+
+/**
+ * Split a PATH value into ABSOLUTE, de-duplicated directories.
+ *
+ * Relative entries (and empty segments, which historically mean "the current
+ * directory") are DROPPED: a relative PATH entry is a binary-hijack vector, and
+ * nothing in the intelligence layer may be resolved out of the working
+ * directory. The walk is bounded by `MAX_TRUSTED_PATH_ENTRIES`.
+ */
+export function trustedPathDirs(pathValue) {
+  const raw = typeof pathValue === "string" ? pathValue : "";
+  const dirs = [];
+  for (const entry of raw.split(path.delimiter)) {
+    const dir = entry.trim();
+    if (dir.length === 0) continue;
+    if (!path.isAbsolute(dir)) continue;
+    if (dirs.includes(dir)) continue;
+    dirs.push(dir);
+    if (dirs.length >= MAX_TRUSTED_PATH_ENTRIES) break;
+  }
+  return dirs;
+}
+
+/**
+ * Bounded, shell-free PATH search for ONE allowlisted basename.
+ *
+ * Nothing is shelled out (`which`/`command -v`/`bash -c` are never used): the
+ * search splits the PATH itself, builds `<dir>/<basename>`, and returns the first
+ * legitimate executable. Symlinks are followed (as any exec would) and the
+ * `realpath` is retained as diagnostic metadata only.
+ */
+export function searchTrustedPath(basename, { path: pathValue = null } = {}) {
+  const searched = trustedPathDirs(pathValue);
+  for (const dir of searched) {
+    const names =
+      process.platform === "win32" ? [basename, ...WINDOWS_EXECUTABLE_EXTENSIONS.map((ext) => `${basename}${ext}`)] : [basename];
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (!isExecutableFile(candidate)) continue;
+      return { path: candidate, realPath: realpathOrNull(candidate), searched };
+    }
+  }
+  return { path: null, realPath: null, searched };
+}
+
+/**
+ * Resolve the executable ONE capability entry is launched with.
+ *
+ * Rules (all fail closed):
+ *
+ *   1. `capability.binary === "agent-reach"` → the exact pinned project-local
+ *      binary, used ONLY for `version` / `doctor --json`.
+ *   2. any other `capability.binary` MUST be a bare basename on
+ *      `REACH_EXECUTABLE_ALLOWLIST` — a path-qualified name, an arbitrary
+ *      caller-supplied executable, or `""` is refused with `ReachBinaryError`.
+ *   3. the upstream executable is resolved with the bounded PATH search above
+ *      (never a shell, never `which`, never command interpolation).
+ *   4. the PATH used is the SANITIZED one: the same environment handed to the
+ *      child, so look-up and launch can never disagree.
+ *   5. selection depends on the capability entry and the PATH alone — a query, a
+ *      candidate, a genome, a proposal or an LLM answer cannot influence it.
+ *
+ * A missing upstream executable is reported as `available: false` (with the
+ * searched directories); it never throws and never triggers an install.
+ *
+ * @returns {{ op: string|null, channel: string|null, basename: string,
+ *   role: "health"|"upstream", source: string, path: string|null,
+ *   realPath: string|null, available: boolean, searched: string[] }}
+ */
+export function resolveCapabilityExecutable(capability, { reachBin = null, projectRoot = process.cwd(), path: pathValue = null, env = null } = {}) {
+  const declared = capability?.binary;
+  const name = typeof declared === "string" ? declared : "";
+  const basename = name.length > 0 ? path.basename(name) : "";
+  const op = capability?.op ?? null;
+  const channel = capability?.channel ?? null;
+
+  if (name.length === 0 || basename !== name) {
+    throw new ReachBinaryError(
+      `capability '${op ?? "?"}' declares the executable '${name}', which is refused: only a bare basename from the ` +
+        `intelligence allowlist is accepted (${REACH_EXECUTABLE_ALLOWLIST.join(", ")}). A path-qualified or ` +
+        "caller-supplied executable is never launched.",
+    );
+  }
+  if (!REACH_EXECUTABLE_ALLOWLIST.includes(basename)) {
+    throw new ReachBinaryError(
+      `executable '${basename}' is not on the intelligence allowlist (${REACH_EXECUTABLE_ALLOWLIST.join(", ")}).`,
+    );
+  }
+
+  if (basename === REACH_HEALTH_EXECUTABLE) {
+    const pinned = resolveReachBinary({ reachBin, projectRoot });
+    return Object.freeze({
+      op,
+      channel,
+      basename,
+      role: "health",
+      source: "agent-reach-pin",
+      path: pinned,
+      realPath: realpathOrNull(pinned),
+      available: isExecutableFile(pinned),
+      searched: Object.freeze([]),
+    });
+  }
+
+  const effectivePath = pathValue ?? (typeof env?.PATH === "string" ? env.PATH : process.env.PATH);
+  const found = searchTrustedPath(basename, { path: effectivePath });
+  return Object.freeze({
+    op,
+    channel,
+    basename,
+    role: "upstream",
+    source: "sanitized-path",
+    path: found.path,
+    realPath: found.realPath,
+    available: found.path !== null,
+    searched: Object.freeze([...found.searched]),
+  });
+}
+
 /**
  * Build the exact argv for one call: substitution happens slot-by-slot, and each
  * slot is validated on its own. `{readerUrl}` composes the read-only Jina Reader
@@ -396,6 +621,19 @@ export function buildReachArgv({ op, channel = null, values = {}, entry = null }
 /**
  * Run ONE bounded, read-only intelligence call.
  *
+ * The executable is chosen by the FROZEN capability entry — never by the pinned
+ * Agent-Reach CLI for a data operation, and never by anything a caller passes:
+ *
+ *   version / health  → the pinned project-local `agent-reach` (`version`, `doctor --json`)
+ *   github            → `gh`
+ *   x                 → `twitter`
+ *   reddit            → `rdt`
+ *   exa / web search  → `mcporter`
+ *   web / rss read    → `curl`
+ *
+ * A missing upstream executable is a bounded, recorded UNAVAILABLE result: no
+ * spawn, no install, no fallback.
+ *
  * @param {{
  *   op: string,
  *   channel?: string|null,
@@ -419,16 +657,71 @@ export function runReachCall({
 } = {}) {
   const requested = String(op ?? "").trim().toLowerCase();
   const action = INTERNAL_REACH_HEALTH_ACTIONS.includes(requested) ? requested : requireReadOnlyAction(op);
-  const binary = resolveReachBinary({ reachBin: config?.reachBin ?? null, projectRoot });
+  // argv is built (and validated read-only) BEFORE anything can be spawned.
   const { capability, argv } = buildReachArgv({ op: action, channel, values });
+  // The budget is consumed before the executable is resolved, so an exhausted
+  // budget refuses the call without even a filesystem walk.
   if (budget) budget.take();
 
   const timeoutMs = Math.min(config?.timeoutMs ?? 20_000, 600_000);
   const maxBytes = Math.min(config?.maxBytes ?? 262_144, 8_388_608);
   const childEnv = sanitizeReachEnv(env);
+  // Look-up uses the SAME sanitized PATH that the child receives.
+  const executable = resolveCapabilityExecutable(capability, {
+    reachBin: config?.reachBin ?? null,
+    projectRoot,
+    env: childEnv,
+  });
+
+  const base = {
+    op: action,
+    channel,
+    capability: capability.op,
+    binary: executable.basename,
+    executable: {
+      basename: executable.basename,
+      role: executable.role,
+      source: executable.source,
+      path: executable.path,
+      realPath: executable.realPath,
+      available: executable.available,
+    },
+    argv,
+    commandPreview: `${executable.basename} ${argv.join(" ")}`,
+    maxBytes,
+    timeoutMs,
+    envKeys: Object.keys(childEnv).sort(),
+    // Both self-checks reuse the single deny-list above, so the vocabulary that
+    // forbids credentials lives in exactly ONE place.
+    walletEnvPresent: Object.keys(childEnv).some((key) => FORBIDDEN_ENV_PATTERN.test(key)),
+    tokensInEnv: Object.keys(childEnv).some((key) => FORBIDDEN_ENV_PATTERN.test(key)),
+  };
+
+  // An approved upstream tool that is not installed is a bounded FAILURE for this
+  // query/channel. Nothing is installed, nothing is substituted, nothing is
+  // spawned, and the pinned Agent-Reach CLI is never used as a fallback.
+  if (executable.role === "upstream" && !executable.available) {
+    const unavailable = new ReachExecutableUnavailableError(executable.basename, executable.searched);
+    return {
+      ...base,
+      ok: false,
+      spawned: false,
+      unavailable: true,
+      status: null,
+      timedOut: false,
+      overflowed: false,
+      durationMs: 0,
+      bytes: 0,
+      stdout: "",
+      stderr: "",
+      error: unavailable.message,
+      errorName: unavailable.name,
+      searched: [...executable.searched],
+    };
+  }
 
   const started = Date.now();
-  const result = spawn(binary, argv, {
+  const result = spawn(executable.path, argv, {
     shell: false,
     timeout: timeoutMs,
     maxBuffer: maxBytes,
@@ -446,20 +739,15 @@ export function runReachCall({
   const ok = !timedOut && !overflowed && result?.status === 0;
 
   return {
-    op: action,
-    channel,
-    capability: capability.op,
-    binary: path.basename(binary),
-    argv,
-    commandPreview: `${path.basename(binary)} ${argv.join(" ")}`,
+    ...base,
     ok,
+    spawned: true,
+    unavailable: false,
     status: result?.status ?? null,
     timedOut,
     overflowed,
     durationMs,
     bytes: Buffer.byteLength(stdout, "utf8"),
-    maxBytes,
-    timeoutMs,
     stdout: ok ? stdout.slice(0, maxBytes) : "",
     stderr: stderr.slice(0, 2_048),
     error: ok
@@ -469,33 +757,41 @@ export function runReachCall({
         : overflowed
           ? `output exceeded the ${maxBytes}-byte limit`
           : `exit ${result?.status ?? "signal"}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`,
-    envKeys: Object.keys(childEnv).sort(),
-    // Both self-checks reuse the single deny-list above, so the vocabulary that
-    // forbids credentials lives in exactly ONE place.
-    walletEnvPresent: Object.keys(childEnv).some((key) => FORBIDDEN_ENV_PATTERN.test(key)),
-    tokensInEnv: Object.keys(childEnv).some((key) => FORBIDDEN_ENV_PATTERN.test(key)),
+    errorName: ok ? null : timedOut ? "ReachTimeoutError" : overflowed ? "ReachOutputOverflowError" : "ReachCallError",
   };
 }
 
 /** `version` + `doctor --json` — side-effect-free health for the doctor/probe CLI. */
 export function probeReachHealth({ config, env = process.env, projectRoot = process.cwd(), spawn = spawnSync } = {}) {
-  const version = runReachCall({ op: "health", config, env, projectRoot, spawn: spawnFor(spawn, "version") });
+  // ONLY the two side-effect-free Agent-Reach paths run here: no upstream tool is
+  // resolved, launched or queried, so a doctor can never turn into a capture.
+  const version = runReachCall({ op: "version", config, env, projectRoot, spawn });
   const doctor = runReachCall({ op: "health", config, env, projectRoot, spawn });
   return {
     provider: "agent-reach",
     pinned: AGENT_REACH_PIN,
     binary: path.basename(resolveReachBinary({ reachBin: config?.reachBin ?? null, projectRoot })),
-    version: { ok: version.ok, stdout: version.stdout.trim(), error: version.error },
-    doctor: { ok: doctor.ok, json: parseJsonSafe(doctor.stdout), error: doctor.error, bytes: doctor.bytes },
+    executables: {
+      health: { basename: version.binary, source: version.executable.source, path: version.executable.path },
+      upstream: [...REACH_UPSTREAM_EXECUTABLES],
+    },
+    version: { ok: version.ok, stdout: version.stdout.trim(), error: version.error, commandPreview: version.commandPreview },
+    doctor: {
+      ok: doctor.ok,
+      json: parseJsonSafe(doctor.stdout),
+      error: doctor.error,
+      bytes: doctor.bytes,
+      commandPreview: doctor.commandPreview,
+    },
+    upstreamCalls: 0,
     channels: { enabled: config?.channels ?? [] },
     readOnly: true,
     paperOnly: true,
-    note: "Read-only probe. `doctor --json` is used deliberately: the text path installs skill files, the JSON path does not.",
+    note:
+      "Read-only probe. `version` + `doctor --json` are the ONLY commands executed: the pinned Agent-Reach CLI is a router/doctor " +
+      "layer, so no upstream intelligence tool is queried during a doctor. (`doctor --json` is used deliberately: the text path " +
+      "installs skill files, the JSON path does not.)",
   };
-}
-
-function spawnFor(spawn, op) {
-  return (binary, argv, options) => spawn(binary, op === "version" ? ["version"] : argv, options);
 }
 
 function parseJsonSafe(text) {

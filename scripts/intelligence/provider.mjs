@@ -77,6 +77,18 @@ export function createAgentReachIntelligenceProvider({ config, env = process.env
         error: result.ok ? null : result.error,
         call: {
           commandPreview: result.commandPreview,
+          // Which executable this bounded read actually ran, and where it came
+          // from: the pinned Agent-Reach CLI for health, or the frozen
+          // capability map's upstream tool resolved on the sanitized PATH.
+          executable: {
+            basename: result.executable.basename,
+            role: result.executable.role,
+            source: result.executable.source,
+            path: result.executable.path,
+            available: result.executable.available,
+          },
+          spawned: result.spawned === true,
+          unavailable: result.unavailable === true,
           durationMs: result.durationMs,
           bytes: result.bytes,
           timedOut: result.timedOut,

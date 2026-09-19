@@ -4,11 +4,17 @@
  *
  * Covers: the fail-closed provider registry (disabled by default, unknown
  * provider refused, `shadow` as the ONLY mode), the deterministic mock provider
- * and its schema parity with the real adapter, the sandboxed Agent-Reach adapter
- * (`shell: false`, executable allowlist, read-only action allowlist, rejected
- * write actions, timeout, call budget, output byte limit, sanitized
- * environment), the versioned deterministic query sets (arbitrary queries
- * refused), the capture → freeze → verify → replay pipeline (immutable captures,
+ * and its schema parity with the real adapter, the TWO-TIER executable
+ * architecture (the pinned project-local `agent-reach` CLI for `version` +
+ * `doctor --json` health ONLY, and the frozen capability map's upstream READ
+ * executable — `gh`/`twitter`/`rdt`/`mcporter`/`curl` — for data acquisition,
+ * resolved through a bounded, shell-free search over the sanitized PATH), the
+ * sandboxed adapter (`shell: false`, executable allowlist, read-only action
+ * allowlist, rejected write actions, timeout, call budget, output byte limit,
+ * sanitized environment, bounded UNAVAILABLE result for a missing upstream
+ * tool with no install and no fallback), the versioned deterministic query sets
+ * (arbitrary queries refused), the capture → freeze → verify → replay pipeline
+ * (immutable captures,
  * clock-independent digests, byte-equivalent offline replay, tamper detection),
  * the bounded deterministic feature vector, the whitelist-only
  * `external-intelligence-packet-v1` (no routing, no Jev call, no DeepSeek call),
@@ -24,13 +30,19 @@
  * whole suite has run.
  *
  * Fully OFFLINE and deterministic: the real Agent-Reach binary is never
- * installed and never launched (every adapter test injects a `spawn` stub), no
- * provider call, no Jev call, no DeepSeek call, and no Arena run happens here.
+ * installed and never launched, and no live upstream tool is ever run either
+ * (every adapter test injects a `spawn` stub and resolves against a fixture PATH
+ * of non-executed stub files), no provider call, no Jev call, no DeepSeek call,
+ * and no Arena run happens here.
+ *
+ * The regression this suite pins: an upstream READ operation must NEVER be
+ * launched as `agent-reach <argv>` — the pinned CLI is a router/doctor layer with
+ * no generic `search`/`read` wrapper.
  *
  * Run with: npm run validate:phase5e
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -64,17 +76,24 @@ import {
   INTERNAL_REACH_HEALTH_ACTIONS,
   REACH_CAPABILITY_MAP_V1,
   REACH_EXECUTABLE_ALLOWLIST,
+  REACH_HEALTH_EXECUTABLE,
+  REACH_UPSTREAM_EXECUTABLES,
   ReachBinaryError,
   ReachBudgetExceededError,
   ReachCommandError,
+  ReachExecutableUnavailableError,
   assertReadOnlyArgv,
   buildReachArgv,
   capabilityFor,
   createReachBudget,
+  isExecutableFile,
   probeReachHealth,
+  resolveCapabilityExecutable,
   resolveReachBinary,
   runReachCall,
   sanitizeReachEnv,
+  searchTrustedPath,
+  trustedPathDirs,
 } from "./intelligence/agent-reach.mjs";
 import {
   CaptureExistsError,
@@ -301,7 +320,20 @@ const ctx = {
   tamperRoot: null,
   tamperCaptureId: null,
   spawnBinaries: [],
+  binDir: null,
+  emptyBinDir: null,
+  missingToolRoot: null,
+  missingToolCapture: null,
+  missingToolSpawn: null,
 };
+
+/**
+ * The upstream READ tools the frozen capability map may select. None of these is
+ * ever executed by this suite: they exist as non-executed stub FILES in a fixture
+ * directory so that the resolver has something legitimate to find (the spawn is
+ * always stubbed).
+ */
+const REACH_FIXTURE_TOOLS = Object.freeze(["gh", "twitter", "rdt", "mcporter", "curl"]);
 
 function mockConfig(overrides = {}) {
   return resolveIntelligenceConfig({ ...HOSTILE_ENV, EVOLVE_INTELLIGENCE_PROVIDER: "mock", ...overrides });
@@ -314,6 +346,20 @@ function reachConfig(overrides = {}) {
     EVOLVE_REACH_BIN: ctx.reachBin,
     ...overrides,
   });
+}
+
+/**
+ * The hostile environment plus the fixture PATH: the fixture directory comes
+ * first, so the resolved upstream executable is always a stub file this suite
+ * owns. Nothing in it is ever executed (spawn is injected everywhere).
+ */
+function reachEnv() {
+  return { ...HOSTILE_ENV, PATH: `${ctx.binDir}${path.delimiter}${HOSTILE_ENV.PATH}` };
+}
+
+/** A PATH that contains NO upstream tool at all (for the missing-tool cases). */
+function emptyReachEnv() {
+  return { ...HOSTILE_ENV, PATH: ctx.emptyBinDir };
 }
 
 /** Record every process this suite launches (must never be agent-reach). */
@@ -355,6 +401,17 @@ async function buildFixtures() {
   ctx.captureRoot = path.join(ctx.tmp, "captures");
   // The project-local install layout: exactly what `resolveReachBinary` defaults to.
   ctx.reachBin = path.join(ctx.tmp, AGENT_REACH_PIN.localInstallDir, "bin", AGENT_REACH_PIN.cli);
+  // Fixture PATH: stub upstream tools (never executed) + an empty directory that
+  // stands in for a machine where an approved tool is missing.
+  ctx.binDir = path.join(ctx.tmp, "fixture-bin");
+  ctx.emptyBinDir = path.join(ctx.tmp, "empty-bin");
+  await mkdir(ctx.binDir, { recursive: true });
+  await mkdir(ctx.emptyBinDir, { recursive: true });
+  for (const tool of REACH_FIXTURE_TOOLS) {
+    const target = path.join(ctx.binDir, tool);
+    await writeFile(target, "#!/bin/sh\nexit 0\n", "utf8");
+    await chmod(target, 0o755);
+  }
   ctx.mockConfig = mockConfig();
   // 16 calls: enough for the seven-query fixture plan (the real default budget of
   // six is exercised separately, in the budget test).
@@ -383,11 +440,26 @@ async function buildFixtures() {
     candidates: [CANDIDATE],
     provider: "agent-reach",
     now: NOW,
-    env: HOSTILE_ENV,
+    env: reachEnv(),
     projectRoot: ctx.tmp,
     spawn,
   });
   ctx.realSpawn = spawn;
+  // A capture on a machine where NO approved upstream tool is installed: every
+  // query must fail closed as UNAVAILABLE, with nothing spawned at all.
+  ctx.missingToolRoot = path.join(ctx.tmp, "captures-missing-tool");
+  const missingSpawn = stubSpawn(() => ({ status: 0, stdout: JSON.stringify([{ ...RAW_SEED }]), stderr: "" }));
+  ctx.missingToolCapture = await runCapture({
+    root: ctx.missingToolRoot,
+    config: ctx.reachConfig,
+    candidates: [CANDIDATE],
+    provider: "agent-reach",
+    now: NOW,
+    env: emptyReachEnv(),
+    projectRoot: ctx.tmp,
+    spawn: missingSpawn,
+  });
+  ctx.missingToolSpawn = missingSpawn;
 
   ctx.tamperRoot = path.join(ctx.tmp, "captures-tamper");
   const tamper = await runCapture({
@@ -530,7 +602,7 @@ test("29. every intelligence call uses shell:false with a non-interactive stdio"
     channel: "x",
     values: { query: "hello world", limit: 3 },
     config: ctx.reachConfig,
-    env: HOSTILE_ENV,
+    env: reachEnv(),
     projectRoot: ctx.tmp,
     spawn,
   });
@@ -542,9 +614,10 @@ test("29. every intelligence call uses shell:false with a non-interactive stdio"
   assertEqual(call.options.timeout, ctx.reachConfig.timeoutMs, "the timeout is passed to the process");
   assertEqual(call.options.maxBuffer, ctx.reachConfig.maxBytes, "the output byte limit is passed to the process");
   assertDeepEqual(call.argv, ["search", "hello world", "--json", "--limit", "3"], "the query is its OWN argv element (never interpolated)");
-  assertEqual(path.basename(call.binary), "agent-reach", "only the pinned CLI is launched");
   assertTrue(!/shell|sh -c|bash/.test(call.options.shell === false ? "" : "shell"), "no shell string is used");
-  assertEqual(result.envKeys.includes("PATH"), true, "PATH is inherited (the CLI needs it)");
+  assertEqual(result.envKeys.includes("PATH"), true, "PATH is inherited (the resolved tool needs it)");
+  assertEqual(path.basename(call.binary), "twitter", "the X capability launches the upstream `twitter` executable, NOT the pinned router");
+  assertEqual(call.binary, path.join(ctx.binDir, "twitter"), "the resolved executable is the first allowlisted match on the sanitized PATH");
   assertTrue(!ctx.spawnBinaries.includes("agent-reach"), "this suite never launched the real Agent-Reach binary");
 });
 
@@ -559,6 +632,9 @@ test("30. the executable allowlist is enforced for every binary the layer could 
       assertTrue(entry.binary !== forbidden, `'${forbidden}' is never an intelligence executable`);
     }
   }
+  assertEqual(REACH_HEALTH_EXECUTABLE, "agent-reach", "exactly one health/router executable exists");
+  assertDeepEqual(REACH_UPSTREAM_EXECUTABLES, ["gh", "twitter", "rdt", "mcporter", "curl"], "the upstream executable set is exact");
+  assertEqual(REACH_EXECUTABLE_ALLOWLIST.includes(REACH_HEALTH_EXECUTABLE), true, "the health executable is on the same allowlist");
   assertEqual(resolveReachBinary({ projectRoot: ctx.tmp }), ctx.reachBin, "the default binary is the project-local pinned CLI");
 });
 
@@ -590,10 +666,11 @@ test("32. every write-capable action is rejected BEFORE any call", async () => {
 test("33. a hung call is bounded by the timeout and reported as a timeout", async () => {
   const config = reachConfig({ EVOLVE_REACH_TIMEOUT_MS: "1500" });
   const spawn = stubSpawn(() => ({ error: { code: "ETIMEDOUT" }, status: null, signal: "SIGTERM", stdout: "", stderr: "" }));
-  const result = runReachCall({ op: "search", channel: "reddit", values: { query: "x", limit: 3 }, config, env: HOSTILE_ENV, projectRoot: ctx.tmp, spawn });
+  const result = runReachCall({ op: "search", channel: "reddit", values: { query: "x", limit: 3 }, config, env: reachEnv(), projectRoot: ctx.tmp, spawn });
   assertEqual(result.timedOut, true, "the timeout is detected");
   assertEqual(result.ok, false, "a timeout is not a success");
   assertEqual(spawn.calls[0].options.timeout, 1500, "the configured timeout reaches the process");
+  assertEqual(result.binary, "rdt", "the Reddit capability runs the upstream `rdt` tool");
   assertTrue(/timed out after 1500ms/.test(result.error), `the error names the timeout (${result.error})`);
   assertEqual(resolveIntelligenceConfig({ EVOLVE_REACH_TIMEOUT_MS: "1" }).timeoutMs, 1_000, "the timeout is clamped to a sane minimum");
   assertEqual(resolveIntelligenceConfig({ EVOLVE_REACH_TIMEOUT_MS: "9999999" }).timeoutMs, 600_000, "the timeout is clamped to a sane maximum");
@@ -625,14 +702,15 @@ test("34. the per-capture call budget is enforced", async () => {
 test("35. the output byte limit is enforced", async () => {
   const config = reachConfig({ EVOLVE_REACH_MAX_BYTES: "1024" });
   const overflow = stubSpawn(() => ({ error: { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }, status: null, stdout: "", stderr: "" }));
-  const over = runReachCall({ op: "search", channel: "web", values: { query: "x", limit: 3 }, config, env: HOSTILE_ENV, projectRoot: ctx.tmp, spawn: overflow });
+  const over = runReachCall({ op: "search", channel: "web", values: { query: "x", limit: 3 }, config, env: reachEnv(), projectRoot: ctx.tmp, spawn: overflow });
   assertEqual(over.overflowed, true, "an output overflow is detected");
   assertEqual(over.ok, false, "an overflow is not a success");
   assertTrue(/byte limit/.test(over.error), `the error names the byte limit (${over.error})`);
   assertEqual(overflow.calls[0].options.maxBuffer, 1024, "the byte limit reaches the process");
 
   const big = stubSpawn(() => ({ status: 0, stdout: "x".repeat(4_000), stderr: "" }));
-  const trimmed = runReachCall({ op: "search", channel: "web", values: { query: "x", limit: 3 }, config, env: HOSTILE_ENV, projectRoot: ctx.tmp, spawn: big });
+  const trimmed = runReachCall({ op: "search", channel: "web", values: { query: "x", limit: 3 }, config, env: reachEnv(), projectRoot: ctx.tmp, spawn: big });
+  assertEqual(trimmed.binary, "mcporter", "the web search capability runs the upstream `mcporter` tool");
   assertTrue(trimmed.stdout.length <= 1024, "the retained stdout is bounded");
   assertEqual(trimmed.bytes, 4_000, "the observed byte count is reported honestly");
   assertEqual(resolveIntelligenceConfig({}).maxBytes, DEFAULT_REACH_MAX_BYTES, "the default byte limit is the documented one");
@@ -653,9 +731,10 @@ test("36. the subprocess environment is sanitized (allowlist, not just a denylis
     assertTrue(env[forbidden] === undefined, `${forbidden} is never inherited`);
   }
   const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
-  const result = runReachCall({ op: "search", channel: "x", values: { query: "x", limit: 2 }, config: ctx.reachConfig, env: HOSTILE_ENV, projectRoot: ctx.tmp, spawn });
+  const result = runReachCall({ op: "search", channel: "x", values: { query: "x", limit: 2 }, config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
   assertEqual(result.walletEnvPresent, false, "no wallet/signer variable is present");
   assertEqual(result.tokensInEnv, false, "no token/cookie/credential variable is present");
+  assertEqual(result.binary, "twitter", "the X capability runs the upstream `twitter` tool");
   const childKeys = Object.keys(spawn.calls[0].options.env);
   for (const key of childKeys) {
     assertTrue(!/(WALLET|PRIVATE|MNEMONIC|SIGNER|TOKEN|COOKIE|SECRET|API_?KEY|PASSWORD|RPC|SOLANA|JUPITER|DEEPSEEK)/i.test(key), `'${key}' must never reach the child`);
@@ -1106,27 +1185,33 @@ test("63. the dashboard panel exposes counts and identity only — never raw con
 
 test("64. the doctor/probe persists nothing unless `--save` is passed and runs no probe by default", async () => {
   const quiet = path.join(ctx.tmp, "doctor-quiet");
-  const report = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--out", quiet]);
+  // EVOLVE_REACH_BIN pins the probe to a path that does NOT exist in this suite,
+  // so the doctor behaves identically whether or not the operator has installed
+  // Agent-Reach project-locally. Nothing is ever executed here.
+  const reachPin = { EVOLVE_REACH_BIN: ctx.reachBin };
+  const report = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--out", quiet], { env: reachPin });
   assertEqual(report.status, 0, `the doctor exits 0 (stderr: ${report.stderr})`);
   const payload = JSON.parse(report.stdout);
   assertEqual(payload.probe, null, "no probe is executed by default");
   assertEqual(payload.saved, null, "nothing is persisted by default");
   assertEqual(payload.readOnly, true, "the doctor is read-only");
   assertEqual(payload.shadowOnly, true, "the doctor is shadow-only");
-  assertEqual(payload.binaryExists, false, "the pinned binary is NOT installed in this workspace (offline suite)");
+  assertEqual(payload.binary, ctx.reachBin, "the doctor reports the resolved pinned health executable");
+  assertEqual(payload.binaryExists, false, "the unpinned path is absent, so the offline probe is skipped (never faked)");
   assertDeepEqual(await listDirSafe(quiet), [], "the doctor wrote nothing");
 
   const saved = path.join(ctx.tmp, "doctor-saved");
-  const savedRun = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--save", "--out", saved]);
+  const savedRun = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--save", "--out", saved], { env: reachPin });
   assertEqual(savedRun.status, 0, "the saving doctor exits 0");
   const savedFiles = (await listDirSafe(saved)).filter((entry) => entry.endsWith(".json"));
   assertTrue(savedFiles.length === 1 && savedFiles[0].startsWith("health/"), `exactly one health report is written (${JSON.stringify(savedFiles)})`);
   const stored = JSON.parse(await readFile(path.join(saved, savedFiles[0]), "utf8"));
   assertTrue(!JSON.stringify(stored).includes(SENTINELS.cookie), "the health report carries no credential material");
 
-  const probe = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--probe", "--out", path.join(ctx.tmp, "doctor-probe")]);
+  const probe = runNode(["scripts/intelligence.mjs", "doctor", "--json", "--probe", "--out", path.join(ctx.tmp, "doctor-probe")], { env: reachPin });
   assertEqual(JSON.parse(probe.stdout).probe.skipped, true, "without the pinned binary the live probe is skipped, never faked");
   assertTrue(!ctx.spawnBinaries.includes("agent-reach"), "no Agent-Reach binary was launched by the suite");
+  assertTrue(!/agent-reach/.test(probe.stderr), "the probe skipped without executing anything");
   const probeSource = await readFile(path.join(REPO, "scripts", "probe-reach.mjs"), "utf8");
   assertTrue(/shell: false/.test(probeSource), "the probe wrapper never uses a shell");
   assertTrue(!/--system|sudo|pip install|curl \| sh/.test(probeSource), "the probe never installs anything system-wide");
@@ -1342,6 +1427,14 @@ test("73. a real-provider capture normalizes raw payloads and never stores them"
       assertTrue(!/(COOKIE|TOKEN|WALLET|SECRET|PRIVATE)/i.test(key), `'${key}' never reaches a child`);
     }
   }
+  // The seven-query fixture plan exercises five capabilities: x(search),
+  // exa(search), web(search ×2), github(search), reddit(search), rss(read).
+  const binaries = calls.map((call) => path.basename(call.binary)).sort();
+  assertDeepEqual(binaries, ["curl", "gh", "mcporter", "mcporter", "mcporter", "rdt", "twitter"], "each query ran its FROZEN upstream executable");
+  assertEqual(binaries.includes("agent-reach"), false, "a data-acquisition capture never runs the pinned Agent-Reach CLI");
+  for (const call of calls) {
+    assertEqual(call.binary.startsWith(ctx.binDir), true, "every upstream executable was resolved on the sanitized PATH");
+  }
 });
 
 test("74. the call budget bounds a whole real-provider capture", async () => {
@@ -1354,7 +1447,7 @@ test("74. the call budget bounds a whole real-provider capture", async () => {
     candidates: [CANDIDATE],
     provider: "agent-reach",
     now: NOW,
-    env: HOSTILE_ENV,
+    env: reachEnv(),
     projectRoot: ctx.tmp,
     spawn,
   });
@@ -1369,18 +1462,481 @@ test("75. the health probe only runs the side-effect-free JSON paths", async () 
   const spawn = stubSpawn(({ argv }) =>
     argv[0] === "version" ? { status: 0, stdout: "1.5.0\n", stderr: "" } : { status: 0, stdout: JSON.stringify({ ok: true }), stderr: "" },
   );
-  const health = probeReachHealth({ config: ctx.reachConfig, env: HOSTILE_ENV, projectRoot: ctx.tmp, spawn });
+  const health = probeReachHealth({ config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
   assertDeepEqual(spawn.calls.map((call) => call.argv.join(" ")), ["version", "doctor --json"], "only `version` and `doctor --json` are executed");
   assertEqual(health.version.ok, true, "the version probe reports success");
   assertEqual(health.doctor.json.ok, true, "the doctor JSON is parsed");
   assertEqual(health.readOnly, true, "the probe is read-only");
+  assertEqual(health.upstreamCalls, 0, "the doctor places NO upstream intelligence query");
+  assertDeepEqual(health.executables.upstream, ["gh", "twitter", "rdt", "mcporter", "curl"], "the upstream set is reported (and never resolved during a doctor)");
   for (const call of spawn.calls) {
     assertEqual(call.options.shell, false, "the probe never uses a shell");
     assertEqual(path.basename(call.binary), "agent-reach", "only the pinned CLI is launched");
+    assertEqual(call.binary, ctx.reachBin, "the pinned project-local path is the one launched");
+  }
+  assertEqual(health.version.commandPreview, "agent-reach version", "the version preview names the pinned CLI");
+  assertEqual(health.doctor.commandPreview, "agent-reach doctor --json", "the doctor preview names the pinned CLI");
+  for (const call of spawn.calls) {
+    assertDeepEqual(REACH_UPSTREAM_EXECUTABLES.includes(path.basename(call.binary)), false, "no upstream tool is launched by a doctor");
   }
   assertDeepEqual(scan(ctx.intelligenceSources, /doctor"\]\s*\}/), [], "the text `doctor` path is never used");
   assertTrue(/doctor --json/.test(ctx.intelligenceSources.get(path.join("scripts", "intelligence", "agent-reach.mjs"))), "the JSON path is the documented one");
   assertTrue(!ctx.spawnBinaries.includes("agent-reach"), "the suite itself never launched Agent-Reach");
+});
+
+/* ============================================================================
+ * PART 5 — the two-tier executable architecture
+ *
+ * The regression pinned here: an upstream READ operation must NEVER be launched
+ * as `agent-reach <argv>`. The pinned CLI is a router/doctor layer with no
+ * generic `search`/`read` wrapper, so the executable actually handed to spawn is
+ * asserted for EVERY frozen capability entry.
+ * ==========================================================================*/
+
+/** Substitution values for one capability entry (placeholder-driven). */
+const ENTRY_VALUES = Object.freeze({
+  query: "evolve paper arena",
+  url: "https://example.test/seed-1",
+  limit: 3,
+  timeoutSeconds: 20,
+});
+
+function valuesForEntry(entry) {
+  const values = {};
+  for (const token of entry.argv) {
+    if (!token.startsWith("{")) continue;
+    const name = token.slice(1, -1);
+    if (name === "readerUrl") continue; // composed from the `url` slot
+    values[name] = ENTRY_VALUES[name];
+  }
+  // `{readerUrl}` is composed from an already-validated https source URL.
+  if (entry.argv.includes("{readerUrl}")) values.url = ENTRY_VALUES.url;
+  return values;
+}
+
+/** The executable every frozen entry MUST launch. */
+const EXPECTED_EXECUTABLE = Object.freeze({
+  "version:-": "agent-reach",
+  "health:-": "agent-reach",
+  "search:x": "twitter",
+  "read:x": "twitter",
+  "search:exa": "mcporter",
+  "search:web": "mcporter",
+  "read:web": "curl",
+  "search:reddit": "rdt",
+  "read:reddit": "rdt",
+  "read:rss": "curl",
+  "search:github": "gh",
+  "read:github": "gh",
+});
+
+test("76. `version` and `health` resolve the pinned project-local Agent-Reach CLI", async () => {
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "1.5.0", stderr: "" }));
+  const version = runReachCall({ op: "version", config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  const health = runReachCall({ op: "health", config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  assertEqual(version.binary, "agent-reach", "version uses the pinned CLI");
+  assertEqual(health.binary, "agent-reach", "health uses the pinned CLI");
+  assertEqual(version.executable.source, "agent-reach-pin", "the pinned install is the source of the executable");
+  assertEqual(health.executable.role, "health", "the health role is explicit");
+  assertDeepEqual(spawn.calls.map((call) => call.binary), [ctx.reachBin, ctx.reachBin], "the exact project-local pinned path is launched");
+  assertDeepEqual(spawn.calls.map((call) => call.argv), [["version"], ["doctor", "--json"]], "the health argv is exactly version / doctor --json");
+  assertDeepEqual(spawn.calls.map((call) => path.basename(call.binary)), ["agent-reach", "agent-reach"], "no upstream tool is launched for health");
+  assertEqual(REACH_UPSTREAM_EXECUTABLES.includes(path.basename(spawn.calls[0].binary)), false, "health never launches an upstream tool");
+  assertEqual(version.ok, true, "the version call succeeds");
+  assertEqual(health.ok, true, "the doctor call succeeds");
+});
+
+test("77. every frozen entry resolves the executable the capability map declares", async () => {
+  const resolvedKeys = new Set();
+  for (const entry of REACH_CAPABILITY_MAP_V1.entries) {
+    const key = `${entry.op}:${entry.channel ?? "-"}`;
+    const resolved = resolveCapabilityExecutable(capabilityFor(entry.op, entry.channel), { path: ctx.binDir, projectRoot: ctx.tmp });
+    assertEqual(resolved.basename, EXPECTED_EXECUTABLE[key], `${key} resolves ${EXPECTED_EXECUTABLE[key]}`);
+    assertEqual(resolved.basename, entry.binary, `${key} resolves exactly what the frozen map declares`);
+    assertEqual(resolved.role, entry.channel === null ? "health" : "upstream", `${key} has the correct role`);
+    resolvedKeys.add(key);
+  }
+  assertEqual(resolvedKeys.size, 12, "all twelve frozen entries were resolved");
+  const resolve = (op, channel) => resolveCapabilityExecutable(capabilityFor(op, channel), { path: ctx.binDir, projectRoot: ctx.tmp });
+  assertEqual(resolve("search", "github").basename, "gh", "GitHub search resolves `gh`");
+  assertEqual(resolve("search", "github").path, path.join(ctx.binDir, "gh"), "the resolved path is the fixture `gh`");
+  assertEqual(resolve("search", "github").available, true, "the approved tool is reported available");
+  assertEqual(resolve("read", "github").basename, "gh", "GitHub repo read resolves `gh`");
+  assertEqual(resolve("search", "x").basename, "twitter", "X search resolves `twitter`");
+  assertEqual(resolve("read", "x").basename, "twitter", "X tweet read resolves `twitter`");
+  assertEqual(resolve("search", "reddit").basename, "rdt", "Reddit search resolves `rdt`");
+  assertEqual(resolve("read", "reddit").basename, "rdt", "Reddit thread read resolves `rdt`");
+  assertEqual(resolve("search", "exa").basename, "mcporter", "Exa search resolves `mcporter`");
+  assertEqual(resolve("search", "web").basename, "mcporter", "web search resolves `mcporter`");
+  assertEqual(resolve("read", "web").basename, "curl", "web read resolves `curl`");
+  assertEqual(resolve("read", "rss").basename, "curl", "RSS read resolves `curl`");
+  for (const answer of [resolve("read", "web"), resolve("read", "rss")]) {
+    assertEqual(answer.basename === "agent-reach", false, "a read never resolves the router");
+  }
+});
+
+test("78. OFFLINE spawn-spy: each capability launches its declared executable, never the router", async () => {
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const entries = REACH_CAPABILITY_MAP_V1.entries;
+  const results = [];
+  for (const entry of entries) {
+    const result = runReachCall({
+      op: entry.op,
+      channel: entry.channel,
+      values: valuesForEntry(entry),
+      config: ctx.reachConfig,
+      env: reachEnv(),
+      projectRoot: ctx.tmp,
+      spawn,
+    });
+    results.push(result);
+    assertEqual(result.spawned, true, `${entry.op}/${entry.channel ?? "-"} was spawned`);
+    assertEqual(result.binary, entry.binary, `${entry.op}/${entry.channel ?? "-"} launched ${entry.binary}`);
+    assertTrue(result.commandPreview.startsWith(`${entry.binary} `), `${entry.op}/${entry.channel ?? "-"} preview names ${entry.binary}`);
+  }
+  assertEqual(spawn.calls.length, entries.length, "exactly one spawn per capability entry");
+  assertDeepEqual(
+    spawn.calls.map((call) => path.basename(call.binary)),
+    entries.map((entry) => entry.binary),
+    "the SPAWN SPY saw exactly the declared executable, in frozen order",
+  );
+  for (const [index, call] of spawn.calls.entries()) {
+    const entry = entries[index];
+    assertEqual(Array.isArray(call.argv), true, "argv is an ARRAY");
+    assertEqual(call.options.shell, false, "shell is false");
+    assertEqual(call.options.windowsHide, true, "windowsHide is set");
+    assertDeepEqual(call.options.stdio, ["ignore", "pipe", "pipe"], "stdin ignored, stdout/stderr captured");
+    assertEqual(Number.isFinite(call.options.timeout), true, "a bounded timeout reaches the process");
+    assertEqual(Number.isFinite(call.options.maxBuffer), true, "a bounded maxBuffer reaches the process");
+    assertEqual(path.isAbsolute(call.binary), true, "an absolute resolved path is launched (no re-resolution by the OS)");
+    if (entry.channel === null) {
+      assertEqual(call.binary, ctx.reachBin, "health launches the exact pinned project-local binary");
+    } else {
+      assertEqual(isExecutableFile(call.binary), true, "the upstream executable exists and is executable");
+      assertEqual(call.binary.startsWith(ctx.binDir), true, "upstream tools come from the sanitized PATH");
+    }
+  }
+  const dataCalls = spawn.calls.filter((_call, index) => entries[index].channel !== null);
+  assertEqual(dataCalls.length, 10, "ten data capabilities were exercised");
+  assertEqual(dataCalls.every((call) => path.basename(call.binary) !== "agent-reach"), true, "NO data acquisition call runs the Agent-Reach CLI");
+  const healthCalls = spawn.calls.filter((_call, index) => entries[index].channel === null);
+  assertEqual(healthCalls.every((call) => path.basename(call.binary) === "agent-reach"), true, "ONLY version/health run the Agent-Reach CLI");
+  assertEqual(results.length, 12, "every entry produced a result");
+});
+
+test("79. an arbitrary or non-allowlisted executable can never be supplied", async () => {
+  const forged = (binary) => ({ op: "search", channel: "github", binary, argv: ["search", "repos", "{query}"] });
+  assertThrows(() => resolveCapabilityExecutable(forged("/usr/bin/gh"), { projectRoot: ctx.tmp }), ReachBinaryError, "a path-qualified executable is refused");
+  assertThrows(() => resolveCapabilityExecutable(forged(`..${path.sep}gh`), { projectRoot: ctx.tmp }), ReachBinaryError, "a relative executable path is refused");
+  assertThrows(() => resolveCapabilityExecutable(forged("bash"), { projectRoot: ctx.tmp }), ReachBinaryError, "a non-allowlisted binary is refused");
+  assertThrows(() => resolveCapabilityExecutable(forged(""), { projectRoot: ctx.tmp }), ReachBinaryError, "an empty executable is refused");
+  assertThrows(() => resolveCapabilityExecutable(forged("gh "), { projectRoot: ctx.tmp }), ReachBinaryError, "a padded executable name is refused");
+  assertThrows(
+    () => buildReachArgv({ op: "search", channel: "github", entry: forged("bash"), values: { query: "x" } }),
+    ReachBinaryError,
+    "a forged entry cannot smuggle an arbitrary binary into an argv build",
+  );
+  assertThrows(() => assertReadOnlyArgv(["x"], { binary: "sh" }), ReachBinaryError, "a raw shell is refused");
+  assertThrows(() => resolveReachBinary({ reachBin: "/usr/bin/gh", projectRoot: ctx.tmp }), ReachBinaryError, "EVOLVE_REACH_BIN cannot name an upstream tool");
+  assertEqual(REACH_EXECUTABLE_ALLOWLIST.includes("curl"), true, "`curl` is allowlisted (and therefore legitimate)");
+  assertThrows(() => resolveCapabilityExecutable({ op: "search", channel: "web", binary: "wget" }, { projectRoot: ctx.tmp }), ReachBinaryError, "an unlisted downloader is refused");
+
+  // EVOLVE_REACH_BIN must not be able to redirect a DATA call either: the frozen
+  // capability map decides the executable, never the environment.
+  const hijacked = resolveIntelligenceConfig({ ...HOSTILE_ENV, EVOLVE_REACH_BIN: "/usr/bin/curl" });
+  assertEqual(hijacked.reachBin, "/usr/bin/curl", "the env value is read (as configuration)");
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const result = runReachCall({
+    op: "search",
+    channel: "github",
+    values: { query: "evolve", limit: 2 },
+    config: hijacked,
+    env: reachEnv(),
+    projectRoot: ctx.tmp,
+    spawn,
+  });
+  assertEqual(result.binary, "gh", "a GitHub call still runs `gh`");
+  assertEqual(spawn.calls[0].binary, path.join(ctx.binDir, "gh"), "the spawn spy confirms the fixture `gh` was launched");
+  assertEqual(result.executable.path, path.join(ctx.binDir, "gh"), "the reported path is the resolved `gh`");
+});
+
+test("80. candidate/query metadata can never influence executable selection", async () => {
+  const hostileCandidate = Object.freeze({
+    symbol: "curl",
+    name: "gh mcporter",
+    domain: "twitter",
+    mint: "agent-reach bash /usr/bin/curl",
+    handle: "@rdt",
+  });
+  const plan = buildQueryPlan({ candidates: [hostileCandidate] });
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const launched = [];
+  for (const query of plan.queries) {
+    const result = runReachCall({
+      op: query.op,
+      channel: query.channel,
+      values: { query: query.query, url: query.query, limit: 3, timeoutSeconds: 20 },
+      config: ctx.reachConfig,
+      env: reachEnv(),
+      projectRoot: ctx.tmp,
+      spawn,
+    });
+    launched.push({ op: query.op, channel: query.channel, binary: result.binary, declared: capabilityFor(query.op, query.channel).binary });
+  }
+  assertTrue(launched.length >= 6, "the hostile candidate still renders the canonical plan");
+  for (const row of launched) {
+    assertEqual(row.binary, row.declared, `metadata never changed the executable (${row.op}/${row.channel})`);
+  }
+  assertDeepEqual(
+    [...new Set(launched.map((row) => row.binary))].sort(),
+    [...REACH_UPSTREAM_EXECUTABLES].sort(),
+    "only the five approved upstream executables can ever appear",
+  );
+  for (const call of spawn.calls) {
+    assertEqual(REACH_EXECUTABLE_ALLOWLIST.includes(path.basename(call.binary)), true, "every launched basename is allowlisted");
+    assertEqual(path.basename(call.binary) === "agent-reach", false, "a query that mentions agent-reach still cannot launch it");
+  }
+  assertEqual(launched.some((row) => row.binary === "agent-reach"), false, "no data row resolved the router");
+});
+
+test("81. PATH handling is a bounded, shell-free search over absolute directories", async () => {
+  const dirA = path.join(ctx.tmp, "path-a");
+  const dirB = path.join(ctx.tmp, "path-b");
+  const dirD = path.join(ctx.tmp, "path-d");
+  await mkdir(dirA, { recursive: true });
+  await mkdir(dirB, { recursive: true });
+  await mkdir(dirD, { recursive: true });
+  await mkdir(path.join(dirD, "gh"), { recursive: true }); // a DIRECTORY named `gh`
+  for (const dir of [dirA, dirB]) {
+    await writeFile(path.join(dir, "gh"), "stub", "utf8");
+    await chmod(path.join(dir, "gh"), 0o755);
+  }
+  assertDeepEqual(
+    trustedPathDirs([dirA, dirB, dirA, "relative-dir", ""].join(path.delimiter)),
+    [dirA, dirB],
+    "relative, empty and duplicate entries are dropped",
+  );
+  assertEqual(trustedPathDirs("relative:" + dirA).includes("relative"), false, "a relative entry never survives");
+  assertEqual(trustedPathDirs(path.delimiter.repeat(4) + dirA).length, 1, "empty segments never survive");
+  const first = searchTrustedPath("gh", { path: [dirA, dirB].join(path.delimiter) });
+  assertEqual(first.path, path.join(dirA, "gh"), "the FIRST legitimate match wins");
+  assertEqual(first.searched.length, 2, "both directories were searched");
+  assertEqual(first.realPath, path.join(dirA, "gh"), "the realpath is recorded as diagnostic metadata");
+  assertEqual(searchTrustedPath("gh", { path: [dirD, dirB].join(path.delimiter) }).path, path.join(dirB, "gh"), "a directory that merely shares the name is skipped");
+  assertEqual(searchTrustedPath("gh", { path: "" }).path, null, "an empty PATH yields nothing");
+  assertDeepEqual(searchTrustedPath("gh", { path: "" }).searched, [], "an empty PATH searches nothing");
+  assertEqual(searchTrustedPath("gh", { path: "relative-dir" }).path, null, "a relative-only PATH yields nothing");
+  assertEqual(searchTrustedPath("mcporter", { path: dirA }).path, null, "an absent basename is not found");
+  assertEqual(searchTrustedPath("gh", { path: dirA }).searched.length, 1, "a single-directory PATH is handled");
+  if (process.platform !== "win32") {
+    const dirE = path.join(ctx.tmp, "path-e");
+    await mkdir(dirE, { recursive: true });
+    await writeFile(path.join(dirE, "gh"), "stub", "utf8");
+    await chmod(path.join(dirE, "gh"), 0o644);
+    assertEqual(
+      searchTrustedPath("gh", { path: [dirE, dirB].join(path.delimiter) }).path,
+      path.join(dirB, "gh"),
+      "a non-executable file is skipped",
+    );
+  }
+  const viaEnv = resolveCapabilityExecutable(capabilityFor("search", "github"), { env: { PATH: dirA }, projectRoot: ctx.tmp });
+  assertEqual(viaEnv.path, path.join(dirA, "gh"), "the environment's PATH is the default lookup source");
+  const viaOption = resolveCapabilityExecutable(capabilityFor("search", "github"), { path: [dirD, dirB].join(path.delimiter), projectRoot: ctx.tmp });
+  assertEqual(viaOption.path, path.join(dirB, "gh"), "an explicit PATH list is honoured (a PATH, never a binary path)");
+  assertEqual(viaOption.source, "sanitized-path", "the resolution source is reported");
+  assertEqual(REACH_EXECUTABLE_ALLOWLIST.includes(viaOption.basename), true, "the basename stays on the allowlist");
+});
+
+test("82. commandPreview names the executable that was actually launched", async () => {
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const github = runReachCall({ op: "search", channel: "github", values: { query: "evolve paper arena", limit: 3 }, config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  const rss = runReachCall({ op: "read", channel: "rss", values: { url: "https://example.test/feed", timeoutSeconds: 20 }, config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  const x = runReachCall({ op: "search", channel: "x", values: { query: "evolve", limit: 2 }, config: ctx.reachConfig, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  assertEqual(
+    github.commandPreview,
+    "gh search repos evolve paper arena --json name,owner,description,url,stargazersCount --limit 3",
+    "the GitHub preview is the `gh` command (never `agent-reach search repos ...`)",
+  );
+  assertEqual(rss.commandPreview, "curl -fsSL --max-time 20 https://example.test/feed", "the RSS preview is the `curl` command");
+  assertEqual(x.commandPreview, "twitter search evolve --json --limit 2", "the X preview is the `twitter` command");
+  const results = [github, rss, x];
+  assertEqual(spawn.calls.length, 3, "three calls were made");
+  results.forEach((result, index) => {
+    const call = spawn.calls[index];
+    assertEqual(result.commandPreview, path.basename(call.binary) + " " + call.argv.join(" "), "the preview matches the launched command exactly");
+    assertTrue(!result.commandPreview.startsWith("agent-reach "), "a data preview never starts with the router");
+    for (const sentinel of Object.values(SENTINELS)) {
+      assertTrue(!result.commandPreview.includes(sentinel), "no secret value appears in a preview");
+    }
+  });
+  assertDeepEqual(scan(ctx.intelligenceSources, /commandPreview: `\$\{path\.basename\(binary\)\}/), [], "the old unconditional-binary preview is gone");
+});
+
+test("83. a missing upstream tool is a bounded UNAVAILABLE failure (no install, no fallback)", async () => {
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const result = runReachCall({
+    op: "search",
+    channel: "github",
+    values: { query: "evolve", limit: 2 },
+    config: ctx.reachConfig,
+    env: emptyReachEnv(),
+    projectRoot: ctx.tmp,
+    spawn,
+  });
+  assertEqual(result.ok, false, "a missing tool is not a success");
+  assertEqual(result.unavailable, true, "it is classified as UNAVAILABLE");
+  assertEqual(result.spawned, false, "NOTHING is spawned");
+  assertEqual(spawn.calls.length, 0, "the spawn spy saw no call at all");
+  assertEqual(result.binary, "gh", "the capability still names its declared tool");
+  assertEqual(result.errorName, "ReachExecutableUnavailableError", "the failure has a stable name");
+  assertTrue(/upstream executable 'gh' is not available on the sanitized PATH/.test(result.error), `the error is specific (${result.error})`);
+  assertTrue(/never installs/.test(result.error) && /never falls back/.test(result.error), "the error states that no install and no fallback happened");
+  assertEqual(result.commandPreview, "gh search repos evolve --json name,owner,description,url,stargazersCount --limit 2", "the preview still describes the intended command");
+  assertEqual(Array.isArray(result.argv), true, "the validated argv is still reported");
+  assertEqual(capabilityFor("search", "github").binary, "gh", "the frozen map is unchanged (no dynamic backend selection)");
+  assertEqual(capabilityFor("search", "github").argv.includes("install"), false, "no install capability exists");
+  assertTrue(result.searched.length >= 1, "the searched directories are reported");
+
+  const missing = new ReachExecutableUnavailableError("rdt", [ctx.emptyBinDir]);
+  assertEqual(missing.name, "ReachExecutableUnavailableError", "the exported error class is usable");
+  assertEqual(REACH_HEALTH_EXECUTABLE, "agent-reach", "the router is never the fallback executable");
+});
+
+test("84. a capture on a machine with no approved tool fails every channel closed", async () => {
+  const capture = ctx.missingToolCapture;
+  assertEqual(ctx.missingToolSpawn.calls.length, 0, "not a single subprocess was created");
+  assertEqual(capture.manifest.counts.calls, 7, "every planned query was attempted");
+  assertEqual(capture.manifest.counts.failures, 7, "every query failed closed");
+  assertEqual(capture.manifest.counts.records, 0, "no evidence was invented");
+  assertEqual(capture.manifest.counts.timeouts, 0, "a missing tool is not a timeout");
+  assertEqual(capture.manifest.health.github.status, "error", "the channel is reported as an error");
+  assertTrue(/upstream executable 'gh'/.test(capture.manifest.health.github.lastError), "the GitHub failure names `gh`");
+  assertTrue(/upstream executable 'twitter'/.test(capture.manifest.health.x.lastError), "the X failure names `twitter`");
+  assertTrue(/upstream executable 'curl'/.test(capture.manifest.health.rss.lastError), "the RSS failure names `curl`");
+  for (const failure of capture.manifest.failures) {
+    assertTrue(/is not available on the sanitized PATH/.test(failure.error), "each failure is an availability failure");
+  }
+  assertEqual(capture.manifest.agentReach.commit, AGENT_REACH_PIN.commit, "the pinned Agent-Reach identity is still recorded");
+  assertEqual(capture.manifest.provider, "agent-reach", "the provider is unchanged");
+  assertEqual(capture.manifest.readOnly, true, "the capture is still read-only");
+  for (const failure of capture.manifest.failures) {
+    assertTrue(!/(pip|npm|brew|apt|choco|apt-get)\s+install|agent-reach\s+install/i.test(failure.error), "no failure ever proposes an install command");
+    assertTrue(/never installs/.test(failure.error), "each failure states explicitly that nothing was installed");
+  }
+  assertEqual(capture.manifest.failures.some((row) => /agent-reach/.test(row.error)), false, "the router is never proposed as a fallback");
+  assertTrue(!ctx.missingToolSpawn.calls.some((call) => path.basename(call.binary) === "agent-reach"), "the router was never used as a fallback");
+  assertDeepEqual(capture.records, [], "no records were produced");
+});
+
+test("85. an upstream call inherits no credential, key or signer material", async () => {
+  const credentialEnv = {
+    PATH: ctx.binDir,
+    HOME: "/home/agent",
+    LANG: "C",
+    TERM: "dumb",
+    AI_GATEWAY_API_KEY: SENTINELS.token,
+    EVOLVE_JEV_API_KEY: SENTINELS.token,
+    OPENAI_API_KEY: SENTINELS.token,
+    ANTHROPIC_API_KEY: SENTINELS.token,
+    DEEPSEEK_API_KEY: SENTINELS.token,
+    EXA_API_KEY: SENTINELS.token,
+    WALLET_PRIVATE_KEY: SENTINELS.wallet,
+    MNEMONIC: SENTINELS.wallet,
+    SIGNER_SECRET: SENTINELS.secret,
+    X_COOKIE: SENTINELS.cookie,
+    X_AUTH_TOKEN: SENTINELS.token,
+    SOLANA_RPC_URL: "https://api.mainnet-beta.solana.invalid",
+  };
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const result = runReachCall({ op: "search", channel: "github", values: { query: "evolve", limit: 2 }, config: ctx.reachConfig, env: credentialEnv, projectRoot: ctx.tmp, spawn });
+  assertEqual(result.binary, "gh", "the upstream call was resolved");
+  assertEqual(result.spawned, true, "the upstream call was made");
+  const childEnv = spawn.calls[0].options.env;
+  assertDeepEqual(Object.keys(childEnv).sort(), ["HOME", "LANG", "PATH", "TERM"], "only the allowlisted variables reach the child");
+  for (const key of Object.keys(credentialEnv)) {
+    if (["HOME", "LANG", "PATH", "TERM"].includes(key)) continue;
+    assertEqual(key in childEnv, false, `${key} is never inherited`);
+  }
+  for (const sentinel of Object.values(SENTINELS)) {
+    assertDeepEqual(Object.values(childEnv).filter((value) => value === sentinel), [], "no credential VALUE reaches the child");
+  }
+  assertEqual(result.walletEnvPresent, false, "no wallet/signer variable is present");
+  assertEqual(result.tokensInEnv, false, "no token/cookie variable is present");
+  assertEqual(Object.keys(childEnv).includes("EVOLVE_REACH_BIN"), false, "the reach-binary override never reaches the child");
+});
+
+test("86. write verbs and file-writing flags are rejected before any spawn", async () => {
+  for (const flag of FORBIDDEN_ARGV_TOKENS.filter((token) => token.startsWith("-"))) {
+    assertThrows(() => assertReadOnlyArgv(["-fsSL", flag, "https://example.test/x"], { binary: "curl" }), ReachCommandError, `'${flag}' is refused for curl`);
+  }
+  for (const verb of ["post", "reply", "retweet", "create", "push", "fork", "delete", "merge", "comment", "publish", "upload", "dm"]) {
+    assertThrows(() => assertReadOnlyArgv([verb], { binary: "gh" }), ReachCommandError, `'${verb}' is refused`);
+    assertThrows(() => assertReadOnlyArgv([verb.toUpperCase()], { binary: "gh" }), ReachCommandError, `'${verb}' is refused case-insensitively`);
+  }
+  assertThrows(() => assertReadOnlyArgv(["api", "--method", "POST"], { binary: "gh" }), ReachCommandError, "a POST is refused for gh");
+  assertThrows(
+    () => buildReachArgv({ op: "read", channel: "web", entry: { op: "read", channel: "web", binary: "curl", argv: ["-fsSL", "--output", "/tmp/leak", "{url}"] }, values: { url: "https://example.test/x" } }),
+    ReachCommandError,
+    "a file-writing flag can never be built into an argv",
+  );
+  for (const entry of REACH_CAPABILITY_MAP_V1.entries) {
+    assertDeepEqual(entry.argv.filter((token) => FORBIDDEN_ARGV_TOKENS.includes(token)), [], `${entry.op}/${entry.channel ?? "-"} carries no write token`);
+  }
+  assertDeepEqual(scan(ctx.intelligenceSources, /spawn\(\s*"|execSync\(|exec\(\s*"/), [], "no shell-string spawn exists anywhere in the layer");
+});
+
+test("87. the budget, timeout and byte cap reach every upstream process", async () => {
+  const config = reachConfig({ EVOLVE_REACH_TIMEOUT_MS: "2500", EVOLVE_REACH_MAX_BYTES: "4096" });
+  const spawn = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  const result = runReachCall({ op: "search", channel: "github", values: { query: "evolve", limit: 2 }, config, env: reachEnv(), projectRoot: ctx.tmp, spawn });
+  assertEqual(spawn.calls.length, 1, "one call was placed");
+  assertEqual(spawn.calls[0].options.timeout, 2500, "the configured timeout reaches the process");
+  assertEqual(spawn.calls[0].options.maxBuffer, 4096, "the configured byte cap reaches the process");
+  assertEqual(result.timeoutMs, 2500, "the timeout is reported");
+  assertEqual(result.maxBytes, 4096, "the byte cap is reported");
+  assertEqual(spawn.calls[0].options.shell, false, "shell is false");
+  assertDeepEqual(spawn.calls[0].options.stdio, ["ignore", "pipe", "pipe"], "stdio is non-interactive");
+
+  const spent = createReachBudget(1);
+  spent.take();
+  const blocked = stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" }));
+  assertThrows(
+    () => runReachCall({ op: "search", channel: "github", values: { query: "evolve", limit: 2 }, config, budget: spent, env: reachEnv(), projectRoot: ctx.tmp, spawn: blocked }),
+    ReachBudgetExceededError,
+    "an exhausted budget refuses an upstream call",
+  );
+  assertEqual(blocked.calls.length, 0, "an exhausted budget spawns NOTHING");
+
+  const capped = runReachCall({
+    op: "search",
+    channel: "github",
+    values: { query: "evolve", limit: 2 },
+    config: reachConfig({ EVOLVE_REACH_TIMEOUT_MS: "9999999" }),
+    env: reachEnv(),
+    projectRoot: ctx.tmp,
+    spawn: stubSpawn(() => ({ status: 0, stdout: "[]", stderr: "" })),
+  });
+  assertEqual(capped.timeoutMs, 600_000, "the timeout stays clamped");
+  assertEqual(capped.ok, true, "the clamped call still succeeds");
+});
+
+test("88. the old unconditional router resolution cannot come back (static pin)", async () => {
+  const source = ctx.intelligenceSources.get(path.join("scripts", "intelligence", "agent-reach.mjs"));
+  assertEqual(typeof source, "string", "the adapter source was loaded");
+  const start = source.indexOf("export function runReachCall(");
+  const healthStart = source.indexOf("export function probeReachHealth(", start);
+  assertTrue(start >= 0 && healthStart > start, "both functions are declared");
+  const body = source.slice(start, healthStart);
+  assertTrue(/resolveCapabilityExecutable\(/.test(body), "runReachCall resolves the CAPABILITY executable");
+  assertTrue(!/resolveReachBinary\(/.test(body), "runReachCall no longer resolves the pinned CLI for every operation");
+  assertTrue(/spawn\(executable\.path, argv/.test(body), "the resolved capability path is what is spawned");
+  assertTrue(/assertReadOnlyArgv/.test(ctx.intelligenceSources.get(path.join("scripts", "intelligence", "agent-reach.mjs"))), "argv validation is still enforced");
+  const health = source.slice(healthStart, source.indexOf("function parseJsonSafe(", healthStart));
+  assertTrue(/op: "version"/.test(health), "the probe runs the `version` operation directly");
+  assertTrue(/op: "health"/.test(health), "the probe runs `doctor --json` through the health operation");
+  assertTrue(!/spawnFor/.test(source), "the argv-rewriting health shim is gone");
+  assertDeepEqual(scan(ctx.intelligenceSources, /"agent-reach "|'agent-reach '/), [], "no command preview or argv hard-codes the router as the launcher");
+  assertTrue(ctx.intelligenceSources.size >= 12, "the whole intelligence layer was scanned");
 });
 
 /* ============================================================================
@@ -1417,6 +1973,7 @@ async function run() {
   await disposeFixtures();
 
   console.log(`\nfixtures built in ${fixtureMs}ms`);
+  console.log(`offline: no live intelligence capture, no upstream tool executed, no network call.`);
   console.log(`EVOLVE Phase 5E external-intelligence validation: ${passed}/${cases.length} checks passed`);
 
   if (failures.length > 0) {
@@ -1426,6 +1983,8 @@ async function run() {
   } else {
     console.log("All Phase 5E checks passed. External intelligence is READ-ONLY, SHADOW-ONLY and isolated:");
     console.log("nothing in the layer can trade, post, sign, write, call Jev/DeepSeek, or alter Arena/evolution/replication.");
+    console.log("The two tiers are separated: the pinned `agent-reach` CLI runs `version`/`doctor --json` health only,");
+    console.log("while `gh`/`twitter`/`rdt`/`mcporter`/`curl` are resolved from the sanitized PATH for data acquisition.");
     console.log("No Agent-Reach binary was installed or launched, and the Wave 2 captures were never read or written.");
   }
 }
