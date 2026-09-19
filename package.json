@@ -12,7 +12,7 @@
     "validate:market": "node scripts/validate-market.mjs",
     "validate:syntax": "node scripts/check-syntax.mjs",
     "smoke:engine": "node scripts/smoke-engine.mjs",
-    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run validate:phase5a31 && npm run validate:phase5b && npm run validate:phase5c && npm run validate:phase5c2 && npm run validate:phase5c3 && npm run validate:phase5d && npm run validate:phase5e && npm run validate:phase5e2 && npm run validate:phase5f && npm run validate:phase5f1 && npm run validate:phase5g && npm run validate:phase5g1 && npm run validate:phase5g1a && npm run validate:phase5g1b && npm run validate:phase5g1c && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm",
+    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run validate:phase5a31 && npm run validate:phase5b && npm run validate:phase5c && npm run validate:phase5c2 && npm run validate:phase5c3 && npm run validate:phase5d && npm run validate:phase5e && npm run validate:phase5e2 && npm run validate:phase5f && npm run validate:phase5f1 && npm run validate:phase5g && npm run validate:phase5g1 && npm run validate:phase5g1a && npm run validate:phase5g1b && npm run validate:phase5g1c && npm run validate:phase5h && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm",
     "research": "node scripts/research.mjs",
     "probe:research-provider": "node scripts/probe-research-provider.mjs",
     "compare:research": "node scripts/research-compare.mjs",
@@ -50,6 +50,7 @@
     "validate:phase5g1a": "node scripts/validate-phase5g1a.mjs",
     "validate:phase5g1b": "node scripts/validate-phase5g1b.mjs",
     "validate:phase5g1c": "node scripts/validate-phase5g1c.mjs",
+    "validate:phase5h": "node scripts/validate-phase5h.mjs",
     "jev": "node scripts/jev.mjs",
     "jev:external": "node scripts/jev-external.mjs",
     "probe:jev": "node scripts/probe-jev.mjs",
@@ -61,6 +62,7 @@
     "intelligence:doctor": "node scripts/intelligence.mjs doctor",
     "intelligence:classify": "node scripts/intelligence-classify.mjs",
     "intelligence:classify-eval": "node scripts/intelligence-classify-eval.mjs",
+    "intelligence:classify-features": "node scripts/intelligence-classify-features.mjs",
     "probe:reach": "node scripts/probe-reach.mjs"
   },
   "dependencies": {

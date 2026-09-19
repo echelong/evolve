@@ -2964,6 +2964,313 @@ npm run validate:phase5g1   # 75 offline cases: taxonomy/definition/projection p
                             # text-free artifact, deterministic audit, offline replay/stats, identity barriers
 ```
 
+## Phase 5H.0 — Deterministic Classifier-Derived Features
+
+```text
+frozen 5G.1 cohort  (clcohort-…)
+  → verify frozen cohort
+  → verify frozen classifier experiments  (clexp-…)
+  → verify frozen source captures
+  → classifier-feature-definition-v1
+  → record-level deterministic extraction
+  → classifier-feature artifact  (clfeat-…)
+  → offline replay / audit / stats
+  → STOP
+```
+
+Phase 5H.0 is a **pure deterministic transformation** over evidence that is already frozen. It pools the
+classifier records of ONE explicit cohort and derives **19 numeric features**. There is **no routing** from this
+phase and no downstream consumer yet.
+
+```text
+Jev:      false
+DeepSeek: false
+Arena:    false
+Trading:  false
+```
+
+- The classifier-derived features are **DESCRIPTIVE ONLY**. They are **not** alpha, **not** signal strength,
+  **not** sentiment, **not** trading direction, **not** project quality, **not** legitimacy, **not** fraud
+  probability, **not** profitability, **not** expected return, **not** market health and **not** buy/sell
+  probability. They have no authority over the Arena, evolution, gates, replication or deployment.
+- Phase 5H.0 is **DEVELOPMENT-only**: the source evidence class is `DEVELOPMENT_CLASSIFIER_EVIDENCE` and the
+  only permitted transition is
+
+  ```text
+  DEVELOPMENT_CLASSIFIER_EVIDENCE  →  DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES
+  ```
+
+  Any other source evidence class **fails closed**. A 5H.0 artifact never claims `CLEAN_REPLICATION`,
+  `VALIDATION`, `TEST`, `OOS` or `PRODUCTION`. **A future clean validation requires entirely new evidence** —
+  no 5H.0 artifact may be relabelled or reused for it.
+- Phase 5H.0 is **offline only**: it reads frozen classifier experiments and their frozen source captures from
+  disk and makes **zero network calls** — no classifier.dev, no Agent-Reach, no Jev, no DeepSeek, no Arena, no
+  trading. It never reclassifies and never captures.
+- **One evidence unit = ONE frozen cohort.** There is no automatic cohort discovery, no "latest cohort", no
+  multi-cohort artifact, no source-capture-level artifact and no classifier-experiment-level artifact. If one
+  experiment needs features, the operator first freezes a one-experiment cohort.
+- **Aggregation is record-weighted and reconstructed record by record** from the frozen cohort evidence —
+  never averaged from experiment summaries: `C = Σ classifiedCount_e`, `n_l = Σ n_e,l`,
+  `fraction = total count / total classified count`.
+- **Aggregation is never inferred from partial evidence**: `0` never stands for unknown. Unavailable derived
+  quantities are `null`.
+- The definition **imports** the frozen classifier identity (`reach-signal-type-v1` v1, nine labels, the
+  classifier definition digest, the instructions digest and `classifier-input-projection-v1`) from the sealed
+  Phase 5G.0 module and never redeclares it. A wrong classifier id/version/projection or a **mixed** version,
+  projection, classifier-definition digest or instructions digest is **refused** (no fallback to "latest").
+
+### Feature definition — `classifier-feature-definition-v1` (Phase 5H.0)
+
+```text
+classifierId            reach-signal-type-v1          (imported)
+classifierVersion       1                             (imported)
+taxonomyLabels          9 descriptive labels          (imported)
+entropyNormalizationK   9
+entropyLogBase          natural (Math.log)
+confidenceLow           { comparator: "lt",  threshold: 0.50 }   # 0.50 is NOT low
+confidenceHigh          { comparator: "gte", threshold: 0.90 }   # 0.90 IS high
+marginAmbiguous         { comparator: "lt",  threshold: 0.10 }   # 0.10 is NOT ambiguous
+scoreVectorCompleteness all_nine_labels_present
+rounding                round6
+quantileMethod          linear_interpolation_sorted_ascending
+featureValueDomain      number|null
+groups                  {}                                    # no grouped semantic features
+```
+
+The definition carries a **computed** digest (`FEATURE_DEFINITION_DIGEST`) that is never hard-coded; the CLI,
+the artifact audit and the validation suite all report the actual value. Print it with
+`npm run intelligence:classify-features -- --definition`.
+
+### The 19 canonical features (exact order)
+
+```text
+ 1. label_fraction_technical_activity
+ 2. label_fraction_project_announcement
+ 3. label_fraction_exchange_or_listing
+ 4. label_fraction_liquidity_or_market_structure
+ 5. label_fraction_security_or_risk
+ 6. label_fraction_governance_or_admin
+ 7. label_fraction_community_attention
+ 8. label_fraction_promotion_or_marketing
+ 9. label_fraction_unrelated_or_noise
+10. observed_label_count
+11. label_entropy_normalized
+12. largest_label_fraction
+13. confidence_mean
+14. confidence_median
+15. confidence_low_fraction
+16. confidence_high_fraction
+17. score_margin_mean
+18. score_margin_median
+19. score_margin_ambiguous_fraction
+```
+
+No other field is persisted in v1. `observed_label_fraction` is **deliberately absent** (redundant), HHI is
+**absent**, score entropy stays **evaluation-only**, and the `<0.05` / `<0.20` margin bands and the p10/p25/p75/p90/
+min/max confidence diagnostics stay in the Phase 5G.1 evaluation — they are never copied here.
+
+### Formulas
+
+```text
+C    = pooled classified records over the cohort (Σ classifiedCount_e)
+n_l  = pooled classified records whose label === l
+
+label_fraction_l              = round6(n_l / C)                      # 0 is a TRUE ZERO, never missingness
+observed_label_count          = # of taxonomy labels with n_l > 0     # integer
+label_entropy_normalized      = round6( -Σ(p_l · ln p_l) / ln(9) )   # p_l = 0 terms ignored
+largest_label_fraction        = round6(max(n_l) / C)                 # ties: frozen taxonomy order
+
+confidence_mean               = round6(mean(confidence))
+confidence_median             = round6(linear quantile at 0.5)
+confidence_low_fraction       = round6(count(confidence <  0.50) / C)
+confidence_high_fraction      = round6(count(confidence >= 0.90) / C)
+
+margin                        = highest_score - second_highest_score  # COMPLETE vectors only
+C_s                           = # of classified records with a complete score vector
+score_margin_mean             = round6(mean(margin))
+score_margin_median           = round6(linear quantile at 0.5)
+score_margin_ambiguous_fraction = round6(count(margin < 0.10) / C_s)
+```
+
+Entropy is always normalized over the **entire taxonomy** (`ln(9)`), never over the number of observed labels;
+a single observed label is exactly `0`. High entropy is descriptive only — it is **not** "good" and it is
+**not** "bad". Each record's margin is rounded to 6 decimals **before** aggregation, so the persisted
+mean/median/ambiguous-fraction reproduce the sealed 5G.1 `scoreMargin` diagnostics exactly.
+
+### Null and missing semantics
+
+```text
+classifiedCount = 0                     → FeatureNoEvidenceError, nothing is written
+confidence missing / NaN / < 0 / > 1    → integrity error, never skipped silently
+score vector incomplete                 → that record is excluded from the MARGIN denominator only;
+                                          label/confidence features still use it
+no complete score vector                → all three margin features are null (never 0)
+```
+
+A present-but-out-of-range or non-numeric score is an integrity error, never coerced. The artifact records
+`scoreVectorCompleteCount` / `scoreVectorIncompleteCount`, `recordCount`, `classifiedCount`,
+`skippedEmptyCount` and `nullFeatureCount`, so every excluded record is accounted for.
+
+### Feature artifact
+
+```text
+.evolve/classifier/features/<feature-id>/feature.json
+feature-id = clfeat-<UTC stamp>-<first 8 hex of the IDENTITY digest>
+```
+
+The artifact persists the schema version and phase, `featureId`, `featureDefinitionVersion`,
+`featureDefinitionDigest`, the derivation evidence class pair (`sourceEvidenceClass` → `evidenceClass`), the
+classifier identity (`classifierId`, `classifierVersion`, `classifierDefinitionDigest`, `instructionsDigest`,
+`inputProjectionVersion`), the cohort identity (`cohortId`, `cohortDigest`), provenance counts and digests
+(`experimentCount`, `captureCount`, `experimentIds`, `sourceCaptureIds`, `experimentDigests`, `resultDigests`,
+`captureManifestDigests`, `recordsDigests`, `experimentRecordCounts`, `infrastructureExperimentPresent`),
+pooled counts (`recordCount`, `classifiedCount`, `skippedEmptyCount`, `distinctRecordDigestCount`,
+`duplicateRecordDigestCount`, `scoreVectorCompleteCount`, `scoreVectorIncompleteCount`, `nullFeatureCount`),
+the descriptive `counts` block (`labelCounts`, `largestLabel`, `largestLabelCount`), the 19 `features`, the
+`aggregation` block, the `timeline`, the `routing` block, the frozen flags (`immutable`, `finalized`,
+`descriptiveOnly`, `developmentOnly`, `noGroundTruth`, `noProfitabilityInference`), `createdAt`, `featureDigest`
+and a `note`.
+
+It contains **no** raw source text, title, excerpt, URL, author, query, credential, raw provider response,
+classifier input, HTTP header or API key. Feature keys are **numeric or null only**.
+
+Duplicate record digests are **reported, never refused**: `distinctRecordDigestCount` and
+`duplicateRecordDigestCount` are persisted and are not reinterpreted (legitimate overlap across experiments is
+allowed).
+
+### Identity and digests
+
+```text
+featureId     = clfeat-<UTC stamp of createdAt>-<identityDigest[:8]>
+identityDigest = digestOf(artifact EXCLUDING featureId and featureDigest)
+featureDigest  = digestOf(artifact EXCLUDING only featureDigest)   # covers featureId, createdAt, provenance, features, flags
+```
+
+Replay rederives **both**. There is no second, parallel canonical hash.
+
+### Timeline (no lookahead, no backdating)
+
+```text
+timeline.earliestCaptureAt    earliest frozen source-capture time
+latestCaptureAt               latest frozen source-capture time
+latestExperimentAt            latest classifier-experiment creation time
+evidenceAsOf                  max(latestCaptureAt, latestExperimentAt)
+featureCreatedAt              the build clock
+```
+
+`featureCreatedAt >= evidenceAsOf` is enforced: a build earlier than its evidence throws `FeatureTimelineError`.
+There is no retrospective injection. A later classifier experiment requires a **new cohort** and therefore a
+**new feature artifact** — an existing artifact is never mutated.
+
+### Write-once
+
+Feature artifacts are written once with exclusive semantics. An existing artifact is **never** overwritten: a
+byte-identical rebuild throws `FeatureExistsError` and leaves the bytes untouched. The feature output root must be
+outside the capture root. Source captures, classifier experiments and cohorts are never modified.
+
+### Audit (before write, during replay, in validation)
+
+One exported audit function proves, for every artifact: exact top-level key whitelist; exact 19 feature keys in
+canonical order; numeric-or-null values only; a frozen semantic-smuggling name denylist (`bullish`, `bearish`,
+`alpha`, `signal_strength`, `opportunity`, `risk_score`, `legitimacy`, `quality`, `fraud`, `buy`, `sell`,
+`profit`, `pnl`, `expected_return`, `market_health`, `token_quality`, `direction`, …) plus the sealed 5G.1
+forbidden metric keys; an empty group space (explicitly rejecting `technical_fraction`,
+`market_structure_fraction`, `governance_admin_fraction`, `announcement_fraction` and any persisted
+`groups` container); text-free (no raw text key, no URL-like string, no author/query/credential); all four routing
+flags strictly false; and the arithmetic invariants
+
+```text
+Σ labelCounts === classifiedCount                label fractions ∈ [0, 1], Σ ≈ 1 (≤ 0.0000045)
+observed_label_count === nonzero label count     largestLabelCount === max count
+0 ≤ entropy ≤ 1                                  single observed label ⇒ entropy === 0
+complete + incomplete === classifiedCount        recordCount === classifiedCount + skippedEmptyCount
+nullFeatureCount === actual null count           all vectors complete ⇒ nullFeatureCount === 0
+```
+
+### CLI
+
+```bash
+# build + freeze ONE feature artifact from ONE explicit frozen cohort
+npm run intelligence:classify-features -- --cohort <clcohort-id>
+
+# offline, zero-network replay (identity, digests, cohort/experiment/capture integrity, every feature)
+npm run intelligence:classify-features -- --replay --feature <clfeat-id>
+
+# offline stats (works WITHOUT a capture root)
+npm run intelligence:classify-features -- --stats  --feature <clfeat-id>
+
+# print the frozen definition and its ACTUAL digest
+npm run intelligence:classify-features -- --definition
+```
+
+Options: `--out <classifier-root>`, `--captures <capture-root>`, `--json`, `--help`. There is **no** provider
+option, **no** network option, **no** routing option and **no** classification option; there is **no latest** —
+every action needs an explicit `clcohort-*`/`clfeat-*` id, exactly one action at a time, and replay/stats are
+mutually exclusive. Errors are prefixed `[classify-features]` and exit non-zero.
+
+`--replay` proves: `featureReadable`, `featureId`, `featureDigest`, `featureIdentity`, `definitionPin`,
+`frozenFlags`, `evidenceClass`, `sourceEvidenceClass`, `noRawText`, `noForbiddenKeys`, `noForbiddenNames`,
+`featuresNumericOnly`, `noGroupKeys`, `routingInactive`, `timeline`, `cohortPresent`, `cohortIdentity`,
+`cohortDigest`, `cohortEvidenceClass`, `cohortClassifier`, `cohortProjection`, `experimentsIntegrity`,
+`capturesIntegrity`, `counts`, `labelDistribution`, `confidence`, `scoreMargin` and
+`featureDigestReproduced` — with `networkCalls: 0`, no reclassification and no writes.
+
+`--stats` reports the feature id, definition version + digest status, evidence class pair, cohort id + digest
+status + cohort verification, experiment/capture counts, record/classified/skipped counts, distinct/duplicate
+record digests, complete/incomplete score vectors, null feature count, all nine label counts and fractions,
+observed label count, entropy, largest label/count/fraction, confidence mean/median/low/high, margin
+mean/median/ambiguous, the **display aliases** `noise fraction` and `promotion fraction` (the same two canonical
+features, never additional ones), `evidenceAsOf`, `createdAt`, the feature digest + status, the four routing
+flags and `networkCalls: 0`. There is **no verdict, no ranking, no gate and no predictive claim**.
+
+### Boundaries
+
+- **No Jev packet exists in Phase 5H.0** (documented only). A future phase MAY whitelist the 19 numeric features
+  plus `featureId`, `featureDefinitionVersion`, `featureDefinitionDigest`, `cohortId`, `cohortDigest`,
+  `featureDigest`, `evidenceClass`, `sourceEvidenceClass`, `classifiedCount`, `recordCount`, `skippedEmptyCount`,
+  `experimentCount`, `captureCount`, `scoreVectorCompleteCount` and `evidenceAsOf`. Raw label counts, the largest
+  label string, duplicate-record details, other timeline fields, evaluation-only diagnostics, text, URLs,
+  authors, audit samples, per-label confidence, score entropy and channel breakdowns are **not** for Jev.
+- **No dashboard changes in Phase 5H.0.** A future display MAY surface the numeric features and the two display
+  aliases; nothing under `src/**` or `scripts/lib/dashboard-state.mjs` is touched by this phase.
+- 5H.0 **activates nothing**: no routing, no thresholds, no gates and no automatic loop.
+
+### Validation
+
+```bash
+npm run validate:phase5h   # 130 offline checks: definition pin + 19-feature order, identity/digest exclusions,
+                           # record-weighted aggregation (50-record vs 5-record proof), every formula and boundary,
+                           # null semantics, every refusal, the artifact audit, replay tamper cases, stats/CLI,
+                           # timeline, existing barriers and a canonical 5G.1 cross-check
+```
+
+The suite also cross-checks the real frozen 5G.1 evidence when it exists locally: it recomputes the 5H.0 values
+from the canonical cohort **without writing anything** and proves that all nine label fractions, the entropy
+(`labelDiversity`), the largest-label concentration, the confidence mean/median/`<0.50`/`>=0.90` fractions, the
+margin mean/median/`<0.10` fraction and both aliases agree **exactly** with the frozen evaluation.
+
+### Phase 5H.0 checklist
+
+- [x] Frozen `classifier-feature-definition-v1` importing (never redeclaring) the sealed classifier identity, with a computed definition digest
+- [x] Exactly 19 numeric features in canonical order; no groups, no HHI, no `observed_label_fraction`, no score entropy, no evaluation-only diagnostics
+- [x] Record-weighted cohort aggregation reconstructed record by record (`C = Σ classifiedCount_e`), never averaged experiment summaries
+- [x] `0` never stands for unknown: incomplete score vectors are excluded from the margin denominator only and yield `null` margin features
+- [x] One-entry evidence-class transition `DEVELOPMENT_CLASSIFIER_EVIDENCE → DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES`; anything else fails closed
+- [x] Fail-closed refusals: zero evidence, wrong/mixed classifier id/version/projection/definition digest/instructions digest, unknown label, bad cohort digest, unmapped evidence class, backdated build, output root inside the capture root
+- [x] Audit before write + during replay + in validation: exact key whitelist, numeric-only values, semantic-smuggling denylist, empty group space, text-free, routing all false, arithmetic invariants
+- [x] Write-once artifact under `.evolve/classifier/features/clfeat-…/feature.json`, outside the capture root; `clfeat` identity and `featureDigest` both rederived on replay
+- [x] Offline `--replay` / `--stats` / `--definition` CLI with zero network calls, no provider/network/routing/classification option and no implicit latest
+- [x] Timeline barrier: `evidenceAsOf = max(latestCaptureAt, latestExperimentAt)` and `featureCreatedAt >= evidenceAsOf`
+- [x] Duplicate record digests reported (distinct + duplicate counts), never refused or reinterpreted
+- [x] Routing stays false (Jev/DeepSeek/Arena/Trading); no Jev packet and no dashboard change in 5H.0
+- [x] Canonical 5G.1 cohort/evaluation/experiments/captures, Wave 1, Wave 2, the frozen cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5h` — 130 offline checks
+- [ ] Canonical `clfeat-*` artifact — operator-run AFTER review/commit (see the command below); it is **not** evidence about profitability or market usefulness
+
+```bash
+npm run intelligence:classify-features -- --cohort clcohort-20260919T163609Z-4d7c6dd9
+```
+
 ## Validation
 
 ```bash
@@ -3711,6 +4018,22 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
 - [x] `npm run validate:phase5g1` — 75 offline cases
 - [ ] First meaningful DEVELOPMENT cohort — operator-run AFTER this commit, fresh development captures across several healthy read-only channels, `classifier-dev`/`reach-signal-type-v1`/`fast`; its metrics are **not** proof that classifier.dev adds predictive value
+
+### Phase 5H.0 checklist
+
+- [x] `classifier-feature-definition-v1` freezing the imported classifier identity, thresholds, rounding, quantile method and the computed `FEATURE_DEFINITION_DIGEST`
+- [x] EXACTLY 19 canonical feature keys in canonical order — no groups, no HHI, no score entropy, no `observed_label_fraction`, no `<0.05`/`<0.20` bands
+- [x] One cohort = one artifact; record-by-record, record-weighted pooling across experiments (`C = Σ classifiedCount_e`)
+- [x] `0` is never unknown; incomplete score vectors affect the margin denominator only and produce `null` margin features
+- [x] `DEVELOPMENT_CLASSIFIER_EVIDENCE → DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES` is the ONLY transition; future clean validation needs new evidence
+- [x] Fail-closed refusals (zero evidence, mixed classifiers/projections/digests, unknown labels, bad digests, unmapped evidence class, backdating, output root inside the capture root)
+- [x] Audit before write + during replay: whitelist, numeric-only, smuggling/group denylists, text-free, routing false, arithmetic invariants
+- [x] Write-once `clfeat-…` artifact with rederived identity/digest on replay; no mutation of captures, experiments or cohorts
+- [x] Offline `--replay` / `--stats` / `--definition` CLI with `networkCalls: 0`, no provider/network/routing/classification option and no latest
+- [x] Routing stays false; no Jev packet and no dashboard change in 5H.0
+- [x] Canonical 5G.1 evidence, Wave 1, Wave 2, the frozen cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5h` — 130 offline checks, plus a canonical 5G.1 cross-check that agrees exactly
+- [ ] Canonical `clfeat-*` artifact — operator-run AFTER review/commit (`npm run intelligence:classify-features -- --cohort clcohort-20260919T163609Z-4d7c6dd9`), then `--replay` and `--stats`; its values are **not** evidence about profitability or market usefulness
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.
