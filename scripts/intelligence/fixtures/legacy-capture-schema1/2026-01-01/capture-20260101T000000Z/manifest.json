@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "phase": "5E",
+  "captureSchemaVersion": 1,
+  "captureId": "capture-20260101T000000Z",
+  "paperOnly": true,
+  "readOnly": true,
+  "shadowOnly": true,
+  "finalized": true,
+  "immutable": true,
+  "provider": "mock",
+  "providerDeterministic": true,
+  "syntheticIntelligence": true,
+  "mode": "shadow",
+  "enabledChannels": [
+    "github"
+  ],
+  "health": {
+    "github": {
+      "channel": "github",
+      "status": "ok",
+      "calls": 1,
+      "records": 5,
+      "failures": 0,
+      "timeouts": 0,
+      "lastError": null
+    }
+  },
+  "queries": {
+    "querySetId": "reach-query-set-v1",
+    "querySetVersion": 1,
+    "count": 5,
+    "channels": [
+      "github"
+    ],
+    "definitions": []
+  },
+  "counts": {
+    "calls": 1,
+    "records": 5,
+    "channels": 1,
+    "failures": 0,
+    "timeouts": 0
+  },
+  "failures": [],
+  "timeouts": [],
+  "startedAt": "2026-01-01T00:00:00.000Z",
+  "endedAt": "2026-01-01T00:00:00.000Z",
+  "finalizedAt": "2026-01-01T00:00:00.000Z",
+  "limits": {
+    "timeoutMs": 20000,
+    "maxCalls": 6,
+    "maxResults": 10,
+    "maxBytes": 262144
+  },
+  "digests": {
+    "recordsDigest": "3a9f21180b294782bb0035d6370636a435a6b29d7b567e29c99e568de76e19bb",
+    "perChannel": {
+      "github": "3a9f21180b294782bb0035d6370636a435a6b29d7b567e29c99e568de76e19bb"
+    },
+    "queryDefinitionsDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "note": "FROZEN Phase 5E.2 compatibility fixture: a legacy schema-1 capture manifest that pins NO featureVersion. It must resolve to external-intelligence-features-v1 forever, and its V1 output must never change.",
+  "manifestDigest": "2400585154cee77c2c917a89f689ee7828adfbc60e5ed88d4d94d7b84093ccef"
+}

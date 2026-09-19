@@ -42,7 +42,8 @@ import {
   resolveIntelligenceConfig,
 } from "./intelligence/config.mjs";
 import { listCaptureSummaries } from "./intelligence/dashboard.mjs";
-import { listCaptures, runCapture, verifyCapture } from "./intelligence/capture.mjs";
+import { CAPTURE_SCHEMA_VERSION, listCaptures, runCapture, verifyCapture } from "./intelligence/capture.mjs";
+import { DEFAULT_FEATURE_VERSION, REGISTERED_FEATURE_VERSIONS } from "./intelligence/features.mjs";
 import { captureStats, replayCapture, verifyReplayDeterminism } from "./intelligence/replay.mjs";
 import { buildExternalIntelligencePacket, auditExternalIntelligencePacket } from "./intelligence/packet.mjs";
 import { probeReachHealth, resolveReachBinary } from "./intelligence/agent-reach.mjs";
@@ -209,6 +210,8 @@ async function captureAction({ args, config, root }) {
       contentSource: source,
       counts: result.manifest.counts,
       manifestDigest: result.manifest.manifestDigest,
+      captureSchemaVersion: result.manifest.captureSchemaVersion,
+      featureVersion: result.manifest.featureVersion,
       recordsDigest: result.manifest.digests.recordsDigest,
       channels: result.manifest.queries.channels,
       health: result.manifest.health,
@@ -224,6 +227,7 @@ async function captureAction({ args, config, root }) {
   console.log(`[intelligence]   records:    ${result.manifest.counts.records}`);
   console.log(`[intelligence]   channels:   ${(result.manifest.queries.channels ?? []).join(", ") || "none"}`);
   console.log(`[intelligence]   failures:   ${result.manifest.counts.failures} · timeouts: ${result.manifest.counts.timeouts}`);
+  console.log(`[intelligence]   pinned:     capture schema ${result.manifest.captureSchemaVersion} · feature ${result.manifest.featureVersion}`);
   console.log(`[intelligence]   digest:     ${result.manifest.manifestDigest}`);
   console.log("[intelligence] captured, frozen and fingerprinted. Nothing was routed to Jev, DeepSeek or the Arena.");
 }
@@ -253,6 +257,9 @@ async function replayAction({ args, root }) {
   console.log(`[intelligence] replay ${captureId}`);
   console.log(`[intelligence]   records:   ${replay.recordCount}`);
   console.log(`[intelligence]   provider:  ${replay.provider}${replay.syntheticIntelligence ? " (SYNTHETIC)" : ""}`);
+  console.log(
+    `[intelligence]   versions:  capture schema ${replay.captureSchemaVersion ?? "unknown"} · feature ${replay.featureVersion} · replay ${replay.replayVersion}`,
+  );
   console.log(`[intelligence]   features:  mentions ${replay.features.mentionCount} · authors ${replay.features.uniqueAuthors} · dupText ${replay.features.duplicateTextRatio} · coordination ${replay.features.coordinationIndicators.count}`);
   console.log(`[intelligence]   replayDigest: ${replay.replayDigest} (deterministic: ${determinism.ok})`);
   console.log("[intelligence] replayed offline: zero network calls, zero provider calls, zero routing.");
@@ -314,6 +321,9 @@ async function doctorAction({ args, config, root }) {
     readOnlyActions: [...READ_ONLY_ACTIONS],
     rejectedWriteActions: [...WRITE_ACTIONS],
     agentReach: { ...AGENT_REACH_PIN },
+    captureSchemaVersion: CAPTURE_SCHEMA_VERSION,
+    featureVersions: [...REGISTERED_FEATURE_VERSIONS],
+    defaultFeatureVersion: DEFAULT_FEATURE_VERSION,
     binary: typeof binary === "string" ? binary : null,
     binaryError: typeof binary === "string" ? null : binary.error ?? null,
     binaryExists,
@@ -352,6 +362,8 @@ async function doctorAction({ args, config, root }) {
     console.log(`[intelligence]   pinned Agent-Reach: ${AGENT_REACH_PIN.release} (${AGENT_REACH_PIN.license}, ${AGENT_REACH_PIN.python})`);
     console.log(`[intelligence]   local binary:    ${report.binary ?? report.binaryError} (exists: ${binaryExists})`);
     console.log(`[intelligence]   limits:          timeout ${config.timeoutMs}ms · max calls ${config.maxCalls} · max results ${config.maxResults} · max bytes ${config.maxBytes}`);
+    console.log(`[intelligence]   capture schema:  ${CAPTURE_SCHEMA_VERSION} · new captures pin ${DEFAULT_FEATURE_VERSION}`);
+    console.log(`[intelligence]   feature versions:${REGISTERED_FEATURE_VERSIONS.join(", ")}`);
     if (report.probe) {
       console.log(`[intelligence]   probe:           ${report.probe.skipped ? `SKIPPED (${report.probe.reason})` : `version=${report.probe.version.stdout || "n/a"} doctorOk=${report.probe.doctor.ok}`}`);
     } else {
@@ -369,6 +381,9 @@ function versionAction({ args, config }) {
     readOnly: true,
     shadowOnly: true,
     agentReach: { ...AGENT_REACH_PIN },
+    captureSchemaVersion: CAPTURE_SCHEMA_VERSION,
+    featureVersions: [...REGISTERED_FEATURE_VERSIONS],
+    defaultFeatureVersion: DEFAULT_FEATURE_VERSION,
     enabledChannels: [...ENABLED_INTELLIGENCE_CHANNELS],
     disabledChannels: [...DISABLED_INTELLIGENCE_CHANNELS],
     readOnlyActions: [...READ_ONLY_ACTIONS],
@@ -381,6 +396,8 @@ function versionAction({ args, config }) {
     console.log(`[intelligence] pinned Agent-Reach: ${AGENT_REACH_PIN.release} · commit ${AGENT_REACH_PIN.commit}`);
     console.log(`[intelligence] repository: ${AGENT_REACH_PIN.repository} · ${AGENT_REACH_PIN.license} · Python ${AGENT_REACH_PIN.python}`);
     console.log(`[intelligence] channels: ${ENABLED_INTELLIGENCE_CHANNELS.join(", ")}`);
+    console.log(`[intelligence] capture schema: ${CAPTURE_SCHEMA_VERSION} · feature transforms: ${REGISTERED_FEATURE_VERSIONS.join(", ")}`);
+    console.log(`[intelligence] new captures pin: ${DEFAULT_FEATURE_VERSION} (legacy schema-1 captures stay on V1)`);
   }
 }
 

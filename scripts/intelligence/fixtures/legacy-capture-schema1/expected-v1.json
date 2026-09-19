@@ -1,0 +1,50 @@
+{
+  "note": "FROZEN expected V1 interpretation of this schema-1 capture. These values must NEVER change: see scripts/validate-phase5e2.mjs.",
+  "featureVersion": "external-intelligence-features-v1",
+  "featuresDigest": "e276675c75528af717e453b890ed4d82367875af8beb5256c6e536a04a737f2c",
+  "replayDigest": "4c47396c72108218aa215ade7254eaa20a44f71f11ce38e9663475d287d64389",
+  "manifestDigest": "2400585154cee77c2c917a89f689ee7828adfbc60e5ed88d4d94d7b84093ccef",
+  "recordsDigest": "3a9f21180b294782bb0035d6370636a435a6b29d7b567e29c99e568de76e19bb",
+  "features": {
+    "featureVersion": "external-intelligence-features-v1",
+    "mentionCount": 5,
+    "uniqueAuthors": 2,
+    "postsPerMinute": 2.5,
+    "engagementTotal": 35,
+    "engagementMedian": 10,
+    "duplicateTextRatio": 0.8,
+    "repeatedAuthorRatio": 0.6,
+    "linkDomainConcentration": 0.75,
+    "accountConcentration": 0.666667,
+    "sourceCount": 1,
+    "backendCount": 1,
+    "sourceDiversity": 0.4,
+    "queryCoverage": 0.2,
+    "captureAgeMs": null,
+    "fetchFailureRate": 0,
+    "coordinationIndicators": {
+      "kind": "coordinationIndicators",
+      "claim": "deterministic observations over the frozen capture — NOT a bot probability",
+      "count": 2,
+      "indicators": [
+        {
+          "id": "repeatedText",
+          "observed": {
+            "duplicateTextRatio": 0.8
+          },
+          "rule": "duplicateTextRatio >= 0.5 (at least half of the records repeat another record's bounded text)",
+          "kind": "coordination"
+        },
+        {
+          "id": "singleLinkDomain",
+          "observed": {
+            "linkDomainConcentration": 0.75
+          },
+          "rule": "linkDomainConcentration >= 0.6 (one link domain dominates the records)",
+          "kind": "coordination"
+        }
+      ]
+    },
+    "note": "Bounded deterministic features over the frozen capture. `coordinationIndicators` describe the captured bytes only — they are NOT a bot probability and are never a gate."
+  }
+}

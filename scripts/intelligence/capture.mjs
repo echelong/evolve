@@ -16,6 +16,11 @@
  * re-capturing means a NEW capture id, so the bytes an experiment consumed can
  * always be replayed and verified.
  *
+ * VERSION PINNING: a new manifest is written at `CAPTURE_SCHEMA_VERSION` (2) and
+ * EXPLICITLY pins the feature transform that interprets its bytes
+ * (`featureVersion`). Legacy schema-1 manifests that predate the pin are never
+ * rewritten; replay resolves those to the frozen V1 transform in code.
+ *
  * PAPER ONLY. Read-only, shadow-only, and no result may influence trading,
  * evolution, scoring, gates or replication.
  */
@@ -32,6 +37,7 @@ import {
   INTELLIGENCE_PROVIDER,
 } from "./config.mjs";
 import { createReachBudget } from "./agent-reach.mjs";
+import { DEFAULT_FEATURE_VERSION } from "./features.mjs";
 import { normalizeRecord, verifyRecord } from "./records.mjs";
 import { assertCanonicalQueryPlan, buildQueryPlan, REACH_QUERY_SET_ID, REACH_QUERY_SET_VERSION } from "./query-sets.mjs";
 import { resolveIntelligenceProvider } from "./provider.mjs";
@@ -40,7 +46,22 @@ export const CAPTURE_MANIFEST_FILE = "manifest.json";
 export const CAPTURE_RECORDS_FILE = "records.ndjson";
 export const CAPTURE_QUERIES_FILE = "queries.json";
 export const CAPTURE_HEALTH_FILE = "health.json";
-export const CAPTURE_SCHEMA_VERSION = 1;
+/**
+ * Capture manifest schema.
+ *
+ *   v1  the original manifest: records/queries/provider/counts/digests only. It
+ *       does NOT pin the feature transform, so replay resolves it to the frozen
+ *       V1 transform by an explicit BACKWARDS-COMPATIBILITY rule.
+ *   v2  a manifest that MUST explicitly pin `featureVersion`.
+ *
+ * Schema is versioned SEPARATELY from the feature transform: the bytes on disk
+ * and the interpretation of those bytes evolve independently. Old manifests are
+ * never rewritten.
+ */
+export const CAPTURE_SCHEMA_VERSION = 2;
+
+/** Legacy schema, kept readable forever (byte-compatibility contract). */
+export const LEGACY_CAPTURE_SCHEMA_VERSION = 1;
 
 export class CaptureExistsError extends Error {
   constructor(captureId) {
@@ -237,6 +258,10 @@ export async function runCapture({
     schemaVersion: CAPTURE_SCHEMA_VERSION,
     phase: INTELLIGENCE_PHASE,
     captureSchemaVersion: CAPTURE_SCHEMA_VERSION,
+    // The frozen manifest PINS the transform that interprets these bytes, so a
+    // later change to features.mjs can never silently reinterpret this capture.
+    // Explicit and versioned — never "latest".
+    featureVersion: DEFAULT_FEATURE_VERSION,
     captureId,
     paperOnly: true,
     readOnly: true,

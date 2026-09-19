@@ -25,13 +25,83 @@
  * captured bytes (e.g. "almost every record repeats the same text"). EVOLVE makes
  * NO bot-probability claim, because it has no validated method for one.
  *
+ * VERSIONED TRANSFORMS (Phase 5E.2)
+ * ---------------------------------
+ * A capture freezes BYTES. The transform that turns those bytes into a feature
+ * vector is versioned SEPARATELY, because otherwise a future edit to this file
+ * would silently reinterpret an immutable capture and move its `featuresDigest`,
+ * `replayDigest` and `packetDigest` without a single frozen byte changing.
+ *
+ *   external-intelligence-features-v1   the original Phase 5E algorithm, FROZEN.
+ *                                       Never "corrected": historical captures
+ *                                       must keep replaying to the same digest.
+ *   external-intelligence-features-v2   distinguishes RECORD COUNT, OBSERVED-FIELD
+ *                                       COUNT and DISTINCT-VALUE COUNT, and never
+ *                                       treats missing data as concentration.
+ *
+ * A schema-v1 manifest with no pin resolves to V1 by an explicit
+ * BACKWARDS-COMPATIBILITY rule (see `./replay.mjs`). An unknown version FAILS
+ * CLOSED: nothing is ever silently mapped to "latest".
+ *
  * PAPER ONLY, READ-ONLY. No network, no clock except an explicitly passed `asOf`.
  */
 
 import { digestOf } from "../lib/hash.mjs";
 import { linkDomain } from "./records.mjs";
 
+/** The FROZEN V1 transform. Its output must never change. */
 export const INTELLIGENCE_FEATURE_VERSION = "external-intelligence-features-v1";
+
+/** The V1 transform, named for its ROLE as the legacy compatibility transform. */
+export const LEGACY_INTELLIGENCE_FEATURE_VERSION = INTELLIGENCE_FEATURE_VERSION;
+
+/** The V2 transform: observation-aware, never treats missing data as signal. */
+export const INTELLIGENCE_FEATURE_VERSION_V2 = "external-intelligence-features-v2";
+
+/** The transform a NEW capture explicitly pins. Never implicit. */
+export const DEFAULT_FEATURE_VERSION = INTELLIGENCE_FEATURE_VERSION_V2;
+
+/** Every registered feature transform, oldest first. */
+export const REGISTERED_FEATURE_VERSIONS = Object.freeze([
+  INTELLIGENCE_FEATURE_VERSION,
+  INTELLIGENCE_FEATURE_VERSION_V2,
+]);
+
+/**
+ * The minimum number of RELEVANTLY OBSERVED records before any coordination
+ * indicator may fire. A semantic validity requirement, NOT a tuned threshold:
+ * one record can never be described as coordination evidence.
+ */
+export const COORDINATION_MIN_OBSERVATIONS = 5;
+
+/**
+ * The documented indicator thresholds. These are DEFINITIONS of the observation,
+ * deliberately not tuned against any live capture.
+ */
+export const COORDINATION_THRESHOLDS = Object.freeze({
+  repeatedText: 0.5,
+  fewAuthors: 0.7,
+  singleLinkDomain: 0.6,
+  burstRate: 30,
+});
+
+/**
+ * Raised when a feature version is unregistered, or when a manifest is required
+ * to pin one but does not. FAIL-CLOSED: there is no fallback to the latest
+ * transform.
+ */
+export class UnknownFeatureVersionError extends Error {
+  constructor(version, detail = null) {
+    super(
+      `unknown external-intelligence feature version ${JSON.stringify(version ?? null)}. ` +
+        `Registered versions: ${REGISTERED_FEATURE_VERSIONS.join(", ")}. ` +
+        "Feature-version resolution is FAIL-CLOSED: an unknown version is never mapped to the latest transform." +
+        (detail ? ` ${detail}` : ""),
+    );
+    this.name = "UnknownFeatureVersionError";
+    this.featureVersion = version ?? null;
+  }
+}
 
 function median(values) {
   const usable = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
@@ -204,4 +274,253 @@ export function featuresDigestSubject(features) {
  */
 export function featuresDigest(features) {
   return digestOf(featuresDigestSubject(features));
+}
+
+/* ============================================================================
+ * V2 — observation-aware features
+ *
+ * V2 exists because V1 conflated three different things:
+ *
+ *   record count            mentionCount
+ *   observed-field count    how many records actually CARRIED the field
+ *   distinct-value count    how many distinct values those observations held
+ *
+ * V1 divided by `mentionCount` unconditionally, so a record with NO author made
+ * `repeatedAuthorRatio` read 1.0 ("everyone repeats") when the truth was "no
+ * author was observed at all". Missing data is UNKNOWN, never concentration, and
+ * a sample of one is never coordination evidence.
+ * ==========================================================================*/
+
+/** Observed/denominator counts for one capture's records (bounded, deterministic). */
+export function observationCounts(records = []) {
+  const authors = new Map();
+  const texts = new Map();
+  const domains = new Map();
+  const published = [];
+  const engagements = [];
+  for (const record of records) {
+    const author = record?.authorId ?? null;
+    if (author) authors.set(author, (authors.get(author) ?? 0) + 1);
+    const text = record?.textExcerpt ?? null;
+    if (text) texts.set(text, (texts.get(text) ?? 0) + 1);
+    const domain = linkDomain(record?.canonicalUrl);
+    if (domain) domains.set(domain, (domains.get(domain) ?? 0) + 1);
+    const publishedMs = record?.publishedAt ? Date.parse(record.publishedAt) : Number.NaN;
+    if (Number.isFinite(publishedMs)) published.push(publishedMs);
+    if (Number.isFinite(record?.engagement)) engagements.push(record.engagement);
+  }
+  const sum = (map) => [...map.values()].reduce((total, count) => total + count, 0);
+  return {
+    authors,
+    texts,
+    domains,
+    published,
+    engagements,
+    authorObservedCount: sum(authors),
+    textObservedCount: sum(texts),
+    linkObservedCount: sum(domains),
+    publishedAtObservedCount: published.length,
+    engagementObservedCount: engagements.length,
+  };
+}
+
+/**
+ * V2 feature transform.
+ *
+ * Every ratio uses its OWN observed-field denominator, and every ratio is `null`
+ * when nothing relevant was observed. No raw text, URL or author is ever exposed:
+ * only counts, ratios and bounded deterministic labels.
+ */
+export function extractIntelligenceFeaturesV2({
+  records = [],
+  capturedAt = null,
+  asOf = null,
+  queryPlanCount = null,
+  failureCount = null,
+} = {}) {
+  const mentionCount = records.length;
+  const channels = new Set();
+  const backends = new Set();
+  const queriesWithRecords = new Set();
+  for (const record of records) {
+    if (record?.channel) channels.add(record.channel);
+    if (record?.backend) backends.add(record.backend);
+    if (record?.queryId) queriesWithRecords.add(record.queryId);
+  }
+
+  const counts = observationCounts(records);
+  const {
+    authors,
+    texts,
+    domains,
+    published,
+    engagements,
+    authorObservedCount,
+    textObservedCount,
+    linkObservedCount,
+    publishedAtObservedCount,
+    engagementObservedCount,
+  } = counts;
+
+  const coverage = (observed) => (mentionCount > 0 ? round6(observed / mentionCount) : null);
+  const spanMinutes =
+    published.length >= 2 ? Math.max(1, (Math.max(...published) - Math.min(...published)) / 60_000) : null;
+  const duplicateTextCount = [...texts.values()].filter((count) => count > 1).reduce((sum, count) => sum + count, 0);
+  // A missing text is UNKNOWN: it is neither a unique text nor a repeated one.
+  const duplicateTextRatio = textObservedCount > 0 ? duplicateTextCount / textObservedCount : null;
+  // A missing author is UNKNOWN: the denominator is the observed author count.
+  const repeatedAuthorRatio =
+    authorObservedCount > 0 ? round6(1 - authors.size / authorObservedCount) : null;
+  const captureAgeMs =
+    capturedAt && Number.isFinite(asOf) ? Math.max(0, asOf - Date.parse(capturedAt)) : null;
+
+  const features = {
+    featureVersion: INTELLIGENCE_FEATURE_VERSION_V2,
+    mentionCount,
+    // Distinct-value counts.
+    uniqueAuthors: authors.size,
+    uniqueTexts: texts.size,
+    uniqueLinkDomains: domains.size,
+    // Observed-field counts: the honest denominators.
+    authorObservedCount,
+    textObservedCount,
+    linkObservedCount,
+    publishedAtObservedCount,
+    engagementObservedCount,
+    // Coverage ratios: how much of the capture actually carried each field.
+    authorCoverage: coverage(authorObservedCount),
+    textCoverage: coverage(textObservedCount),
+    linkCoverage: coverage(linkObservedCount),
+    publishedAtCoverage: coverage(publishedAtObservedCount),
+    engagementCoverage: coverage(engagementObservedCount),
+    // Only timestamps that EXIST participate; null when no span is defined.
+    postsPerMinute: spanMinutes ? round6(publishedAtObservedCount / spanMinutes) : null,
+    engagementTotal: engagements.length > 0 ? round6(engagements.reduce((sum, value) => sum + value, 0)) : null,
+    engagementMedian: round6(median(engagements)),
+    duplicateTextRatio: round6(duplicateTextRatio),
+    repeatedAuthorRatio,
+    linkDomainConcentration: round6(shareOfLargest(Object.fromEntries(domains))),
+    accountConcentration: round6(shareOfLargest(Object.fromEntries(authors))),
+    sourceCount: channels.size,
+    backendCount: backends.size,
+    sourceDiversity: linkObservedCount > 0 ? round6(domains.size / linkObservedCount) : null,
+    queryCoverage:
+      Number.isFinite(queryPlanCount) && queryPlanCount > 0 ? round6(queriesWithRecords.size / queryPlanCount) : null,
+    captureAgeMs,
+    fetchFailureRate: null,
+  };
+  features.fetchFailureRate = computeFetchFailureRate({ calls: queryPlanCount ?? null, failures: failureCount ?? 0 });
+  features.coordinationIndicators = coordinationIndicatorsV2(features);
+  features.note =
+    "Bounded deterministic features over the frozen capture. Every ratio uses its OWN observed-field denominator and is null " +
+    "when nothing relevant was observed: missing data is UNKNOWN, never concentration. `coordinationIndicators` describe the " +
+    "captured bytes only — they are NOT a bot probability and are never a gate.";
+  return features;
+}
+
+/**
+ * V2 coordination indicators. Each indicator may fire ONLY when its RELEVANT
+ * observed-field count reaches `COORDINATION_MIN_OBSERVATIONS`, so a one-record
+ * sample can never be described as coordination. Descriptive observations only:
+ * never a bot probability, never a risk score, never a gate, never a trading input.
+ */
+export function coordinationIndicatorsV2(features) {
+  const indicators = [];
+  const add = (id, observed, rule) => indicators.push({ id, observed, rule, kind: "coordination" });
+  const minimum = COORDINATION_MIN_OBSERVATIONS;
+  if (
+    features.textObservedCount >= minimum &&
+    Number.isFinite(features.duplicateTextRatio) &&
+    features.duplicateTextRatio >= COORDINATION_THRESHOLDS.repeatedText
+  ) {
+    add(
+      "repeatedText",
+      { textObservedCount: features.textObservedCount, duplicateTextRatio: features.duplicateTextRatio },
+      `textObservedCount >= ${minimum} AND duplicateTextRatio >= ${COORDINATION_THRESHOLDS.repeatedText} over the OBSERVED texts`,
+    );
+  }
+  if (
+    features.authorObservedCount >= minimum &&
+    Number.isFinite(features.repeatedAuthorRatio) &&
+    features.repeatedAuthorRatio >= COORDINATION_THRESHOLDS.fewAuthors
+  ) {
+    add(
+      "fewAuthors",
+      {
+        authorObservedCount: features.authorObservedCount,
+        uniqueAuthors: features.uniqueAuthors,
+        repeatedAuthorRatio: features.repeatedAuthorRatio,
+      },
+      `authorObservedCount >= ${minimum} AND repeatedAuthorRatio >= ${COORDINATION_THRESHOLDS.fewAuthors} over the OBSERVED authors`,
+    );
+  }
+  if (
+    features.linkObservedCount >= minimum &&
+    Number.isFinite(features.linkDomainConcentration) &&
+    features.linkDomainConcentration >= COORDINATION_THRESHOLDS.singleLinkDomain
+  ) {
+    add(
+      "singleLinkDomain",
+      {
+        linkObservedCount: features.linkObservedCount,
+        linkDomainConcentration: features.linkDomainConcentration,
+      },
+      `linkObservedCount >= ${minimum} AND linkDomainConcentration >= ${COORDINATION_THRESHOLDS.singleLinkDomain} over the OBSERVED link domains`,
+    );
+  }
+  if (
+    features.publishedAtObservedCount >= minimum &&
+    Number.isFinite(features.postsPerMinute) &&
+    features.postsPerMinute >= COORDINATION_THRESHOLDS.burstRate
+  ) {
+    add(
+      "burstRate",
+      {
+        publishedAtObservedCount: features.publishedAtObservedCount,
+        postsPerMinute: features.postsPerMinute,
+      },
+      `publishedAtObservedCount >= ${minimum} AND postsPerMinute >= ${COORDINATION_THRESHOLDS.burstRate} over the OBSERVED publication timestamps`,
+    );
+  }
+  return {
+    kind: "coordinationIndicators",
+    claim: "deterministic observations over the frozen capture — NOT a bot probability",
+    minRelevantObservations: minimum,
+    count: indicators.length,
+    indicators,
+  };
+}
+
+/* ============================================================================
+ * Registry — the ONLY way a feature version becomes an extractor
+ * ==========================================================================*/
+
+/** version → transform. Frozen at module load; never edited at runtime. */
+const FEATURE_EXTRACTORS = new Map([
+  [INTELLIGENCE_FEATURE_VERSION, { version: INTELLIGENCE_FEATURE_VERSION, extract: extractIntelligenceFeatures }],
+  [INTELLIGENCE_FEATURE_VERSION_V2, { version: INTELLIGENCE_FEATURE_VERSION_V2, extract: extractIntelligenceFeaturesV2 }],
+]);
+
+/** Is this an explicitly registered feature version? */
+export function isRegisteredFeatureVersion(version) {
+  return typeof version === "string" && FEATURE_EXTRACTORS.has(version.trim());
+}
+
+/**
+ * Resolve a feature version to its extractor.
+ *
+ * FAIL-CLOSED: a missing, empty, whitespace or unknown version throws
+ * `UnknownFeatureVersionError`. It is NEVER mapped to the latest transform.
+ *
+ * @param {string} version
+ * @returns {{ version: string, extract: Function }}
+ */
+export function featureExtractorFor(version) {
+  if (typeof version !== "string" || version.trim().length === 0) {
+    throw new UnknownFeatureVersionError(version ?? null, "An explicit registered version is required.");
+  }
+  const normalized = version.trim();
+  const entry = FEATURE_EXTRACTORS.get(normalized);
+  if (!entry) throw new UnknownFeatureVersionError(version);
+  return entry;
 }

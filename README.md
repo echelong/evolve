@@ -2191,6 +2191,11 @@ market data + external intelligence → bounded evidence → Jev shadow judgment
 Only the **capture** layer is active in Phase 5E. No Agent-Reach result can affect trading, evolution,
 Arena scoring, gates, species matching, cohorts or replication.
 
+**The first real capture (`capture-20260919T122601Z`, one GitHub record) is INFRASTRUCTURE PROOF ONLY.**
+It demonstrates that the plumbing works end to end — one read-only call, one record, zero failures, a
+verifiable immutable manifest — and nothing more. It is a single record from a single channel, so it is
+deliberately **not** used as evidence for anything, and it was **never routed** to Jev or DeepSeek.
+
 ### Live internet is never used inside the Arena
 
 Observations are **captured, frozen, fingerprinted and replayed from disk**:
@@ -2321,6 +2326,92 @@ vector: `mentionCount`, `uniqueAuthors`, `postsPerMinute`, `engagementTotal`, `e
 digest), `fetchFailureRate`, and `coordinationIndicators`. Suspicious patterns are reported as
 `coordinationIndicators` — deterministic observations over the captured bytes, explicitly **not** a bot
 probability.
+
+## Phase 5E.2 — Versioned Feature Transforms
+
+Phase 5E.2 fixes two correctness gaps found in the first real capture. It adds **no** capability: no
+wallet, no signing, no routing, no provider call, no Arena participation, and no change to any Arena or
+replication gate.
+
+### Capture bytes and feature interpretation are versioned SEPARATELY
+
+A capture freezes **bytes**. The transform that turns those bytes into a feature vector used to be
+imported "as current" at replay time, so a future edit to `features.mjs` could silently reinterpret an
+old immutable capture and move its `featuresDigest`, `replayDigest` and `packetDigest` — even though not
+one frozen byte changed. Two independent versions now exist:
+
+| Layer | Version | Where |
+| --- | --- | --- |
+| Capture manifest schema | `captureSchemaVersion` (`2` for new captures, `1` legacy) | `manifest.json` |
+| Feature transform | `featureVersion` = `external-intelligence-features-v1` \| `-v2` | `manifest.json` (`transforms`-free, one explicit field) |
+| Replay semantics | `external-intelligence-replay-v2` | replay result provenance |
+| Packet schema | `external-intelligence-packet-v1` (unchanged — it already carries `featureVersion`) | packet |
+
+`featureExtractorFor(version)` is the **only** way a version becomes an extractor, and it is
+**fail-closed**: an unknown, empty or whitespace version throws `UnknownFeatureVersionError` and is
+never mapped to "latest". A **new** capture explicitly pins `external-intelligence-features-v2`.
+
+### Legacy schema-v1 captures stay on feature V1
+
+A legacy manifest **without** a `featureVersion` pin is resolved to `external-intelligence-features-v1`
+by an explicit **backwards-compatibility rule** (not a default-to-latest rule), and the V1 algorithm is
+frozen: it is never "corrected", and a schema-2 manifest that pins nothing fails closed instead. Old
+manifests are never rewritten — the legacy interpretation happens in code.
+
+The first real capture therefore still replays to exactly the same digest it always did
+(`replayDigest b3904fe2…`, `packetDigest ce82b740…`), and a committed schema-1 fixture
+(`scripts/intelligence/fixtures/legacy-capture-schema1/`) pins the V1 output so nobody can later "tidy
+up" the old extractor and invalidate historical replays.
+
+### Missing metadata is UNKNOWN, not concentration
+
+V1 divided by the record count unconditionally, so a record with **no author field** made
+`repeatedAuthorRatio` read `1.0` — "everyone repeats" — when the truth was "no author was observed at
+all". That produced a meaningless `fewAuthors` indicator from a single GitHub record with no author.
+
+V2 separates three different quantities everywhere it matters:
+
+- **record count** — `mentionCount`;
+- **observed-field count** — `authorObservedCount`, `textObservedCount`, `linkObservedCount`,
+  `publishedAtObservedCount`, `engagementObservedCount`;
+- **distinct-value count** — `uniqueAuthors`, `uniqueTexts`, `uniqueLinkDomains`.
+
+Every ratio now uses its **own observed-field denominator and is `null` when nothing was observed**:
+
+- `repeatedAuthorRatio = 1 − uniqueAuthors / authorObservedCount` (`null` with no author observed) — a
+  missing author is UNKNOWN, never a repeat;
+- `duplicateTextRatio` is over `textObservedCount` (`null` when no bounded text exists);
+- `sourceDiversity = distinctDomains / linkObservedCount` (`null` when no link was observed) — it is
+  never divided by all records just because some channel does not expose URLs;
+- `linkDomainConcentration` and `accountConcentration` are computed over observed values only, and are
+  `null` when there are none;
+- `postsPerMinute` only counts publication timestamps that actually exist, and stays `null` when the
+  sample cannot define a span;
+- `engagementTotal`/`engagementMedian` still ignore missing engagement, which is also counted.
+
+Bounded coverage ratios (`authorCoverage`, `textCoverage`, `linkCoverage`, `publishedAtCoverage`,
+`engagementCoverage`) expose how much of the capture actually carried each field. No raw text, URL or
+author is ever exposed.
+
+### Coordination indicators require a minimum relevant sample
+
+A single record is not coordination evidence. Every V2 indicator may fire only when its **relevant
+observed-field count** reaches `COORDINATION_MIN_OBSERVATIONS = 5`:
+
+| Indicator | Requires |
+| --- | --- |
+| `repeatedText` | `textObservedCount ≥ 5` and `duplicateTextRatio ≥ 0.5` |
+| `fewAuthors` | `authorObservedCount ≥ 5` and `repeatedAuthorRatio ≥ 0.7` |
+| `singleLinkDomain` | `linkObservedCount ≥ 5` and `linkDomainConcentration ≥ 0.6` |
+| `burstRate` | `publishedAtObservedCount ≥ 5` and `postsPerMinute ≥ 30` |
+
+The thresholds are unchanged definitions and were deliberately **not** tuned against the first live
+capture — the minimum-sample rule is a semantic validity requirement, not outcome optimisation. Under
+V2 the one-record GitHub capture reports `repeatedAuthorRatio: null`, no `fewAuthors`, no
+`singleLinkDomain`, and `coordinationIndicators.count: 0`.
+
+These indicators remain **descriptive observations only**: never a bot probability, never a risk
+probability, never an Arena gate, never a trading input.
 
 ### Jev / DeepSeek boundaries
 
@@ -2714,6 +2805,33 @@ Phase 5E adds `npm run validate:phase5e` (65 offline cases):
   PATH of non-executed stub files, no binary is installed or launched, no live intelligence capture is
   taken, and nothing needs a system-wide install
 
+Phase 5E.2 adds `npm run validate:phase5e2` (36 offline cases):
+
+- **Registry** — exactly two transforms are registered (`v1`, `v2`), each resolves to a different
+  implementation, and an unknown/empty/whitespace version throws `UnknownFeatureVersionError` rather
+  than falling back to "latest"
+- **Resolution** — a schema-1 manifest with no pin resolves to V1; an explicit pin resolves to exactly
+  that transform; a schema-2 manifest with no pin and an unknown pin both fail closed
+- **New captures** — a capture taken by the suite pins `external-intelligence-features-v2` at schema 2,
+  the pin survives a round-trip through disk, and replay reports both the schema and feature version
+- **V1 preservation** — the frozen fixture's whole V1 vector, feature digest and replay digest are
+  asserted byte-for-byte, and the documented Phase 5E sample still produces its exact numbers
+- **V2 semantics** — authorless/textless/linkless records have `null` ratios (not `1`), missing values
+  are excluded from their own denominators, distinct-value counts differ from observed-field counts, and
+  coverage is an honest zero
+- **Minimum sample** — each of the four indicators is shown unable to fire below the minimum relevant
+  observation count (including the GitHub-shaped one-record case, which yields zero indicators) and able
+  to fire when the sample minimum and threshold are legitimately met
+- **Real-capture identity** — the first real capture still verifies and still replays to exactly
+  `b3904fe2…`, with packet digest exactly `ce82b740…`, under the frozen V1 transform (skipped, with an
+  explicit note, on a checkout that does not contain that workspace artifact)
+- **Determinism** — V1 and V2 feature and replay digests are deterministic, clock-derived fields stay
+  out of both digests, and the packet still audits while containing no raw text and no URL
+- **Barriers** — Wave 1, Wave 2, the six replication datasets and the two frozen cohorts are verified
+  byte-identical, the evaluation contract digest is exactly `4cf8ac1f…`, nothing under `.evolve/` changes
+  while the suite runs, and no Jev call, DeepSeek call, Arena run, provider call or network call is
+  reachable
+
 ## Roadmap
 
 ### Phase 1 — evolutionary lab
@@ -2912,7 +3030,18 @@ Phase 5E adds `npm run validate:phase5e` (65 offline cases):
 - [x] `external-intelligence-packet-v1` interface only: `jevRoutingActive: false`, `deepseekRoutingActive: false`, no Jev/DeepSeek calls
 - [x] Mock provider, `intelligence:doctor`/`probe:reach` (nothing persisted without `--save`), and a compact shadow dashboard panel with counts/identity only
 - [x] `npm run validate:phase5e` — 65 offline cases
-- [ ] One real, bounded, read-only public-data probe and any experiment that tests whether external intelligence has value — operator-run, after Wave 2
+- [x] One real, bounded, read-only public-data capture — `capture-20260919T122601Z`, one GitHub record, `immutable`, `integrity ok`, **infrastructure proof only**, never routed
+
+### Phase 5E.2 — versioned feature transforms
+- [x] Versioned feature transforms: the current algorithm is frozen as `external-intelligence-features-v1`, `external-intelligence-features-v2` is added, and `featureExtractorFor(version)` is the only registry (unknown version fails closed, never "latest")
+- [x] Legacy schema-v1 captures with no `featureVersion` resolve to V1 by an explicit backwards-compatibility rule; new captures pin `external-intelligence-features-v2` at `captureSchemaVersion: 2`; old manifests are never rewritten
+- [x] V2 denominator semantics: observed-field counts and distinct-value counts are separated from the record count, so missing data is UNKNOWN (`null`) rather than concentration
+- [x] `COORDINATION_MIN_OBSERVATIONS = 5` — every coordination indicator requires its relevant observed-field sample minimum; thresholds are documented, not tuned
+- [x] Replay resolves the transform from the frozen manifest (`external-intelligence-replay-v2`), reports `featureVersion` + `captureSchemaVersion`, and keeps `external-intelligence-packet-v1` (the packet already carried `featureVersion`)
+- [x] Committed schema-1 compatibility fixture (`scripts/intelligence/fixtures/legacy-capture-schema1/`) with a frozen expected V1 vector, digest and replay digest
+- [x] `npm run validate:phase5e2` — 36 offline cases
+- [ ] A NEW one-channel GitHub capture under V2, replayed twice offline and integrity-verified, before any External Intelligence → Jev shadow experiment
+- [ ] One External Intelligence → Jev **shadow** experiment — operator-run, Jev routing still inactive until explicitly enabled
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

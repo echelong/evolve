@@ -1188,6 +1188,7 @@ test("24. No wallet, signing, or transaction-execution path exists (including in
       if (normalized.endsWith("scripts/validate-phase5c3.mjs")) continue;
       if (normalized.endsWith("scripts/validate-phase5d.mjs")) continue;
       if (normalized.endsWith("scripts/validate-phase5e.mjs")) continue;
+      if (normalized.endsWith("scripts/validate-phase5e2.mjs")) continue;
 
       const text = await readFile(path.join(PROJECT_ROOT, relative), "utf8");
       scanLineForbidden(normalized, text);

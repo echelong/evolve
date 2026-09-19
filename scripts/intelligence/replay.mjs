@@ -13,13 +13,36 @@
  *     REFUSED instead of being replayed with silently different evidence.
  *
  * PAPER ONLY. No wallet, no signing, no write RPC, no posting.
+ *
+ * FEATURE-VERSION RESOLUTION (Phase 5E.2)
+ * ---------------------------------------
+ * Replay chooses the feature transform FROM THE FROZEN MANIFEST — never from
+ * "latest" — and fails closed on anything it does not recognise:
+ *
+ *   schema 1 (or older) + no featureVersion   -> external-intelligence-features-v1
+ *                                                 (explicit BACKWARDS-COMPATIBILITY
+ *                                                 rule, not a default-to-latest rule)
+ *   featureVersion = ...features-v1            -> V1
+ *   featureVersion = ...features-v2            -> V2
+ *   schema >= 2 with NO featureVersion         -> fail closed (malformed manifest)
+ *   any unknown featureVersion                  -> fail closed
+ *
+ * `replayDigest` deliberately does NOT include the replay implementation version
+ * or the resolved feature version: the historical contract is that a legacy
+ * capture replays to exactly the same digest it always did, under its frozen V1
+ * transform. The resolved versions are reported as provenance instead.
  */
 
 import { digestOf } from "../lib/hash.mjs";
-import { loadCaptureRecords, readCaptureManifest, verifyCapture } from "./capture.mjs";
-import { extractIntelligenceFeatures, featuresDigest } from "./features.mjs";
+import { LEGACY_CAPTURE_SCHEMA_VERSION, loadCaptureRecords, readCaptureManifest, verifyCapture } from "./capture.mjs";
+import {
+  INTELLIGENCE_FEATURE_VERSION,
+  UnknownFeatureVersionError,
+  featureExtractorFor,
+  featuresDigest,
+} from "./features.mjs";
 
-export const INTELLIGENCE_REPLAY_VERSION = "external-intelligence-replay-v1";
+export const INTELLIGENCE_REPLAY_VERSION = "external-intelligence-replay-v2";
 
 export class CaptureIntegrityError extends Error {
   constructor(captureId, reason) {
@@ -30,6 +53,38 @@ export class CaptureIntegrityError extends Error {
     this.name = "CaptureIntegrityError";
     this.captureId = captureId;
   }
+}
+
+/**
+ * Resolve the feature transform a frozen manifest pins.
+ *
+ * FAIL-CLOSED. See the module header for the exact rules.
+ *
+ * @param {object|null} manifest
+ * @returns {string} a registered feature version
+ */
+export function resolveCaptureFeatureVersion(manifest) {
+  const pinned = typeof manifest?.featureVersion === "string" && manifest.featureVersion.trim().length > 0
+    ? manifest.featureVersion.trim()
+    : null;
+  const declared = Number.isFinite(manifest?.captureSchemaVersion)
+    ? manifest.captureSchemaVersion
+    : Number.isFinite(manifest?.schemaVersion)
+      ? manifest.schemaVersion
+      : null;
+  if (pinned !== null) {
+    // Registered => that transform. Unknown => throws (never "latest").
+    return featureExtractorFor(pinned).version;
+  }
+  // No pin. A manifest that PREDATES the pin (schema 1, or no schema at all) is
+  // legacy V1 by an explicit compatibility rule. Anything newer MUST pin one.
+  if (declared === null || declared <= LEGACY_CAPTURE_SCHEMA_VERSION) {
+    return INTELLIGENCE_FEATURE_VERSION;
+  }
+  throw new UnknownFeatureVersionError(
+    null,
+    `Capture manifest schema ${declared} requires an explicit registered \`featureVersion\`; the manifest pins none.`,
+  );
 }
 
 /**
@@ -46,7 +101,9 @@ export async function replayCapture({ root, captureId, asOf = null, verify = tru
   if (!integrity.ok) throw new CaptureIntegrityError(captureId, integrity.reason ?? "integrity check failed");
 
   const records = await loadCaptureRecords(root, captureId);
-  const features = extractIntelligenceFeatures({
+  const featureVersion = resolveCaptureFeatureVersion(manifest);
+  const extractor = featureExtractorFor(featureVersion);
+  const features = extractor.extract({
     records,
     capturedAt: manifest.startedAt ?? null,
     asOf,
@@ -66,6 +123,14 @@ export async function replayCapture({ root, captureId, asOf = null, verify = tru
     replayVersion: INTELLIGENCE_REPLAY_VERSION,
     captureId,
     captureManifestDigest: manifest.manifestDigest,
+    // Provenance: which manifest schema produced these bytes, and which frozen
+    // feature transform interpreted them. Neither participates in `replayDigest`.
+    captureSchemaVersion: Number.isFinite(manifest.captureSchemaVersion)
+      ? manifest.captureSchemaVersion
+      : Number.isFinite(manifest.schemaVersion)
+        ? manifest.schemaVersion
+        : null,
+    featureVersion,
     mode: "replay",
     live: false,
     networkCalls: 0,
@@ -109,6 +174,8 @@ export function captureStats(replay) {
     provider: replay?.provider ?? null,
     syntheticIntelligence: replay?.syntheticIntelligence === true,
     capturedAt: replay?.capturedAt ?? null,
+    captureSchemaVersion: replay?.captureSchemaVersion ?? null,
+    featureVersion: replay?.featureVersion ?? null,
     recordCount: replay?.recordCount ?? 0,
     channels: replay?.channels ?? [],
     counts: replay?.counts ?? {},
