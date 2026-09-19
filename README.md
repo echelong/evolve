@@ -2713,6 +2713,140 @@ retries are never enabled at the same time — otherwise attempt accounting woul
 npm run validate:phase5f1   # 64 offline cases: classification, Retry-After, backoff, cooldown, chain, identity
 ```
 
+## Phase 5G.0 — classifier.dev Frozen External-Intelligence Classification
+
+```text
+Agent-Reach
+  → frozen public observations              (immutable capture, never re-queried)
+  → deterministic bounded text projection   (title + textExcerpt only)
+  → classifier.dev FAST tier                (ONE request, fixed taxonomy)
+  → frozen classification artifact
+  → STOP
+```
+
+classifier.dev is a **bounded, external, descriptive labelling step** over observations that are already
+frozen. Phase 5G.0 proves the plumbing and freezes the semantics; it does **not** decide whether the labels
+are useful. That needs a later prospective experiment.
+
+- classifier.dev **does not trade**.
+- classifier.dev **does not generate strategies**.
+- classifier.dev **does not call Jev** and is **not a Jev fallback**.
+- classifier.dev **does not invoke DeepSeek**.
+- classifier.dev **labels are descriptive and unverified**.
+- classifier.dev output has **no authority** over the Arena, evolution, gates, replication or deployment.
+- **Smart tier is disabled.** It can involve another reasoning-model provider, which would add a second model
+  to provenance.
+- Nothing is routed anywhere: `external-intelligence-packet-v1`, `external-intelligence-features-v2`, the Jev
+  packet projection and question sets are all unchanged.
+
+### Endpoint and request
+
+`POST https://classifier.dev/v1/classify` via native `fetch` (the versioned REST route — not MCP, not the bare
+`POST /`). The request contains exactly `inputs`, the frozen `labels`, `tier: "fast"`, the frozen
+`instructions` and `multi: false` (`max_labels` is never sent). No credential exists: **no `Authorization`
+header, no gateway key, no Jev key, no cookie.** Redirects are never followed. At most 1,000 inputs per
+request; more eligible records **fail closed** (nothing is truncated, nothing is silently dropped).
+
+### Frozen classifier `reach-signal-type-v1` (version 1)
+
+Exactly nine labels, never extended dynamically and never supplied by a caller:
+
+`technical_activity` · `project_announcement` · `exchange_or_listing` · `liquidity_or_market_structure` ·
+`security_or_risk` · `governance_or_admin` · `community_attention` · `promotion_or_marketing` ·
+`unrelated_or_noise`
+
+The instruction text is pinned (`instructionsDigest` `79be0792…`):
+
+> Classify the primary research-relevant type of this public external observation. Describe what kind of
+> observation it is, not whether an asset should be bought or sold. Do not infer price direction,
+> profitability, legitimacy, coordinated manipulation, identity, or intent. Choose unrelated_or_noise when
+> none of the other categories clearly applies.
+
+The labels are **descriptive**. `promotion_or_marketing` does **not** mean scam, manipulation, malicious, pump
+or fraud, and `security_or_risk` means only that the text is principally *about* a security/risk topic — not
+that EVOLVE verified any claim.
+
+### Input projection `classifier-input-projection-v1`
+
+Only **`title`** and **`textExcerpt`** of a normalized record can reach classifier.dev — joined
+deterministically, whitespace-normalized, secret-shaped strings redacted (EVOLVE's existing sanitizer plus a
+few bare credential shapes), embedded URLs replaced with `[URL]`, bounded to **800 characters**, empty input
+skipped. Never sent: `query`, `queryId`, `canonicalId`, `canonicalUrl`, `authorId`, `rawDigest`, `captureId`,
+`backend`, `engagement`, `publishedAt`, nor any genome, candidate parameter, P&L, paper return, Arena/gate/
+replication result, research proposal, DeepSeek/Jev output, wallet, transaction, credential, environment
+variable, filesystem path or raw provider object. Nothing is prepended (no symbol, price, query, channel,
+author, URL, reputation or EVOLVE state).
+
+`inputDigest = digestOf(final classifier input)` is persisted; the input text itself is **not** (the capture
+already holds the frozen excerpt and the projection re-derives the input).
+
+### Response validation
+
+Whitelisted and checked field by field: `tier` must be `fast`; `results.length` must equal the input count
+(order preserved); every `label` must be in the taxonomy; `confidence` must be finite and in `[0, 1]`;
+`scores` must be an object whose keys are taxonomy labels and whose values are finite and in `[0, 1]`;
+`usage.escalated` must not exceed 0. A malformed, partial or reordered answer is **rejected**, never repaired.
+Unknown additive fields are ignored. The raw HTTP response is never persisted.
+
+### Frozen artifact
+
+```text
+.evolve/classifier/experiments/clexp-<UTC stamp>-<resultDigest[:8]>/
+  experiment.json            identity + provenance + counts + resultDigest   (written LAST, immutable)
+  results.ndjson             one bounded record per classified source record, in capture order
+  provider/runs/run-0001.json   bounded attempt metadata
+```
+
+The capture directory is never written to and the source capture is never copied. A classification record holds
+only `recordDigest` (the source `normalizedDigest`), `inputProjectionVersion`, `inputDigest`, `classifierId`,
+`classifierVersion`, `label`, `confidence`, `scores`, `provider`, `model`, `tier` — no title, excerpt, URL,
+author, query or raw response. `resultDigest = digestOf(ordered classification records)`; re-reading the
+stored experiment offline reproduces it exactly.
+
+Only descriptive counts are derived (classified count, `labelCounts`, mean confidence, returned model, API
+version, latency). There is deliberately **no** bullishness, expected return, trade confidence, buy/sell
+probability, token-quality, scam or profitability number.
+
+### Transport recovery
+
+Bounded and EVOLVE-owned: **retry** 429, 502, 503, 504, timeout and temporary network failure; **never retry**
+400, 404, other 4xx/5xx, a malformed response, an invalid classifier definition, an invalid capture or a
+failed integrity check. `EVOLVE_CLASSIFIER_MAX_ATTEMPTS` (default 3, clamped 1..5), exponential backoff from
+`EVOLVE_CLASSIFIER_BACKOFF_BASE_MS` (1000) to `EVOLVE_CLASSIFIER_BACKOFF_MAX_MS` (30000) with ±25% jitter, and
+`Retry-After` honoured as a floor (integer seconds or HTTP-date, clamped to 60s). Only bounded parsed rate-limit
+metadata is persisted — `httpStatus`, `retryAfterMs`, `rateLimitLimit`, `rateLimitRemaining`,
+`rateLimitPolicy`, `attemptNumber`, `latencyMs`, `status` (`null` when unavailable) — never raw headers.
+`fetchImpl`, `sleepImpl` and `randomImpl` are injectable, so tests use zero real delay.
+
+### Capture integrity requirement
+
+Before anything is sent: the capture manifest must exist, `immutable === true`, `finalized === true`, and the
+existing capture integrity verification must pass. Only then are the frozen normalized records loaded and the
+inputs built locally. Classification never calls Agent-Reach and never triggers a capture.
+
+### CLI
+
+```bash
+# the provider is DISABLED unless chosen explicitly; nothing is classified after a capture automatically
+npm run intelligence:classify -- --capture <capture-id> --classifier reach-signal-type-v1 --provider classifier-dev [--save]
+
+# offline inspection — zero network calls, no reclassification
+npm run intelligence:classify -- --stats  --experiment <clexp-id>
+npm run intelligence:classify -- --replay --experiment <clexp-id>
+```
+
+`--replay` recomputes `resultDigest`, verifies the source capture identity and integrity, re-projects the
+frozen records and checks every stored `recordDigest`/`inputDigest` in order. `--tier smart`, `--multi`,
+`--labels` and `--instructions` are refused. Without `--save` the result is printed and nothing is persisted; a
+failed classification persists nothing.
+
+### Validation
+
+```bash
+npm run validate:phase5g   # 74 offline cases: endpoint/tier/taxonomy pins, projection, response validation,
+                           # retry, no-credential, storage, replay, no-routing, identity barriers
+```
+
 ## Validation
 
 ```bash
@@ -3092,6 +3226,27 @@ Phase 5E.2 adds `npm run validate:phase5e2` (36 offline cases):
 - **Determinism** — V1 and V2 feature and replay digests are deterministic, clock-derived fields stay
   out of both digests, and the packet still audits while containing no raw text and no URL
 
+Phase 5G.0 adds `npm run validate:phase5g` (74 offline cases; `fetch` is a scripted stub, so no classifier.dev
+request is ever made):
+
+- **Pins** — endpoint exactly `/v1/classify`, API major `v1`, FAST tier only (smart rejected in request, provider,
+  response and CLI), `multi: false`, taxonomy id/version/nine labels, dynamic labels refused, instruction text and
+  digest, input projection version
+- **Projection** — only `title`/`textExcerpt` are read; query, URL metadata, author, capture id, and any
+  P&L/Arena/Jev/genome/wallet/env state cannot enter; URLs and secret shapes are sanitized; input bounded;
+  empty input skipped; `recordDigest`/`inputDigest` preserved and deterministic
+- **Persistence** — no raw input, title or excerpt anywhere in the artifact; results map to record order
+- **Response** — unknown labels, out-of-range confidence, malformed scores, partial/extra results and smart-tier
+  escalation rejected; model/tier captured; `resultDigest` deterministic; offline replay reproduces it and detects
+  tampering with zero network calls
+- **Transport** — 429 with `Retry-After` (seconds/HTTP-date/clamped/malformed), 502/503/504, timeout and network
+  failure retried; 400/404/other/malformed never retried; max attempts and jitter bounded; zero real delay
+- **Credentials** — no `Authorization`, no gateway key, no Jev/TypeSafe key, only `EVOLVE_CLASSIFIER_*` env read
+- **Isolation** — stored outside the capture, capture byte-identical, failed integrity refuses before any request,
+  no Agent-Reach/Jev/DeepSeek/Arena/wallet code reachable, packet/feature version/routing flags/Jev experiments/
+  provider-health unchanged, real V2 + legacy V1 captures, Wave 1, Wave 2, cohorts, six datasets and the
+  evaluation contract digest all unchanged
+
 Phase 5F.1 adds `npm run validate:phase5f1` (64 offline cases):
 
 - **Retry classification** — 429/5xx/timeout/network retried; 400/401/402/403/404/422, malformed
@@ -3379,6 +3534,21 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, the six datasets, the frozen cohorts and `evaluationContractDigest` all byte-unchanged
 - [x] `npm run validate:phase5f1` — 64 offline cases
 - [ ] First real resilience test on `capture-20260919T130756Z` — operator-run AFTER this commit, 1 logical call / up to 3 transport attempts, `vercel-jev`, `typesafe-ai/jev`, `--save`; its disposition is **not** evidence that external intelligence adds value
+
+### Phase 5G.0 checklist
+
+- [x] classifier.dev `POST /v1/classify` (REST, native `fetch`), **FAST tier only**, single-label only, no credential of any kind, redirects never followed
+- [x] Frozen classifier `reach-signal-type-v1` v1: exactly nine descriptive labels, pinned instruction text and `instructionsDigest`, dynamic labels and the smart tier refused
+- [x] `classifier-input-projection-v1`: ONLY `title` + `textExcerpt`, whitespace-normalized, secret-redacted, URLs → `[URL]`, bounded to 800 characters, empty skipped; `inputDigest` persisted, raw input NOT persisted
+- [x] Whitelisted, fail-closed response validation (tier, count, order, label, confidence, scores, no escalation); raw HTTP response never persisted
+- [x] Frozen artifact under `.evolve/classifier/experiments/clexp-…` (`experiment.json`, `results.ndjson`, `provider/runs/*.json`), outside the immutable capture, no raw text, deterministic `resultDigest`
+- [x] Bounded transport recovery (429/502/503/504/timeout/network; never 400/404/malformed), `Retry-After` seconds + HTTP-date clamped to 60s, bounded jitter, injectable `fetchImpl`/`sleepImpl`/`randomImpl`
+- [x] Capture integrity gate (manifest, `immutable`, `finalized`, existing verification) before any request; more than 1,000 eligible records fail closed
+- [x] Explicit CLI `npm run intelligence:classify` (provider disabled by default) + offline `--stats` / `--replay` (zero network)
+- [x] No downstream routing: packet, feature version, Jev projection/question sets, Jev/DeepSeek routing flags, Arena, evolution, gates, replication all unchanged
+- [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5g` — 74 offline cases
+- [ ] First real infrastructure test on `capture-20260919T130756Z` — operator-run AFTER this commit, ONE request, `classifier-dev`, `fast`, `--save`; the label it returns is **not** evidence about profitability or market usefulness
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.
