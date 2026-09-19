@@ -2847,6 +2847,123 @@ npm run validate:phase5g   # 74 offline cases: endpoint/tier/taxonomy pins, proj
                            # retry, no-credential, storage, replay, no-routing, identity barriers
 ```
 
+## Phase 5G.1 — Offline Classifier Taxonomy Evaluation
+
+```text
+DEVELOPMENT-only Agent-Reach captures
+  → frozen normalized records
+  → Phase 5G.0 classifier experiments  (clexp-…)
+  → explicit immutable DEVELOPMENT cohort  (clcohort-…)
+  → OFFLINE descriptive taxonomy evaluation  (cleval-…)
+  → STOP
+```
+
+Phase 5G.1 consumes **multiple already-frozen** classifier experiments and describes the classifier's
+behaviour across them. It is an **evaluation of classifier behaviour**, not of truth: it does **not** establish
+truth, predictive value or profitability, and it routes nothing downstream.
+
+- Every cohort and evaluation is pinned to `evidenceClass: "DEVELOPMENT_CLASSIFIER_EVIDENCE"` — **never**
+  `CLEAN_REPLICATION`, `VALIDATION`, `TEST`, `OOS` or `PRODUCTION`. No future clean artifact may depend on it.
+- The evaluator is **offline only**: it reads classifier experiment artifacts and their frozen source captures
+  and makes **zero network calls** — no classifier.dev, no Agent-Reach, no Jev, no DeepSeek, no Arena.
+- The taxonomy is **frozen**. Phase 5G.1 never edits `reach-signal-type-v1`; a future `reach-signal-type-v2`
+  would be a separate phase evaluated on **new** development captures. There is no automatic
+  evaluate → mutate → rerun loop.
+
+### Cohort manifest
+
+```text
+.evolve/classifier/cohorts/<cohort-id>.json      cohort-id = clcohort-<UTC stamp>-<cohortDigest[:8]>
+```
+
+The cohort contains **only** `cohortId`, `purpose` (`DEVELOPMENT`), `evidenceClass`, `classifierId`,
+`classifierVersion`, `inputProjectionVersion`, `experimentIds`, `sourceCaptureIds`, `experimentDigests`,
+`resultDigests`, `recordCounts`, `createdAt`, `immutable`, `note` and `cohortDigest`. It embeds **no** raw text,
+title, excerpt, URL or author, and it is immutable (never overwritten). Freezing requires **explicit**
+`clexp-*` ids — there is no "latest experiment" search.
+
+A cohort is **rejected** if it lists a duplicate experiment id, an experiment whose classifier id, version or
+input projection does not match the frozen definition, a non-finalized experiment, an experiment that fails its
+own integrity check, a missing source capture, or a source capture that fails integrity. The canonical Phase 5G.0
+one-record **infrastructure experiment** (`clexp-20260919T143623Z-69170f53`) is excluded from the meaningful
+development cohort by default.
+
+### Evaluation artifact
+
+```text
+.evolve/classifier/evaluations/<evaluation-id>/evaluation.json   evaluation-id = cleval-<UTC stamp>-<evaluationDigest[:8]>
+```
+
+The artifact persists `evaluationId`, `cohortId`, `evidenceClass`, `classifierId`, `classifierVersion`,
+`inputProjectionVersion`, `experimentCount`, `captureCount`, `recordCount`, `channelCounts`, `metrics`,
+`cohortDigest`, `evaluationDigest`, `createdAt`, `immutable`, `descriptiveOnly`, `noGroundTruth` and
+`noProfitabilityInference`. It contains **no** raw text, URL, author or secret.
+
+### Descriptive metrics
+
+- **Label distribution** — per-label count/fraction over all nine labels, `totalClassified`, `labelsObserved`,
+  and `labelDiversity` = normalized Shannon entropy (0 = one label, 1 = uniform over nine). High diversity is
+  **not** "good".
+- **Confidence** — mean, median, p10/p25/p75/p90, min, max, plus fixed descriptive bands (`< 0.50`, `< 0.70`,
+  `>= 0.90`). These thresholds are **not** acceptance gates.
+- **Per-label confidence** — count, mean, median, p25, p75 for every observed label. No label is ranked.
+- **Score margin** — `top1Score`, `top2Score`, `scoreMargin = top1 - top2`; mean, median, p10/p25/p75/p90 and
+  fixed descriptive ambiguity bands (`< 0.05`, `< 0.10`, `< 0.20`). No gate.
+- **Score entropy** — the nine scores normalized by their sum (only when nonnegative and sum > 0), then
+  normalized Shannon entropy; an unnormalizable vector is stored as `null` — a missing value is never invented.
+- **Channel × label** — classifications are joined back to the frozen source records by
+  `recordDigest === normalizedDigest`; the source `channel` is the only grouping key (no text is copied).
+  Reported per channel: `recordCount`, `labelCounts`, `labelFractions`, mean/median confidence and mean/median
+  margin. A missing source record **fails closed**.
+- **Channel coverage** — channels represented, count and fraction per channel. More channels is **not**
+  automatically better evidence.
+- **Noise** — exactly `unrelated_or_noise` count/fraction. These records are **not** discarded in Phase 5G.1.
+- **Promotion** — exactly `promotion_or_marketing` count/fraction, a descriptive category only — **not** scam,
+  manipulation, bot activity, fraud or spam.
+- **Concentration** — `largestLabelCount` / `largestLabelFraction`. There is **no** "taxonomy passed" / "taxonomy
+  failed" / "good" / "bad" verdict anywhere, and **no** accuracy, precision, recall, F1, ROC or calibration
+  metric (there is no ground truth), and **no** correlation against returns, price, P&L, Arena score, survival
+  or gate outcomes.
+
+### Human audit view (ephemeral)
+
+```bash
+npm run intelligence:classify-eval -- --cohort <cohort-id> --audit
+npm run intelligence:classify-eval -- --cohort <cohort-id> --audit-low-confidence [N]   # default 20, clamped 1..100
+```
+
+These read the original frozen capture and print **bounded** rows to the terminal only: shortened `recordDigest`,
+channel, a bounded title/text excerpt (URLs redacted), the predicted label, confidence and the top two scores.
+They never show a canonical URL, author id, query or credential, and they write **no** artifact. Sampling is
+deterministic (up to three observations per observed label by lowest digest order; the lowest-confidence audit is
+sorted by confidence then digest) — no randomness.
+
+### CLI
+
+```bash
+# freeze an explicit DEVELOPMENT cohort from exact experiment ids
+npm run intelligence:classify-eval -- --freeze-cohort --experiments <clexp-id,clexp-id,...>
+
+# create the offline evaluation artifact
+npm run intelligence:classify-eval -- --cohort <cohort-id>
+
+# offline, zero-network inspection
+npm run intelligence:classify-eval -- --stats  --evaluation <cleval-id>
+npm run intelligence:classify-eval -- --replay --evaluation <cleval-id>
+```
+
+`--replay` verifies the cohort identity, every classifier experiment and every source capture, recomputes every
+metric, reproduces `evaluationDigest` exactly and proves the stored evaluation carries no raw text, URL or
+author. `--freeze-cohort` validates every experiment **before** writing anything.
+
+### Validation
+
+```bash
+npm run validate:phase5g1   # 75 offline cases: taxonomy/definition/projection pins, cohort rejection rules,
+                            # DEVELOPMENT evidence class, every metric, no-truth/no-profitability/no-verdict,
+                            # text-free artifact, deterministic audit, offline replay/stats, identity barriers
+```
+
 ## Validation
 
 ```bash
@@ -3247,6 +3364,34 @@ request is ever made):
   provider-health unchanged, real V2 + legacy V1 captures, Wave 1, Wave 2, cohorts, six datasets and the
   evaluation contract digest all unchanged
 
+Phase 5G.1 adds `npm run validate:phase5g1` (75 offline cases; every fixture is built in a temp dir and no
+classifier.dev request is ever made):
+
+- **Frozen pins** — taxonomy id/version/nine labels, classifier-definition digest, input projection version, and
+  the canonical one-record infrastructure experiment are unchanged
+- **Cohort rejection** — explicit ids required; duplicate, missing, non-finalized, integrity-failed, mixed
+  classifier id/version/projection, missing capture and tampered capture are all refused; the infrastructure
+  experiment is excluded by default; the cohort is immutable and pinned to `DEVELOPMENT_CLASSIFIER_EVIDENCE`
+- **Text-free cohort** — no raw text, URL, author or query is embedded, and the key set is exactly the frozen one
+- **Offline only** — the evaluator and its CLI make zero classifier.dev / Agent-Reach / Jev / DeepSeek / Arena
+  calls and touch no trading or transaction code
+- **Metrics** — label counts, fractions and normalized label entropy; confidence mean/median/quantiles and the
+  three fixed bands; per-label confidence; top1/top2 extraction, margins and the three fixed ambiguity bands;
+  score entropy (with zero-sum → `null`); the channel × label matrix and channel confidence stats; noise and
+  promotion fractions; largest-label concentration
+- **Join** — classifications join to frozen source records by `recordDigest === normalizedDigest` only, and a
+  missing source record fails closed
+- **No verdict / no truth / no profitability** — no pass/fail key exists, no accuracy/precision/recall/F1/ROC/
+  calibration metric exists, and nothing correlates labels against returns, P&L, Arena score, survival or gates
+- **Artifact hygiene** — the evaluation carries no raw text, no URL and no author
+- **Audit** — the deterministic label sample and the lowest-confidence audit are stable, produce no artifact, and
+  never show a URL, author, query or credential
+- **Replay / stats** — both run with zero network calls; replay recomputes every metric and reproduces
+  `evaluationDigest`; changing one stored label or one stored confidence breaks replay integrity
+- **Isolation** — packet, feature versions, Jev projection/question sets, Jev/DeepSeek routing flags, Jev
+  experiments, provider-health, real V2 + legacy V1 captures, Wave 1, Wave 2, cohorts, six datasets and
+  `evaluationContractDigest` all unchanged
+
 Phase 5F.1 adds `npm run validate:phase5f1` (64 offline cases):
 
 - **Retry classification** — 429/5xx/timeout/network retried; 400/401/402/403/404/422, malformed
@@ -3549,6 +3694,23 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
 - [x] `npm run validate:phase5g` — 74 offline cases
 - [ ] First real infrastructure test on `capture-20260919T130756Z` — operator-run AFTER this commit, ONE request, `classifier-dev`, `fast`, `--save`; the label it returns is **not** evidence about profitability or market usefulness
+
+### Phase 5G.1 checklist
+
+- [x] Explicit immutable cohort manifest under `.evolve/classifier/cohorts/clcohort-…` containing ONLY ids/digests/counts/`createdAt`/`immutable`/`note` — no raw text, title, excerpt, URL or author
+- [x] Cohort rejects duplicate/missing/mixed-classifier/mixed-version/mixed-projection/non-final/integrity-failed experiments and missing or tampered source captures; requires explicit `clexp-*` ids
+- [x] Canonical Phase 5G.0 one-record infrastructure experiment excluded from the meaningful cohort by default
+- [x] Every cohort and evaluation pinned to `evidenceClass: DEVELOPMENT_CLASSIFIER_EVIDENCE` — never CLEAN_REPLICATION/VALIDATION/TEST/OOS/PRODUCTION
+- [x] Offline-only evaluator (`npm run intelligence:classify-eval`) with ZERO classifier.dev / Agent-Reach / Jev / DeepSeek / Arena calls
+- [x] Deterministic descriptive metrics: label distribution + normalized label diversity, confidence stats + fixed bands, per-label confidence, score margin + fixed ambiguity bands, score entropy (null when unnormalizable), channel × label, channel coverage, noise, promotion, concentration
+- [x] Text-free evaluation artifact at `.evolve/classifier/evaluations/cleval-…/evaluation.json` with `descriptiveOnly`/`noGroundTruth`/`noProfitabilityInference`
+- [x] No automated verdict, no accuracy/precision/recall/F1/ROC/calibration (no ground truth) and no profitability/Arena correlation
+- [x] Ephemeral deterministic `--audit` / `--audit-low-confidence` (terminal only, no artifact, no URL/author/query shown)
+- [x] Offline `--replay` (verifies cohort + every experiment + every capture, recomputes metrics, reproduces `evaluationDigest`) and `--stats`
+- [x] Frozen taxonomy v1 untouched — no automatic evaluate → mutate → rerun loop; a future v2 is a separate phase on new captures
+- [x] Real V2 capture, legacy V1 capture, Wave 1, Wave 2, cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5g1` — 75 offline cases
+- [ ] First meaningful DEVELOPMENT cohort — operator-run AFTER this commit, fresh development captures across several healthy read-only channels, `classifier-dev`/`reach-signal-type-v1`/`fast`; its metrics are **not** proof that classifier.dev adds predictive value
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.
