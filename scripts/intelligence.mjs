@@ -46,7 +46,13 @@ import { CAPTURE_SCHEMA_VERSION, listCaptures, runCapture, verifyCapture } from 
 import { DEFAULT_FEATURE_VERSION, REGISTERED_FEATURE_VERSIONS } from "./intelligence/features.mjs";
 import { captureStats, replayCapture, verifyReplayDeterminism } from "./intelligence/replay.mjs";
 import { buildExternalIntelligencePacket, auditExternalIntelligencePacket } from "./intelligence/packet.mjs";
-import { inspectReachCapabilities, probeReachHealth, resolveReachBinary } from "./intelligence/agent-reach.mjs";
+import {
+  REACH_ACTIVE_CAPABILITY_MAP_VERSION,
+  REACH_CAPABILITY_MAP_VERSION,
+  inspectReachCapabilities,
+  probeReachHealth,
+  resolveReachBinary,
+} from "./intelligence/agent-reach.mjs";
 import { REACH_QUERY_SET_ID } from "./intelligence/query-sets.mjs";
 
 const BOOLEAN_FLAGS = ["json", "probe", "save", "help", "verify"];
@@ -237,6 +243,7 @@ async function captureAction({ args, config, root }) {
       manifestDigest: result.manifest.manifestDigest,
       captureSchemaVersion: result.manifest.captureSchemaVersion,
       featureVersion: result.manifest.featureVersion,
+      capabilityMapVersion: result.manifest.capabilityMapVersion ?? null,
       recordsDigest: result.manifest.digests.recordsDigest,
       channels: result.manifest.queries.channels,
       health: result.manifest.health,
@@ -253,6 +260,9 @@ async function captureAction({ args, config, root }) {
   console.log(`[intelligence]   channels:   ${(result.manifest.queries.channels ?? []).join(", ") || "none"}`);
   console.log(`[intelligence]   failures:   ${result.manifest.counts.failures} · timeouts: ${result.manifest.counts.timeouts}`);
   console.log(`[intelligence]   pinned:     capture schema ${result.manifest.captureSchemaVersion} · feature ${result.manifest.featureVersion}`);
+  if (result.manifest.capabilityMapVersion) {
+    console.log(`[intelligence]   capability: ${result.manifest.capabilityMapVersion}`);
+  }
   console.log(`[intelligence]   digest:     ${result.manifest.manifestDigest}`);
   console.log("[intelligence] captured, frozen and fingerprinted. Nothing was routed to Jev, DeepSeek or the Arena.");
 }
@@ -344,6 +354,13 @@ async function doctorAction({ args, config, root }) {
   // spawns NOTHING. This is the distinction the coarse channel health could not
   // make — e.g. `web` read ready via `curl` while `web` search is unavailable
   // because `mcporter` is missing.
+  //
+  // The V1 map stays the documented readiness basis: its (operation, channel,
+  // executable) triples are IDENTICAL to V2's — Phase 5G.1b changed only the
+  // MCPorter search ARGV, never which executable a capability needs — so local
+  // readiness is the same for both contracts. The ACTIVE contract is reported
+  // alongside (and asserted triple-identical by `validate:phase5g1b`), so this
+  // doctor remains a zero-upstream-statement inspection either way.
   const capabilityReadiness = inspectReachCapabilities({
     reachBin: config.reachBin ?? null,
     projectRoot: process.cwd(),
@@ -369,11 +386,18 @@ async function doctorAction({ args, config, root }) {
     captureSchemaVersion: CAPTURE_SCHEMA_VERSION,
     featureVersions: [...REGISTERED_FEATURE_VERSIONS],
     defaultFeatureVersion: DEFAULT_FEATURE_VERSION,
+    capabilityMaps: {
+      active: REACH_ACTIVE_CAPABILITY_MAP_VERSION,
+      historical: REACH_CAPABILITY_MAP_VERSION,
+    },
     binary: typeof binary === "string" ? binary : null,
     binaryError: typeof binary === "string" ? null : binary.error ?? null,
     binaryExists,
     capabilityReadiness: {
+      // Which map the readiness rows below were resolved against, and which map a
+      // NEW capture is bounded by. They are triple-identical today.
       capabilityMapVersion: capabilityReadiness.capabilityMapVersion,
+      activeCapabilityMapVersion: REACH_ACTIVE_CAPABILITY_MAP_VERSION,
       // The upstream Agent-Reach doctor health is reported separately from the
       // frozen EVOLVE capability readiness; they are never collapsed.
       health: capabilityReadiness.health,
@@ -420,6 +444,10 @@ async function doctorAction({ args, config, root }) {
     console.log(`[intelligence]   limits:          timeout ${config.timeoutMs}ms · max calls ${config.maxCalls} · max results ${config.maxResults} · max bytes ${config.maxBytes}`);
     console.log(`[intelligence]   capture schema:  ${CAPTURE_SCHEMA_VERSION} · new captures pin ${DEFAULT_FEATURE_VERSION}`);
     console.log(`[intelligence]   feature versions:${REGISTERED_FEATURE_VERSIONS.join(", ")}`);
+    console.log(
+      `[intelligence]   capability map:  ${REACH_ACTIVE_CAPABILITY_MAP_VERSION} (active for new captures; ` +
+        `${REACH_CAPABILITY_MAP_VERSION} stays frozen for historical captures)`,
+    );
     const upstreamDoctor = report.probe
       ? report.probe.skipped
         ? `not run (${report.probe.reason})`

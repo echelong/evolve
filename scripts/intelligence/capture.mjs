@@ -36,7 +36,13 @@ import {
   INTELLIGENCE_PHASE,
   INTELLIGENCE_PROVIDER,
 } from "./config.mjs";
-import { createReachBudget, evaluateReachPlanReadiness, ReachPlanUnavailableError, sanitizeReachEnv } from "./agent-reach.mjs";
+import {
+  REACH_ACTIVE_CAPABILITY_MAP,
+  createReachBudget,
+  evaluateReachPlanReadiness,
+  ReachPlanUnavailableError,
+  sanitizeReachEnv,
+} from "./agent-reach.mjs";
 import { DEFAULT_FEATURE_VERSION } from "./features.mjs";
 import { normalizeRecord, verifyRecord } from "./records.mjs";
 import { assertCanonicalQueryPlan, buildQueryPlan, REACH_QUERY_SET_ID, REACH_QUERY_SET_VERSION } from "./query-sets.mjs";
@@ -255,6 +261,10 @@ export async function runCapture({
       reachBin: config?.reachBin ?? null,
       projectRoot,
       env: sanitizeReachEnv(env),
+      // The preflight and the runtime call must agree on the CONTRACT: a new
+      // capture is resolved against the same versioned capability map the
+      // adapter will launch (never a silently different one).
+      capabilityMap: REACH_ACTIVE_CAPABILITY_MAP,
     });
     if (!readiness.ready) throw new ReachPlanUnavailableError(readiness);
   }
@@ -382,6 +392,11 @@ export async function runCapture({
     provider: providerName,
     providerDeterministic: resolved.deterministic === true,
     syntheticIntelligence: providerSyntheticIntelligence,
+    // CAPABILITY-CONTRACT PROVENANCE (Phase 5G.1b): which versioned capability
+    // map bounded this capture. `null` means the provider uses no external
+    // capability map at all (the offline mock). Historical manifests are never
+    // rewritten; this field is additive on schema 2.
+    capabilityMapVersion: resolved.capabilityMapVersion ?? null,
     agentReach: { ...AGENT_REACH_PIN },
     evolveCommit: readEvolveCommit(),
     mode: config?.mode ?? "shadow",

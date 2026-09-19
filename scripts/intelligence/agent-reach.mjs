@@ -54,6 +54,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { digestOf } from "../lib/hash.mjs";
 import {
   AGENT_REACH_PIN,
   READ_ONLY_ACTIONS,
@@ -62,6 +63,120 @@ import {
 
 /** The capability map version — a change here is a deliberate contract change. */
 export const REACH_CAPABILITY_MAP_VERSION = "reach-capability-map-v1";
+
+/**
+ * VERSIONED SUCCESSOR (Phase 5G.1b) — `reach-capability-map-v2`.
+ *
+ * `reach-capability-map-v1` is FROZEN: historical captures (and every replay
+ * identity derived from them) were bounded by its EXACT argv, and silently
+ * mutating it would rewrite the meaning of already-frozen evidence. V2 is
+ * therefore an explicit, published successor — it never redefines V1.
+ *
+ * V2 changes ONE thing: the MCPorter / Exa web-search invocation contract. The
+ * installed `mcporter 0.13.13` no longer accepts `--query`/`--limit` on `call`
+ * (it wants `key=<value>` tool arguments and the Exa schema names the bounded
+ * result count `numResults`, with a REQUIRED `objective`). V1 remains readable
+ * forever; every NEW Agent-Reach capture is bounded by V2.
+ */
+export const REACH_CAPABILITY_MAP_VERSION_V2 = "reach-capability-map-v2";
+
+/** The capability map NEW captures are bounded by (see `REACH_ACTIVE_CAPABILITY_MAP`). */
+export const REACH_ACTIVE_CAPABILITY_MAP_VERSION = REACH_CAPABILITY_MAP_VERSION_V2;
+
+/* ----------------------------------------------------------------------------
+ * The frozen Exa / MCPorter web-search contract (V2)
+ * --------------------------------------------------------------------------*/
+
+/** The MCP tool EVOLVE calls for `exa`/`web` search. Exact, frozen, never built. */
+export const EXA_WEB_SEARCH_TOOL = "exa.web_search_exa";
+
+/**
+ * The FROZEN search-ranking objective (a static literal, version 1).
+ *
+ * The installed `web_search_exa` schema makes `objective` REQUIRED, so EVOLVE
+ * supplies a STATIC one: NO LLM, no candidate, no strategy, no genome and no
+ * research proposal may ever write, extend or influence it. It is search-ranking
+ * context only — never a research conclusion, never trading direction, never
+ * asset quality, never profitability.
+ *
+ * The wording below is the carefully EQUIVALENT comma form of the semantic
+ * content "... return search-result evidence only; do not infer trading
+ * direction, asset quality or profitability." The `;` was replaced because the
+ * frozen argv-token barrier refuses shell/control characters in EVERY token
+ * (including this one) — the barrier is never weakened to accommodate a string.
+ */
+export const EXA_SEARCH_OBJECTIVE_VERSION = 1;
+export const EXA_SEARCH_OBJECTIVE_V1 =
+  "Return the public web pages most relevant to the supplied query. Prefer direct, substantive and information-rich pages. " +
+  "Exclude unrelated results. Return search-result evidence only, and do not infer trading direction, asset quality or profitability.";
+/** Pins BOTH the objective text and its version (a change here is a contract change). */
+export const EXA_SEARCH_OBJECTIVE_DIGEST = digestOf({
+  version: EXA_SEARCH_OBJECTIVE_VERSION,
+  objective: EXA_SEARCH_OBJECTIVE_V1,
+});
+
+/** EVOLVE's hard cap for ONE Exa transport request: never ask Exa for more than this. */
+export const EXA_WEB_SEARCH_MAX_RESULTS = 25;
+
+/**
+ * The CONSTRAINED named-tool-argument template form.
+ *
+ * Only a token of the exact shape `<approvedKey>={<approvedPlaceholder>}` is
+ * ever recognised: one key, one placeholder, one substitution per token. Nested
+ * braces, multiple placeholders, an unknown key, an unknown placeholder and a
+ * caller-defined argument name are all refused. There is no general string
+ * interpolation anywhere in the adapter — each item stays its OWN argv token.
+ */
+export const REACH_NAMED_ARGUMENT_PATTERN = /^([A-Za-z][A-Za-z0-9_]*)=\{([A-Za-z][A-Za-z0-9_]*)\}$/;
+
+/** The ONLY placeholder names a named argument may resolve through. */
+export const REACH_NAMED_ARGUMENT_PLACEHOLDERS = Object.freeze(["query", "limit", "objective"]);
+
+/** The ONLY argument keys the MCPorter/Exa capability may declare. */
+export const REACH_MCPORTER_ARGUMENT_KEYS = Object.freeze(["query", "numResults", "objective"]);
+
+/**
+ * The FROZEN key → placeholder PAIRING for the MCPorter/Exa contract.
+ *
+ * A named argument is accepted only as one of these exact pairs, so a forged or
+ * hostile capability entry can neither invent a tool-argument name
+ * (`maxResults=`, `limit=`, …) nor re-point a key at another placeholder (which
+ * could otherwise push caller text into the `objective` slot).
+ */
+export const REACH_MCPORTER_ARGUMENT_TEMPLATES = Object.freeze({
+  query: "query",
+  numResults: "limit",
+  objective: "objective",
+});
+
+/**
+ * The FROZEN named-argument keys, per upstream executable.
+ *
+ * A named argument is accepted only when its key is a frozen literal for the
+ * executable the capability declares — so a forged/hostile capability entry can
+ * never define its own tool-argument name (`maxResults=`, `limit=`, …), even if
+ * it tries to declare one.
+ */
+export const REACH_FROZEN_ARGUMENT_KEYS_BY_BINARY = Object.freeze({
+  mcporter: REACH_MCPORTER_ARGUMENT_KEYS,
+});
+
+/** The bounded result-count argument name at the Exa provider boundary. */
+export const EXA_RESULT_COUNT_ARGUMENT = "numResults";
+
+/**
+ * MCPorter's explicit output-format flag.
+ *
+ * `--output <format>` writes no file: it selects MCPorter's OUTPUT FORMAT, and
+ * EVOLVE always asks for `raw` so the COMPLETE MCP CallResult is available to
+ * the bounded parser (a JSON convenience mode must never decide how many
+ * results exist). The flag is only ever accepted for MCPorter and only ever
+ * followed by an approved format — the file-writing flag list stays closed for
+ * every other tool (+ everything else MCPorter could be asked to do).
+ */
+export const REACH_MCPORTER_OUTPUT_FLAG = "--output";
+export const REACH_MCPORTER_OUTPUT_FORMATS = Object.freeze(["raw"]);
+export const REACH_MCPORTER_OUTPUT_BINARIES = Object.freeze(["mcporter"]);
 
 /**
  * Side-effect-free health operations. These are INTERNAL ONLY: they exist for the
@@ -307,10 +422,14 @@ export class ReachPlanUnavailableError extends Error {
  * ==========================================================================*/
 
 /**
- * FROZEN capability map. Placeholders (`{query}`, `{limit}`, `{url}`,
+ * FROZEN capability map (V1). Placeholders (`{query}`, `{limit}`, `{url}`,
  * `{readerUrl}`, `{timeoutSeconds}`) are the ONLY substitution points, and each
  * is validated before it becomes its own argv element (never
  * string-interpolated).
+ *
+ * FROZEN FOREVER: this map bounded every historical capture, so it is never
+ * mutated. Phase 5G.1b introduced `REACH_CAPABILITY_MAP_V2` as an explicit,
+ * versioned successor for NEW captures (see below).
  *
  * The `binary` field names the executable each entry is launched WITH (see
  * `resolveCapabilityExecutable`): `agent-reach` only for the two side-effect-free
@@ -344,11 +463,83 @@ export const REACH_CAPABILITY_MAP_V1 = Object.freeze({
     "`agent-reach` CLI only ever runs `version` and `doctor --json`. No write verb appears anywhere in this map.",
 });
 
+/**
+ * The V2 replacement for ONE search entry: named tool arguments + explicit raw
+ * output, with every item remaining its OWN argv token.
+ *
+ * The conceptual command is
+ *
+ *   mcporter call exa.web_search_exa query=<query> numResults=<limit> \
+ *     objective=<frozen objective> --output raw
+ *
+ * but it is NEVER a string: it is an argv ARRAY handed to `spawn` with
+ * `shell: false`, exactly like every V1 entry.
+ */
+function withMcpSearchInvocation(entry) {
+  if (entry.op !== "search" || (entry.channel !== "exa" && entry.channel !== "web")) return entry;
+  return Object.freeze({
+    op: "search",
+    channel: entry.channel,
+    binary: "mcporter",
+    tool: EXA_WEB_SEARCH_TOOL,
+    // `<key>={<placeholder>}` only: no interpolation, no nesting, no caller keys.
+    argv: Object.freeze([
+      "call",
+      EXA_WEB_SEARCH_TOOL,
+      `query={query}`,
+      `${EXA_RESULT_COUNT_ARGUMENT}={limit}`,
+      `objective={objective}`,
+      REACH_MCPORTER_OUTPUT_FLAG,
+      REACH_MCPORTER_OUTPUT_FORMATS[0],
+    ]),
+    namedArguments: REACH_MCPORTER_ARGUMENT_KEYS,
+  });
+}
+
+/**
+ * FROZEN successor capability map (Phase 5G.1b).
+ *
+ * Identical to V1 — same twelve entries, in the same order, with the same
+ * `(operation, channel, executable)` triples, the same allowlists, the same
+ * `shell: false` launch and the same read-only discipline — EXCEPT the two
+ * MCPorter search entries (`search:exa` and `search:web`), which now use the
+ * named-tool-argument contract above and explicitly request `--output raw`.
+ *
+ * Nothing about V1 is redefined here: `extendsVersion` records the parent the
+ * successor was derived from.
+ */
+export const REACH_CAPABILITY_MAP_V2 = Object.freeze({
+  version: REACH_CAPABILITY_MAP_VERSION_V2,
+  extendsVersion: REACH_CAPABILITY_MAP_VERSION,
+  pinned: AGENT_REACH_PIN,
+  entries: Object.freeze(REACH_CAPABILITY_MAP_V1.entries.map(withMcpSearchInvocation)),
+  mcpSearch: Object.freeze({
+    binary: "mcporter",
+    tool: EXA_WEB_SEARCH_TOOL,
+    queryArgument: "query",
+    resultCountArgument: EXA_RESULT_COUNT_ARGUMENT,
+    objectiveArgument: "objective",
+    objectiveVersion: EXA_SEARCH_OBJECTIVE_VERSION,
+    objectiveDigest: EXA_SEARCH_OBJECTIVE_DIGEST,
+    maxResults: EXA_WEB_SEARCH_MAX_RESULTS,
+    outputFlag: REACH_MCPORTER_OUTPUT_FLAG,
+    outputFormat: REACH_MCPORTER_OUTPUT_FORMATS[0],
+  }),
+  note:
+    "Read-only capability map successor. Only the MCPorter/Exa search invocation changed: named tool arguments " +
+    "(`query=`, `numResults=`, `objective=`) plus an explicit `--output raw`, so MCPorter 0.13.13's `call` contract and " +
+    "Exa's installed `web_search_exa` schema are both satisfied without any shell interpolation. `reach-capability-map-v1` " +
+    "stays frozen and readable for historical captures; this map bounds every NEW capture.",
+});
+
+/** The capability map new captures are bounded by (an explicit, versioned successor). */
+export const REACH_ACTIVE_CAPABILITY_MAP = REACH_CAPABILITY_MAP_V2;
+
 /** Look up the frozen entry for (op, channel). */
-export function capabilityFor(op, channel = null) {
+export function capabilityFor(op, channel = null, capabilityMap = REACH_CAPABILITY_MAP_V1) {
   const requested = String(op ?? "").trim().toLowerCase();
   const action = INTERNAL_REACH_HEALTH_ACTIONS.includes(requested) ? requested : requireReadOnlyAction(op);
-  const entries = REACH_CAPABILITY_MAP_V1.entries.filter((entry) => entry.op === action);
+  const entries = (capabilityMap?.entries ?? REACH_CAPABILITY_MAP_V1.entries).filter((entry) => entry.op === action);
   if (entries.length === 0) throw new ReachCommandError(`no capability entry for action '${action}'`);
   if (channel === null || channel === undefined) {
     const health = entries.find((entry) => entry.channel === null);
@@ -384,6 +575,20 @@ export function validateUrl(value) {
   return text;
 }
 
+/**
+ * Is this exact token position the ONE bounded `--output <format>` exception?
+ *
+ * `--output` stays a file-writing flag for every tool (and for every value)
+ * except MCPorter's output-FORMAT selector, and then only when the very next
+ * token is an approved format from the frozen allowlist (`raw`). Nothing else
+ * about the flag list is relaxed.
+ */
+function isApprovedOutputFlag({ text, next, basename }) {
+  if (text !== REACH_MCPORTER_OUTPUT_FLAG) return false;
+  if (basename === null || !REACH_MCPORTER_OUTPUT_BINARIES.includes(basename)) return false;
+  return REACH_MCPORTER_OUTPUT_FORMATS.includes(String(next ?? ""));
+}
+
 /** Reject a write-capable argv before anything is spawned. */
 export function assertReadOnlyArgv(argv = [], { binary = null } = {}) {
   const basename = binary === null ? null : path.basename(String(binary));
@@ -392,8 +597,12 @@ export function assertReadOnlyArgv(argv = [], { binary = null } = {}) {
       `executable '${basename}' is not on the intelligence allowlist (${REACH_EXECUTABLE_ALLOWLIST.join(", ")}).`,
     );
   }
-  for (const token of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
     const text = String(token);
+    // The bounded MCPorter output-FORMAT flag (writes no file): approved only
+    // for `mcporter` and only when followed by an approved format token.
+    if (isApprovedOutputFlag({ text, next: argv[index + 1], basename })) continue;
     // Bare write verbs are matched case-insensitively (`POST` is as forbidden as
     // `post`); flags and file-writing options match exactly.
     if (FORBIDDEN_ARGV_TOKENS.includes(text) || BARE_FORBIDDEN_VERBS.has(text.toLowerCase())) {
@@ -798,28 +1007,134 @@ export function evaluateReachPlanReadiness(plan, {
 }
 
 /**
+ * Resolve the FROZEN Exa search objective.
+ *
+ * The objective is a code literal. A caller that tries to supply one (a
+ * candidate, an LLM answer, a strategy, a research proposal — anything that can
+ * reach `values`) is REFUSED rather than silently overridden.
+ */
+function resolveFrozenObjective(values = {}) {
+  const supplied = values.objective;
+  if (supplied !== undefined && supplied !== null && String(supplied) !== EXA_SEARCH_OBJECTIVE_V1) {
+    throw new ReachCommandError(
+      "the Exa search objective is FROZEN (EXA_SEARCH_OBJECTIVE_V1, version " +
+        `${EXA_SEARCH_OBJECTIVE_VERSION}) and may never be supplied by a caller, a candidate, an LLM answer, a strategy or a ` +
+        "research proposal — a substituted objective is refused.",
+    );
+  }
+  return validateArgvValue("objective", EXA_SEARCH_OBJECTIVE_V1);
+}
+
+/**
+ * Resolve a bounded result count for one named argument.
+ *
+ * EVOLVE's generic `limit` concept is unchanged: the query set still passes its
+ * own logical `limit`, and only the Exa transport request is additionally
+ * clamped to `EXA_WEB_SEARCH_MAX_RESULTS`. The requested/effective pair is
+ * reported as bounded diagnostics (never a raw payload).
+ */
+function resolveResultCount({ key, placeholder, values, boundedArguments }) {
+  const requested = Number.parseInt(validateArgvValue(placeholder, values[placeholder]), 10);
+  if (!Number.isFinite(requested)) {
+    throw new ReachCommandError(`the result count for named argument '${key}' is not a number`);
+  }
+  const max = key === EXA_RESULT_COUNT_ARGUMENT ? EXA_WEB_SEARCH_MAX_RESULTS : Number.MAX_SAFE_INTEGER;
+  const effective = Math.max(1, Math.min(max, requested));
+  boundedArguments.push({ argument: key, requested, effective, max, clamped: effective !== requested });
+  return String(effective);
+}
+
+/**
  * Build the exact argv for one call: substitution happens slot-by-slot, and each
  * slot is validated on its own. `{readerUrl}` composes the read-only Jina Reader
  * URL from an already-validated https source URL.
+ *
+ * TWO template forms exist, and only these two:
+ *
+ *   1. `{placeholder}`      a WHOLE token (every V1 entry): the substituted value
+ *                           becomes that entire argv element.
+ *   2. `<key>={placeholder}` a constrained NAMED-ARGUMENT token (the V2 MCPorter
+ *                           contract): the key must be a frozen literal the
+ *                           capability map declared, the placeholder must be one
+ *                           of the three approved names, and the value is
+ *                           validated through the SAME path as form 1 before it
+ *                           becomes its own argv element.
+ *
+ * Anything else — a nested placeholder, two placeholders in one token, an
+ * unapproved key, an unknown placeholder, a caller-defined argument name, a
+ * stray brace — is refused. There is no general string interpolation, no eval,
+ * no string-built command and no shell.
  */
-export function buildReachArgv({ op, channel = null, values = {}, entry = null } = {}) {
-  const capability = entry ?? capabilityFor(op, channel);
+export function buildReachArgv({ op, channel = null, values = {}, entry = null, capabilityMap = REACH_CAPABILITY_MAP_V1 } = {}) {
+  const capability = entry ?? capabilityFor(op, channel, capabilityMap);
+  const frozenKeys = REACH_FROZEN_ARGUMENT_KEYS_BY_BINARY[capability.binary] ?? [];
+  const declaredKeys = Array.isArray(capability.namedArguments) ? capability.namedArguments : [];
+  // A caller-defined argument NAME is refused outright, even before a token is
+  // inspected: only the executable's frozen key literals may be declared.
+  const undeclared = declaredKeys.filter((key) => !frozenKeys.includes(key));
+  if (undeclared.length > 0) {
+    throw new ReachCommandError(
+      `capability '${capability.op}/${capability.channel ?? "-"}' declares the named argument(s) ` +
+        `${undeclared.map((key) => `'${key}'`).join(", ")}, which are not frozen keys for '${capability.binary}' ` +
+        `(frozen: ${frozenKeys.join(", ") || "none"}) — a caller can never define a tool argument name.`,
+    );
+  }
+  const approvedKeys = declaredKeys;
+  const boundedArguments = [];
   const argv = capability.argv.map((token) => {
-    if (!token.startsWith("{")) return token;
-    const name = token.slice(1, -1);
-    // `{readerUrl}` is composed from the caller's `url` slot.
-    const source = name === "readerUrl" ? (values.readerUrl ?? values.url) : values[name];
-    if (source === undefined) throw new ReachCommandError(`missing substitution '${name}' for capability '${capability.op}'`);
-    if (name === "url") return validateUrl(source);
-    if (name === "readerUrl") {
-      const composed = `https://r.jina.ai/${validateUrl(source)}`;
-      if (!isHttpsUrlToken(composed)) throw new ReachCommandError("the reader URL could not be composed safely");
-      return composed;
+    if (token.startsWith("{")) {
+      const name = token.slice(1, -1);
+      // `{readerUrl}` is composed from the caller's `url` slot.
+      const source = name === "readerUrl" ? (values.readerUrl ?? values.url) : values[name];
+      if (source === undefined) throw new ReachCommandError(`missing substitution '${name}' for capability '${capability.op}'`);
+      if (name === "url") return validateUrl(source);
+      if (name === "readerUrl") {
+        const composed = `https://r.jina.ai/${validateUrl(source)}`;
+        if (!isHttpsUrlToken(composed)) throw new ReachCommandError("the reader URL could not be composed safely");
+        return composed;
+      }
+      return validateArgvValue(name, values[name]);
     }
-    return validateArgvValue(name, values[name]);
+    const named = REACH_NAMED_ARGUMENT_PATTERN.exec(token);
+    if (named) {
+      const [, key, placeholder] = named;
+      if (!approvedKeys.includes(key)) {
+        throw new ReachCommandError(
+          `named argument '${key}' is not approved for capability '${capability.op}/${capability.channel ?? "-"}' ` +
+            `(approved: ${approvedKeys.join(", ") || "none"}) — a caller can never define a tool argument name.`,
+        );
+      }
+      if (!REACH_NAMED_ARGUMENT_PLACEHOLDERS.includes(placeholder)) {
+        throw new ReachCommandError(
+          `named argument '${key}' references the unknown placeholder '{${placeholder}}' (approved: ` +
+            `${REACH_NAMED_ARGUMENT_PLACEHOLDERS.map((name) => `{${name}}`).join(", ")}).`,
+        );
+      }
+      // The pairing is FROZEN: `query={query}`, `numResults={limit}`,
+      // `objective={objective}`. Nothing else is a valid named argument.
+      const expected = REACH_MCPORTER_ARGUMENT_TEMPLATES[key];
+      if (expected !== undefined && placeholder !== expected) {
+        throw new ReachCommandError(
+          `named argument '${key}' may only resolve '{${expected}}' (got '{${placeholder}}') — the key/placeholder pairing is frozen.`,
+        );
+      }
+      // The `objective` key can NEVER carry caller text: it is always the frozen
+      // constant, whatever a caller put in `values`.
+      if (key === "objective") return `${key}=${resolveFrozenObjective(values)}`;
+      if (key === EXA_RESULT_COUNT_ARGUMENT) {
+        return `${key}=${resolveResultCount({ key, placeholder, values, boundedArguments })}`;
+      }
+      return `${key}=${validateArgvValue(placeholder, values[placeholder])}`;
+    }
+    if (TEMPLATE_BRACES.test(token)) {
+      throw new ReachCommandError(
+        `argv token '${token}' is neither an approved whole-token placeholder nor a single approved named argument and is refused`,
+      );
+    }
+    return token;
   });
   assertReadOnlyArgv(argv, { binary: capability.binary });
-  return { capability, argv };
+  return { capability, argv, boundedArguments };
 }
 
 /**
@@ -858,11 +1173,12 @@ export function runReachCall({
   env = process.env,
   projectRoot = process.cwd(),
   spawn = spawnSync,
+  capabilityMap = REACH_CAPABILITY_MAP_V1,
 } = {}) {
   const requested = String(op ?? "").trim().toLowerCase();
   const action = INTERNAL_REACH_HEALTH_ACTIONS.includes(requested) ? requested : requireReadOnlyAction(op);
   // argv is built (and validated read-only) BEFORE anything can be spawned.
-  const { capability, argv } = buildReachArgv({ op: action, channel, values });
+  const { capability, argv, boundedArguments } = buildReachArgv({ op: action, channel, values, capabilityMap });
   // The budget is consumed before the executable is resolved, so an exhausted
   // budget refuses the call without even a filesystem walk.
   if (budget) budget.take();
@@ -881,6 +1197,11 @@ export function runReachCall({
     op: action,
     channel,
     capability: capability.op,
+    // Which capability CONTRACT bounded this call, and any bounded result-count
+    // clamp that was applied at the provider boundary (requested vs effective).
+    capabilityMapVersion: capabilityMap?.version ?? REACH_CAPABILITY_MAP_VERSION,
+    tool: capability.tool ?? null,
+    boundedArguments,
     binary: executable.basename,
     executable: {
       basename: executable.basename,
