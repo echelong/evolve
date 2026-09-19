@@ -20,7 +20,13 @@
 
 import { parseArgs } from "./lib/args.mjs";
 import { loadEnvFiles } from "./lib/env.mjs";
-import { REGISTERED_JEV_PROVIDERS, UnknownJevProviderError, requireJevProviderName, resolveJevConfig } from "./jev/config.mjs";
+import {
+  REGISTERED_JEV_PROVIDERS,
+  UnknownJevProviderError,
+  requireJevProviderName,
+  resolveJevConfig,
+  resolveJevModelName,
+} from "./jev/config.mjs";
 import { resolveJevProvider } from "./jev/provider.mjs";
 import {
   buildCandidateDecisionPacket,
@@ -173,10 +179,17 @@ async function main() {
     return;
   }
 
-  const model = args.model ? String(args.model) : envConfig.model;
+  // Each provider has its OWN canonical model default (the direct route pins
+  // `jev-1.13.0`; the Vercel AI Gateway route uses `typesafe-ai/jev`). An
+  // explicit --model always wins.
+  const model = resolveJevModelName(envConfig, {
+    provider: resolution.provider,
+    override: args.model !== undefined ? String(args.model) : null,
+  });
   const timeoutMs = args["timeout-ms"] ? Number.parseInt(String(args["timeout-ms"]), 10) : envConfig.timeoutMs;
   const provider = resolveJevProvider(resolution.provider, {
     apiKey: envConfig.apiKey,
+    gatewayApiKey: envConfig.gatewayApiKey,
     model,
     baseURL: envConfig.baseURL,
     timeoutMs,

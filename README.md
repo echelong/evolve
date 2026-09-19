@@ -1090,7 +1090,7 @@ EVOLVE_RESEARCH_MIN_UNIQUE_RATIO=0.95 npm run arena -- --research-mode fair <dat
 EVOLVE_RESEARCH_MAX_SPECIES_SHARE=0.5 EVOLVE_ARENA_RESEARCH_SHARE=0.4 npm run arena -- --research-mode fair <dataset>
 npm run validate:phase5a2                       # Phase 5A.2 suite (60 offline cases)
 npm run arena -- --research-mode ab DATASET     # matched A/B benchmark (Phase 5A.3)
-npm run validate:phase5a3                       # Phase 5A.3 suite (69 offline cases)
+npm run validate:phase5a3                       # Phase 5A.3 suite (82 offline cases)
 ```
 
 ## Phase 5A.3 — controlled research vs conventional A/B benchmarking
@@ -1325,7 +1325,7 @@ EVOLVE_ARENA_AB_EXPAND=1 npm run arena -- --research-mode ab <dataset>          
 EVOLVE_ARENA_AB_SPECIES_MATCHED=1 npm run arena -- --research-mode ab <dataset> # strict species-matched control
 EVOLVE_ARENA_AB_BOOTSTRAP_ITERATIONS=5000 npm run arena -- --research-mode ab <dataset>
 EVOLVE_ARENA_WORKERS=8 npm run arena -- --research-mode ab <dataset>
-npm run validate:phase5a3                                  # Phase 5A.3 suite (69 offline cases)
+npm run validate:phase5a3                                  # Phase 5A.3 suite (82 offline cases)
 npm run validate:phase5a31                                 # Phase 5A.3.1 strict species-match suite (24 offline cases)
 ```
 
@@ -1961,39 +1961,96 @@ A dedicated provider subsystem, entirely separate from the research-provider abs
 `scripts/research/`. Jev is **not** a research proposal provider, and neither namespace can select
 the other's provider.
 
-| Provider | Selected by | Behavior |
-| --- | --- | --- |
-| *(unset)* | default | **DISABLED** — every call records `JEV_DISABLED` / `NO_JEV_DECISION`, zero network calls are ever possible |
-| `mock-jev` | `EVOLVE_JEV_PROVIDER=mock-jev` | deterministic, offline, no network — the offline test baseline |
-| `typesafe-jev` | `EVOLVE_JEV_PROVIDER=typesafe-jev` | the real TypeSafe AI HTTP provider, through the official `@typesafe-ai/sdk` |
+| Provider | Selected by | Transport | Upstream | Credential | Behavior |
+| --- | --- | --- | --- | --- | --- |
+| *(unset)* | default | — | — | — | **DISABLED** — every call records `JEV_DISABLED` / `NO_JEV_DECISION`, zero network calls are ever possible |
+| `mock-jev` | `EVOLVE_JEV_PROVIDER=mock-jev` | offline | `evolve-mock` | none | deterministic, offline, no network — the offline test baseline |
+| `typesafe-jev` | `EVOLVE_JEV_PROVIDER=typesafe-jev` | `typesafe-sdk` | `typesafe-ai` | `EVOLVE_JEV_API_KEY` | the real TypeSafe AI HTTP provider (DIRECT), through the official `@typesafe-ai/sdk` |
+| `vercel-jev` | `EVOLVE_JEV_PROVIDER=vercel-jev` | `vercel-ai-gateway` | `typesafe-ai` | `AI_GATEWAY_API_KEY` | the same model through the Vercel AI Gateway, using the AI SDK `experimental_evaluate` API |
 
 Selection is fail-closed: an unrecognized explicit name throws `UnknownJevProviderError` — there is no
 fallback to `mock-jev` and no silent disabled state for a typo. `EVOLVE_JEV_MODE` must be `shadow`
 (the only supported operational mode in Phase 5D); `active`/`enforce`/`trade`/`route` do not exist yet.
 
+#### Two real routes, two different credentials (no substitution, ever)
+
+`typesafe-jev` and `vercel-jev` reach the **same upstream model** (`typesafe-ai`) by **different routes**,
+and each route uses a **different credential** that belongs to a different service:
+
+| Route | Endpoint | Credential | Which key belongs here |
+| --- | --- | --- | --- |
+| `typesafe-jev` | `https://api.typesafe.ai/v1/systemone` (official SDK) | `EVOLVE_JEV_API_KEY` | a **TypeSafe AI** API key |
+| `vercel-jev` | the Vercel AI Gateway evaluation-model transport | `AI_GATEWAY_API_KEY` | a **Vercel AI Gateway** key |
+
+- **A Vercel AI Gateway key must not be sent directly to `api.typesafe.ai`.** It is a Vercel credential,
+  not a TypeSafe AI key; `typesafe-jev` would be rejected (or, worse, would look like a bad key) if it were
+  placed in `EVOLVE_JEV_API_KEY`. The reverse is equally true: a TypeSafe AI key is not a gateway key.
+- **The two variables are never copied into one another.** `AI_GATEWAY_API_KEY` is read into its own
+  `gatewayApiKey` field and is only ever used by the `vercel-jev` provider; `EVOLVE_JEV_API_KEY` is only
+  ever used by `typesafe-jev`. Neither is written to a run record, an artifact, a log, or the dashboard.
+- **There is NO provider fallback of any kind.** No silent substitution between the two real routes, and
+  none to `mock-jev`. A missing credential produces `JEV_CONFIG_ERROR` **before any request is attempted**;
+  it never quietly switches to a route that happens to have a key configured.
+- **`vercel-jev` is SHADOW ONLY and PAPER ONLY**, exactly like the direct route. It is orchestration and
+  shadow infrastructure: it cannot change Arena scoring, gates, the replication evaluator, frozen cohorts,
+  Wave 1, or Wave 2.
+
 Environment variables:
 
 ```
-EVOLVE_JEV_PROVIDER        mock-jev | typesafe-jev (unset = disabled)
+EVOLVE_JEV_PROVIDER        mock-jev | typesafe-jev | vercel-jev (unset = disabled)
 EVOLVE_JEV_MODE            shadow (default and only supported value)
-EVOLVE_JEV_API_KEY         never persisted, never logged
-EVOLVE_JEV_MODEL           default: the pinned jev-1.13.0 (never the moving `jev-latest` alias)
+EVOLVE_JEV_API_KEY         DIRECT TypeSafe AI credential — never persisted, never logged
+AI_GATEWAY_API_KEY         Vercel AI Gateway credential — never persisted, never logged
+EVOLVE_JEV_MODEL           explicit model override (applies to the selected provider)
 EVOLVE_JEV_BASE_URL        default: https://api.typesafe.ai
-EVOLVE_JEV_TIMEOUT_MS      default: 20000, clamped to [1000, 120000]
-EVOLVE_JEV_MAX_CALLS       default: 20, clamped to [1, 500]
+EVOLVE_VERCEL_JEV_MODEL    default: typesafe-ai/jev (never `jev-latest` unless explicitly requested)
+EVOLVE_JEV_TIMEOUT_MS      default: 20000, clamped to [1000, 120000]; applies to BOTH real routes
+EVOLVE_JEV_MAX_CALLS       default: 20, clamped to [1, 500]; applies identically to vercel-jev
 EVOLVE_JEV_MIN_CONFIDENCE  offline confidence-gating analysis only — never an operational threshold
 EVOLVE_JEV_CACHE           default: true
 ```
 
+The direct route's default model is the pinned `jev-1.13.0`; the gateway route's default model is the
+gateway-qualified `typesafe-ai/jev`. Each provider defaults to its **own** canonical id, so a gateway run
+can never accidentally request the direct route's pinned version (or vice versa).
+
 ### SDK verification
 
-Verified against the official `@typesafe-ai/sdk@0.6.0` (installed dependency) and the published docs
-at `docs.typesafe.ai`: `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`,
-`client.systemOne({ state, questions, model })` returning `{ model, answers, usage }`. The pinned model
-`jev-1.13.0` is the versioned id behind the `jev-latest`/`jev-preview` aliases at the time of
-verification — canonical Phase 5D evidence always requests the versioned id, never an alias that can
-move underneath a repeated experiment. The real provider is exercised in tests exclusively through the
-SDK's own `fetch` override, so no live network call is required to validate this subsystem.
+**Direct route (`typesafe-jev`).** Verified against the official `@typesafe-ai/sdk@0.6.0` (installed
+dependency) and the published docs at `docs.typesafe.ai`: `POST https://api.typesafe.ai/v1/systemone`,
+`Authorization: Bearer <key>`, `client.systemOne({ state, questions, model })` returning
+`{ model, answers, usage }`. The pinned model `jev-1.13.0` is the versioned id behind the
+`jev-latest`/`jev-preview` aliases at the time of verification — canonical Phase 5D evidence always
+requests the versioned id, never an alias that can move underneath a repeated experiment. The real
+provider is exercised in tests exclusively through the SDK's own `fetch` override, so no live network
+call is required to validate this subsystem.
+
+**Gateway route (`vercel-jev`).** Verified against the installed `ai@^7` (AI SDK 7) evaluation API:
+`experimental_evaluate({ model, state, questions, maxRetries: 0, abortSignal })` with the gateway-qualified
+model `typesafe-ai/jev`, which the AI Gateway resolves to upstream provider `typesafe-ai`. EVOLVE passes
+`maxRetries: 0` so one EVOLVE call is exactly one provider attempt, and wires the existing Jev timeout
+through the SDK's `abortSignal`. The gateway's typed answers are converted back into the **same raw wire
+shape** the direct SDK returns, so `runtime.mjs#normalizeAnswers` normalizes both routes identically and
+no Vercel-specific object ever reaches the decision packet, the experiment layer, calibration, or the
+dashboard. Tests stub the AI SDK evaluation layer, so no live network call (and no gateway key) is
+required to validate this subsystem.
+
+### Gateway metadata, errors, and boundedness (`vercel-jev`)
+
+Each run record carries a **bounded, non-secret** `providerMetadata` block: `provider`, `upstreamProvider`,
+`model`, `transport`, `gatewayUsed`, `providerAttemptCount`, `providerStatus`/`httpStatus`, `latencyMs`,
+`tokenUsage`, `generationId`, and the gateway-reported `gatewayCost` / `marketCost` **when available**.
+Raw provider metadata is never persisted — only allowlisted scalars plus upstream metadata key *names*.
+Authorization headers, the API key, cookies, environment dumps, and raw credential-bearing request
+objects are dropped by the normalizer. **All monetary values are observational only**: nothing bills,
+charges, or infers profitability from them.
+
+Gateway failures are mapped into EVOLVE's existing status vocabulary, with these distinctions made
+explicitly: `401`/`403` → `JEV_AUTH_ERROR`; `429` → `JEV_RATE_LIMIT`; upstream `5xx` (including `503`) →
+`JEV_UNAVAILABLE` — **never** an authentication failure; `400`/`404`/`422` → `JEV_CONFIG_ERROR`;
+malformed typed answers → `JEV_INVALID_RESPONSE`; an aborted/timed-out call → `JEV_TIMEOUT`; anything
+unexpected → `JEV_INTERNAL_ERROR`. There is still **no automatic provider fallback**.
 
 ### Decision packet (`jev-decision-packet-v1`) and question sets
 
@@ -2021,9 +2078,10 @@ Two fixed, versioned question sets — never dynamically invented:
 ### Fail-closed statuses
 
 `JEV_OK`, `JEV_DISABLED`, `JEV_UNAVAILABLE`, `JEV_TIMEOUT`, `JEV_HTTP_ERROR`, `JEV_INVALID_RESPONSE`,
-`JEV_BUDGET_EXCEEDED`, `JEV_CONFIG_ERROR`. A Jev failure never changes an EVOLVE strategy, never
-switches to another provider silently, never fabricates a decision, and never blocks deterministic
-EVOLVE operation — shadow mode records `NO_JEV_DECISION` and EVOLVE continues unchanged.
+`JEV_BUDGET_EXCEEDED`, `JEV_CONFIG_ERROR`, `JEV_AUTH_ERROR`, `JEV_RATE_LIMIT`, `JEV_INTERNAL_ERROR`.
+A Jev failure never changes an EVOLVE strategy, never switches to another provider silently, never
+fabricates a decision, and never blocks deterministic EVOLVE operation — shadow mode records
+`NO_JEV_DECISION` and EVOLVE continues unchanged.
 
 ### Cache, budget, and storage
 
@@ -2059,15 +2117,40 @@ npm run calibrate:jev -- --experiment <id> --arena <arena-id>
 npm run probe:jev -- --provider mock-jev
 ```
 
-The live provider is never called automatically. To probe the real provider once, with an explicit key
-already configured in the environment:
+The live providers are never called automatically. Load a key **without writing it into shell history or
+the repository** (paste it at the prompt; it is read silently and never echoed):
 
 ```bash
-EVOLVE_JEV_PROVIDER=typesafe-jev EVOLVE_JEV_API_KEY=<key> npm run probe:jev -- --provider typesafe-jev
+read -rsp "Paste Vercel AI Gateway key: " AI_GATEWAY_API_KEY
+echo
+export AI_GATEWAY_API_KEY
 ```
 
-The probe makes exactly one bounded call against synthetic, non-market state, prints provider/model/
-status/latency/typed-answer validity, and writes nothing unless `--save` is given.
+Then probe the gateway route once:
+
+```bash
+EVOLVE_JEV_PROVIDER=vercel-jev npm run probe:jev -- --provider vercel-jev
+```
+
+For the direct route the credential is the **TypeSafe AI** key, loaded the same way into
+`EVOLVE_JEV_API_KEY`, and selected explicitly:
+
+```bash
+EVOLVE_JEV_PROVIDER=typesafe-jev npm run probe:jev -- --provider typesafe-jev
+```
+
+Never place a real key in an example, a committed file, or a command you share. The probe makes exactly
+one bounded call against synthetic, non-market state, prints provider/upstream/model/mode/status/latency/
+typed-answer validity (and which credential variable it expects, never its value), and writes nothing
+unless `--save` is given. A successful gateway probe therefore reads:
+
+```
+provider: vercel-jev
+upstream: typesafe-ai
+model: typesafe-ai/jev
+mode: shadow
+typed answer valid: yes
+```
 
 ### Dashboard
 
@@ -2077,8 +2160,9 @@ decision timestamp) — counts and identity only, never prompts, raw state, or t
 
 ### Tests
 
-`npm run validate:phase5d` (98 offline cases) covers the provider registry and fail-closed selection,
-typed-answer normalization for both providers, the decision packet's leakage audit, both fixed
+`npm run validate:phase5d` (131 offline cases) covers the provider registry and fail-closed selection,
+typed-answer normalization for all three providers (`mock-jev`, `typesafe-jev`, `vercel-jev`), the
+decision packet's leakage audit, both fixed
 question sets, deterministic state/question digests, cache identity and no-call replay, run-budget
 accounting, timeout/HTTP-error/connection-error classification, secret hygiene, mock determinism, the
 shadow-only invariant (byte-identical deterministic Arena scoring/gates whether Jev is disabled or a
@@ -2314,7 +2398,7 @@ Phase 4.1 adds `npm run validate:phase41` (26 offline cases):
 - **No non-finite state** — a full arena run and a multi-generation live snapshot contain no
   `NaN`/`Infinity`
 
-Phase 5A adds `npm run validate:phase5a` (63 offline cases):
+Phase 5A adds `npm run validate:phase5a` (78 offline cases):
 
 - **Configurable population** — 48/96/192/arbitrary sizes stay exact across generations; invalid values
   clamp safely; `EVOLVE_POPULATION_SIZE` takes priority over the legacy `EVOLVE_POPULATION`; births
@@ -2393,7 +2477,7 @@ Phase 5A.2 adds `npm run validate:phase5a2` (60 offline cases):
   evidence accounting is preserved; evaluated candidates keep species-specific gene bounds; no Phase 5A.2
   module contains a wallet, signing, or transaction-execution path
 
-Phase 5C adds `npm run validate:phase5c` (89 offline cases):
+Phase 5C adds `npm run validate:phase5c` (96 offline cases):
 
 - **CLI dispatch** — every command mode is exclusive (a table resolves exactly one action per
   invocation, and conflicting or impossible combinations fail loudly instead of silently choosing one);
@@ -2467,17 +2551,28 @@ fabricated; unknown wave ids fail closed
 the canonical Wave 1 replication, the historical freeze, the frozen cohorts, both wave manifests and
 all three Wave 2 captures stay byte-identical throughout the suite
 
-Phase 5D adds `npm run validate:phase5d` (98 offline cases):
+Phase 5D adds `npm run validate:phase5d` (131 offline cases):
 
 - **Registry & fail-closed selection** — Jev is disabled by default (zero network calls ever possible),
-  `mock-jev`/`typesafe-jev` are selected by name only, an unregistered name throws
-  `UnknownJevProviderError`, an unsupported `EVOLVE_JEV_MODE` is a configuration error, and Jev
-  configuration is completely independent from `EVOLVE_RESEARCH_PROVIDER`
-- **Provider factories** — both providers answer with the same normalized typed shape; `mock-jev` is
+  `mock-jev`/`typesafe-jev`/`vercel-jev` are selected by name only, an unregistered name (including a
+  typo near `vercel-jev`) throws `UnknownJevProviderError`, an unsupported `EVOLVE_JEV_MODE` is a
+  configuration error, and Jev configuration is completely independent from `EVOLVE_RESEARCH_PROVIDER`
+- **Provider factories** — all providers answer with the same normalized typed shape; `mock-jev` is
   deterministic and marks every answer `syntheticDecision: true`; `typesafe-jev` calls the documented
   endpoint with the pinned model and a Bearer header (verified through an injected `fetch`, never a
   live network call) and classifies HTTP 401/403, 429/5xx, connection failures, and timeouts into
   distinct explicit statuses; a missing API key never even constructs the SDK client
+- **Vercel AI Gateway route** — `vercel-jev` defaults to `typesafe-ai/jev` (never `jev-latest`), sends
+  the SAME fixed question set with `noul` mapped to the AI SDK's `boolean` type, passes `maxRetries: 0`
+  so one EVOLVE call is exactly one provider attempt, wires the Jev timeout through an `AbortSignal`,
+  and maps the gateway's typed answers back into the identical normalized shape. The two credentials
+  are proven strictly separate (a gateway key never authenticates the direct route and vice versa),
+  the gateway key is never printed, persisted, or copied into `EVOLVE_JEV_API_KEY`, a missing
+  `AI_GATEWAY_API_KEY` is a configuration error *before* any request, and there is no fallback to
+  `typesafe-jev` or to `mock-jev`. Gateway errors are distinguished explicitly (401/403 → auth,
+  429 → rate limit, 5xx/503 → unavailable — never auth, 400/404/422 → config, malformed → invalid),
+  metadata is bounded and cost-observational-only, and the whole route is exercised through a stubbed
+  AI SDK evaluation layer with zero live network calls
 - **Decision packet** — non-whitelisted genome parameters and invented regime labels are dropped,
   every excluded evidence class is declared, `auditJevDecisionPacket` flags every forbidden key (however
   deeply nested) and credential-shaped value, the market packet never carries the deterministic regime
@@ -2504,7 +2599,7 @@ Phase 5D adds `npm run validate:phase5d` (98 offline cases):
   source file references the untouched Wave 2 dataset, and exercising the Jev subsystem never touches
   `.evolve/datasets`, `.evolve/history`, or any Phase 5C artifact
 
-Phase 5C.3 adds `npm run validate:phase5c3` (30 offline cases):
+Phase 5C.3 adds `npm run validate:phase5c3` (36 offline cases):
 
 - **Byte identity** — Wave 1's freeze, its replication `rep-66884de4e460`, its frozen Mock/DeepSeek
   cohort digests and its three datasets stay byte-identical, and the historical freeze digest is
@@ -2722,16 +2817,18 @@ Phase 5E adds `npm run validate:phase5e` (52 offline cases):
 
 ### Phase 5D — Jev shadow decision supervisor
 - [x] Dedicated `scripts/jev/` provider subsystem, fully independent from `scripts/research/`
-- [x] Fail-closed provider selection: disabled by default, `mock-jev`/`typesafe-jev` by explicit name only, any other name is a configuration error, `EVOLVE_JEV_MODE` restricted to `shadow`
-- [x] Real provider verified against the official `@typesafe-ai/sdk@0.6.0` and docs.typesafe.ai; pinned model `jev-1.13.0`, never the moving `jev-latest` alias
+- [x] Fail-closed provider selection: disabled by default, `mock-jev`/`typesafe-jev`/`vercel-jev` by explicit name only, any other name is a configuration error, `EVOLVE_JEV_MODE` restricted to `shadow`
+- [x] Real direct provider verified against the official `@typesafe-ai/sdk@0.6.0` and docs.typesafe.ai; pinned model `jev-1.13.0`, never the moving `jev-latest` alias
+- [x] Real gateway route `vercel-jev` verified against AI SDK 7 `experimental_evaluate` (`typesafe-ai/jev`), with DISTINCT credentials (`AI_GATEWAY_API_KEY` vs `EVOLVE_JEV_API_KEY`), no fallback between the two routes, `maxRetries: 0`, an `AbortSignal`-wired timeout, bounded observational metadata, and distinct auth/rate-limit/unavailable/config/invalid statuses
 - [x] Versioned, whitelist-only decision packet (`jev-decision-packet-v1`) with a leakage audit excluding every VALIDATE/TEST/OOS/Arena/gate/deployment/champion/shadow-league/replication field
 - [x] Fixed candidate question set (`jev-question-set-v1`: gateFailureRisk, primaryRisk, evidenceQuality, generalizationConfidence, researchDisposition) and market question set (`jev-market-v1`, blind regime classification into EVOLVE's existing vocabulary)
 - [x] Cache keyed on provider/model/packet-version/question-set-version/state-digest/question-digest; run-level call budget; explicit `JEV_*` fail-closed statuses
 - [x] Zero authority: no Jev reference anywhere in Arena/compiler/watchdog/simulation code; deterministic Arena scoring/gates proven byte-identical with Jev disabled vs. shadow
 - [x] Predictions persisted and timestamped BEFORE any outcome exists; pure offline post-outcome calibration (Brier score, reliability bins, multi-label `primaryRisk` agreement, regime-shadow comparison, threshold-coverage analysis) that never calls Jev again and promotes no operational threshold
 - [x] `npm run jev`, `npm run calibrate:jev`, `npm run probe:jev`, and a bounded `jevShadow` dashboard panel
-- [x] `npm run validate:phase5d` — 98 offline cases
+- [x] `npm run validate:phase5d` — 131 offline cases
 - [ ] First real Jev shadow experiment against real candidates — recommended AFTER Wave 2 replication completes (see `## Phase 5D`)
+- [ ] First real Vercel-AI-Gateway `vercel-jev` synthetic shadow probe (command in `## Phase 5D`)
 
 ### Phase 5C.3 — canonical per-wave freezes
 - [x] Per-wave freeze architecture (`freezePath` + `freezeDigest` + `evaluationContractDigest` on every wave manifest); Wave 1 keeps its historical freeze and evidence untouched
@@ -2739,8 +2836,8 @@ Phase 5E adds `npm run validate:phase5e` (52 offline cases):
 - [x] `--write-freeze --wave <wave>` / `--verify-freeze --wave <wave>`; clean tree required, zero Arena units, zero Jev/DeepSeek calls, no auto-freeze during a normal run
 - [x] Missing/stale freeze fails closed; canonical runs need no `--dev`; `--dev` evidence stays `NON_CANONICAL` and is excluded by default
 - [x] Cross-wave comparability decided by the evaluation contract + both frozen cohort digests; `INCOMPARABLE_WAVES` with explicit differing fields instead of silent aggregation
-- [x] `npm run validate:phase5c3` — 30 offline cases
-- [ ] Canonical Wave 2 freeze + canonical Wave 2 run — after the implementation source is committed (see `## Phase 5C.3`)
+- [x] `npm run validate:phase5c3` — 36 offline cases
+- [x] Canonical Wave 2 freeze + canonical Wave 2 run — `rep-ffe4b968e51a`, 6/6 units COMPLETED, 3 CLEAN datasets, `CANONICAL`, under the same evaluation contract as Wave 1 (see `## Phase 5C.3`)
 
 ### Phase 5E — external intelligence shadow layer
 - [x] Isolated, read-only Agent-Reach adapter pinned to `v1.5.0` (commit `f65526c…`, MIT, Python ≥3.10): no upstream package import, `shell: false`, executable/action/argv allowlists, timeout, call budget, byte limit, sanitized environment

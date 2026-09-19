@@ -1,7 +1,7 @@
 /**
  * Jev provider runtime (Phase 5D): HTTP call wrapper, answer normalization,
- * cache, run budget, and provenance. Shared by both providers (`mock-jev`,
- * `typesafe-jev`), the probe, the CLI, and the validators.
+ * cache, run budget, and provenance. Shared by every provider (`mock-jev`,
+ * `typesafe-jev`, `vercel-jev`), the probe, the CLI, and the validators.
  *
  * Security posture, in one sentence: Jev is ONLY an HTTPS decision-API client.
  * This module never spawns a process, never touches the filesystem outside its
@@ -16,7 +16,7 @@ import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { digestOf } from "../lib/hash.mjs";
-import { redactSecrets } from "../lib/sanitize.mjs";
+import { isSensitiveKey, redactSecrets } from "../lib/sanitize.mjs";
 import { JEV_STATUS } from "./config.mjs";
 
 export const JEV_RUNTIME_VERSION = 1;
@@ -154,6 +154,95 @@ export function validateAnswers(answers, expectedNames) {
 }
 
 /* ============================================================================
+ * Bounded provider metadata
+ * ==========================================================================*/
+
+export const JEV_PROVIDER_METADATA_VERSION = 1;
+export const JEV_PROVIDER_METADATA_MAX_FIELDS = 24;
+export const JEV_PROVIDER_METADATA_MAX_STRING = 200;
+export const JEV_PROVIDER_METADATA_MAX_ARRAY = 12;
+export const JEV_PROVIDER_METADATA_MAX_DEPTH = 2;
+
+/**
+ * Field names that may never appear in a persisted provider-metadata block:
+ * credential-shaped names and the unbounded/credential-bearing request objects
+ * a provider could otherwise forward. Anything matching
+ * `sanitize.mjs#isSensitiveKey` is dropped automatically too, so a provider can
+ * never smuggle an authorization header through this path.
+ */
+export const JEV_PROVIDER_METADATA_FORBIDDEN_FIELDS = Object.freeze([
+  "apikey",
+  "api_key",
+  "api-key",
+  "gatewayapikey",
+  "gateway_api_key",
+  "gateway-api-key",
+  "authorization",
+  "auth",
+  "bearer",
+  "cookie",
+  "cookies",
+  "env",
+  "environment",
+  "headers",
+  "request",
+  "rawrequest",
+  "rawresponse",
+  "requestheaders",
+  "responseheaders",
+  "body",
+  "state",
+  "questions",
+]);
+
+/**
+ * Produce a BOUNDED, non-secret, JSON-safe view of a provider's observational
+ * metadata. This is a whitelist-by-shape normalizer, not a passthrough:
+ *
+ *   - credential-shaped keys (anything `isSensitiveKey` matches, plus the
+ *     explicit forbidden names) are DROPPED, never redacted-in-place
+ *   - strings are truncated, arrays are truncated, nesting is bounded
+ *   - objects/functions/symbols that cannot survive a JSON round trip are
+ *     dropped
+ *
+ * The result is observational only: nothing here is ever fed back into a
+ * decision, a gate, a score, the Arena, or research.
+ */
+export function boundedProviderMetadata(metadata, { depth = 0, secrets = [] } = {}) {
+  if (depth > JEV_PROVIDER_METADATA_MAX_DEPTH) return undefined;
+  // `undefined` is DROPPED (the field simply disappears); an explicit `null` is
+  // preserved, because "the provider reported no value" is meaningful and
+  // different from "the provider said nothing at all".
+  if (typeof metadata === "undefined") return undefined;
+  if (metadata === null) return null;
+  if (typeof metadata === "number") return Number.isFinite(metadata) ? metadata : null;
+  if (typeof metadata === "boolean") return metadata;
+  if (typeof metadata === "string") {
+    return redactSecrets(metadata, secrets).slice(0, JEV_PROVIDER_METADATA_MAX_STRING);
+  }
+  if (Array.isArray(metadata)) {
+    return metadata
+      .slice(0, JEV_PROVIDER_METADATA_MAX_ARRAY)
+      .map((entry) => boundedProviderMetadata(entry, { depth: depth + 1, secrets }))
+      .filter((entry) => entry !== undefined);
+  }
+  if (typeof metadata !== "object") return undefined;
+
+  const out = {};
+  let fields = 0;
+  for (const [key, value] of Object.entries(metadata)) {
+    if (fields >= JEV_PROVIDER_METADATA_MAX_FIELDS) break;
+    if (isSensitiveKey(key)) continue;
+    if (JEV_PROVIDER_METADATA_FORBIDDEN_FIELDS.includes(String(key).toLowerCase())) continue;
+    const next = boundedProviderMetadata(value, { depth: depth + 1, secrets });
+    if (next === undefined) continue;
+    out[key] = next;
+    fields += 1;
+  }
+  return out;
+}
+
+/* ============================================================================
  * Provenance
  * ==========================================================================*/
 
@@ -184,6 +273,7 @@ export function createJevRunRecord({
   usage = null,
   answers = null,
   rawResponseDigest = null,
+  providerMetadata = null,
 }) {
   return {
     schemaVersion: JEV_RUNTIME_VERSION,
@@ -211,6 +301,12 @@ export function createJevRunRecord({
       : null,
     answers,
     rawResponseDigest,
+    // Bounded, non-secret provider observability (gateway/model/latency/usage/
+    // cost). Always normalized through the whitelist above; a provider can
+    // never write an unbounded or credential-bearing object here. The key is
+    // always present (`null` when the provider reported nothing) so every run
+    // record has the same shape regardless of provider.
+    providerMetadata: boundedProviderMetadata(providerMetadata) ?? null,
   };
 }
 

@@ -24,6 +24,7 @@ import { digestOf } from "../lib/hash.mjs";
 import { JEV_STATUS, NO_JEV_DECISION } from "./config.mjs";
 import { auditJevDecisionPacket, jevStateDigestOf } from "./decision-packet.mjs";
 import {
+  boundedProviderMetadata,
   createJevRunRecord,
   isJevFailure,
   jevCacheKey,
@@ -130,6 +131,9 @@ export async function jevDecide({
           usage: null,
           answers: cached.answers,
           rawResponseDigest: cached.rawResponseDigest ?? null,
+          // A cache hit made no call, so provider metadata from the ORIGINAL
+          // call is reused verbatim (already bounded when it was persisted).
+          providerMetadata: cached.providerMetadata ?? null,
         });
         run.cacheKey = cacheKey;
         run.originalJevRunId = cached.jevRunId ?? null;
@@ -224,6 +228,12 @@ export async function jevDecide({
     }
   }
 
+  // Provider observability (gateway/model/latency/usage/cost) is recorded as a
+  // BOUNDED, sanitized block. It is never authoritative and never replaces a
+  // normalized answer — `normalizeAnswers` above is the only path into a
+  // decision.
+  const providerMetadata = boundedProviderMetadata(outcome?.providerMetadata ?? null);
+
   const run = createJevRunRecord({
     jevRunId,
     experimentId,
@@ -244,6 +254,7 @@ export async function jevDecide({
     usage: outcome?.usage ?? null,
     answers,
     rawResponseDigest,
+    providerMetadata,
   });
   run.cacheKey = cacheKey;
   run.syntheticDecision = outcome?.syntheticDecision === true;
@@ -261,6 +272,7 @@ export async function jevDecide({
         answers,
         rawResponseDigest,
         syntheticDecision: run.syntheticDecision,
+        providerMetadata,
       });
     }
   }

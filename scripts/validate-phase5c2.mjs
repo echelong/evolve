@@ -1145,16 +1145,81 @@ test("31. leave-one-wave-out and between-wave differences are descriptive only",
   assertEqual(single.available, false, "one wave has no leave-one-wave-out sensitivity");
 });
 
-test("32. the meta-summary over the real artifacts never runs a wave and reports Wave 2 as pending", async () => {
+test("32. the meta-summary over the real artifacts never runs a wave and derives every count from the COMPLETED waves", async () => {
   const meta = await loadMetaSummary({ baseDir: REAL_BASE, generatedAt: 1 });
   assert(meta.waves.some((row) => row.waveId === "wave-1"), "Wave 1 is represented");
   assert(meta.waves.some((row) => row.waveId === "wave-2"), "Wave 2 is represented");
+
   const wave1 = meta.waves.find((row) => row.waveId === "wave-1");
+  const wave2 = meta.waves.find((row) => row.waveId === "wave-2");
+
+  // --- INDIVIDUAL-WAVE semantics. A wave's own count comes from ITS OWN
+  // declared membership and ITS OWN completed summary — never from the global
+  // total. Wave membership is predeclared, so this holds at every lifecycle
+  // stage: 3 while pending, 3 once complete, and never 6.
   assertEqual(wave1.available, true, "Wave 1 has a completed summary");
-  assertEqual(meta.totalCleanDatasets, wave1.cleanDatasetCount, "the meta-summary totals only completed dataset observations");
+  assertEqual(wave1.cleanDatasetCount, WAVE_1_DATASET_IDS.length, "Wave 1 contributes exactly its own declared datasets");
+  assertEqual(wave1.declaredDatasetCount, WAVE_1_DATASET_IDS.length, "Wave 1 declares exactly three datasets");
+  assertEqual(wave2.declaredDatasetCount, WAVE_2_DATASET_IDS.length, "Wave 2 declares exactly three datasets");
+  assertEqual(
+    wave2.cleanDatasetCount,
+    wave2.available === true ? WAVE_2_DATASET_IDS.length : 0,
+    "Wave 2 contributes its own declared datasets once — and only once — its summary exists",
+  );
+  assertEqual(meta.datasetsPerWave["wave-1"], wave1.cleanDatasetCount, "datasetsPerWave reports Wave 1's own count");
+  assertEqual(meta.datasetsPerWave["wave-2"], wave2.cleanDatasetCount, "datasetsPerWave reports Wave 2's own count");
+  for (const row of meta.waves) {
+    if (row.available !== true) assertEqual(row.cleanDatasetCount, 0, `a wave without a summary (${row.waveId}) contributes no datasets`);
+  }
+
+  // --- CROSS-WAVE semantics. The meta total is the SUM of the completed,
+  // canonical (non-excluded) waves' own counts. A wave completing changes this
+  // total BY DESIGN, so the expectation is derived from the same wave rows the
+  // summary aggregated — never pinned to a historical literal.
+  const aggregated = meta.waves.filter((row) => row.available === true && row.excludedFromAggregate !== true);
+  const expectedTotal = aggregated.reduce((sum, row) => sum + row.cleanDatasetCount, 0);
+  assertEqual(meta.totalCleanDatasets, expectedTotal, "totalCleanDatasets is the sum of the COMPLETED canonical waves' own counts");
+  assertDeepEqual(
+    [...meta.aggregatedWaveIds].sort(),
+    aggregated.map((row) => row.waveId).sort(),
+    "the aggregated wave list is exactly the completed canonical waves",
+  );
+  assertEqual(
+    meta.totalCleanDatasets,
+    meta.perDataset.length,
+    "the total equals the number of dataset-level observations actually aggregated",
+  );
+
+  // --- PENDING semantics. Pending means "no completed summary", derived from
+  // the stored manifests — a wave leaving the pending list is a normal
+  // lifecycle transition, not a test failure. A pending wave may never
+  // contribute to the aggregate.
+  assertDeepEqual(
+    [...meta.pendingWaves.map((row) => row.waveId)].sort(),
+    meta.waves.filter((row) => row.available !== true).map((row) => row.waveId).sort(),
+    "exactly the waves without a completed summary are reported as pending",
+  );
+  for (const pending of meta.pendingWaves) {
+    const row = meta.waves.find((candidate) => candidate.waveId === pending.waveId);
+    assertEqual(row?.cleanDatasetCount ?? 0, 0, `pending wave ${pending.waveId} contributes nothing`);
+    assertEqual(meta.datasetsPerWave[pending.waveId] ?? 0, 0, `pending wave ${pending.waveId} has no per-wave count`);
+  }
+
+  // --- COMPARABILITY. Different full freeze digests are expected; the
+  // evaluation contract and both frozen cohort digests must match before the
+  // waves may be described together. Incomparable waves are refused, never
+  // silently combined.
+  assert(meta.comparability, "a cross-wave comparability verdict is reported");
+  assert(
+    meta.comparability.status !== "INCOMPARABLE_WAVES",
+    `the canonical waves are comparable (status: ${meta.comparability.status})`,
+  );
+
   assertEqual(meta.significance, null, "no significance claim");
   assertEqual(meta.verdict, null, "no verdict");
-  assertDeepEqual(meta.pendingWaves.map((row) => row.waveId), ["wave-2"], "the unfinished wave is reported as pending, not fabricated");
+  assertEqual(meta.crossValidation, false, "never cross-validation");
+  assertEqual(meta.paperOnly, true, "paper only");
+  assertEqual(meta.unitOfReplication, "dataset", "the dataset remains the unit of replication");
   assert(/PAPER ONLY/.test(meta.note), "the meta-summary states the paper-only guarantee");
   assertEqual(await readRunSummary(REAL_BASE, "rep-does-not-exist"), null, "a missing run summary reads as null");
 });

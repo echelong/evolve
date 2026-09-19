@@ -77,7 +77,8 @@ import {
   waveMembership,
   writeWaveManifest,
 } from "./replication/waves.mjs";
-import { loadMetaSummary, readRunCanonicality } from "./replication/meta-summary.mjs";
+import { loadMetaSummary, readRunCanonicality, readRunSummary } from "./replication/meta-summary.mjs";
+import { replicationStatusFor } from "./replication/aggregate.mjs";
 
 const cases = [];
 function test(name, fn) {
@@ -999,14 +1000,26 @@ test("24. a --dev run stays NON_CANONICAL even when the freeze matches", async (
   }
 });
 
-test("25. a historical wave is NEVER re-run", async () => {
+test("25. a historical wave is NEVER re-run — refused, non-zero, and written to by nothing", async () => {
   await resetArenaSpawns();
   const run = runCli({ actionArgs: ["--wave", "rc-wave-1"], out: ctx.repDir });
   assertEqual(run.status, 1, "running a historical wave exits 1");
   assert(/HISTORICAL/.test(run.stderr), `the failure explains why (stderr: ${run.stderr.slice(0, 240)})`);
   assertEqual((await arenaSpawns()).length, 0, "zero Arena subprocesses");
-  // The real Wave 1 is refused too, read-only, against the real registry
-  // (metadata only: the historical guard fires before anything is read).
+
+  // The real Wave 1 is refused too, read-only, against the real registry.
+  //
+  // LIFECYCLE-AWARE: the exact refusal reason depends on the stored canonical
+  // state. A historical wave is refused EITHER by the HISTORICAL guard OR by a
+  // named wave-validation invariant that fires before anything can run (once a
+  // later wave has COMPLETED, that wave's datasets are prior-wave datasets the
+  // earlier wave does not exclude). What must hold in EVERY lifecycle state is:
+  // a non-zero exit, zero Arena spawns, an EXPLICIT named refusal that quotes
+  // the wave id, and a byte-identical canonical tree — "never re-run" also
+  // means "never written to". This case asserts that invariant rather than a
+  // frozen message, so a wave legitimately completing never makes it stale.
+  const realRoot = path.resolve(REAL_BASE);
+  const beforeRefusal = await dirDigest(realRoot);
   const real = runCli({
     actionArgs: ["--wave", "wave-1"],
     out: REAL_BASE,
@@ -1016,8 +1029,15 @@ test("25. a historical wave is NEVER re-run", async () => {
       EVOLVE_ARENAS_DIR: path.join(process.cwd(), ".evolve", "arenas"),
     },
   });
+  const afterRefusal = await dirDigest(realRoot);
   assertEqual(real.status, 1, "the real Wave 1 is refused too");
-  assert(/HISTORICAL/.test(real.stderr), "with the same explicit reason");
+  assert(
+    /HISTORICAL|wave1Excluded|prior-wave dataset\(s\) not explicitly excluded/.test(real.stderr),
+    `the refusal is explicit and names its reason (stderr: ${real.stderr.slice(0, 240)})`,
+  );
+  assert(/wave-1/.test(real.stderr), "the refusal names the wave it refused");
+  assertEqual((await arenaSpawns()).length, 0, "still zero Arena subprocesses for the real refusal");
+  assertDeepEqual(afterRefusal, beforeRefusal, "the canonical replication tree is byte-identical after the refused re-run");
 });
 
 /* ============================================================================
@@ -1448,18 +1468,70 @@ test("34. the canonical `--plan --wave wave-2` mutates NOTHING on disk and stays
   const payload = JSON.parse(run.stdout);
   assertEqual(payload.action, ACTION.PLAN, "the JSON names the plan action");
   assertEqual(payload.unitsExecuted, 0, "the plan executed zero units");
-  assertEqual(payload.datasetIds.length, 3, "exactly the three predeclared Wave 2 datasets");
-  assertEqual(payload.units.length, 6, "three datasets x two providers = six pending units");
-  assert(payload.units.every((unit) => unit.status === "PENDING"), "every planned unit is still PENDING");
-  assertEqual(payload.replicationStatus, "PLANNED", "the canonical Wave 2 plan is PLANNED");
-  assertEqual(payload.executionStatus, "PLANNED", "its execution status is PLANNED (zero units executed)");
-  assertEqual(payload.datasetReadiness, "MULTI_DATASET_REPLICATION", "readiness comes from the three selected datasets");
-  assertEqual(payload.selectedCleanDatasets, 3, "selectedCleanDatasets is 3");
-  assertEqual(payload.completedDatasets, 0, "completedDatasets is 0");
-  assertEqual(payload.evidenceStatus, "NO_REPLICATION_EVIDENCE", "zero completed datasets is NO evidence, not insufficient data");
+  assertEqual(payload.datasetIds.length, WAVE_2_DATASET_IDS.length, "exactly the predeclared Wave 2 datasets");
+  assertEqual(payload.units.length, WAVE_2_DATASET_IDS.length * 2, "datasets x two providers = the planned units");
+  // READINESS — the regression this case protects — is a statement about the
+  // SELECTION, so it holds in every lifecycle state, before and after a run.
+  assertEqual(payload.datasetReadiness, "MULTI_DATASET_REPLICATION", "readiness comes from the selected datasets, never from execution");
+  assertEqual(payload.selectedCleanDatasets, WAVE_2_DATASET_IDS.length, "selectedCleanDatasets is the predeclared selection");
+  assertEqual(payload.minimumRequired, 2, "the unchanged minimum is still 2");
+  assertEqual(payload.multiDatasetThreshold, 3, "the unchanged multi-dataset threshold is still 3");
   assert(
     !run.stdout.includes("INSUFFICIENT_INDEPENDENT_REAL_DATASETS"),
     "a ready plan never claims insufficient independent datasets",
+  );
+
+  // Every planned unit belongs to a Wave 2 dataset and to one of the two
+  // providers; no Wave 1 dataset may appear inside a Wave 2 replication.
+  for (const unit of payload.units) {
+    assert(WAVE_2_DATASET_IDS.includes(unit.datasetId), `planned unit is a Wave 2 dataset (${unit.datasetId})`);
+    assert(["mock", "deepseek"].includes(unit.provider), `planned unit has a known provider (${unit.provider})`);
+  }
+  for (const wave1Id of WAVE_1_DATASET_IDS) {
+    assertEqual(
+      payload.units.filter((unit) => unit.datasetId === wave1Id).length,
+      0,
+      `no Wave 1 unit (${wave1Id}) exists inside a Wave 2 plan`,
+    );
+  }
+
+  // The EXECUTION view is a projection of the SAME planned units (a plan
+  // executes nothing), so it stays internally consistent at any lifecycle stage
+  // rather than being pinned to PLANNED forever.
+  const allPending = payload.units.every((unit) => unit.status === "PENDING");
+  assertEqual(payload.execution.plannedUnits, payload.units.length, "the execution view plans every unit it lists");
+  assertEqual(payload.execution.executedUnits, 0, "the plan's own execution view executed zero units");
+  assertEqual(
+    payload.execution.pendingUnits,
+    payload.units.filter((unit) => unit.status === "PENDING").length,
+    "the pending count matches the listed units",
+  );
+  assertEqual(payload.replicationStatus, payload.executionStatus, "a plan's replicationStatus IS its execution status");
+  assertEqual(payload.executionStatus === "PLANNED", allPending, "PLANNED means every planned unit is still PENDING");
+
+  // EVIDENCE is a READ of the stored lifecycle state, so it is derived from the
+  // same artifacts the plan itself reads — never from a historical literal.
+  // Before the wave runs there is no evidence (0); once it completes, the same
+  // command honestly reports the completed dataset pairs.
+  const storedManifest = await readWaveManifest(REAL_BASE, "wave-2");
+  const storedSummary = storedManifest?.replicationId
+    ? await readRunSummary(REAL_BASE, storedManifest.replicationId)
+    : null;
+  const expectedCompleted = storedSummary?.datasetCoverage?.cleanCompletedDatasets ?? 0;
+  assertEqual(
+    payload.completedDatasets,
+    expectedCompleted,
+    "completedDatasets mirrors the stored replication's completed dataset pairs",
+  );
+  assertEqual(
+    payload.evidenceStatus,
+    replicationStatusFor(expectedCompleted),
+    "evidence status is the descriptive status of the stored completed-dataset count",
+  );
+  assertEqual(
+    payload.multiDatasetClaimAvailable,
+    expectedCompleted >= payload.multiDatasetThreshold,
+    "the multi-dataset claim follows the stored evidence, never the selection",
   );
 });
 
@@ -1495,6 +1567,110 @@ test("35. the Wave 2 lifecycle invariant accepts UNBOUND and BOUND and rejects H
     halfBound.failures.some((row) => row.check === "lifecycleConsistent"),
     `the half-bound failure is named explicitly (${JSON.stringify(halfBound.failures.map((row) => row.check))})`,
   );
+});
+
+/* ============================================================================
+ * 36. Canonical COMPLETED wave — stored-lifecycle invariants (READ-ONLY)
+ *
+ * A canonical wave completing is a NORMAL lifecycle transition, so these
+ * assertions describe the CURRENT stored state instead of insisting on a
+ * historical one. Every expectation is derived from the stored artifacts (the
+ * wave manifest, the per-wave freeze, the frozen cohorts, the run manifest and
+ * the run summary) or from the predeclared wave definition — never from a
+ * literal that would have to be edited the next time a wave completes.
+ *
+ * Nothing here writes: no freeze, no cohort, no manifest, no run artifact.
+ * ==========================================================================*/
+
+test("36. the canonical COMPLETED Wave 2 satisfies every stored-lifecycle invariant (read-only)", async () => {
+  const manifest = await readWaveManifest(REAL_BASE, "wave-2");
+  assert(manifest, "the stored Wave 2 manifest exists");
+  const definition = waveDefinitionFor("wave-2");
+  assert(definition, "wave-2 resolves to a predeclared definition");
+
+  // --- lifecycle: COMPLETED, bound, and consistent with its own freeze.
+  assertEqual(manifest.status, WAVE_STATUS.COMPLETED, "the stored Wave 2 status is COMPLETED");
+  assertEqual(manifest.historical, false, "Wave 2 is not a historical wave");
+  assertEqual(waveFreezeBound(manifest), true, "a COMPLETED wave is freeze-bound");
+  assertEqual(isSafeFreezePath(manifest.freezePath), true, "its per-wave freeze path is safe");
+
+  const freeze = await readFreeze({ root: REAL_BASE, file: manifest.freezePath });
+  assert(freeze, "the per-wave freeze exists");
+  assertEqual(freezeDigest(freeze), manifest.freezeDigest, "the freeze's recomputed digest matches the manifest pin");
+  assertEqual(evaluationContractDigest(freeze), manifest.evaluationContractDigest, "the freeze's evaluation contract matches the manifest pin");
+  assertEqual(manifest.evaluationContractDigest, CANONICAL_EVALUATION_CONTRACT_DIGEST, "Wave 2 pins the canonical evaluation contract");
+
+  const cohorts = {
+    mock: await readFrozenCohort(REAL_BASE, "mock"),
+    deepseek: await readFrozenCohort(REAL_BASE, "deepseek"),
+  };
+  assertEqual(manifest.mockCohortDigest, cohorts.mock.cohortDigest, "the frozen Mock cohort digest matches the manifest pin");
+  assertEqual(manifest.deepseekCohortDigest, cohorts.deepseek.cohortDigest, "the frozen DeepSeek cohort digest matches the manifest pin");
+  assertEqual(manifest.mockCohortDigest, definition.mockCohortDigest, "and it is the predeclared Mock cohort");
+  assertEqual(manifest.deepseekCohortDigest, definition.deepseekCohortDigest, "and it is the predeclared DeepSeek cohort");
+
+  // --- replication: a COMPLETED wave points at a real, completed, CANONICAL run.
+  assert(typeof manifest.replicationId === "string" && manifest.replicationId.length > 0, "a COMPLETED wave records a replication id");
+  const runManifest = JSON.parse(
+    await readFile(path.join(REAL_BASE, manifest.replicationId, "manifest.json"), "utf8"),
+  );
+  const summary = await readRunSummary(REAL_BASE, manifest.replicationId);
+  assert(summary, "the completed replication directory holds a summary");
+  assertEqual(runManifest.replicationId, manifest.replicationId, "the run manifest IS the directory the wave points at");
+  assertEqual(runManifest.status, "COMPLETED", "the replication run itself is COMPLETED");
+  assertEqual(runManifest.freezeDigest, manifest.freezeDigest, "the run recorded the wave's own freeze digest");
+
+  const canonicality = await readRunCanonicality(REAL_BASE, manifest.replicationId);
+  assertEqual(canonicality.canonical, true, "the completed run is CANONICAL, not --dev evidence");
+  assertEqual(canonicality.devOverride, false, "no --dev override was used");
+  assertEqual(runManifest.canonicality?.dirty, false, "the canonical run was recorded against a clean tree");
+
+  // --- units: exactly datasets x two providers, all COMPLETED, one per pair.
+  const units = Array.isArray(runManifest.units) ? runManifest.units : [];
+  assertEqual(units.length, WAVE_2_DATASET_IDS.length * 2, "the wave holds datasets x two providers units");
+  assertEqual(units.every((unit) => unit.status === "COMPLETED"), true, "every Wave 2 unit is COMPLETED");
+  for (const datasetId of WAVE_2_DATASET_IDS) {
+    for (const provider of ["mock", "deepseek"]) {
+      const matches = units.filter((unit) => unit.datasetId === datasetId && unit.provider === provider);
+      assertEqual(matches.length, 1, `${datasetId} has exactly one ${provider} unit`);
+      assertEqual(matches[0].status, "COMPLETED", `${datasetId} ${provider} is COMPLETED`);
+      assertEqual(matches[0].cohortDigest, manifest[`${provider}CohortDigest`], `${datasetId} ${provider} ran the wave's frozen cohort`);
+    }
+  }
+  for (const wave1Id of WAVE_1_DATASET_IDS) {
+    assertEqual(
+      units.filter((unit) => unit.datasetId === wave1Id).length,
+      0,
+      `no Wave 1 unit (${wave1Id}) exists inside the Wave 2 replication`,
+    );
+  }
+
+  // --- datasets: exactly the predeclared three, all CLEAN, both providers complete.
+  assertEqual(summary.cleanDatasets.length, WAVE_2_DATASET_IDS.length, "exactly the three predeclared CLEAN Wave 2 datasets");
+  assertDeepEqual([...summary.cleanDatasets].sort(), [...WAVE_2_DATASET_IDS].sort(), "the CLEAN set is exactly the predeclared membership");
+  assertEqual(summary.datasetCoverage.completedUnits, WAVE_2_DATASET_IDS.length * 2, "six completed units are recorded");
+  assertEqual(summary.datasetCoverage.pendingUnits, 0, "no unit is left pending in a COMPLETED run");
+  assertEqual(summary.datasetCoverage.failedUnits, 0, "no unit failed");
+  assertEqual(
+    summary.datasetCoverage.cleanCompletedDatasets,
+    WAVE_2_DATASET_IDS.length,
+    "three datasets have both providers complete",
+  );
+  assertEqual(
+    summary.replicationStatus,
+    replicationStatusFor(summary.datasetCoverage.cleanCompletedDatasets),
+    "the run's status is the descriptive status of its own completed dataset pairs",
+  );
+
+  // --- declarations: replication needs zero provider/Jev generation, PAPER ONLY.
+  assertEqual(manifest.providerCallsRequired, false, "the wave declares that replication required zero provider generation calls");
+  assertEqual(manifest.jevInvolved, false, "the wave declares no Jev involvement");
+  assertEqual(summary.paperOnly, true, "the completed run is PAPER ONLY");
+  assertEqual(summary.significance, null, "no significance claim");
+  assertEqual(summary.verdict, null, "no verdict");
+
+  // --- no look-ahead / no tuning: the summary states it explicitly.
+  assertEqual(summary.noTuningFromOutcomes, true, "the summary records that nothing was tuned from outcomes");
 });
 
 /* ============================================================================

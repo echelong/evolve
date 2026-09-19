@@ -36,7 +36,12 @@ import { REGIMES, computeArenaScore, evaluateSurvivalGates } from "./arena/orche
 import {
   DEFAULT_JEV_MODE,
   DEFAULT_JEV_MODEL,
+  DEFAULT_VERCEL_JEV_MODEL,
+  DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER,
   JEV_PROVIDER,
+  JEV_PROVIDER_CREDENTIAL_ENV,
+  JEV_PROVIDER_TRANSPORT,
+  JEV_PROVIDER_UPSTREAM,
   JEV_STATUS,
   NO_JEV_DECISION,
   REGISTERED_JEV_PROVIDERS,
@@ -47,11 +52,27 @@ import {
   readIntEnv,
   requireJevProviderName,
   resolveJevConfig,
+  resolveJevModelName,
   validateJevProviderName,
 } from "./jev/config.mjs";
 import { createDisabledJevProvider, resolveJevProvider } from "./jev/provider.mjs";
 import { createMockJevProvider, MOCK_JEV_PROVIDER } from "./jev/providers/mock-jev.mjs";
 import { createTypeSafeJevProvider } from "./jev/providers/typesafe-jev.mjs";
+import {
+  VERCEL_JEV_DEFAULT_MODEL,
+  VERCEL_JEV_PROVIDER,
+  VERCEL_JEV_TRANSPORT,
+  VERCEL_JEV_UPSTREAM_PROVIDER,
+  buildVercelProviderMetadata,
+  classifyVercelError,
+  createVercelJevProvider,
+  fromEvaluationAnswers,
+  legendForQuestion,
+  toEvaluationQuestions,
+  usageFromResult,
+} from "./jev/providers/vercel-jev.mjs";
+import { CANONICAL_EVALUATION_CONTRACT_DIGEST, CANONICAL_HISTORICAL_FREEZE_PATH } from "./replication/waves.mjs";
+import { evaluationContractDigest } from "./replication/contract.mjs";
 import {
   ALLOWED_GENOME_PARAM_KEYS,
   FORBIDDEN_JEV_KEYS,
@@ -77,6 +98,7 @@ import {
   buildMarketQuestions,
 } from "./jev/questions.mjs";
 import {
+  boundedProviderMetadata,
   createJevRunBudget,
   isJevFailure,
   jevCacheKey,
@@ -914,6 +936,7 @@ const JEV_SOURCE_FILES = [
   "scripts/jev/dashboard.mjs",
   "scripts/jev/providers/mock-jev.mjs",
   "scripts/jev/providers/typesafe-jev.mjs",
+  "scripts/jev/providers/vercel-jev.mjs",
   "scripts/jev.mjs",
   "scripts/probe-jev.mjs",
   "scripts/calibrate-jev.mjs",
@@ -1411,6 +1434,721 @@ test("88. `jevExperimentIdFor` is deterministic for the same inputs and collisio
   const c = jevExperimentIdFor({ provider: "typesafe-jev", startedAt: 1_700_000_000_000 });
   assertEqual(a, b, "identical inputs produce an identical id");
   assert(a !== c, "different providers at the same instant still produce different ids");
+});
+
+/* ============================================================================
+ * M2. Vercel AI Gateway provider (`vercel-jev`, Phase 5D)
+ *
+ * Everything below is OFFLINE: the AI SDK evaluation call (`experimental_evaluate`)
+ * is replaced by an injected `evaluateImpl`, exactly the way `typesafe-jev` tests
+ * replace `fetch`. No gateway key is ever required, no request is ever made.
+ * ==========================================================================*/
+
+const FAKE_GATEWAY_KEY = "gw-vercel-test-key-0000000001";
+const FAKE_DIRECT_KEY = "sk-typesafe-test-key-0000000002";
+
+/** A stand-in for the AI SDK's `EvaluationResult`, in the AI SDK's own shape. */
+function vercelEvaluationResult(overrides = {}) {
+  return {
+    answers: {
+      gateFailureRisk: { type: "boolean", probability: 0.98 },
+      primaryRisk: { type: "choice", choice: "concentration", probabilities: { concentration: 0.7, drawdown: 0.3 } },
+      evidenceQuality: { type: "score", score: 3, probabilities: { 0: 0, 1: 0.1, 2: 0.2, 3: 0.6, 4: 0.1 } },
+      generalizationConfidence: { type: "boolean", probability: 0.62 },
+      researchDisposition: {
+        type: "choice",
+        choice: "continue_observing",
+        probabilities: { continue_observing: 0.55, high_risk: 0.45 },
+      },
+    },
+    usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 },
+    warnings: [],
+    providerMetadata: { gateway: { generationId: "gen-vercel-0001", totalCost: 0.00031, marketCost: 0.00042 } },
+    response: { timestamp: new Date(0), modelId: DEFAULT_VERCEL_JEV_MODEL, id: "gen-vercel-0001" },
+    ...overrides,
+  };
+}
+
+/** Build a vercel-jev provider whose AI SDK evaluation call is a local stub. */
+function stubVercelProvider({ answers = null, throwError = null, timeoutMs = 5_000, seen = null } = {}) {
+  const calls = [];
+  const provider = createVercelJevProvider({
+    gatewayApiKey: FAKE_GATEWAY_KEY,
+    timeoutMs,
+    evaluateImpl: async (options) => {
+      calls.push(options);
+      if (seen) seen.push(options);
+      if (throwError) throw throwError;
+      return vercelEvaluationResult(answers ? { answers } : {});
+    },
+  });
+  return { provider, calls };
+}
+
+async function decideWithVercel({ provider, budget = null, root = null, cacheEnabled = false, packet = null }) {
+  return jevDecide({
+    provider,
+    packet: packet ?? candidatePacketFixture(),
+    questions: buildCandidateQuestions(),
+    questionSetId: JEV_CANDIDATE_QUESTION_SET_ID,
+    questionSetVersion: JEV_CANDIDATE_QUESTION_SET_VERSION,
+    decisionPacketVersion: JEV_DECISION_PACKET_VERSION,
+    experimentId: "jexp-vercel-test-000000000000-vercel-jev-abcdef",
+    root,
+    cacheEnabled,
+    budget,
+  });
+}
+
+test("95. `vercel-jev` is selected explicitly and only by its own name", () => {
+  const config = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev" });
+  assertEqual(config.provider, JEV_PROVIDER.VERCEL, "the explicit name is honoured");
+  assertEqual(config.enabled, true, "an explicit registered provider is enabled in shadow mode");
+  assertEqual(config.upstreamProvider, DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER, "the upstream provider is recorded");
+  assertEqual(config.transport, "vercel-ai-gateway", "the transport is the AI Gateway");
+  assertEqual(config.credentialEnvVar, "AI_GATEWAY_API_KEY", "the credential variable is the gateway one");
+  assertEqual(resolveJevConfig({ EVOLVE_JEV_PROVIDER: "VERCEL-JEV" }).provider, JEV_PROVIDER.VERCEL, "case-insensitive");
+  assertEqual(REGISTERED_JEV_PROVIDERS.length, 3, "exactly three providers are registered");
+  assertDeepEqual(
+    [...REGISTERED_JEV_PROVIDERS].sort(),
+    ["mock-jev", "typesafe-jev", "vercel-jev"],
+    "the registered set is mock / typesafe / vercel",
+  );
+  const provider = resolveJevProvider(JEV_PROVIDER.VERCEL, { gatewayApiKey: FAKE_GATEWAY_KEY });
+  assertEqual(provider.name, VERCEL_JEV_PROVIDER, "the resolved provider identifies itself by name");
+  assertEqual(provider.gatewayUsed, true, "the resolved provider self-reports gateway usage");
+});
+
+test("96. A typo near `vercel-jev` FAILS CLOSED — no provider, no fallback, no silent disabled state", () => {
+  let thrown = null;
+  try {
+    resolveJevProvider("vercel-jve", { gatewayApiKey: FAKE_GATEWAY_KEY });
+  } catch (error) {
+    thrown = error;
+  }
+  assert(thrown instanceof UnknownJevProviderError, "an unregistered name throws UnknownJevProviderError");
+  assert([...thrown.registeredProviders].includes(JEV_PROVIDER.VERCEL), "the registry lists vercel-jev");
+  const config = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jve" });
+  assertEqual(config.provider, null, "no provider is resolved for the typo");
+  assertEqual(config.enabled, false, "never enabled on a typo");
+  assert(typeof config.configError === "string" && config.configError.length > 0, "a configuration error is reported");
+});
+
+test("97. The default is UNCHANGED: Jev is still disabled by default and the direct default model is untouched", () => {
+  const config = resolveJevConfig({});
+  assertEqual(config.provider, null, "still disabled by default");
+  assertEqual(config.enabled, false, "never enabled by default");
+  assertEqual(config.allowFallback, false, "there is never an automatic fallback");
+  assertEqual(DEFAULT_JEV_MODEL, "jev-1.13.0", "the direct route's pinned default is unchanged");
+  assertEqual(
+    resolveJevModelName(resolveJevConfig({}), { provider: JEV_PROVIDER.TYPESAFE }),
+    DEFAULT_JEV_MODEL,
+    "the direct route still defaults to jev-1.13.0",
+  );
+});
+
+test("98. A missing `AI_GATEWAY_API_KEY` is a CONFIGURATION ERROR before any request — with zero provider calls", async () => {
+  let calls = 0;
+  const provider = resolveJevProvider(JEV_PROVIDER.VERCEL, {
+    gatewayApiKey: "",
+    evaluateImpl: async () => {
+      calls += 1;
+      return vercelEvaluationResult();
+    },
+  });
+  assertEqual(provider.name, JEV_PROVIDER.VERCEL, "the failure is attributed to the requested provider");
+  const result = await provider.evaluate({ state: candidatePacketFixture(), questions: buildCandidateQuestions() });
+  assertEqual(result.ok, false, "not ok");
+  assertEqual(result.status, JEV_STATUS.CONFIG_ERROR, "a missing gateway credential is a configuration error");
+  assertEqual(calls, 0, "the AI SDK evaluation call is never reached");
+  const config = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev" });
+  assertEqual(config.gatewayApiKeyConfigured, false, "the config reports no gateway credential");
+  assertEqual(config.apiKeyConfigured, false, "and no direct credential either");
+});
+
+test("99. The two credentials are strictly separate and never cross-assigned", async () => {
+  const config = resolveJevConfig({
+    EVOLVE_JEV_PROVIDER: "vercel-jev",
+    EVOLVE_JEV_API_KEY: FAKE_DIRECT_KEY,
+    AI_GATEWAY_API_KEY: FAKE_GATEWAY_KEY,
+  });
+  assertEqual(config.apiKey, FAKE_DIRECT_KEY, "the direct key stays in its own field");
+  assertEqual(config.gatewayApiKey, FAKE_GATEWAY_KEY, "the gateway key stays in its own field");
+  assert(config.apiKey !== config.gatewayApiKey, "the two fields are never the same value");
+  assertEqual(JEV_PROVIDER_CREDENTIAL_ENV[JEV_PROVIDER.TYPESAFE], "EVOLVE_JEV_API_KEY", "direct route credential env");
+  assertEqual(JEV_PROVIDER_CREDENTIAL_ENV[JEV_PROVIDER.VERCEL], "AI_GATEWAY_API_KEY", "gateway route credential env");
+  assertEqual(JEV_PROVIDER_UPSTREAM[JEV_PROVIDER.VERCEL], "typesafe-ai", "the gateway route's upstream is typesafe-ai");
+  assertEqual(JEV_PROVIDER_TRANSPORT[JEV_PROVIDER.TYPESAFE], "typesafe-sdk", "the direct transport is the SDK");
+  assertEqual(JEV_PROVIDER_TRANSPORT[JEV_PROVIDER.VERCEL], "vercel-ai-gateway", "the gateway transport is the gateway");
+
+  // A gateway key never authenticates the DIRECT route.
+  const direct = resolveJevProvider(JEV_PROVIDER.TYPESAFE, { apiKey: "", gatewayApiKey: FAKE_GATEWAY_KEY });
+  assertEqual(direct.name, JEV_PROVIDER.TYPESAFE, "still the direct provider");
+  const directResult = await direct.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(directResult.status, JEV_STATUS.CONFIG_ERROR, "a gateway key does not satisfy the direct route");
+
+  // A direct key never authenticates the GATEWAY route.
+  const gateway = resolveJevProvider(JEV_PROVIDER.VERCEL, { apiKey: FAKE_DIRECT_KEY, gatewayApiKey: "" });
+  assertEqual(gateway.name, JEV_PROVIDER.VERCEL, "still the gateway provider");
+  const gatewayResult = await gateway.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(gatewayResult.status, JEV_STATUS.CONFIG_ERROR, "a direct key does not satisfy the gateway route");
+});
+
+test("100. The gateway key is never printed and never lands in a run record, decision, or cache entry", async () => {
+  const { provider } = stubVercelProvider();
+  const { run, decision } = await decideWithVercel({ provider });
+  assertEqual(run.status, JEV_STATUS.OK, "the stubbed gateway call succeeds");
+  const serialized = JSON.stringify({ run, decision });
+  assert(!serialized.includes(FAKE_GATEWAY_KEY), "no part of the run or decision contains the gateway key");
+  for (const forbidden of ["apiKey", "gatewayApiKey", "authorization", "Authorization", "bearer"]) {
+    assert(!serialized.includes(`"${forbidden}":`), `run/decision never has a '${forbidden}' field`);
+  }
+  const publicView = JSON.stringify(sanitizeForPublic({ gatewayApiKey: FAKE_GATEWAY_KEY, apiKey: FAKE_DIRECT_KEY }));
+  assert(!publicView.includes(FAKE_GATEWAY_KEY), "sanitizeForPublic drops the gateway credential");
+  assert(!publicView.includes(FAKE_DIRECT_KEY), "sanitizeForPublic drops the direct credential");
+});
+
+test("101. The gateway key is never PERSISTED to disk by a vercel-jev run", async () => {
+  await withTempDir(async (dir) => {
+    const { provider } = stubVercelProvider();
+    const { run } = await decideWithVercel({ provider, root: dir, cacheEnabled: true });
+    assertEqual(run.status, JEV_STATUS.OK, "the run succeeded");
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(dir, { recursive: true });
+    const files = entries.filter((entry) => typeof entry === "string" && entry.endsWith(".json"));
+    assert(files.length > 0, "the run persisted at least one artifact");
+    for (const file of files) {
+      const text = await readFile(path.join(dir, file), "utf8");
+      assert(!text.includes(FAKE_GATEWAY_KEY), `${file} must not contain the gateway key`);
+    }
+  });
+});
+
+test("102. `vercel-jev` defaults to `typesafe-ai/jev`, never `jev-latest`, and sends the AI SDK question shape", async () => {
+  assertEqual(DEFAULT_VERCEL_JEV_MODEL, "typesafe-ai/jev", "the canonical gateway model id");
+  assertEqual(VERCEL_JEV_DEFAULT_MODEL, "typesafe-ai/jev", "the provider default matches");
+  assert(!DEFAULT_VERCEL_JEV_MODEL.includes("latest"), "never a moving alias by default");
+  assertEqual(
+    resolveJevModelName(resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev" }), { provider: JEV_PROVIDER.VERCEL }),
+    DEFAULT_VERCEL_JEV_MODEL,
+    "the gateway route defaults to its OWN canonical model id",
+  );
+  assertEqual(VERCEL_JEV_UPSTREAM_PROVIDER, "typesafe-ai", "the upstream provider is typesafe-ai");
+  assertEqual(VERCEL_JEV_TRANSPORT, "vercel-ai-gateway", "the transport label is the gateway");
+
+  const seen = [];
+  const { provider } = stubVercelProvider({ seen });
+  const questions = buildCandidateQuestions();
+  await provider.evaluate({ state: candidatePacketFixture(), questions });
+  assertEqual(seen.length, 1, "exactly one provider attempt");
+  assertEqual(seen[0].model, DEFAULT_VERCEL_JEV_MODEL, "the canonical model id is sent");
+  assertEqual(seen[0].maxRetries, 0, "exactly one provider attempt: no SDK-level retry storm");
+  assert(Boolean(seen[0].abortSignal), "the Jev timeout is wired through an AbortSignal");
+  const sentTypes = Object.fromEntries(Object.entries(seen[0].questions).map(([name, q]) => [name, q.type]));
+  assertDeepEqual(
+    sentTypes,
+    { gateFailureRisk: "boolean", primaryRisk: "choice", evidenceQuality: "score", generalizationConfidence: "boolean", researchDisposition: "choice" },
+    "the SAME fixed question set is sent, with noul mapped to the AI SDK's boolean type",
+  );
+  assertEqual(
+    seen[0].questions.gateFailureRisk.instructions,
+    questions.gateFailureRisk.instructions,
+    "the question wording is reused verbatim — no second decision schema",
+  );
+  assertDeepEqual(
+    seen[0].questions.primaryRisk.criteria,
+    questions.primaryRisk.criteria,
+    "the bounded vocabulary is reused verbatim",
+  );
+  assertDeepEqual(
+    toEvaluationQuestions({}),
+    {},
+    "the question adapter is total: no questions in, no questions out",
+  );
+  assertEqual(
+    toEvaluationQuestions({ q: { type: "noul" } }).q.instructions,
+    "",
+    "a missing instruction becomes an empty string the AI SDK accepts, never null",
+  );
+});
+
+test("103. Model precedence for the gateway route: explicit override > EVOLVE_JEV_MODEL > `typesafe-ai/jev`", () => {
+  const base = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev" });
+  assertEqual(
+    resolveJevModelName(base, { provider: JEV_PROVIDER.VERCEL, override: "typesafe-ai/jev-pinned" }),
+    "typesafe-ai/jev-pinned",
+    "an explicit override wins",
+  );
+  const withGeneric = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev", EVOLVE_JEV_MODEL: "typesafe-ai/jev-2" });
+  assertEqual(
+    resolveJevModelName(withGeneric, { provider: JEV_PROVIDER.VERCEL }),
+    "typesafe-ai/jev-2",
+    "EVOLVE_JEV_MODEL overrides the gateway default",
+  );
+  const withVercel = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev", EVOLVE_VERCEL_JEV_MODEL: "typesafe-ai/jev-3" });
+  assertEqual(
+    resolveJevModelName(withVercel, { provider: JEV_PROVIDER.VERCEL }),
+    "typesafe-ai/jev-3",
+    "EVOLVE_VERCEL_JEV_MODEL overrides the gateway default",
+  );
+  assertEqual(
+    resolveJevModelName(base, { provider: JEV_PROVIDER.TYPESAFE }),
+    DEFAULT_JEV_MODEL,
+    "the direct route is unaffected by the gateway default",
+  );
+});
+
+test("104. Typed BOOLEAN/noul answers map into EVOLVE's normalized probability shape", () => {
+  const raw = fromEvaluationAnswers({ gateFailureRisk: { type: "boolean", probability: 0.98 } }, { gateFailureRisk: { type: "noul" } });
+  assertDeepEqual(raw.gateFailureRisk, { type: "noul", noul: 0.98 }, "the AI SDK boolean maps to the raw noul shape");
+  const normalized = normalizeAnswers(raw);
+  assertDeepEqual(normalized.gateFailureRisk, { type: "noul", probability: 0.98 }, "and normalizes to the internal shape");
+  assertEqual(validateAnswers(normalized, ["gateFailureRisk"]).ok, true, "the normalized answer validates");
+});
+
+test("105. Typed CHOICE answers map with label + derived confidence + distribution", () => {
+  const raw = fromEvaluationAnswers(
+    { primaryRisk: { type: "choice", choice: "concentration", probabilities: { concentration: 0.7, drawdown: 0.3 } } },
+    { primaryRisk: { type: "choice" } },
+  );
+  assertDeepEqual(
+    raw.primaryRisk,
+    { type: "choice", choice: "concentration", confidence: 0.7, probabilities: { concentration: 0.7, drawdown: 0.3 } },
+    "the selected label and its probability are preserved",
+  );
+  const normalized = normalizeAnswers(raw);
+  assertEqual(normalized.primaryRisk.choice, "concentration", "the normalized choice is preserved");
+  assertEqual(normalized.primaryRisk.confidence, 0.7, "confidence is the selected label's probability");
+  assertEqual(validateAnswers(normalized, ["primaryRisk"]).ok, true, "the normalized answer validates");
+
+  const noDistribution = normalizeAnswers(
+    fromEvaluationAnswers({ primaryRisk: { type: "choice", choice: "drawdown" } }, { primaryRisk: { type: "choice" } }),
+  );
+  assertEqual(noDistribution.primaryRisk.confidence, null, "missing probabilities yield a null confidence, never a fabricated one");
+  assertDeepEqual(noDistribution.primaryRisk.probabilities, {}, "a missing distribution becomes an empty one");
+});
+
+test("106. Typed ordered SCORE answers map with score, confidence, and the fixed rubric legend", async () => {
+  const questions = { evidenceQuality: buildCandidateQuestions().evidenceQuality };
+  const raw = fromEvaluationAnswers(
+    { evidenceQuality: { type: "score", score: 3, probabilities: { 0: 0, 1: 0.1, 2: 0.2, 3: 0.6, 4: 0.1 } } },
+    questions,
+  );
+  assertEqual(raw.evidenceQuality.type, "score", "the score type is preserved");
+  assertEqual(raw.evidenceQuality.score, 3, "the ordered score is preserved");
+  assertEqual(raw.evidenceQuality.confidence, 0.6, "confidence is the strongest rubric level's probability");
+  assertDeepEqual(raw.evidenceQuality.probabilities, { 0: 0, 1: 0.1, 2: 0.2, 3: 0.6, 4: 0.1 }, "the distribution is preserved");
+  assertEqual(Object.keys(raw.evidenceQuality.legend).length, 5, "the 5-level rubric legend is carried");
+  assert(raw.evidenceQuality.legend["4"].startsWith("strong"), "the legend text is the pre-registered rubric");
+  assertDeepEqual(legendForQuestion({ type: "choice", criteria: { a: "x" } }), {}, "only score questions carry a legend");
+  const normalized = normalizeAnswers(raw);
+  assertEqual(validateAnswers(normalized, ["evidenceQuality"]).ok, true, "the normalized score answer validates");
+});
+
+test("107. A full `vercel-jev` answer set normalizes to the SAME internal shape `typesafe-jev` produces", async () => {
+  const { provider } = stubVercelProvider();
+  const result = await provider.evaluate({ state: candidatePacketFixture(), questions: buildCandidateQuestions() });
+  const normalized = normalizeAnswers(result.answers);
+  const typesafeEquivalent = normalizeAnswers(okCandidateAnswers());
+  assertDeepEqual(
+    Object.keys(normalized).sort(),
+    Object.keys(typesafeEquivalent).sort(),
+    "both routes produce the same answer names",
+  );
+  for (const name of CANDIDATE_QUESTION_NAMES) {
+    assertEqual(normalized[name]?.type, typesafeEquivalent[name]?.type, `${name} has the same normalized type`);
+  }
+  assertEqual(validateAnswers(normalized, CANDIDATE_QUESTION_NAMES).ok, true, "the whole set validates");
+  assertEqual(result.syntheticDecision, false, "a real gateway answer is never marked synthetic");
+});
+
+test("108. Malformed or missing typed answers become JEV_INVALID_RESPONSE (never a fabricated decision)", async () => {
+  const malformed = new Error("Question 'gateFailureRisk' must return P(true) as a finite probability in [0, 1].");
+  malformed.name = "AI_InvalidResponseDataError";
+  const bad = createVercelJevProvider({ gatewayApiKey: FAKE_GATEWAY_KEY, evaluateImpl: async () => { throw malformed; } });
+  const badResult = await bad.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(badResult.status, JEV_STATUS.INVALID_RESPONSE, "a malformed typed answer is an invalid response");
+  assertEqual(classifyVercelError(malformed).status, JEV_STATUS.INVALID_RESPONSE, "classified directly too");
+
+  const { provider } = stubVercelProvider({
+    answers: { gateFailureRisk: { type: "boolean", probability: 0.5 } }, // four answers missing
+  });
+  const { run, decision } = await decideWithVercel({ provider });
+  assertEqual(run.status, JEV_STATUS.INVALID_RESPONSE, "an incomplete answer set is rejected at the decision boundary");
+  assertEqual(decision, NO_JEV_DECISION, "no decision is fabricated");
+});
+
+test("109. A slow gateway call is JEV_TIMEOUT and returns promptly (no hanging provider call)", async () => {
+  const provider = createVercelJevProvider({
+    gatewayApiKey: FAKE_GATEWAY_KEY,
+    timeoutMs: 40,
+    evaluateImpl: (options) =>
+      new Promise((resolve, reject) => {
+        options.abortSignal.addEventListener("abort", () => {
+          const aborted = new Error("The operation was aborted");
+          aborted.name = "AbortError";
+          reject(aborted);
+        });
+        setTimeout(() => resolve(vercelEvaluationResult()), 5_000);
+      }),
+  });
+  const started = Date.now();
+  const result = await provider.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(result.status, JEV_STATUS.TIMEOUT, "the timeout is classified as JEV_TIMEOUT");
+  assert(Date.now() - started < 3_000, "the call returns promptly instead of waiting out the stub delay");
+});
+
+test("110. A gateway 401/403 is JEV_AUTH_ERROR (an authentication/configuration failure)", () => {
+  for (const status of [401, 403]) {
+    const error = new Error("unauthorized");
+    error.statusCode = status;
+    assertEqual(classifyVercelError(error).status, JEV_STATUS.AUTH_ERROR, `HTTP ${status} is an authentication failure`);
+  }
+  const authError = classifyVercelError({ name: "LoadAPIKeyError", message: "AI_GATEWAY_API_KEY is missing" });
+  assertEqual(authError.status, JEV_STATUS.AUTH_ERROR, "a missing credential reported by the SDK is an auth failure");
+  assert(authError.status !== JEV_STATUS.UNAVAILABLE, "never confused with availability");
+});
+
+test("111. A gateway 429 is JEV_RATE_LIMIT", () => {
+  const error = new Error("rate limit exceeded");
+  error.statusCode = 429;
+  assertEqual(classifyVercelError(error).status, JEV_STATUS.RATE_LIMIT, "HTTP 429 is a rate limit");
+  assertEqual(
+    classifyVercelError({ type: "rate_limit_exceeded", statusCode: 429 }).status,
+    JEV_STATUS.RATE_LIMIT,
+    "the gateway's own error type is honored too",
+  );
+});
+
+test("112. A gateway 503 is JEV_UNAVAILABLE and NEVER an authentication failure", () => {
+  for (const status of [500, 502, 503, 504, 529]) {
+    const error = new Error("upstream unavailable");
+    error.statusCode = status;
+    const classified = classifyVercelError(error);
+    assertEqual(classified.status, JEV_STATUS.UNAVAILABLE, `HTTP ${status} is unavailable`);
+    assert(classified.status !== JEV_STATUS.AUTH_ERROR, `HTTP ${status} must never be authentication`);
+    assert(classified.status !== JEV_STATUS.CONFIG_ERROR, `HTTP ${status} must never be a config error`);
+  }
+  const gatewayType = classifyVercelError({ type: "internal_server_error", statusCode: 503 });
+  assertEqual(gatewayType.status, JEV_STATUS.UNAVAILABLE, "the gateway's internal_server_error type is unavailable");
+});
+
+test("113. 400/404/422 are CONFIGURATION errors, other 4xx are HTTP errors, and the unexpected is INTERNAL", () => {
+  for (const status of [400, 404, 422]) {
+    const error = new Error("bad request");
+    error.statusCode = status;
+    assertEqual(classifyVercelError(error).status, JEV_STATUS.CONFIG_ERROR, `HTTP ${status} is a configuration error`);
+  }
+  const teapot = new Error("client error");
+  teapot.statusCode = 418;
+  assertEqual(classifyVercelError(teapot).status, JEV_STATUS.HTTP_ERROR, "other 4xx stay HTTP errors");
+  const modelError = new Error("model not found");
+  modelError.name = "NoSuchModelError";
+  assertEqual(classifyVercelError(modelError).status, JEV_STATUS.CONFIG_ERROR, "an unknown model is a config error");
+  assertEqual(
+    classifyVercelError(new Error("something we have never seen")).status,
+    JEV_STATUS.INTERNAL_ERROR,
+    "an unexpected failure is an internal error, not a fabricated answer",
+  );
+  const connection = new TypeError("fetch failed");
+  assertEqual(classifyVercelError(connection).status, JEV_STATUS.UNAVAILABLE, "a connection failure is unavailable");
+});
+
+test("114. The call budget applies IDENTICALLY to `vercel-jev` and is enforced BEFORE the request", async () => {
+  const config = resolveJevConfig({ EVOLVE_JEV_PROVIDER: "vercel-jev", EVOLVE_JEV_MAX_CALLS: "3" });
+  assertEqual(config.maxCallsPerRun, 3, "the shared EVOLVE_JEV_MAX_CALLS budget applies to vercel-jev");
+  const budget = createJevRunBudget(1);
+  budget.consume();
+  const { provider, calls } = stubVercelProvider();
+  const { run, decision } = await decideWithVercel({ provider, budget });
+  assertEqual(run.status, JEV_STATUS.BUDGET_EXCEEDED, "an exhausted budget produces JEV_BUDGET_EXCEEDED");
+  assertEqual(decision, NO_JEV_DECISION, "no decision is produced");
+  assertEqual(calls.length, 0, "the provider is never even called");
+});
+
+test("115. There is NO fallback to `typesafe-jev` and NO fallback to `mock-jev`", async () => {
+  const unavailable = new Error("service unavailable");
+  unavailable.statusCode = 503;
+  const { provider } = stubVercelProvider({ throwError: unavailable });
+  const { run, decision } = await decideWithVercel({ provider });
+  assertEqual(run.provider, JEV_PROVIDER.VERCEL, "the run is attributed to vercel-jev, not another provider");
+  assertEqual(run.status, JEV_STATUS.UNAVAILABLE, "the gateway failure is reported, not swallowed");
+  assertEqual(decision, NO_JEV_DECISION, "NO decision — the mock would have answered with a synthetic one");
+  assertEqual(run.syntheticDecision, false, "no synthetic mock answer is substituted");
+  assertEqual(run.answers, null, "no fabricated answers");
+  assertEqual(run.model, DEFAULT_VERCEL_JEV_MODEL, "the model is the gateway model, not a mock model id");
+});
+
+test("116. Token usage is normalized into EVOLVE's record shape", async () => {
+  const { provider } = stubVercelProvider();
+  const { run } = await decideWithVercel({ provider });
+  assertEqual(run.usage.inputTokens, 120, "input tokens are carried through");
+  assertEqual(run.usage.outputTokens, 45, "output tokens are carried through");
+  assertDeepEqual(
+    usageFromResult({ usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } }),
+    { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+    "the AI SDK usage shape maps to the wire shape the run record expects",
+  );
+  assertEqual(usageFromResult({}), null, "missing usage is null, never a fabricated zero");
+});
+
+test("117. Gateway metadata is normalized, bounded, and non-authoritative", async () => {
+  const { provider } = stubVercelProvider();
+  const { run } = await decideWithVercel({ provider });
+  const metadata = run.providerMetadata;
+  assertEqual(metadata.provider, VERCEL_JEV_PROVIDER, "provider is recorded");
+  assertEqual(metadata.upstreamProvider, DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER, "the upstream provider is recorded");
+  assertEqual(metadata.model, DEFAULT_VERCEL_JEV_MODEL, "the model is recorded");
+  assertEqual(metadata.gatewayUsed, true, "gateway usage is recorded");
+  assertEqual(metadata.providerAttemptCount, 1, "the provider attempt count is recorded");
+  assertEqual(metadata.providerStatus, JEV_STATUS.OK, "the provider success status is recorded");
+  assert(Number.isFinite(metadata.latencyMs), "latency is recorded");
+  assertEqual(metadata.tokenUsage.totalTokens, 165, "token usage is recorded in the metadata block");
+  assertEqual(metadata.gatewayCost, 0.00031, "the gateway-reported cost is recorded when available");
+  assertEqual(metadata.marketCost, 0.00042, "the market cost is recorded when available");
+  assert(typeof metadata.costNote === "string" && /observational/i.test(metadata.costNote), "cost is explicitly observational");
+  assertDeepEqual(metadata.upstreamMetadataKeys, ["gateway"], "upstream metadata key NAMES are recorded, not values");
+  assert(JSON.stringify(metadata).length < 2_000, "the metadata block is bounded in size");
+  for (const forbidden of ["apiKey", "gatewayApiKey", "authorization", "headers", "request", "env"]) {
+    assert(!JSON.stringify(metadata).includes(`"${forbidden}":`), `metadata never carries a '${forbidden}' field`);
+  }
+});
+
+test("118. Generation IDs are handled: captured when present, null when absent, truncated when enormous", async () => {
+  const { provider } = stubVercelProvider();
+  const { run } = await decideWithVercel({ provider });
+  assertEqual(run.providerMetadata.generationId, "gen-vercel-0001", "the generation id is captured");
+  assertEqual(run.requestId, "gen-vercel-0001", "and surfaced as the run's request id");
+
+  const withoutId = createVercelJevProvider({
+    gatewayApiKey: FAKE_GATEWAY_KEY,
+    evaluateImpl: async () => vercelEvaluationResult({ providerMetadata: {}, response: {} }),
+  });
+  const result = await withoutId.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(result.providerMetadata.generationId, null, "no generation id is fabricated");
+  assertEqual(result.requestId, null, "and the request id stays null");
+
+  const huge = "g".repeat(500);
+  const truncated = boundedProviderMetadata({ generationId: huge });
+  assert(truncated.generationId.length <= 200, "an enormous id is truncated to the bounded string length");
+});
+
+test("119. Cost metadata is bounded/stripped, and the metadata normalizer drops credential-shaped fields", () => {
+  const cleaned = boundedProviderMetadata({
+    authorization: "Bearer should-never-appear",
+    apiKey: "should-never-appear",
+    gatewayApiKey: "should-never-appear",
+    env: { TOKEN: "x" },
+    nested: { secret: "should-never-appear", ok: 1 },
+    ok: 2,
+    broken: undefined,
+    fn: () => 1,
+  });
+  const serialized = JSON.stringify(cleaned);
+  assert(!serialized.includes("should-never-appear"), "no credential-shaped value survives the normalizer");
+  assertEqual(cleaned.ok, 2, "ordinary scalars survive");
+  assertEqual(cleaned.nested.ok, 1, "ordinary nested scalars survive");
+  assert(!("broken" in cleaned), "undefined values are dropped");
+  assert(!("fn" in cleaned), "functions are dropped");
+  const built = buildVercelProviderMetadata({ gatewayCost: Number.NaN, marketCost: "free" });
+  assertEqual(built.gatewayCost, null, "a non-numeric cost is not recorded as a number");
+  assertEqual(built.marketCost, null, "a non-numeric market cost is dropped");
+});
+
+test("120. The downstream decision record stays PROVIDER-NEUTRAL", async () => {
+  const { provider } = stubVercelProvider();
+  const { run, decision } = await decideWithVercel({ provider });
+  const record = buildJevDecisionRecord({
+    decisionId: "JD-vercel-fixture-0001",
+    experimentId: "jexp-vercel-test-000000000000-vercel-jev-abcdef",
+    packetKind: JEV_PACKET_KIND.CANDIDATE,
+    subjectDigest: "cand-fixture-0001",
+    questionSetId: JEV_CANDIDATE_QUESTION_SET_ID,
+    questionSetVersion: JEV_CANDIDATE_QUESTION_SET_VERSION,
+    decisionPacketVersion: JEV_DECISION_PACKET_VERSION,
+    stateDigest: run.stateDigest,
+    jevRunId: run.jevRunId,
+    provider: run.provider,
+    model: run.model,
+    status: run.status,
+    answers: decision,
+    syntheticDecision: false,
+    deterministicComparators: {},
+    predictedAt: run.completedAt,
+  });
+  const serialized = JSON.stringify(record);
+  for (const vercelSpecific of ["providerMetadata", "gatewayUsed", "generationId", "marketCost", "upstreamProvider"]) {
+    assert(!serialized.includes(`"${vercelSpecific}":`), `the decision record never leaks '${vercelSpecific}'`);
+  }
+  for (const name of CANDIDATE_QUESTION_NAMES) {
+    assert(record.answers[name] !== undefined, `${name} is present in the provider-neutral decision`);
+  }
+  assertEqual(record.answers.gateFailureRisk.type, "noul", "the internal answer shape is unchanged");
+  assertEqual(record.answers.evidenceQuality.type, "score", "the internal score shape is unchanged");
+  assertEqual(record.provider, VERCEL_JEV_PROVIDER, "the provider is recorded as provenance only");
+});
+
+test("121. The existing `mock-jev` provider is UNCHANGED", async () => {
+  const provider = createMockJevProvider();
+  const packet = candidatePacketFixture();
+  const first = await provider.evaluate({ state: packet, questions: buildCandidateQuestions() });
+  const second = await provider.evaluate({ state: packet, questions: buildCandidateQuestions() });
+  assertEqual(provider.name, MOCK_JEV_PROVIDER, "the mock keeps its name");
+  assertEqual(provider.offline, true, "the mock stays offline");
+  assertEqual(first.syntheticDecision, true, "the mock still marks answers synthetic");
+  assertDeepEqual(first.answers, second.answers, "the mock is still deterministic");
+});
+
+test("122. The existing `typesafe-jev` provider is UNCHANGED", async () => {
+  assertEqual(DEFAULT_JEV_MODEL, "jev-1.13.0", "the direct route's pinned model is untouched");
+  let seenUrl = null;
+  const fetchImpl = async (url) => {
+    seenUrl = url;
+    return new Response(JSON.stringify({ model: DEFAULT_JEV_MODEL, answers: okCandidateAnswers(), usage: { input_tokens: 1, output_tokens: 1 } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const provider = createTypeSafeJevProvider({ apiKey: FAKE_DIRECT_KEY, model: DEFAULT_JEV_MODEL, fetchImpl });
+  const result = await provider.evaluate({ state: candidatePacketFixture(), questions: buildCandidateQuestions() });
+  assertEqual(seenUrl, "https://api.typesafe.ai/v1/systemone", "the direct endpoint is unchanged");
+  assertEqual(result.ok, true, "the direct provider still answers");
+  const unauthorized = createTypeSafeJevProvider({
+    apiKey: FAKE_DIRECT_KEY,
+    model: DEFAULT_JEV_MODEL,
+    fetchImpl: async () => new Response(JSON.stringify({ error: "nope" }), { status: 401, headers: { "content-type": "application/json" } }),
+  });
+  const failed = await unauthorized.evaluate({ state: {}, questions: buildCandidateQuestions() });
+  assertEqual(failed.status, JEV_STATUS.CONFIG_ERROR, "the direct provider's 401 classification is unchanged");
+  assertEqual(resolveJevConfig({ EVOLVE_JEV_PROVIDER: "typesafe-jev" }).model, DEFAULT_JEV_MODEL, "its default model is unchanged");
+});
+
+test("123. Calibration still consumes the normalized packets produced by a `vercel-jev` decision", async () => {
+  const { provider } = stubVercelProvider();
+  const { run, decision } = await decideWithVercel({ provider });
+  const decisionRecord = buildJevDecisionRecord({
+    decisionId: "JD-vercel-calibration-0001",
+    experimentId: "jexp-vercel-test-000000000000-vercel-jev-abcdef",
+    packetKind: JEV_PACKET_KIND.CANDIDATE,
+    subjectDigest: "cand-fixture-0001",
+    questionSetId: JEV_CANDIDATE_QUESTION_SET_ID,
+    questionSetVersion: JEV_CANDIDATE_QUESTION_SET_VERSION,
+    decisionPacketVersion: JEV_DECISION_PACKET_VERSION,
+    stateDigest: run.stateDigest,
+    jevRunId: run.jevRunId,
+    provider: run.provider,
+    model: run.model,
+    status: run.status,
+    answers: decision,
+    syntheticDecision: false,
+    deterministicComparators: {},
+    predictedAt: run.completedAt,
+  });
+  const outcome = buildJevOutcomeRecord({
+    decisionId: decisionRecord.decisionId,
+    arenaId: "arena-fixture",
+    gateResult: { status: "PASSED", gates: [{ label: "minTrades", pass: true, detail: "25" }], passed: 1, failed: 0, total: 1 },
+    recordedAt: "2026-09-19T00:00:01.000Z",
+  });
+  const calibration = runJevCalibration({ decisions: [decisionRecord], outcomes: [outcome] });
+  assertEqual(calibration.predictionCount, 1, "the vercel decision is joined to its outcome by id only");
+  assert(Number.isFinite(calibration.gateFailureRisk.brierScore), "Brier score computed from the normalized probability");
+  assertEqual(calibration.noThresholdPromoted, true, "no threshold is promoted");
+});
+
+test("124. The dashboard works with all three providers", async () => {
+  await withTempDir(async (dir) => {
+    for (const [provider, model] of [
+      [JEV_PROVIDER.MOCK, "mock-jev-v1"],
+      [JEV_PROVIDER.TYPESAFE, DEFAULT_JEV_MODEL],
+      [JEV_PROVIDER.VERCEL, DEFAULT_VERCEL_JEV_MODEL],
+    ]) {
+      const experimentId = jevExperimentIdFor({ provider, startedAt: 1_700_000_000_000 });
+      const root = jevExperimentRootFor(path.join(dir, "jev", "experiments"), experimentId);
+      await writeJevExperiment(
+        root,
+        createJevExperiment({
+          experimentId,
+          provider,
+          model,
+          decisionPacketVersion: JEV_DECISION_PACKET_VERSION,
+          questionSetId: JEV_CANDIDATE_QUESTION_SET_ID,
+          questionSetVersion: JEV_CANDIDATE_QUESTION_SET_VERSION,
+        }),
+      );
+    }
+    const state = await loadJevShadowState(dir);
+    assertEqual(state.available, true, "the latest experiment is discovered");
+    assertEqual(state.provider, JEV_PROVIDER.VERCEL, "the gateway provider is displayed");
+    assertEqual(state.model, DEFAULT_VERCEL_JEV_MODEL, "the gateway model is displayed");
+    assertEqual(state.mode, "shadow", "shadow mode is still the only mode");
+    const serialized = JSON.stringify(state);
+    assert(!serialized.includes(FAKE_GATEWAY_KEY), "the dashboard never receives a credential");
+    assert(!serialized.includes(`"gatewayApiKey":`), "the dashboard never has a gateway-credential field");
+  });
+});
+
+test("125. `vercel-jev` imports/calls no Arena, no research provider, no external-signal layer, and no replication code — and makes NO live call", async () => {
+  const source = await readFile("scripts/jev/providers/vercel-jev.mjs", "utf8");
+  for (const pattern of [/arena\//i, /orchestrator\.mjs/i, /research\//i, /EVOLVE_RESEARCH_PROVIDER/i, /agent-?reach/i, /probe-reach/i, /replication/i]) {
+    assert(!pattern.test(source), `vercel-jev.mjs must not reference ${pattern}`);
+  }
+  for (const pattern of [/\bchild_process\b/, /\bexecSync\b/, /\breadFile\b/, /\bwriteFile\b/, /new\s+Connection\s*\(/]) {
+    assert(!pattern.test(source), `vercel-jev.mjs must not contain ${pattern}`);
+  }
+  // The provider only ever performs network I/O through the AI SDK; with the
+  // evaluation layer stubbed, the process-wide fetch must never be reached.
+  let realFetchCalled = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    realFetchCalled = true;
+    return originalFetch(...args);
+  };
+  try {
+    const { provider } = stubVercelProvider();
+    const result = await provider.evaluate({ state: candidatePacketFixture(), questions: buildCandidateQuestions() });
+    assertEqual(result.ok, true, "the stubbed gateway call succeeds");
+    assertEqual(realFetchCalled, false, "no live network call was made by the vercel-jev test path");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("126. Exercising `vercel-jev` mutates NO replication artifact", async () => {
+  const files = [
+    path.join(".evolve", "replication", "waves", "wave-1.json"),
+    path.join(".evolve", "replication", "waves", "wave-2.json"),
+    path.join(".evolve", "replication", "rep-66884de4e460", "manifest.json"),
+    path.join(".evolve", "replication", "freezes", "wave-2.json"),
+    path.join(".evolve", "replication", "phase5c-freeze.json"),
+  ];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8").then(digestOf)));
+  const { provider } = stubVercelProvider();
+  await decideWithVercel({ provider });
+  const after = await Promise.all(files.map((file) => readFile(file, "utf8").then(digestOf)));
+  assertDeepEqual(after, before, "every replication artifact is byte-identical after a vercel-jev shadow decision");
+});
+
+test("127. The canonical evaluation contract digest is EXACTLY unchanged by adding the Vercel provider", async () => {
+  assertEqual(
+    CANONICAL_EVALUATION_CONTRACT_DIGEST,
+    "4cf8ac1fa7db290acadeccf6043ec34c3239f8e3f848e9e50d8560826de85052",
+    "the pinned constant still holds the required digest",
+  );
+  const freeze = JSON.parse(await readFile(path.join(".evolve", "replication", CANONICAL_HISTORICAL_FREEZE_PATH), "utf8"));
+  assertEqual(
+    evaluationContractDigest(freeze),
+    CANONICAL_EVALUATION_CONTRACT_DIGEST,
+    "the stored historical freeze still derives the canonical contract digest",
+  );
+  for (const waveId of ["wave-1", "wave-2"]) {
+    const manifest = JSON.parse(await readFile(path.join(".evolve", "replication", "waves", `${waveId}.json`), "utf8"));
+    assertEqual(
+      manifest.evaluationContractDigest,
+      CANONICAL_EVALUATION_CONTRACT_DIGEST,
+      `${waveId} still pins the canonical evaluation contract`,
+    );
+  }
 });
 
 /* ============================================================================

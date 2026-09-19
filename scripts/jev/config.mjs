@@ -21,20 +21,32 @@
  *                                        JEV_DISABLED / NO_JEV_DECISION.
  *   explicit `mock-jev`               -> the deterministic offline mock
  *   explicit `typesafe-jev`           -> the real TypeSafe AI HTTP provider
+ *                                        (DIRECT, `EVOLVE_JEV_API_KEY`)
+ *   explicit `vercel-jev`             -> the Vercel AI Gateway route to the
+ *                                        same model (`AI_GATEWAY_API_KEY`),
+ *                                        through the AI SDK's
+ *                                        `experimental_evaluate`
  *   any other explicit name           -> CONFIGURATION ERROR: nothing is
  *                                        resolved, no call is ever attempted
  *
  * A typo can never silently fall back to the mock, and it can never silently
  * run "disabled" behaviour that looks like a deliberate choice — both are
- * reported as an explicit configuration error.
+ * reported as an explicit configuration error. There is also NO fallback
+ * BETWEEN the two real providers: `typesafe-jev` and `vercel-jev` are distinct
+ * routes with DISTINCT credentials, and one is never silently substituted for
+ * the other. A Vercel AI Gateway key must never be sent to `api.typesafe.ai`,
+ * and a direct TypeSafe key must never be sent to the AI Gateway.
  *
  * `EVOLVE_JEV_MODE` must be `shadow` (the only supported operational mode in
  * Phase 5D). Any other explicit value is a configuration error. There is no
  * `active`/`enforce`/`trade`/`route` mode yet — routing on Jev's answers is
  * future work, not Phase 5D.
  *
- * The API key (`EVOLVE_JEV_API_KEY`) is read once, passed to the SDK client at
- * call time, and NEVER persisted, logged, or echoed back — see
+ * Credentials are provider-specific and are NEVER cross-assigned:
+ *   `EVOLVE_JEV_API_KEY`  — direct TypeSafe AI key (`typesafe-jev` only)
+ *   `AI_GATEWAY_API_KEY`  — Vercel AI Gateway key (`vercel-jev` only)
+ * Each is read once into its own field, is NEVER copied into the other's
+ * field, and is NEVER persisted, logged, or echoed back — see
  * `scripts/jev/runtime.mjs` and `scripts/lib/sanitize.mjs`.
  *
  * PAPER ONLY. No wallet, no signing, no RPC, no order execution — Jev is only
@@ -46,10 +58,41 @@ export const JEV_CONFIG_FORMAT_VERSION = 1;
 export const JEV_PROVIDER = Object.freeze({
   MOCK: "mock-jev",
   TYPESAFE: "typesafe-jev",
+  VERCEL: "vercel-jev",
 });
 
 /** Every name the registry can resolve to a real implementation. */
-export const REGISTERED_JEV_PROVIDERS = Object.freeze([JEV_PROVIDER.MOCK, JEV_PROVIDER.TYPESAFE]);
+export const REGISTERED_JEV_PROVIDERS = Object.freeze([
+  JEV_PROVIDER.MOCK,
+  JEV_PROVIDER.TYPESAFE,
+  JEV_PROVIDER.VERCEL,
+]);
+
+/**
+ * The provider names that reach a real (external, network) Jev route. These are
+ * NOT interchangeable: each has its own credential and its own transport.
+ */
+export const EXTERNAL_JEV_PROVIDERS = Object.freeze([JEV_PROVIDER.TYPESAFE, JEV_PROVIDER.VERCEL]);
+
+/** Environment variable name holding each external provider's own credential. */
+export const JEV_PROVIDER_CREDENTIAL_ENV = Object.freeze({
+  [JEV_PROVIDER.TYPESAFE]: "EVOLVE_JEV_API_KEY",
+  [JEV_PROVIDER.VERCEL]: "AI_GATEWAY_API_KEY",
+});
+
+/** Human-readable upstream identity for each provider (never a secret). */
+export const JEV_PROVIDER_UPSTREAM = Object.freeze({
+  [JEV_PROVIDER.MOCK]: "evolve-mock",
+  [JEV_PROVIDER.TYPESAFE]: "typesafe-ai",
+  [JEV_PROVIDER.VERCEL]: "typesafe-ai",
+});
+
+/** How each provider reaches upstream. Recorded as bounded, non-authoritative metadata. */
+export const JEV_PROVIDER_TRANSPORT = Object.freeze({
+  [JEV_PROVIDER.MOCK]: "offline",
+  [JEV_PROVIDER.TYPESAFE]: "typesafe-sdk",
+  [JEV_PROVIDER.VERCEL]: "vercel-ai-gateway",
+});
 
 /** Phase 5D supports exactly one operational mode. */
 export const JEV_MODE = Object.freeze({
@@ -71,6 +114,22 @@ export const DEFAULT_JEV_MODE = JEV_MODE.SHADOW;
  */
 export const DEFAULT_JEV_MODEL = "jev-1.13.0";
 
+/**
+ * The canonical model id for the Vercel AI Gateway route (`vercel-jev`).
+ *
+ * This is the GATEWAY-qualified id the AI SDK resolves through the AI Gateway:
+ * `<upstream-provider>/<model>`, i.e. `typesafe-ai/jev`. It is deliberately
+ * distinct from the direct TypeSafe SDK's pinned version id (`jev-1.13.0`):
+ * the two transports address the same upstream model through different
+ * catalogues, and each provider defaults to ITS OWN canonical id.
+ *
+ * `jev-latest` is never used for this route unless explicitly requested.
+ */
+export const DEFAULT_VERCEL_JEV_MODEL = "typesafe-ai/jev";
+
+/** The upstream provider the Vercel AI Gateway route resolves to. */
+export const DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER = "typesafe-ai";
+
 export const JEV_STATUS = Object.freeze({
   OK: "JEV_OK",
   DISABLED: "JEV_DISABLED",
@@ -80,6 +139,13 @@ export const JEV_STATUS = Object.freeze({
   INVALID_RESPONSE: "JEV_INVALID_RESPONSE",
   BUDGET_EXCEEDED: "JEV_BUDGET_EXCEEDED",
   CONFIG_ERROR: "JEV_CONFIG_ERROR",
+  // Added for the Vercel AI Gateway route (Phase 5D): a single HTTP_ERROR
+  // bucket could not distinguish an authentication problem from a rate limit
+  // from an upstream 5xx. Both real providers may use these; existing
+  // `typesafe-jev` behaviour is unchanged.
+  AUTH_ERROR: "JEV_AUTH_ERROR",
+  RATE_LIMIT: "JEV_RATE_LIMIT",
+  INTERNAL_ERROR: "JEV_INTERNAL_ERROR",
 });
 
 export const JEV_FAILURE_STATUSES = Object.freeze([
@@ -90,6 +156,9 @@ export const JEV_FAILURE_STATUSES = Object.freeze([
   JEV_STATUS.INVALID_RESPONSE,
   JEV_STATUS.BUDGET_EXCEEDED,
   JEV_STATUS.CONFIG_ERROR,
+  JEV_STATUS.AUTH_ERROR,
+  JEV_STATUS.RATE_LIMIT,
+  JEV_STATUS.INTERNAL_ERROR,
 ]);
 
 /** Recorded in place of a decision whenever Jev did not produce one. */
@@ -134,6 +203,25 @@ export const JEV_DEFAULTS = Object.freeze({
   cacheEnabled: true,
   minConfidence: null,
 });
+
+/**
+ * Resolve the model id a given provider should use.
+ *
+ * Precedence: an explicit `--model` override wins; then an explicit
+ * `EVOLVE_JEV_MODEL`; then the provider's OWN canonical default. The two real
+ * providers have different canonical defaults (`jev-1.13.0` for the direct
+ * TypeSafe SDK, `typesafe-ai/jev` for the Vercel AI Gateway), so a
+ * `vercel-jev` run never accidentally requests the direct route's pinned id
+ * and vice versa.
+ */
+export function resolveJevModelName(config = {}, { provider = config.provider, override = null } = {}) {
+  const explicit = override === null || override === undefined ? "" : String(override).trim();
+  if (explicit.length > 0) return explicit;
+  if (config.modelConfigured === true) return config.model;
+  if (provider === JEV_PROVIDER.VERCEL) return config.vercelModel ?? DEFAULT_VERCEL_JEV_MODEL;
+  if (provider === JEV_PROVIDER.TYPESAFE) return DEFAULT_JEV_MODEL;
+  return config.model ?? DEFAULT_JEV_MODEL;
+}
 
 export const JEV_TIMEOUT_BOUNDS = Object.freeze({ min: 1_000, max: 120_000 });
 export const JEV_MAX_CALLS_BOUNDS = Object.freeze({ min: 1, max: 500 });
@@ -274,10 +362,33 @@ export function resolveJevConfig(env = process.env) {
     configValid: configError === null,
     // Never `true`: a recognized Jev provider must never be silently replaced.
     allowFallback: false,
+    // Which environment variable holds the SELECTED provider's own credential,
+    // and whether that credential is present. This is what lets the probe and
+    // the CLI report "set X" without ever touching or printing the value.
+    credentialEnvVar: provider ? JEV_PROVIDER_CREDENTIAL_ENV[provider] ?? null : null,
+    credentialConfigured:
+      provider === JEV_PROVIDER.TYPESAFE
+        ? readStringEnv(env, "EVOLVE_JEV_API_KEY", "").length > 0
+        : provider === JEV_PROVIDER.VERCEL
+          ? readStringEnv(env, "AI_GATEWAY_API_KEY", "").length > 0
+          : true,
+    upstreamProvider: provider ? JEV_PROVIDER_UPSTREAM[provider] ?? null : null,
+    transport: provider ? JEV_PROVIDER_TRANSPORT[provider] ?? null : null,
     model: readStringEnv(env, "EVOLVE_JEV_MODEL", DEFAULT_JEV_MODEL),
+    modelConfigured: readStringEnv(env, "EVOLVE_JEV_MODEL", "").length > 0,
+    // The Vercel AI Gateway route's own model id / override. Kept SEPARATE from
+    // `model` so a gateway run can never accidentally reuse the direct route's
+    // pinned TypeSafe version id (or vice versa).
+    vercelModel: readStringEnv(env, "EVOLVE_VERCEL_JEV_MODEL", DEFAULT_VERCEL_JEV_MODEL),
+    vercelModelConfigured: readStringEnv(env, "EVOLVE_VERCEL_JEV_MODEL", "").length > 0,
     baseURL: readStringEnv(env, "EVOLVE_JEV_BASE_URL", JEV_DEFAULTS.baseURL),
     apiKey: readStringEnv(env, "EVOLVE_JEV_API_KEY", ""),
     apiKeyConfigured: readStringEnv(env, "EVOLVE_JEV_API_KEY", "").length > 0,
+    // The Vercel AI Gateway credential. Deliberately a DIFFERENT field from
+    // `apiKey`: it is never copied into `apiKey`, never copied out of it, and
+    // is only ever read by the `vercel-jev` provider.
+    gatewayApiKey: readStringEnv(env, "AI_GATEWAY_API_KEY", ""),
+    gatewayApiKeyConfigured: readStringEnv(env, "AI_GATEWAY_API_KEY", "").length > 0,
     timeoutMs: timeoutRaw,
     maxCallsPerRun: maxCallsRaw,
     minConfidence,
@@ -290,7 +401,20 @@ export function jevIdentity(config = {}) {
   if (config.provider === JEV_PROVIDER.TYPESAFE) {
     return {
       provider: JEV_PROVIDER.TYPESAFE,
-      model: config.model ?? DEFAULT_JEV_MODEL,
+      model: resolveJevModelName(config, { provider: JEV_PROVIDER.TYPESAFE }),
+      upstreamProvider: DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER,
+      gatewayUsed: false,
+      offline: false,
+      external: true,
+      mode: config.mode ?? DEFAULT_JEV_MODE,
+    };
+  }
+  if (config.provider === JEV_PROVIDER.VERCEL) {
+    return {
+      provider: JEV_PROVIDER.VERCEL,
+      model: resolveJevModelName(config, { provider: JEV_PROVIDER.VERCEL }),
+      upstreamProvider: DEFAULT_VERCEL_JEV_UPSTREAM_PROVIDER,
+      gatewayUsed: true,
       offline: false,
       external: true,
       mode: config.mode ?? DEFAULT_JEV_MODE,
@@ -300,6 +424,8 @@ export function jevIdentity(config = {}) {
     return {
       provider: JEV_PROVIDER.MOCK,
       model: null,
+      upstreamProvider: JEV_PROVIDER_UPSTREAM[JEV_PROVIDER.MOCK],
+      gatewayUsed: false,
       offline: true,
       external: false,
       mode: config.mode ?? DEFAULT_JEV_MODE,

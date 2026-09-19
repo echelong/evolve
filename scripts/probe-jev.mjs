@@ -4,7 +4,13 @@
  *
  *   npm run probe:jev -- --provider mock-jev
  *   npm run probe:jev -- --provider typesafe-jev
+ *   npm run probe:jev -- --provider vercel-jev
  *   npm run probe:jev -- --provider typesafe-jev --save
+ *
+ * The two real providers use DIFFERENT credentials: `typesafe-jev` reads
+ * `EVOLVE_JEV_API_KEY` (direct TypeSafe AI), `vercel-jev` reads
+ * `AI_GATEWAY_API_KEY` (Vercel AI Gateway). Neither credential is ever printed,
+ * persisted, or copied into the other's variable.
  *
  * ONE bounded call against SYNTHETIC, non-market state — never a real
  * candidate, never real market data. Verifies, cheaply and explicitly:
@@ -27,11 +33,12 @@ import path from "node:path";
 import { parseArgs } from "./lib/args.mjs";
 import { loadEnvFiles } from "./lib/env.mjs";
 import {
-  JEV_PROVIDER,
+  JEV_PROVIDER_UPSTREAM,
   REGISTERED_JEV_PROVIDERS,
   UnknownJevProviderError,
   requireJevProviderName,
   resolveJevConfig,
+  resolveJevModelName,
 } from "./jev/config.mjs";
 import { resolveJevProvider } from "./jev/provider.mjs";
 import { buildCandidateDecisionPacket, JEV_DECISION_PACKET_VERSION } from "./jev/decision-packet.mjs";
@@ -57,7 +64,7 @@ function usage() {
     "Options:",
     `  --provider <name>   ${REGISTERED_JEV_PROVIDERS.join(" | ")} (default: env, else disabled)`,
     "  --timeout-ms <n>    wall-clock bound for the probe call",
-    "  --model <id>        model override (default: the pinned Jev model)",
+    "  --model <id>        model override (default: the selected provider's canonical model)",
     "  --save              write the probe artifact under .evolve/jev/probes/ (nothing else is touched)",
     "  --json              print the machine-readable probe result",
     "",
@@ -135,16 +142,25 @@ async function main() {
 
   if (resolution.provider === null) {
     console.error("[probe:jev] Jev is disabled (EVOLVE_JEV_PROVIDER is not set / no --provider given).");
-    console.error(`[probe:jev] pass --provider mock-jev or --provider ${JEV_PROVIDER.TYPESAFE} to probe a provider.`);
+    console.error(
+      `[probe:jev] pass --provider ${REGISTERED_JEV_PROVIDERS.join(" | --provider ")} to probe a provider.`,
+    );
     process.exitCode = 2;
     return;
   }
 
-  const model = args.model ? String(args.model) : envConfig.model;
+  // The model defaults to the SELECTED provider's own canonical id: the direct
+  // route pins `jev-1.13.0`, the gateway route uses `typesafe-ai/jev`. An
+  // explicit --model always wins.
+  const model = resolveJevModelName(envConfig, {
+    provider: resolution.provider,
+    override: args.model !== undefined ? String(args.model) : null,
+  });
   const timeoutMs = args["timeout-ms"] ? Number.parseInt(String(args["timeout-ms"]), 10) : envConfig.timeoutMs;
 
   const provider = resolveJevProvider(resolution.provider, {
     apiKey: envConfig.apiKey,
+    gatewayApiKey: envConfig.gatewayApiKey,
     model,
     baseURL: envConfig.baseURL,
     timeoutMs,
@@ -171,11 +187,18 @@ async function main() {
     schemaVersion: 1,
     probe: "jev-provider",
     provider: resolution.provider,
+    upstreamProvider: JEV_PROVIDER_UPSTREAM[resolution.provider] ?? null,
+    gatewayUsed: provider.gatewayUsed === true,
     model: run.model ?? model,
+    mode: envConfig.mode,
     status: run.status,
     reason: run.reason,
     latencyMs: run.latencyMs,
     requestId: run.requestId,
+    credentialEnvVar: envConfig.credentialEnvVar,
+    credentialConfigured: envConfig.credentialConfigured,
+    providerMetadata: run.providerMetadata ?? null,
+    tokenUsage: run.usage ?? null,
     decisionPacketVersion: JEV_DECISION_PACKET_VERSION,
     questionSetId: JEV_CANDIDATE_QUESTION_SET_ID,
     questionSetVersion: JEV_CANDIDATE_QUESTION_SET_VERSION,
@@ -194,12 +217,18 @@ async function main() {
   } else {
     console.log("EVOLVE Jev provider probe (PAPER ONLY, SHADOW ONLY)");
     console.log(`  provider              ${result.provider}`);
+    console.log(`  upstream              ${result.upstreamProvider ?? "n/a"}`);
     console.log(`  model                 ${result.model}`);
+    console.log(`  mode                  ${result.mode}`);
+    console.log(`  gateway used          ${result.gatewayUsed ? "yes" : "no"}`);
     console.log(`  status                ${result.status}`);
     console.log(`  latency               ${Number.isFinite(result.latencyMs) ? `${result.latencyMs}ms` : "n/a"}`);
     console.log(`  typed answer valid    ${result.typedAnswerValid ? "yes" : "no"}`);
     console.log(`  decision packet ver.  ${result.decisionPacketVersion}`);
     console.log(`  question set          ${result.questionSetId} v${result.questionSetVersion}`);
+    if (result.credentialEnvVar) {
+      console.log(`  credential env        ${result.credentialEnvVar} (configured: ${result.credentialConfigured ? "yes" : "no"})`);
+    }
     if (result.reason) console.log(`  reason                ${result.reason}`);
     console.log("  note                  no secrets are printed; no Arena/dataset/champion state was touched");
   }

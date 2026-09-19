@@ -10,17 +10,29 @@
  *                              `NO_JEV_DECISION` for every call; zero network
  *                              calls are ever possible)
  *   `mock-jev`               -> the deterministic offline mock
- *   `typesafe-jev`           -> the real TypeSafe AI HTTP provider
+ *   `typesafe-jev`           -> the real TypeSafe AI HTTP provider (DIRECT,
+ *                              credential `EVOLVE_JEV_API_KEY`)
+ *   `vercel-jev`             -> the Vercel AI Gateway route to the same model
+ *                              (credential `AI_GATEWAY_API_KEY`, AI SDK
+ *                              `experimental_evaluate`)
  *   anything else            -> throws `UnknownJevProviderError` — FAIL CLOSED,
  *                              no provider is constructed, no call is possible
  *
- * The API key never leaves this module as a plain constructor argument by
+ * The two REAL routes are never interchangeable. There is no fallback from one
+ * to the other (and none to the mock): each provider is resolved ONLY by its
+ * own name and ONLY with its OWN credential. A missing credential yields a
+ * `JEV_CONFIG_ERROR` provider that cannot make a call — it does NOT silently
+ * switch routes.
+ *
+ * Credentials never leave this module as plain constructor arguments by
  * accident: when `EVOLVE_JEV_API_KEY` is not configured, `typesafe-jev`
  * resolves to a provider whose `evaluate()` returns `JEV_CONFIG_ERROR`
  * WITHOUT ever constructing the SDK client — this sidesteps the SDK's own
  * `TYPESAFE_API_KEY` environment fallback entirely, so an unrelated key
  * sitting in the shell environment can never silently authenticate a call
- * EVOLVE's own configuration did not authorize.
+ * EVOLVE's own configuration did not authorize. The same fail-closed rule
+ * applies to `AI_GATEWAY_API_KEY` for `vercel-jev`, which is checked BEFORE any
+ * AI SDK/gateway client is touched.
  *
  * PAPER ONLY.
  */
@@ -28,6 +40,7 @@
 import { JEV_PROVIDER, JEV_STATUS, UnknownJevProviderError, requireJevProviderName } from "./config.mjs";
 import { createMockJevProvider } from "./providers/mock-jev.mjs";
 import { createTypeSafeJevProvider } from "./providers/typesafe-jev.mjs";
+import { createVercelJevProvider } from "./providers/vercel-jev.mjs";
 
 export { UnknownJevProviderError } from "./config.mjs";
 
@@ -46,10 +59,14 @@ export function createDisabledJevProvider() {
   };
 }
 
-/** A provider that reports a configuration error on every call, without ever touching the network. */
-function createConfigErrorProvider(reason) {
+/**
+ * A provider that reports a configuration error on every call, without ever
+ * touching the network. `name` is preserved so a failure is never attributed to
+ * a DIFFERENT provider than the one that was requested.
+ */
+function createConfigErrorProvider(reason, name = null) {
   return {
-    name: JEV_PROVIDER.TYPESAFE,
+    name,
     model: null,
     offline: true,
     external: false,
@@ -67,11 +84,13 @@ function createConfigErrorProvider(reason) {
  * @param {string} name
  * @param {{
  *   provider?: object,          // test injection; still validated by NAME
- *   apiKey?: string,
+ *   apiKey?: string,            // EVOLVE_JEV_API_KEY (typesafe-jev only)
+ *   gatewayApiKey?: string,     // AI_GATEWAY_API_KEY (vercel-jev only)
  *   model?: string,
  *   baseURL?: string,
  *   timeoutMs?: number,
  *   fetchImpl?: Function|null,
+ *   evaluateImpl?: Function|null, // test-only injection for the AI SDK evaluation call
  * }} [options]
  * @returns {{ name: string|null, evaluate: Function, offline: boolean, [key: string]: unknown }}
  * @throws {UnknownJevProviderError}
@@ -98,6 +117,7 @@ export function resolveJevProvider(name = "", options = {}) {
     if (!options.apiKey || String(options.apiKey).trim().length === 0) {
       return createConfigErrorProvider(
         "EVOLVE_JEV_API_KEY is not set; typesafe-jev was requested but no key is configured",
+        JEV_PROVIDER.TYPESAFE,
       );
     }
     return createTypeSafeJevProvider({
@@ -106,6 +126,24 @@ export function resolveJevProvider(name = "", options = {}) {
       baseURL: options.baseURL,
       timeoutMs: options.timeoutMs,
       fetchImpl: options.fetchImpl ?? null,
+    });
+  }
+
+  if (resolution.provider === JEV_PROVIDER.VERCEL) {
+    // Checked BEFORE the AI SDK / gateway is touched: a missing gateway
+    // credential is a configuration error, never an attempted request (and
+    // never a silent fall-through to another provider).
+    if (!options.gatewayApiKey || String(options.gatewayApiKey).trim().length === 0) {
+      return createConfigErrorProvider(
+        "the Vercel AI Gateway credential (AI_GATEWAY_API_KEY) is not set; vercel-jev was requested but no gateway credential is configured",
+        JEV_PROVIDER.VERCEL,
+      );
+    }
+    return createVercelJevProvider({
+      gatewayApiKey: options.gatewayApiKey,
+      model: options.model,
+      timeoutMs: options.timeoutMs,
+      evaluateImpl: options.evaluateImpl ?? null,
     });
   }
 

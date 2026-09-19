@@ -18,7 +18,7 @@
  * `apiKeyConfigured` (a boolean the dashboard legitimately displays) is kept.
  */
 const SENSITIVE_KEY =
-  /^(api[_-]?key|apikey|key|secret|client[_-]?secret|private[_-]?key|secret[_-]?key|seed[_-]?ph\w+|mnem\w+|passphrase|authorization|bearer|access[_-]?token|refresh[_-]?token|secretvalues|wallet[_-]?secret)$/i;
+  /^(api[_-]?key|apikey|key|secret|client[_-]?secret|private[_-]?key|secret[_-]?key|gateway[_-]?api[_-]?key|seed[_-]?ph\w+|mnem\w+|passphrase|authorization|bearer|access[_-]?token|refresh[_-]?token|secretvalues|wallet[_-]?secret)$/i;
 
 const REDACTION = "[redacted]";
 const MAX_DEPTH = 12;
