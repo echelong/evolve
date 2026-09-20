@@ -3435,10 +3435,53 @@ automated winner — and no "Jev wins" label.
 - **Maker/queue simulation is deferred to a future Phase 5I.2**, and only after Phase 5I.1 replication and a genuinely granular feed (real depth, queue-ahead, placement/cancel timestamps, partial fills, fees, slippage). A touch must never imply a fill, and L2/L3 will never be manufactured from Jupiter quotes.
 - New evidence tree `.evolve/jev-direction/experiments/<experiment-id>/` — separate from Phase 5D experiment storage.
 
+### Canonical Phase 5I.0b development barrier
+
+The completed canonical development experiment is a source-pinned, READ-ONLY historical identity. It is
+never rewritten, and its interpretation is frozen as written words rather than an automated verdict:
+
+```text
+Canonical Phase 5I.0b development experiment:
+jdir-20260920T063311Z-3a9163
+
+120 / 120 observations were valid and scorable.
+
+Jev:
+Brier 0.2546
+log loss 0.7024
+accuracy 0.5000
+
+Neutral baseline:
+Jev delta Brier +0.0046
+Jev delta log loss +0.0093
+Jev delta accuracy -0.0167
+
+The development dataset did not show a clear Jev advantage over neutral.
+
+This is not replication and makes no profitability claim.
+```
+
+The remaining canonical relative results are preserved verbatim: vs `momentum-v1` −0.0145 / −0.0314 /
++0.0294, vs `mean-reversion-v1` −0.0001 / −0.0011 / −0.0294, vs `volume-flow-imbalance-v1`
++0.0058 / +0.0118 / +0.0083, and vs `momentum-liquidity-v1` −0.0021 / −0.0042 / +0.0294
+(Brier delta / log-loss delta / accuracy delta). Its infrastructure was clean: 120 `JEV_OK`, 0 failed,
+0 late, 0 transport retries, 0 tamper, 0 outcome-window exclusions and 7140 lookahead recomputation pairs;
+outcome offsets averaged 5977 ms (max 6005 ms), the achieved horizon averaged 36118 ms, and Jev latency
+averaged 698 ms. `npm run validate:phase5i` verifies all of it read only whenever the experiment directory
+is present locally, and skips those filesystem-specific cases cleanly when it is absent.
+
+The frozen interpretation is:
+
+> Phase 5I.0b showed no clear directional advantage for Jev over the neutral baseline. This is DEVELOPMENT
+> evidence only. No persistent edge has been established. No profitability inference is permitted.
+
+No automated winner is emitted anywhere, and **none** of the predictive protocol was modified because of
+these results.
+
 ### Validation
 
 ```bash
-npm run validate:phase5i   # 229 offline checks, zero network, sections A–AF
+npm run validate:phase5i   # 287 offline checks, zero network, sections A–AL
 ```
 
 Sections: frozen identities, question-set contract, packet whitelist, feature formulas, warmup/null
@@ -3447,9 +3490,12 @@ semantics, timestamp causality, staleness rules, prediction immutability, outcom
 probability validation, deterministic baselines, same-state fairness, Brier/log-loss/accuracy, calibration
 bins, latency stats, provider/model/gateway enforcement, no runtime confidence threshold,
 transport-attempt provenance, failed-prediction preservation, resume semantics, replay/tamper detection,
-data-granularity integrity, zero routing/trading authority, frozen historical evidence preservation and CLI
-behaviour. The suite never creates canonical 5I evidence: every fixture lives in a temp directory, and the
-real `.evolve/jev-direction` tree is asserted byte-unchanged at the end.
+data-granularity integrity, zero routing/trading authority, frozen historical evidence preservation, CLI
+behaviour, the canonical development barrier (AH), Phase 5I.1 session eligibility and drift rejection (AI),
+the replication wave end to end (AJ), the replication CLI (AK) and 5I.1 isolation/no-tuning (AL). The suite
+never creates canonical 5I evidence and never runs a real replication session: every fixture lives in a temp
+directory, and the real `.evolve/jev-direction` tree (including its replication subtree) is asserted
+byte-unchanged at the end.
 
 ### CLI
 
@@ -3464,6 +3510,151 @@ npm run jev:direction -- --stats   --experiment <id>
 `--start` is the only action that may create an experiment; every other action requires an **explicit**
 experiment id (there is no `--latest`). Runs are bounded and resumable, never a daemon. `--start` never
 auto-runs from the dashboard, and there is no silent overwrite: reusing an existing id is refused.
+
+## Phase 5I.1 — Fresh Jev Direction Replication
+
+> **Phase 5I.1 is replication, not development, and still PAPER ONLY.** It re-runs the **exact frozen Phase
+> 5I.0b protocol** against **fresh, unseen** SOL/USDC sessions. It adds no signal, changes no question
+> wording, no feature formula, no baseline coefficient, no horizon, no outcome tolerance, no staleness
+> cutoff, no calibration bin, no metric formula and no threshold, and it gives Jev **no** authority.
+
+The frozen scientific question is:
+
+> Does the exact Phase 5I.0b direct-TypeSafe Jev directional protocol reproduce its predictive behavior on
+> multiple fresh, unseen SOL/USDC market sessions?
+
+### Frozen protocol — fail closed, no "compatible enough"
+
+A session is replication evidence only when **every** semantic pin matches the frozen development experiment
+**and its digest**: market `SOL-USDC`, provider `typesafe-jev`, model `jev-1.13.0`, `gatewayUsed: false`,
+mode `shadow`, horizon 30 s, cadence 30 s, 120 observations per session, outcome-resolution **v2**
+(10000 ms), question set `jev-microstructure-direction-v1`, feature definition
+`direction-feature-definition-v1`, baseline definition `direction-baseline-definition-v1`, the exact
+Phase 5I.0b reference-price definition, metric definition **v2**, and **no confidence threshold**. Any
+mismatch makes the session ineligible — it is never reconciled.
+
+### One deterministic protocol digest
+
+`replicationProtocolDigest` is derived from the frozen source constants as they are today, and is
+**reproduced identically** by the canonical development experiment and by every replication session. No
+timestamp, session id, experiment id or file path is ever part of it.
+
+```text
+1cc0661cf207d861e9809b3374ff70ce3a6434a7b49acc17598d5928935a5fb3
+```
+
+It covers the market and mints, the reference-price definition, the horizon and target basis, the cadence,
+the session size, the provider/upstream/model/gateway/mode forecaster identity, the question set and packet,
+the feature definition, the baselines, the metrics, the outcome-resolution policy (version, digest, bound and
+selection rule), the staleness policy (version, digest and both cutoffs), the probability semantics, and the
+no-threshold rule.
+
+### Replication evidence class
+
+Real replication sessions carry the distinct class `CLEAN_JEV_DIRECTION_REPLICATION_EVIDENCE` and the flags
+`developmentOnly: false`, `replicationOnly: true`, `noProfitabilityInference`, `noTradingInference`,
+`noDeploymentInference`, `paperOnly`, `shadowOnly`. They are **never** labelled
+`DEVELOPMENT_JEV_DIRECTION_EVIDENCE`. The class is chosen when an experiment is created
+(`--start --replication-session`) and can never be changed afterwards.
+
+### Freshness and independence
+
+A replication session must start **after** the canonical development experiment completed, and its
+observation window must not overlap the development window or another session's window. Every session
+persists `sessionStartedAt`, `sessionCompletedAt`, `earliestObservationAt`, `latestObservationAt`,
+`developmentExperimentId`, `developmentLatestObservationAt` and `temporalOverlap`, and a wave requires
+`temporalOverlap = false`. Overlap is **symmetric**: a newly added session that overlaps an existing CLEAN
+session contaminates **both**, so the manifest can never keep a stale "clean" label. An overlapping session
+is recorded as `CONTAMINATED` with its reasons and excluded from aggregation — never silently discarded.
+
+### Three independent sessions, aggregated by SESSION
+
+```text
+3 independent real sessions × 120 observations each
+primary inference unit: dataset/session  (never the individual observation)
+```
+
+The three sessions are **never** concatenated into a single N=360 experiment, and the cross-session summary
+is **equal-weighted by eligible session**, so a session with a few more scorable observations is never
+weighted more heavily. For each of the five frozen comparisons (`neutral-v1`, `momentum-v1`,
+`mean-reversion-v1`, `volume-flow-imbalance-v1`, `momentum-liquidity-v1`) the summary reports
+`sessionCount`, `values`, `mean`, `median`, `min`, `max`, `positiveCount`, `negativeCount` and `zeroCount`,
+plus `jevBetterCount` / `baselineBetterCount` / `equalCount` for Brier and log loss. The sign convention is
+unchanged and printed on every report:
+
+```text
+negative Brier delta    = Jev has a LOWER Brier score than the baseline
+negative log-loss delta = Jev has a LOWER log loss than the baseline
+accuracy delta is Jev minus baseline (higher is better)
+```
+
+No winner field is ever produced, and no observation-level pseudo-replication is permitted.
+
+### Uncertainty — descriptive only
+
+With fewer than 3 CLEAN sessions the wave reports `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS` and no interval.
+With 3 or more, a **deterministic, session-level** bootstrap (fixed `mulberry32` seed, fixed resample count)
+resamples **sessions**, never observations, and reports a percentile interval described as exactly that: an
+interval. There is **no p-value, no significance label, no "statistically proven" language**, and no verdict.
+
+### Replication tree and manifest
+
+```text
+.evolve/jev-direction/replication/<replication-id>/
+  replication.json   frozen manifest: development id + digest, protocol digest, every expected pin, no-tuning rules
+  sessions.json      one record per ADDED session — CLEAN, CONTAMINATED or INELIGIBLE, with explicit reasons
+  summary.json       the frozen cross-session aggregation, its digest and the descriptive interval
+```
+
+The manifest **references** the immutable `jdir-*` experiments by id (and pins each one's metrics digest). It
+never copies, edits or re-scores their raw artifacts, and the observation-level detail stays exactly where it
+was frozen.
+
+### Operator-only, never automatic
+
+The implementation **never launches a replication session**. The operator runs each 120-observation session
+manually, reviews its integrity, and only then adds it to the manifest.
+
+```bash
+# 1. create the manifest (source-pins the canonical development barrier; runs nothing)
+npm run jev:direction -- --replication-create \
+  --development jdir-20260920T063311Z-3a9163
+
+# 2. run ONE fresh session by hand (real direct-TypeSafe Jev; 120 observations, ~1 hour)
+npm run jev:direction -- --start --replication-session \
+  --market SOL-USDC --max-observations 120
+
+# 3. review and record it (offline: reads + replays the finished session, launches nothing)
+npm run jev:direction -- --replication-add \
+  --replication <replication-id> --experiment <fresh-jdir-id>
+
+# 4. verify and read the wave (both offline, zero network)
+npm run jev:direction -- --replication-replay --replication <replication-id>
+npm run jev:direction -- --replication-stats  --replication <replication-id>
+```
+
+There is no `--latest`: every command takes an explicit id. `--replication-session` refuses `--allow-mock`,
+`--allow-unsafe-model`, a non-120 session size, a non-30 s cadence and any outcome bound other than policy
+v2 **before** a single observation is taken, so a mistyped replication run cannot burn an hour of real
+observations and then be discarded. After session 1, after session 2 and after session 3 the protocol is
+**not** modified: if infrastructure breaks, the wave is declared interrupted and incomparable rather than
+silently patched midway.
+
+### Frozen interpretation
+
+A replication session is **not** a replication result. Wave-level description comes only from the frozen
+cross-session aggregation over CLEAN sessions, and even that makes **no profitability, trading or deployment
+claim**, and establishes nothing about the future. As of this phase, **no real replication session has been
+run**, and the canonical development result above still stands: no clear directional advantage over neutral,
+no persistent edge, no profitability inference.
+
+### Preserved barriers
+
+`jdir-20260920T060810Z-3a9163` (v1 canary) and `jdir-20260920T062804Z-3a9163` (v2 canary) stay immutable
+infrastructure evidence and are **never** promoted to replication evidence, as is the canonical development
+experiment itself. Phase 5H.0 (`clfeat-20260919T173844Z-7a9193bb`, digest
+`65218b38f80a344a99f12f8a98784a49250d0ec0b88cd88ea9cd795fab39312b`) and `evaluationContractDigest`
+`4cf8ac1fa7db290acadeccf6043ec34c3239f8e3f848e9e50d8560826de85052` are unchanged.
 
 ## Validation
 
@@ -4250,8 +4441,26 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Replay/stats make zero network, provider, Jev, Agent-Reach, classifier, DeepSeek, Arena or trading calls; tamper tests fail closed on a mutated prediction/outcome, a foreign baseline state, an injected future observation or a moved `targetAt`
 - [x] Zero routing/trading authority: no wallet/signer/order/swap path exists and every routing flag is persisted false while `jevPredictionActive` is true
 - [x] New evidence tree `.evolve/jev-direction/`; Phase 5G.1, Phase 5H.0 (`clfeat-20260919T173844Z-7a9193bb`), Wave 1, Wave 2 and `evaluationContractDigest` all byte-unchanged
-- [x] `npm run validate:phase5i` — 229 offline checks, zero network, zero canonical 5I evidence created
-- [ ] **NOT RUN YET** — the first small real direct-TypeSafe canary (5 observations) and the 120-observation development benchmark are operator-only commands; neither has been executed, so **no canonical 5I development evidence exists** and no predictive claim is made
+- [x] `npm run validate:phase5i` — 287 offline checks, zero network, zero canonical 5I evidence created and no real replication session launched
+- [x] First real direct-TypeSafe canaries: `jdir-20260920T060810Z-3a9163` (v1 outcome policy) and `jdir-20260920T062804Z-3a9163` (v2) — immutable, operator-run, never promoted to replication evidence
+- [x] Canonical 120-observation development benchmark `jdir-20260920T063311Z-3a9163` (`metricsDigest` `984cc26dd9f247dbd625dc8c7bfb07d82600ed9a353fe7ef2bba423cc79f29ba`) — **DEVELOPMENT evidence only**: no clear advantage over the neutral baseline, no persistent edge, no profitability inference
+
+### Phase 5I.1 checklist
+
+- [x] Source-pinned, READ-ONLY canonical development barrier (id, metrics digest, counts, metrics, relative results, infrastructure, timing, session window, interpretation)
+- [x] One deterministic `replicationProtocolDigest` covering every predictive semantic, derived from frozen source constants with no timestamps or ids, and reproduced identically by the development experiment and by every replication session
+- [x] Distinct `CLEAN_JEV_DIRECTION_REPLICATION_EVIDENCE` class with `developmentOnly: false`, `replicationOnly: true`, paper/shadow only and no profitability/trading/deployment inference
+- [x] Fail-closed session eligibility: direct TypeSafe, pinned model, gateway false, exact frozen question/feature/baseline/reference-price/metric/policy pins, correct horizon+cadence+session size, no threshold, no tamper, lookahead clean, finalized, real observations only — with every reason persisted
+- [x] Freshness + symmetric temporal independence against the development experiment and against every other session; overlapping sessions are `CONTAMINATED`, preserved and excluded
+- [x] `mock`/fixture, gateway, model, threshold, question, feature, baseline, outcome-policy, metric, horizon and cadence drift all rejected with explicit reasons
+- [x] Session-level aggregation only: 3 independent sessions × 120 observations, never concatenated, equal-weighted by eligible session, with `sessionCount`/`values`/`mean`/`median`/`min`/`max`/positive/negative/zero and Brier/log-loss better/worse/equal counts
+- [x] Frozen sign convention (negative Brier/log-loss delta = Jev lower = better) documented and asserted
+- [x] Deterministic session-level bootstrap (fixed seed, fixed resample count) that resamples sessions, and only once 3 CLEAN sessions exist — otherwise `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS`; no p-value, no significance label, no verdict
+- [x] Operator-only commands (`--replication-create` / `--replication-add` / `--replication-replay` / `--replication-stats`) with explicit ids, no `--latest`, offline replay/stats (zero network) and **no** automatic session launch
+- [x] No tuning from development and no tuning between sessions; an interrupted wave is declared incomparable rather than patched
+- [x] Zero routing/trading authority, zero wallet/signer/order/swap path, and zero automated winner
+- [x] Phase 5H.0, Wave 1, Wave 2, `evaluationContractDigest`, the canonical development experiment and both canaries all byte-unchanged
+- [ ] **NOT RUN YET** — no real Phase 5I.1 replication session has been executed. The operator runs each 120-observation session manually, reviews it, and only then records it; nothing in the code launches one
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

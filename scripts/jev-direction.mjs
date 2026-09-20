@@ -8,6 +8,18 @@
  *   npm run jev:direction -- --replay  --experiment <id>
  *   npm run jev:direction -- --stats   --experiment <id>
  *
+ * Phase 5I.1 adds the FROZEN-PROTOCOL REPLICATION surface (also ID-only, also
+ * offline for every read):
+ *
+ *   npm run jev:direction -- --start --replication-session --market SOL-USDC --max-observations 120
+ *   npm run jev:direction -- --replication-create --development <canonical-development-id>
+ *   npm run jev:direction -- --replication-add    --replication <id> --experiment <fresh-jdir-id>
+ *   npm run jev:direction -- --replication-replay --replication <id>
+ *   npm run jev:direction -- --replication-stats  --replication <id>
+ *
+ * No replication command LAUNCHES a session: the operator runs each 120-observation
+ * session manually, reviews its integrity, and only then adds it.
+ *
  * This is a DIRECTIONAL PREDICTION BENCHMARK:
  *
  *   - it is NOT a trading strategy, produces NO orders (real or paper), and
@@ -31,7 +43,7 @@ import { createResilientJevProvider } from "./jev/provider.mjs";
 import { createJevRunBudget } from "./jev/runtime.mjs";
 import { createMarketConfig } from "./market/config.mjs";
 import {
-  DIRECTION_ACTIONS,
+  DIRECTION_ALL_ACTIONS,
   DIRECTION_BOOLEAN_FLAGS,
   DIRECTION_EVIDENCE_CLASS,
   DIRECTION_EXPERIMENTS_DIR,
@@ -44,8 +56,29 @@ import {
   REQUIRED_MODEL,
   REQUIRED_PROVIDER,
   SUPPORTED_MARKET_IDS,
+  isReplicationAction,
   resolveDirectionAction,
 } from "./jev/direction/definition.mjs";
+import {
+  DEVELOPMENT_EVIDENCE_PROFILE,
+  DIRECTION_EVIDENCE_CLASSES,
+  REPLICATION_EVIDENCE_CLASS,
+  REPLICATION_EVIDENCE_PROFILE,
+} from "./jev/direction/evidence.mjs";
+import {
+  DIRECTION_REPLICATION_ROOT_DIR,
+  REPLICATION_INFERENCE_UNIT,
+  REPLICATION_PROTOCOL_DIGEST,
+  REPLICATION_SESSION_OBSERVATIONS,
+  REQUIRED_CLEAN_REPLICATION_SESSIONS,
+} from "./jev/direction/replication/protocol.mjs";
+import { CANONICAL_DEVELOPMENT_BARRIER } from "./jev/direction/replication/development-barrier.mjs";
+import {
+  replicationAdd,
+  replicationCreate,
+  replicationReplay,
+  replicationStats,
+} from "./jev/direction/replication/runner.mjs";
 import { DIRECTION_QUESTION_SET_ID, DIRECTION_QUESTION_SET_VERSION, buildDirectionQuestions, directionQuestionDigest } from "./jev/direction/questions.mjs";
 import { DIRECTION_PACKET_VERSION } from "./jev/direction/packet.mjs";
 import {
@@ -69,13 +102,26 @@ const ALL_FLAGS = new Set([...DIRECTION_BOOLEAN_FLAGS, ...DIRECTION_VALUE_FLAGS]
 function usage() {
   return [
     `EVOLVE Phase ${DIRECTION_PHASE} — direct TypeSafe Jev short-horizon DIRECTIONAL PREDICTION BENCHMARK`,
-    "(DEVELOPMENT EVIDENCE ONLY — no orders, no PnL, no trading authority)",
+    "(DEVELOPMENT EVIDENCE ONLY by default; replication sessions are labelled CLEAN replication evidence)",
+    "(no orders, no PnL, no trading authority)",
     "",
     "  npm run jev:direction -- --start --market SOL-USDC --max-observations 120",
     "  npm run jev:direction -- --resume  --experiment <id>",
     "  npm run jev:direction -- --resolve --experiment <id>",
     "  npm run jev:direction -- --replay  --experiment <id>",
     "  npm run jev:direction -- --stats   --experiment <id>",
+    "",
+    `Phase ${DIRECTION_PHASE} has TWO evidence classes; the class is chosen when an experiment is CREATED and never changes:`,
+    `  ${DEVELOPMENT_EVIDENCE_PROFILE.evidenceClass}   development evidence (default)`,
+    `  ${REPLICATION_EVIDENCE_CLASS}   ONE fresh replication session of the frozen protocol`,
+    "",
+    "Phase 5I.1 REPLICATION (frozen protocol, fresh unseen sessions, ID-ONLY):",
+    "  npm run jev:direction -- --start --replication-session --market SOL-USDC --max-observations 120",
+    "  npm run jev:direction -- --replication-create --development jdir-20260920T063311Z-3a9163",
+    "  npm run jev:direction -- --replication-add --replication <id> --experiment <fresh-jdir-id>",
+    "  npm run jev:direction -- --replication-replay --replication <id>",
+    "  npm run jev:direction -- --replication-stats --replication <id>",
+    "  (a replication command NEVER launches a session: the operator runs each one manually and reviews it first)",
     "",
     "Options:",
     `  --market <id>              ${SUPPORTED_MARKET_IDS.join(" | ")} (Phase ${DIRECTION_PHASE} benchmarks exactly one market)`,
@@ -86,15 +132,19 @@ function usage() {
     `                             bound (5000 -> policy v1, 10000 -> policy v2, the default for new experiments)`,
     `  --max-runtime-minutes <n>  bounded runtime per invocation (default 90)`,
     `  --provider <name>          must resolve to ${REQUIRED_PROVIDER} for canonical evidence`,
-    `  --experiment <id>          explicit experiment id (REQUIRED for resume/resolve/replay/stats)`,
+    `  --experiment <id>          explicit experiment id (REQUIRED for resume/resolve/replay/stats/replication-add)`,
     `  --out <dir>                experiments directory (default ${DIRECTION_EXPERIMENTS_DIR})`,
     "  --allow-mock               explicit OFFLINE run with mock-jev (never canonical evidence)",
     "  --allow-unsafe-model       explicit non-canonical model override (recorded honestly)",
+    "  --replication-session      mark this run as ONE CLEAN Phase 5I.1 replication session",
+    "  --replication <id>         explicit replication id (REQUIRED for replication-add/replay/stats)",
+    "  --development <id>         explicit development experiment id (REQUIRED for replication-create)",
+    `  --replication-out <dir>    replication tree (default ${DIRECTION_REPLICATION_ROOT_DIR})`,
     "  --definition               print the frozen definition (market, horizon, digests, omitted feature families)",
     "  --json                     machine-readable output",
     "  --help                     this help",
     "",
-    `There is NO "latest": every action except --start needs an EXPLICIT experiment id.`,
+    `There is NO "latest": every action except --start needs an EXPLICIT experiment or replication id.`,
     `There is NO confidence threshold: every valid probability is retained (target is P(HIGHER), kept raw).`,
     "FORBIDDEN here (hard error): thresholds, trading, wallets, signing, swaps, Arena, DeepSeek, routing, PnL.",
   ].join("\n");
@@ -103,6 +153,176 @@ function usage() {
 function fail(message, code = 2) {
   console.error(`[jev:direction] ${message}`);
   process.exitCode = code;
+}
+
+/* ============================================================================
+ * Phase 5I.1 replication commands
+ *
+ * Four explicit, ID-ONLY operations. NONE of them ever launches a session: the
+ * operator runs each 120-observation session manually, reviews its integrity,
+ * and only then adds it to the manifest (§18). `--replication-replay` and
+ * `--replication-stats` are strictly offline: zero network, zero provider, no
+ * credentials.
+ * ==========================================================================*/
+
+function replicationContext(args) {
+  const baseRoot = args.out !== undefined && String(args.out).trim() !== "" ? String(args.out).trim() : null;
+  const replicationRoot =
+    args["replication-out"] !== undefined && String(args["replication-out"]).trim() !== ""
+      ? String(args["replication-out"]).trim()
+      : null;
+  const replicationId = args.replication !== undefined ? String(args.replication).trim() : null;
+  return { baseRoot, replicationRoot, replicationId };
+}
+
+function fmt(value, digits = 4) {
+  return Number.isFinite(value) ? Number(value).toFixed(digits) : "n/a";
+}
+
+function printReplicationSessionLine(session) {
+  const jev = session.metrics?.jev ?? {};
+  console.log(
+    `[jev:direction]   ${session.sessionId}  ${String(session.status).padEnd(12)} ` +
+      `Brier ${fmt(jev.brier)} · log loss ${fmt(jev.logLoss)} · accuracy ${fmt(jev.accuracy)} ` +
+      `(N=${jev.brierSampleCount ?? 0})`,
+  );
+  console.log(
+    `[jev:direction]     window ${session.timing?.earliestObservationAt ?? "n/a"} -> ${session.timing?.latestObservationAt ?? "n/a"} · ` +
+      `overlap ${session.timing?.temporalOverlap === true} · protocol ${session.protocolOk === true ? "matches" : "MISMATCH"} · ` +
+      `metrics ${String(session.metricsDigest ?? "none").slice(0, 12)}…`,
+  );
+  for (const reason of session.reasons ?? []) console.log(`[jev:direction]     reason: ${reason}`);
+}
+
+function printReplicationAggregate(summary) {
+  console.log(
+    `[jev:direction]   status            ${summary.status} · clean sessions ${summary.cleanSessionCount}/${summary.requiredCleanSessions} ` +
+      `(total ${summary.totalSessionCount})`,
+  );
+  console.log(
+    `[jev:direction]   inference unit    ${summary.primaryInferenceUnit} · equal-weighted by eligible session ` +
+      `${summary.equalWeightedByEligibleSession === true} · observation-level pseudo-replication ${summary.noObservationLevelPseudoReplication !== true}`,
+  );
+  for (const [comparisonId, block] of Object.entries(summary.comparisons ?? {})) {
+    const brier = block.brier ?? {};
+    const logLoss = block.logLoss ?? {};
+    const accuracy = block.accuracy ?? {};
+    console.log(
+      `[jev:direction]   Jev - ${comparisonId.padEnd(26)} ` +
+        `Brier mean ${fmt(brier.mean)} (n=${brier.sessionCount ?? 0}, better ${brier.jevBetterCount ?? "n/a"}/${brier.baselineBetterCount ?? "n/a"} worse) · ` +
+        `log loss mean ${fmt(logLoss.mean)} (better ${logLoss.jevBetterCount ?? "n/a"}) · ` +
+        `accuracy mean ${fmt(accuracy.mean)}`,
+    );
+  }
+  console.log(
+    `[jev:direction]   Jev absolute      Brier mean ${fmt(summary.absolute?.brier?.mean)} · log loss mean ${fmt(summary.absolute?.logLoss?.mean)} · ` +
+      `accuracy mean ${fmt(summary.absolute?.accuracy?.mean)}`,
+  );
+  const bootstrap = summary.bootstrap ?? {};
+  console.log(
+    `[jev:direction]   uncertainty       ${bootstrap.available === true ? bootstrap.method : bootstrap.status} ` +
+      `(seed ${bootstrap.seed}, resamples ${bootstrap.resamples}, p-value ${bootstrap.pValueEmitted === true ? "PRESENT" : "none"})`,
+  );
+  if (bootstrap.available === true) {
+    for (const [key, interval] of Object.entries(bootstrap.comparisons ?? {})) {
+      console.log(`[jev:direction]     ${key.padEnd(34)} mean ${fmt(interval.pointEstimate)} · interval [${fmt(interval.lower)}, ${fmt(interval.upper)}] (descriptive only)`);
+    }
+  }
+  console.log("[jev:direction]   NO winner is emitted; no significance is claimed. Negative Brier/log-loss delta = Jev lower (better).");
+}
+
+async function runReplicationAction(action, args) {
+  const { baseRoot, replicationRoot, replicationId } = replicationContext(args);
+  const json = args.json === true;
+
+  if (action === "replication-create") {
+    const developmentId =
+      args.development !== undefined && String(args.development).trim() !== "" ? String(args.development).trim() : null;
+    const result = await replicationCreate({ replicationRoot, baseRoot, developmentExperimentId: developmentId });
+    if (!result.ok) {
+      fail(result.error ?? "replication-create failed", 1);
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ ...result, summary: undefined }, null, 2));
+      return;
+    }
+    console.log(`EVOLVE Phase 5I.1 replication created — ${result.replicationId}`);
+    console.log(`[jev:direction]   artifacts         ${result.root}`);
+    console.log(`[jev:direction]   development       ${result.developmentExperimentId} (metricsDigest ${String(result.developmentMetricsDigest ?? CANONICAL_DEVELOPMENT_BARRIER.metricsDigest).slice(0, 12)}…)`);
+    console.log(`[jev:direction]   barrier digest    ${result.developmentBarrierDigest ?? "n/a"}`);
+    console.log(`[jev:direction]   protocol digest   ${result.replicationProtocolDigest}`);
+    console.log(`[jev:direction]   development tree  ${result.developmentArtifactsPresent ? "verified READ ONLY" : "absent here — the source-pinned barrier was used"}`);
+    console.log(`[jev:direction]   sessions          0 added · status ${result.status} · needs ${result.requiredCleanSessions} CLEAN sessions`);
+    console.log("[jev:direction]   NOTHING was launched: run each session manually with --start --replication-session, then --replication-add.");
+    return;
+  }
+
+  if (!replicationId) {
+    fail(`--${action} requires an explicit --replication <id>; there is NO "latest"`);
+    return;
+  }
+  if (replicationId.toLowerCase() === "latest" || replicationId.toLowerCase() === "all") {
+    fail(`--replication ${replicationId} is refused: Phase 5I.1 never guesses which replication you meant`);
+    return;
+  }
+
+  if (action === "replication-add") {
+    const sessionId = args.experiment !== undefined ? String(args.experiment).trim() : null;
+    const result = await replicationAdd({ replicationId, sessionId, replicationRoot, baseRoot });
+    if (!result.ok) {
+      fail(result.error ?? "replication-add failed", 1);
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ ...result, summary: undefined }, null, 2));
+      return;
+    }
+    console.log(`EVOLVE Phase 5I.1 replication ${replicationId} — added ${result.sessionId}`);
+    console.log(`[jev:direction]   session status    ${result.sessionStatus} (eligible ${result.sessionEligible})`);
+    console.log(`[jev:direction]   network           ${result.networkCalls} · jev calls ${result.jevCalls} · launched sessions ${result.launchedSessions}`);
+    console.log(`[jev:direction]   protocol digest   ${result.protocolDigest} (${result.protocolOk ? "matches" : "MISMATCH — ineligible"})`);
+    console.log(`[jev:direction]   clean sessions    ${result.cleanSessionCount}/${REQUIRED_CLEAN_REPLICATION_SESSIONS} · status ${result.status}`);
+    for (const reason of result.sessionReasons ?? []) console.error(`[jev:direction]   reason            ${reason}`);
+    return;
+  }
+
+  if (action === "replication-replay") {
+    const report = await replicationReplay({ replicationId, replicationRoot, baseRoot });
+    if (json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.log(`EVOLVE Phase 5I.1 offline replication replay — ${replicationId}`);
+      console.log(`[jev:direction]   integrity         ${report.ok ? "OK" : "FAIL"}`);
+      console.log(`[jev:direction]   read only         yes · network ${report.networkCalls} · jev ${report.jevCalls} · arena ${report.arenaRuns} · trading ${report.tradingCalls} · launched sessions ${report.launchedSessions}`);
+      console.log(`[jev:direction]   evidence class    ${report.evidenceClass ?? "n/a"}`);
+      console.log(`[jev:direction]   development       ${report.developmentExperimentId ?? "n/a"} (metricsDigest ${String(report.developmentMetricsDigest ?? "n/a").slice(0, 12)}…)`);
+      console.log(`[jev:direction]   protocol digest   ${report.replicationProtocolDigest ?? "n/a"}`);
+      console.log(`[jev:direction]   counts            ${JSON.stringify(report.counts ?? {})}`);
+      console.log(`[jev:direction]   manifest digest   ${report.manifestDigestMatches ? "reproduced" : "MISMATCH"} · session records ${report.sessionsDigestMatches ? "reproduced" : "MISMATCH"}`);
+      console.log(`[jev:direction]   aggregation       ${report.metricsMatch ? "reproduced" : "MISMATCH"}`);
+      for (const problem of report.problems ?? []) console.error(`[jev:direction]   problem           ${problem}`);
+    }
+    process.exitCode = report.ok ? 0 : 1;
+    return;
+  }
+
+  const stats = await replicationStats({ replicationId, replicationRoot, baseRoot });
+  if (!stats.ok) {
+    fail(stats.error ?? "replication-stats failed", 1);
+    return;
+  }
+  if (json) {
+    console.log(JSON.stringify({ ...stats, storedSummary: undefined }, null, 2));
+    return;
+  }
+  console.log(`EVOLVE Phase 5I.1 replication stats — ${replicationId} (READ ONLY, REPLICATION EVIDENCE — no profitability claim)`);
+  console.log(`[jev:direction]   evidence class    ${stats.manifest.evidenceClass}`);
+  console.log(`[jev:direction]   protocol digest   ${stats.manifest.replicationProtocolDigest}`);
+  console.log(`[jev:direction]   development       ${stats.manifest.developmentExperimentId} (metricsDigest ${String(stats.manifest.developmentMetricsDigest).slice(0, 12)}…)`);
+  console.log(`[jev:direction]   aggregation       ${stats.metricsMatch ? "reproduces the stored summary" : "DOES NOT reproduce the stored summary"}`);
+  for (const session of stats.sessions ?? []) printReplicationSessionLine(session);
+  printReplicationAggregate(stats.summary);
+  console.log("[jev:direction]   evidence class    CLEAN_JEV_DIRECTION_REPLICATION_EVIDENCE — replicationOnly, paper/shadow, no profitability/trading/deployment inference");
 }
 
 function printDefinition() {
@@ -116,8 +336,18 @@ function printDefinition() {
   console.log(`[jev:direction]   packet:           JEV_MICROSTRUCTURE_DIRECTION_PACKET v${DIRECTION_PACKET_VERSION}`);
   console.log(`[jev:direction]   features:         direction-feature-definition-v${DIRECTION_FEATURE_DEFINITION_VERSION} (${DIRECTION_FEATURE_DEFINITION_DIGEST.slice(0, 12)}…)`);
   console.log(`[jev:direction]   baselines:        direction-baseline-definition-v${BASELINE_DEFINITION_VERSION} (${BASELINE_DEFINITION_DIGEST.slice(0, 12)}…)`);
-  console.log(`[jev:direction]   evidence class:   ${DIRECTION_EVIDENCE_CLASS} (developmentOnly, no profitability/trading/deployment inference)`);
+  console.log(`[jev:direction]   evidence classes: ${DIRECTION_EVIDENCE_CLASSES.join(", ")}`);
   console.log(`[jev:direction]   research tree:    ${DIRECTION_ROOT_DIR}/experiments/<experiment-id>/`);
+  console.log(`[jev:direction]   replication tree: ${DIRECTION_REPLICATION_ROOT_DIR}/<replication-id>/ (Phase 5I.1)`);
+  console.log(`[jev:direction]   protocol digest:  ${REPLICATION_PROTOCOL_DIGEST} (frozen replication contract)`);
+  console.log(
+    `[jev:direction]   replication:      ${REQUIRED_CLEAN_REPLICATION_SESSIONS} independent sessions x ` +
+      `${REPLICATION_SESSION_OBSERVATIONS} observations; primary inference unit ${REPLICATION_INFERENCE_UNIT}`,
+  );
+  console.log(
+    `[jev:direction]   development:      ${CANONICAL_DEVELOPMENT_BARRIER.experimentId} ` +
+      `(metricsDigest ${CANONICAL_DEVELOPMENT_BARRIER.metricsDigest.slice(0, 12)}…) — DEVELOPMENT evidence only`,
+  );
   console.log("[jev:direction]   omitted families: orderBookImbalance, queueDepth, cvd, makerFlow, quoteSpread, routePriceImpact (not observable in EVOLVE's schema)");
 }
 
@@ -198,7 +428,18 @@ async function main() {
   const { action, error: actionError } = resolveDirectionAction(args);
   if (actionError) {
     fail(actionError);
-    console.error(`[jev:direction] actions: ${DIRECTION_ACTIONS.map((name) => `--${name}`).join(" | ")}`);
+    console.error(`[jev:direction] actions: ${DIRECTION_ALL_ACTIONS.map((name) => `--${name}`).join(" | ")}`);
+    return;
+  }
+
+  // ---- Phase 5I.1 replication commands are dispatched FIRST ----------------
+  // None of them needs a provider, a credential, or a market: `--replication-add`
+  // replays an already-completed session OFFLINE, and `--replication-replay` /
+  // `--replication-stats` only ever read persisted artifacts. Dispatching here
+  // means a replication command can NEVER construct a market config or a model
+  // provider, even by accident.
+  if (isReplicationAction(action)) {
+    await runReplicationAction(action, args);
     return;
   }
 
@@ -271,10 +512,14 @@ async function main() {
       console.log(JSON.stringify({ ...stats, experiment: { ...stats.experiment }, metrics: stats.metrics }, null, 2));
       return;
     }
-    console.log(`EVOLVE Phase ${DIRECTION_PHASE} prediction-quality stats — ${experimentId} (READ ONLY, DEVELOPMENT EVIDENCE)`);
+    const statsClass = stats.experiment?.evidenceClass ?? DIRECTION_EVIDENCE_CLASS;
+    const statsProfile = statsClass === REPLICATION_EVIDENCE_CLASS ? REPLICATION_EVIDENCE_PROFILE : DEVELOPMENT_EVIDENCE_PROFILE;
+    console.log(`EVOLVE Phase ${DIRECTION_PHASE} prediction-quality stats — ${experimentId} (READ ONLY, ${statsProfile.evidenceScope} EVIDENCE)`);
     console.log(`[jev:direction]   metrics digest    ${stats.metricsDigest}${stats.metricsMatch === null ? " (no summary stored yet)" : stats.metricsMatch ? " (matches stored summary)" : " (does NOT match stored summary)"}`);
     printMetricsBlock(stats.metrics);
-    console.log("[jev:direction]   evidence class    DEVELOPMENT_JEV_DIRECTION_EVIDENCE — developmentOnly, not replication, not profitability");
+    console.log(
+      `[jev:direction]   evidence class    ${statsClass} — ${statsProfile.id === "replication" ? "replicationOnly, one session of the frozen protocol, not a wave result" : "developmentOnly, not replication"}, not profitability`,
+    );
     return;
   }
 
@@ -372,6 +617,10 @@ async function main() {
       questions,
       experimentId,
       pinResult,
+      // The evidence class is chosen HERE and recorded on every artifact of the
+      // run. It changes NO predictive semantics: the frozen protocol digest is
+      // identical for both classes and is verified fail-closed either way.
+      evidenceProfile: settings.evidenceProfileId,
     });
 
     if (!result.ok) {
@@ -392,8 +641,8 @@ async function main() {
             report: result.report ?? null,
             metrics: summary.metrics,
             metricsDigest: summary.metricsDigest,
-            evidenceClass: DIRECTION_EVIDENCE_CLASS,
-            developmentOnly: true,
+            evidenceClass: result.evidenceClass ?? result.experiment?.evidenceClass ?? DIRECTION_EVIDENCE_CLASS,
+            developmentOnly: (result.experiment?.developmentOnly ?? true) === true,
             noProfitabilityInference: true,
             noTradingInference: true,
             noDeploymentInference: true,
@@ -416,7 +665,10 @@ async function main() {
     console.log(`[jev:direction]   this invocation   ${JSON.stringify(result.report ?? {})}`);
     console.log(`[jev:direction]   counters          ${JSON.stringify(result.experiment.counters ?? {})}`);
     printMetricsBlock(result.metrics);
-    console.log("[jev:direction]   NOTE              DEVELOPMENT_JEV_DIRECTION_EVIDENCE only — not replication, not a strategy, no orders were produced.");
+    console.log(
+      `[jev:direction]   NOTE              ${result.experiment.evidenceClass ?? DIRECTION_EVIDENCE_CLASS} — ` +
+        "not a strategy, no orders were produced, and no profitability/trading/deployment inference is permitted.",
+    );
     process.exitCode = 0;
   } finally {
     process.removeListener("SIGINT", onSigint);

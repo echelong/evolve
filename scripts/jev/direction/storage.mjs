@@ -27,7 +27,14 @@
  * Nothing here ever mutates Phase 5D/5F Jev evidence, the Phase 5H canonical
  * feature artifact, or any replication freeze.
  *
- * PAPER ONLY / DEVELOPMENT EVIDENCE ONLY.
+ * EVIDENCE PROFILE (Phase 5I.1): every artifact carries the evidence class and
+ * flag set of the profile its experiment was created under. The DEFAULT is the
+ * frozen development profile, so a run that does not ask for anything else
+ * produces byte-identical development artifacts exactly as before; a CLEAN
+ * replication session passes the replication profile and nothing else about the
+ * artifact changes.
+ *
+ * PAPER ONLY / DEVELOPMENT OR REPLICATION EVIDENCE ONLY.
  */
 
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
@@ -36,10 +43,9 @@ import path from "node:path";
 import { digestOf } from "../../lib/hash.mjs";
 import { sanitizeForPublic } from "../../lib/sanitize.mjs";
 import { boundedProviderAttempts } from "../transport.mjs";
+import { DEVELOPMENT_EVIDENCE_PROFILE, evidenceProfileById, evidenceProfileForClass } from "./evidence.mjs";
 import { packetDigestOf } from "./packet.mjs";
 import {
-  DIRECTION_DEVELOPMENT_FLAGS,
-  DIRECTION_EVIDENCE_CLASS,
   DIRECTION_ROUTING_FLAGS,
   EXECUTED_ACTION_IN_5I_0B,
   MODEL_INTENT_DEFINITION,
@@ -58,6 +64,27 @@ import {
 } from "./definition.mjs";
 
 export const DIRECTION_STORAGE_VERSION = 1;
+
+/**
+ * Resolve an evidence profile argument. `null`/`undefined` means the frozen
+ * development profile (the historical default, so nothing changes for a run
+ * that never mentions replication). Any unrecognised value THROWS: an artifact
+ * must never be written under a guessed evidence class.
+ */
+export function resolveEvidenceProfile(evidenceProfile) {
+  if (evidenceProfile === null || evidenceProfile === undefined) return DEVELOPMENT_EVIDENCE_PROFILE;
+  if (typeof evidenceProfile === "string") {
+    const byId = evidenceProfileById(evidenceProfile);
+    if (byId !== null) return byId;
+    throw new Error(`unknown Phase 5I evidence profile '${evidenceProfile}'`);
+  }
+  if (typeof evidenceProfile === "object" && typeof evidenceProfile.evidenceClass === "string") {
+    const resolved = evidenceProfileForClass(evidenceProfile.evidenceClass);
+    if (resolved !== null) return resolved;
+    throw new Error(`unknown Phase 5I evidence class '${evidenceProfile.evidenceClass}'`);
+  }
+  throw new Error("unresolvable Phase 5I evidence profile");
+}
 
 /** Thrown when something tries to rewrite an already-frozen artifact. */
 export class ImmutableArtifactError extends Error {
@@ -173,7 +200,10 @@ export function createDirectionExperiment({
   offlineFixture = false,
   providerImplementation = null,
   observationEndpoints = null,
+  evidenceProfile = null,
 }) {
+  // FAIL CLOSED: an unknown profile is never silently replaced by the default.
+  const profile = resolveEvidenceProfile(evidenceProfile);
   return {
     schemaVersion: DIRECTION_SCHEMA_VERSION,
     phase: DIRECTION_PHASE,
@@ -213,8 +243,9 @@ export function createDirectionExperiment({
     outcomeResolutionPolicyDigest,
     outcomeResolutionPolicyVersion,
     unavailableFeatureFamiliesDigest,
-    evidenceClass: DIRECTION_EVIDENCE_CLASS,
-    ...DIRECTION_DEVELOPMENT_FLAGS,
+    evidenceClass: profile.evidenceClass,
+    evidenceScope: profile.evidenceScope,
+    ...profile.flags,
     ...(routingFlags ?? DIRECTION_ROUTING_FLAGS),
     startedAt: new Date(startedAt).toISOString(),
     updatedAt: null,
@@ -234,8 +265,12 @@ export function createDirectionExperiment({
     },
     providerConfigNote,
     note:
-      "DEVELOPMENT-ONLY directional PREDICTION benchmark. It produces no orders, no P&L, no profitability " +
-      "claim, and gives Jev no trading authority. A positive result here is NOT replication.",
+      "DIRECTIONAL PREDICTION benchmark. It produces no orders, no P&L, no profitability claim, and gives Jev no " +
+      "trading authority. " +
+      (profile.id === "replication"
+        ? "This is ONE CLEAN Phase 5I.1 replication SESSION of the frozen 5I.0b protocol — replication, not development, " +
+          "and still not a wave-level replication result until it is aggregated with the other CLEAN sessions."
+        : "This is DEVELOPMENT evidence only; a positive result here is NOT replication."),
   };
 }
 
@@ -374,14 +409,17 @@ export function buildDirectionPredictionRecord({
   referencePrice = null,
   quoteObservedPrice = null,
   cacheHit = false,
+  evidenceProfile = null,
 }) {
+  const profile = resolveEvidenceProfile(evidenceProfile);
   const attempts = Array.isArray(providerAttempts) ? boundedProviderAttempts(providerAttempts) : null;
   const record = {
     schemaVersion: DIRECTION_SCHEMA_VERSION,
     phase: DIRECTION_PHASE,
     artifactKind: "DIRECTION_PREDICTION",
-    evidenceClass: DIRECTION_EVIDENCE_CLASS,
-    ...DIRECTION_DEVELOPMENT_FLAGS,
+    evidenceClass: profile.evidenceClass,
+    evidenceScope: profile.evidenceScope,
+    ...profile.flags,
     ...DIRECTION_ROUTING_FLAGS,
     observationId,
     experimentId,
@@ -538,13 +576,16 @@ export function buildDirectionOutcomeRecord({
   tamperDetected = false,
   resolvedAt = Date.now(),
   outcomeResolutionPolicy = DEFAULT_OUTCOME_RESOLUTION_POLICY,
+  evidenceProfile = null,
 }) {
+  const profile = resolveEvidenceProfile(evidenceProfile);
   const record = {
     schemaVersion: DIRECTION_SCHEMA_VERSION,
     phase: DIRECTION_PHASE,
     artifactKind: "DIRECTION_OUTCOME",
-    evidenceClass: DIRECTION_EVIDENCE_CLASS,
-    ...DIRECTION_DEVELOPMENT_FLAGS,
+    evidenceClass: profile.evidenceClass,
+    evidenceScope: profile.evidenceScope,
+    ...profile.flags,
     observationId,
     experimentId,
     observationIndex,

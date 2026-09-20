@@ -45,6 +45,10 @@ import {
   outcomeResolutionPolicyForOffset,
 } from "./definition.mjs";
 import { jevIdentity, requireJevProviderName, resolveJevModelName } from "../config.mjs";
+import {
+  REPLICATION_SESSION_CADENCE_SECONDS,
+  REPLICATION_SESSION_OBSERVATIONS,
+} from "./replication/protocol.mjs";
 
 export const DIRECTION_SETTINGS_VERSION = 1;
 
@@ -127,9 +131,56 @@ export function buildDirectionRunSettings(args = {}) {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Phase 5I.1 REPLICATION SESSION pre-run guard (§5, §11, FAIL CLOSED).
+  //
+  // `--replication-session` marks ONE run as a CLEAN replication session of the
+  // frozen 5I.0b protocol. Every value that the frozen protocol fixes is
+  // therefore REFUSED if it differs — before a single observation is taken, so a
+  // mistyped replication run can never burn 120 real observations and then be
+  // discarded as ineligible. This guard changes NO protocol value; it only
+  // refuses a run that would not be the frozen protocol.
+  // ---------------------------------------------------------------------------
+  const replicationSession = args["replication-session"] === true;
+  if (replicationSession) {
+    if (args["allow-mock"] === true) {
+      fail(
+        problems,
+        `--replication-session refuses --allow-mock: a replication session must be genuine, direct-TypeSafe ${REQUIRED_PROVIDER} ` +
+          "evidence on real observations, never an offline fixture",
+      );
+    }
+    if (args["allow-unsafe-model"] === true) {
+      fail(problems, `--replication-session refuses --allow-unsafe-model: the pinned model '${REQUIRED_MODEL}' is not optional`);
+    }
+    if (maxObservations !== REPLICATION_SESSION_OBSERVATIONS) {
+      fail(
+        problems,
+        `--replication-session requires exactly ${REPLICATION_SESSION_OBSERVATIONS} observations per session ` +
+          `(got --max-observations ${maxObservations}); a session of another size is not the frozen protocol`,
+      );
+    }
+    if (cadenceSeconds !== REPLICATION_SESSION_CADENCE_SECONDS) {
+      fail(
+        problems,
+        `--replication-session requires the frozen ${REPLICATION_SESSION_CADENCE_SECONDS}-second cadence ` +
+          `(got --cadence-seconds ${cadenceSeconds})`,
+      );
+    }
+    if (requestedToleranceMs !== null && outcomeResolutionPolicy.version !== CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION) {
+      fail(
+        problems,
+        `--replication-session requires frozen outcome-resolution policy v${CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION} ` +
+          `(got --tolerance-ms ${requestedToleranceMs})`,
+      );
+    }
+  }
+
   return {
     version: DIRECTION_SETTINGS_VERSION,
     phase: DIRECTION_PHASE,
+    replicationSession,
+    evidenceProfileId: replicationSession ? "replication" : "development",
     marketId,
     market: BENCHMARK_MARKET,
     horizonSeconds: HORIZON_SECONDS,

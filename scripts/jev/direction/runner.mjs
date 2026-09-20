@@ -38,8 +38,6 @@ import { jevDecide } from "../decide.mjs";
 import { computeBaselines } from "./baselines.mjs";
 import {
   BENCHMARK_MARKET,
-  DIRECTION_DEVELOPMENT_FLAGS,
-  DIRECTION_EVIDENCE_CLASS,
   DIRECTION_PHASE,
   DIRECTION_ROUTING_FLAGS,
   DIRECTION_SCHEMA_VERSION,
@@ -84,6 +82,7 @@ import {
   outcomeLabelOf,
 } from "./metrics.mjs";
 import { collectOfflineAuditInputs } from "./audit.mjs";
+import { DEVELOPMENT_EVIDENCE_PROFILE, evidenceProfileForExperiment } from "./evidence.mjs";
 import {
   DIRECTION_ALLOWED_EVIDENCE_CLASS,
   DIRECTION_PACKET_KIND,
@@ -116,6 +115,7 @@ import {
   readDirectionOutcome,
   readDirectionPrediction,
   readDirectionProgress,
+  resolveEvidenceProfile,
   withOutcomeDigest,
   withPredictionDigest,
   writeDirectionExperiment,
@@ -129,6 +129,31 @@ export const DIRECTION_RUNNER_VERSION = 1;
 
 /** How many pre-t0 universe snapshots the regime feature is computed over. */
 export const REGIME_SNAPSHOT_LIMIT = 12;
+
+/**
+ * Resolve an experiment's evidence profile. THROWS on an unrecognised evidence
+ * class: an artifact whose class this phase does not know must never be treated
+ * as either development or replication evidence.
+ */
+export function requireEvidenceProfile(experiment) {
+  const profile = evidenceProfileForExperiment(experiment);
+  if (profile === null) {
+    throw new Error(
+      `unknown Phase 5I evidence class ${JSON.stringify(experiment?.evidenceClass ?? null)}; ` +
+        "the runner refuses to continue rather than guess which evidence it is looking at",
+    );
+  }
+  return profile;
+}
+
+/**
+ * Lenient variant for artifact builders used by tests with partial fixtures: an
+ * absent class falls back to the frozen development profile, an UNKNOWN class
+ * still fails closed through `resolveEvidenceProfile`.
+ */
+export function evidenceProfileOrDevelopment(experiment) {
+  return evidenceProfileForExperiment(experiment) ?? DEVELOPMENT_EVIDENCE_PROFILE;
+}
 
 /* ============================================================================
  * Waiting (bounded, interruptible, injectable for deterministic fixtures)
@@ -192,8 +217,11 @@ export async function freezeDirectionObservation({
   now = () => Date.now(),
   history = [],
   regimeSnapshots = [],
+  evidenceProfile = null,
 }) {
+  const profile = resolveEvidenceProfile(evidenceProfile ?? evidenceProfileOrDevelopment(experiment));
   const baseRecordInput = {
+    evidenceProfile: profile,
     observationId,
     experimentId: experiment.experimentId,
     observationIndex,
@@ -491,7 +519,9 @@ export async function resolveDirectionObservation({
   root,
   now = () => Date.now(),
   waitFor,
+  evidenceProfile = null,
 }) {
+  const profile = resolveEvidenceProfile(evidenceProfile ?? evidenceProfileOrDevelopment(experiment));
   const targetAtMs = Date.parse(prediction.targetAt);
   if (!Number.isFinite(targetAtMs)) return { outcome: null, skipped: true, reason: "target_at_unparseable" };
 
@@ -514,6 +544,7 @@ export async function resolveDirectionObservation({
 
   const resolutionStartedAtMs = now();
   const common = {
+    evidenceProfile: profile,
     observationId: prediction.observationId,
     experimentId: experiment.experimentId,
     observationIndex: prediction.observationIndex,
@@ -620,8 +651,9 @@ function outcomePolicyOf(experiment) {
   return outcomeResolutionPolicyFor(version) ?? DEFAULT_OUTCOME_RESOLUTION_POLICY;
 }
 
-function pinsFromSettings({ settings, experimentId, pinResult, now }) {
+function pinsFromSettings({ settings, experimentId, pinResult, now, evidenceProfile = null }) {
   return {
+    evidenceProfile,
     experimentId,
     market: settings.market,
     provider: pinResult.resolution.provider,
@@ -709,8 +741,16 @@ function samePinValue(a, b) {
   return false;
 }
 
-/** Every pinned field must match, or a resume/replay is refused. */
-export function verifyDirectionPins(experiment, expected) {
+/**
+ * Every pinned field must match, or a resume/replay is refused.
+ *
+ * The evidence class + flag set is verified against the experiment's OWN
+ * profile, so a replication session is checked against the replication flags
+ * (`developmentOnly: false`, `replicationOnly: true`) and a development
+ * experiment against the development flags — and an UNKNOWN class is a problem,
+ * never a pass.
+ */
+export function verifyDirectionPins(experiment, expected, { profile = null } = {}) {
   const problems = [];
   for (const key of PIN_COMPARISONS) {
     if (!samePinValue(experiment?.[key], expected?.[key])) {
@@ -722,8 +762,19 @@ export function verifyDirectionPins(experiment, expected) {
   }
   if (experiment?.gatewayUsed !== false) problems.push("experiment does not pin gatewayUsed=false");
   if (experiment?.mode !== "shadow") problems.push("experiment does not pin mode=shadow");
-  if (experiment?.evidenceClass !== DIRECTION_EVIDENCE_CLASS) {
-    problems.push("experiment does not declare the Phase 5I development evidence class");
+  const resolvedProfile = profile ?? evidenceProfileForExperiment(experiment);
+  if (resolvedProfile === null) {
+    problems.push(
+      `experiment declares an unknown evidence class ${JSON.stringify(experiment?.evidenceClass ?? null)}; ` +
+        "only the frozen Phase 5I development and replication classes are accepted",
+    );
+  } else {
+    if (experiment?.evidenceClass !== resolvedProfile.evidenceClass) {
+      problems.push(`experiment does not declare the ${resolvedProfile.id} evidence class`);
+    }
+    for (const [flag, value] of Object.entries(resolvedProfile.flags)) {
+      if (experiment?.[flag] !== value) problems.push(`experiment evidence flag '${flag}' is not ${value}`);
+    }
   }
   for (const flag of [
     "jevTradingRoutingActive",
@@ -739,8 +790,9 @@ export function verifyDirectionPins(experiment, expected) {
   return { ok: problems.length === 0, problems };
 }
 
-/** Build the finalized summary (metrics + identity pins + development flags). */
-export async function finalizeDirectionSummary({ root, experiment, predictions, outcomes, status }) {
+/** Build the finalized summary (metrics + identity pins + evidence-profile flags). */
+export async function finalizeDirectionSummary({ root, experiment, predictions, outcomes, status, evidenceProfile = null }) {
+  const profile = resolveEvidenceProfile(evidenceProfile ?? requireEvidenceProfile(experiment));
   // The SAME optional audit inputs the replay and `--stats` recompute, so the
   // written `metricsDigest` reproduces exactly on a later read.
   const { featureStability, lookaheadAudit } = collectOfflineAuditInputs(predictions);
@@ -766,8 +818,9 @@ export async function finalizeDirectionSummary({ root, experiment, predictions, 
     schemaVersion: DIRECTION_SCHEMA_VERSION,
     phase: DIRECTION_PHASE,
     summaryKind: "DIRECTION_SUMMARY",
-    evidenceClass: DIRECTION_EVIDENCE_CLASS,
-    ...DIRECTION_DEVELOPMENT_FLAGS,
+    evidenceClass: profile.evidenceClass,
+    evidenceScope: profile.evidenceScope,
+    ...profile.flags,
     ...DIRECTION_ROUTING_FLAGS,
     experimentId: experiment.experimentId,
     status,
@@ -812,11 +865,19 @@ export async function finalizeDirectionSummary({ root, experiment, predictions, 
     noAutomatedWinner: true,
     noConfidenceThreshold: true,
     everyValidProbabilityRetained: true,
-    evidenceScope: "DEVELOPMENT",
-    replicationStatus: "NOT_REPLICATED",
+    replicationStatus: profile.replicationStatus,
+    evidenceProfile: profile.id,
+    evidenceInterpretation: profile.interpretation,
+    protocolUnchangedByResults: profile.protocolUnchangedByResults === true,
     note:
-      "DEVELOPMENT-ONLY directional prediction evidence. Not a trading strategy, not a profitability claim, not a " +
-      "deployment decision. A later Phase 5I.1 must use fresh unseen data before anything is described as replicated.",
+      (profile.id === "replication"
+        ? "REPLICATION SESSION of the frozen Phase 5I.0b predictive protocol on fresh unseen data. "
+        : "DEVELOPMENT-ONLY directional prediction evidence. ") +
+      "Not a trading strategy, not a profitability claim, not a deployment decision. " +
+      (profile.id === "replication"
+        ? "One session is not a replication result: the frozen cross-session aggregation over CLEAN sessions is the " +
+          "only thing that can describe a wave, and it makes no significance claim either."
+        : "A later Phase 5I.1 must use fresh unseen data before anything is described as replicated."),
   };
   await writeDirectionSummary(root, summary);
   return summary;
@@ -855,11 +916,19 @@ export async function runDirectionBenchmark({
   questions,
   experimentId = null,
   pinResult,
+  evidenceProfile = null,
 }) {
   const waitFor = createWaitFor({ now, sleep, control });
   const emit = (event) => {
     if (typeof onProgress === "function") onProgress(event);
   };
+
+  // ---- EVIDENCE PROFILE ----------------------------------------------------
+  // `--replication-session` asks for the CLEAN replication class; everything
+  // else keeps the frozen development class. On resume/resolve the profile comes
+  // from the STORED experiment and an explicit conflicting request is refused —
+  // an experiment's evidence class is decided once, when it is created.
+  const requestedProfile = evidenceProfile === null ? null : resolveEvidenceProfile(evidenceProfile);
 
   let root = null;
   let experiment = null;
@@ -871,8 +940,9 @@ export async function runDirectionBenchmark({
     if (existing) {
       return { ok: false, error: `experiment ${id} already exists; use --resume (explicit ids are never reused)`, experimentId: id, root };
     }
-    const pins = pinsFromSettings({ settings, experimentId: id, pinResult, now });
-    experiment = createDirectionExperiment({ ...pins, experimentId: id });
+    const profile = requestedProfile ?? DEVELOPMENT_EVIDENCE_PROFILE;
+    const pins = pinsFromSettings({ settings, experimentId: id, pinResult, now, evidenceProfile: profile });
+    experiment = createDirectionExperiment({ ...pins, experimentId: id, evidenceProfile: profile });
     await writeDirectionExperiment(root, experiment);
     await writeDirectionProgress(root, {
       schemaVersion: DIRECTION_SCHEMA_VERSION,
@@ -889,13 +959,37 @@ export async function runDirectionBenchmark({
     root = directionExperimentRootFor(baseRoot, experimentId);
     experiment = await readDirectionExperiment(root);
     if (!experiment) return { ok: false, error: `no Phase 5I experiment at ${root}`, experimentId, root };
-    const pins = pinsFromSettings({ settings, experimentId, pinResult, now });
-    const verified = verifyDirectionPins(experiment, pins);
+    const storedProfile = evidenceProfileForExperiment(experiment);
+    if (storedProfile === null) {
+      return {
+        ok: false,
+        error:
+          `experiment ${experimentId} declares an unknown evidence class ` +
+          `${JSON.stringify(experiment.evidenceClass ?? null)}; refusing to continue`,
+        experimentId,
+        root,
+      };
+    }
+    if (requestedProfile !== null && requestedProfile.id !== storedProfile.id) {
+      return {
+        ok: false,
+        error:
+          `experiment ${experimentId} is ${storedProfile.evidenceClass} evidence; this invocation asked for ` +
+          `${requestedProfile.evidenceClass} — an experiment's evidence class is decided when it is created, never changed later`,
+        experimentId,
+        root,
+      };
+    }
+    const pins = pinsFromSettings({ settings, experimentId, pinResult, now, evidenceProfile: storedProfile });
+    const verified = verifyDirectionPins(experiment, pins, { profile: storedProfile });
     if (!verified.ok) {
       return { ok: false, error: `experiment pins do not match this invocation: ${verified.problems.join("; ")}`, experimentId, root };
     }
     emit({ type: action.toUpperCase(), experimentId, root });
   }
+
+  // The profile every artifact of THIS invocation is written under.
+  const profile = requestedProfile ?? evidenceProfileForExperiment(experiment) ?? DEVELOPMENT_EVIDENCE_PROFILE;
 
   const budgetGuard =
     budget ?? { exhausted: () => false, consume: () => true, max: null, used: 0, remaining: null };
@@ -984,7 +1078,7 @@ export async function runDirectionBenchmark({
         emit({ type: "OUTCOME_REFUSED", observationId: prediction.observationId, reason: OUTCOME_UNAVAILABLE_REASON });
         continue;
       }
-      const result = await resolveDirectionObservation({ experiment, prediction, settings, source, root, now, waitFor });
+      const result = await resolveDirectionObservation({ experiment, prediction, settings, source, root, now, waitFor, evidenceProfile: profile });
       if (result.skipped) {
         interrupted = true;
         break;
@@ -1007,6 +1101,7 @@ export async function runDirectionBenchmark({
       predictions: refreshed.predictions,
       outcomes: refreshed.outcomes,
       status: experiment.status,
+      evidenceProfile: profile,
     });
     return {
       ok: true,
@@ -1059,7 +1154,7 @@ export async function runDirectionBenchmark({
     const pending = await readDirectionPrediction(root, observationId);
     if (pending) {
       if (pending.scorable === true && (await readDirectionOutcome(root, observationId)) === null) {
-        const result = await resolveDirectionObservation({ experiment, prediction: pending, settings, source, root, now, waitFor });
+        const result = await resolveDirectionObservation({ experiment, prediction: pending, settings, source, root, now, waitFor, evidenceProfile: profile });
         if (result.skipped) {
           interrupted = true;
           finalStatus = "INTERRUPTED";
@@ -1092,6 +1187,7 @@ export async function runDirectionBenchmark({
       now,
       history: progress.history ?? [],
       regimeSnapshots: progress.regimeSnapshots ?? [],
+      evidenceProfile: profile,
     });
 
     const prediction = frozen.prediction;
@@ -1143,6 +1239,7 @@ export async function runDirectionBenchmark({
       root,
       now,
       waitFor,
+      evidenceProfile: profile,
     });
     if (resolvedResult.skipped) {
       interrupted = true;
@@ -1171,11 +1268,14 @@ export async function runDirectionBenchmark({
     predictions: bundle.predictions,
     outcomes: bundle.outcomes,
     status: finalStatus,
+    evidenceProfile: profile,
   });
 
   return {
     ok: true,
     action,
+    evidenceProfile: profile.id,
+    evidenceClass: profile.evidenceClass,
     experimentId: experiment.experimentId,
     root,
     experiment,
@@ -1210,6 +1310,36 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
       ok: false,
       problems: [`no Phase 5I experiment at ${root}`],
       readOnly: true,
+      networkCalls: 0,
+      providerCalls: 0,
+      jevCalls: 0,
+      agentReachCalls: 0,
+      classifierCalls: 0,
+      deepseekCalls: 0,
+      arenaRuns: 0,
+      tradingCalls: 0,
+    };
+  }
+
+  // ---- FAIL CLOSED on an unrecognised evidence class ----------------------
+  // A stored artifact whose class this phase does not recognise is neither
+  // development nor replication evidence, and is never verified as either.
+  const profile = evidenceProfileForExperiment(experiment);
+  if (profile === null) {
+    return {
+      schemaVersion: DIRECTION_SCHEMA_VERSION,
+      phase: DIRECTION_PHASE,
+      replayVersion: DIRECTION_RUNNER_VERSION,
+      experimentId,
+      root,
+      ok: false,
+      problems: [
+        `experiment declares an unknown evidence class ${JSON.stringify(experiment.evidenceClass ?? null)}; ` +
+          "only the frozen Phase 5I development and replication classes are accepted",
+      ],
+      readOnly: true,
+      evidenceClass: experiment.evidenceClass ?? null,
+      evidenceProfile: null,
       networkCalls: 0,
       providerCalls: 0,
       jevCalls: 0,
@@ -1381,8 +1511,13 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
     if (prediction.gatewayUsed !== false) {
       problems.push(`prediction ${prediction.observationId}: gatewayUsed is not false`);
     }
-    if (prediction.evidenceClass !== DIRECTION_EVIDENCE_CLASS || prediction.developmentOnly !== true) {
-      problems.push(`prediction ${prediction.observationId}: development evidence class/flags are wrong`);
+    for (const [flag, value] of Object.entries(profile.flags)) {
+      if (prediction[flag] !== value) {
+        problems.push(`prediction ${prediction.observationId}: evidence flag '${flag}' is not ${value}`);
+      }
+    }
+    if (prediction.evidenceClass !== profile.evidenceClass) {
+      problems.push(`prediction ${prediction.observationId}: evidence class is wrong`);
     }
     for (const key of ["minConfidence", "minconfidence", "confidenceThreshold", "threshold"]) {
       if (Object.hasOwn(prediction, key) || (prediction.baselines && Object.hasOwn(prediction.baselines, key))) {
@@ -1554,14 +1689,8 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
     }
   }
   if (experiment.gatewayUsed !== false) problems.push("gatewayUsed is true: canonical 5I evidence must use the direct route");
-  if (experiment.evidenceClass !== DIRECTION_EVIDENCE_CLASS) problems.push("experiment evidence class is not the 5I development class");
-  for (const flag of [
-    "developmentOnly",
-    "noProfitabilityInference",
-    "noTradingInference",
-    "noDeploymentInference",
-  ]) {
-    if (experiment[flag] !== true) problems.push(`experiment development flag '${flag}' is not true`);
+  for (const [flag, value] of Object.entries(profile.flags)) {
+    if (experiment[flag] !== value) problems.push(`experiment evidence flag '${flag}' is not ${value}`);
   }
   if (experiment.noGroundTruthBeyondObservedFutureOutcome !== true) {
     problems.push("experiment does not declare noGroundTruthBeyondObservedFutureOutcome");
@@ -1596,8 +1725,18 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
   if (bundle.summary) {
     const profitability = auditNoProfitabilityFields(bundle.summary);
     if (!profitability.ok) problems.push(`summary contains profitability-shaped fields: ${profitability.problems.join("; ")}`);
-    if (bundle.summary.evidenceScope !== "DEVELOPMENT") problems.push("summary evidenceScope is not DEVELOPMENT");
-    if (bundle.summary.replicationStatus !== "NOT_REPLICATED") problems.push("summary claims a replication status it cannot have");
+    if (bundle.summary.evidenceScope !== profile.evidenceScope) {
+      problems.push(`summary evidenceScope is not ${profile.evidenceScope}`);
+    }
+    if (bundle.summary.replicationStatus !== profile.replicationStatus) {
+      problems.push("summary claims a replication status it cannot have");
+    }
+    for (const [flag, value] of Object.entries(profile.flags)) {
+      if (bundle.summary[flag] !== value) problems.push(`summary evidence flag '${flag}' is not ${value}`);
+    }
+    if (bundle.summary.evidenceClass !== profile.evidenceClass) {
+      problems.push("summary does not declare the experiment's evidence class");
+    }
     if (bundle.summary.noConfidenceThreshold !== true) problems.push("summary does not declare the absence of a confidence threshold");
     if (bundle.summary.winner !== null || bundle.summary.noAutomatedWinner !== true) {
       problems.push("summary emits a winner label");
@@ -1638,6 +1777,9 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
     networkCalls: 0,
     providerCalls: 0,
     evidenceClass: experiment.evidenceClass,
+    evidenceProfile: profile.id,
+    evidenceScope: profile.evidenceScope,
+    replicationStatus: profile.replicationStatus,
     provider: experiment.provider,
     model: experiment.model,
     gatewayUsed: experiment.gatewayUsed === true,

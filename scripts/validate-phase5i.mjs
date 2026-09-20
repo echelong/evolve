@@ -60,7 +60,9 @@ import {
   DEFAULT_CADENCE_SECONDS,
   DEFAULT_MAX_OBSERVATIONS,
   DIRECTION_ACTIONS,
+  DIRECTION_ALL_ACTIONS,
   DIRECTION_DEVELOPMENT_FLAGS,
+  DIRECTION_REPLICATION_ACTIONS,
   DIRECTION_EVIDENCE_CLASS,
   DIRECTION_EXPERIMENTS_DIR,
   DIRECTION_FORBIDDEN_FLAGS,
@@ -119,6 +121,7 @@ import {
   outcomeResolutionPolicyDigestFor,
   outcomeResolutionPolicyFor,
   outcomeResolutionPolicyForOffset,
+  isReplicationAction,
   resolveDirectionAction,
   resolveOutcomeOffset,
 } from "./jev/direction/definition.mjs";
@@ -208,6 +211,7 @@ import {
   latencyStats,
   logLoss,
   meanOf,
+  medianOf,
   metricDefinitionDigestForVersion,
   metricDefinitionForVersion,
   metricsDigestOf,
@@ -262,11 +266,105 @@ import {
   buildDirectionRunSettings,
   enforceDirectionProviderPins,
 } from "./jev/direction/settings.mjs";
+import { resolveEvidenceProfile } from "./jev/direction/storage.mjs";
 import {
   DIRECTION_FIXTURE_PROVIDER_VERSION,
   createDirectionFixtureProvider,
   fixtureProbabilityFor,
 } from "./jev/direction/fixture-provider.mjs";
+
+/* ----------------------------------------------------------------------------
+ * Phase 5I.1 — evidence profiles, replication protocol, manifest, eligibility,
+ * aggregation and the frozen development barrier.
+ * -------------------------------------------------------------------------*/
+import {
+  DEVELOPMENT_EVIDENCE_PROFILE,
+  DIRECTION_EVIDENCE_CLASSES,
+  DIRECTION_EVIDENCE_PROFILES,
+  DIRECTION_REPLICATION_FLAGS,
+  evidenceProfileForClass,
+  REPLICATION_EVIDENCE_CLASS,
+  REPLICATION_EVIDENCE_PROFILE,
+  evidenceProfileById,
+  evidenceProfileForExperiment,
+} from "./jev/direction/evidence.mjs";
+import {
+  CANONICAL_DEVELOPMENT_BARRIER,
+  CANONICAL_DEVELOPMENT_BARRIER_DIGEST,
+  DEVELOPMENT_BARRIER_COMPLETED_AT_MS,
+  DEVELOPMENT_BARRIER_LATEST_OBSERVATION_AT_MS,
+  DEVELOPMENT_BARRIER_METRIC_TOLERANCE,
+  DEVELOPMENT_BARRIER_TIMING_TOLERANCE_MS,
+  verifyCanonicalDevelopmentBarrier,
+} from "./jev/direction/replication/development-barrier.mjs";
+import {
+  DIRECTION_REPLICATION_ROOT_DIR,
+  REPLICATION_ABSOLUTE_METRICS,
+  REPLICATION_COMPARISON_IDS,
+  REPLICATION_DELTA_METRICS,
+  REPLICATION_DELTA_SIGN_CONVENTION,
+  REPLICATION_INFERENCE_UNIT,
+  REPLICATION_MANIFEST_FILE,
+  REPLICATION_PROTOCOL_CONTRACT,
+  REPLICATION_PROTOCOL_DIGEST,
+  REPLICATION_PROTOCOL_VERSION,
+  REPLICATION_SESSION_CADENCE_SECONDS,
+  REPLICATION_SESSION_OBSERVATIONS,
+  REPLICATION_SESSIONS_FILE,
+  REPLICATION_SOURCE_GUARD,
+  REPLICATION_SUMMARY_FILE,
+  REQUIRED_CLEAN_REPLICATION_SESSIONS,
+  protocolContractDifferences,
+  protocolDigestOfExperiment,
+  verifyReplicationProtocol,
+  verifyReplicationSourceGuard,
+} from "./jev/direction/replication/protocol.mjs";
+
+import {
+  REPLICATION_MANIFEST_VERSION,
+  aggregateDigestOf,
+  createReplicationManifest,
+  createSessionsDocument,
+  isValidReplicationId, // used by the storage-identity assertions
+  manifestDigestOf,
+  readReplicationBundle,
+  readReplicationManifest,
+  readReplicationSessions,
+  replicationIdFor,
+  replicationMetadataSnapshot,
+  replicationRootFor,
+  sessionsDigestOf,
+} from "./jev/direction/replication/manifest.mjs";
+import {
+  PROTECTED_NON_REPLICATION_EXPERIMENT_IDS,
+  SESSION_STATUS,
+  evaluateReplicationSession,
+  protectedExperimentReason,
+  sessionObservationWindow,
+  windowsOverlap,
+} from "./jev/direction/replication/eligibility.mjs";
+import {
+  REPLICATION_BOOTSTRAP_ALPHA,
+  REPLICATION_BOOTSTRAP_PRNG,
+  REPLICATION_BOOTSTRAP_RESAMPLES,
+  REPLICATION_BOOTSTRAP_SEED,
+  REPLICATION_COMPLETE_STATE,
+  REPLICATION_INSUFFICIENT_STATE,
+  aggregateComparison,
+  aggregateReplicationSessions,
+  bootstrapSessionMean,
+  mulberry32,
+  stableSessionStats,
+} from "./jev/direction/replication/aggregate.mjs";
+import {
+  REPLICATION_RUNNER_VERSION,
+  deriveReplicationSessionRecord,
+  replicationAdd,
+  replicationCreate,
+  replicationReplay,
+  replicationStats,
+  sessionRecordDigestOf,
+} from "./jev/direction/replication/runner.mjs";
 import {
   DIRECTION_OBSERVATION_VERSION,
   POLITE_WAIT_MAX_STEPS,
@@ -285,6 +383,7 @@ import { CANONICAL_EVALUATION_CONTRACT_DIGEST, CANONICAL_HISTORICAL_FREEZE_PATH 
 const REPO = process.cwd();
 const REAL_DIRECTION_ROOT = path.join(REPO, DIRECTION_ROOT_DIR);
 const REAL_EXPECTED_DIR = path.join(REPO, DIRECTION_EXPERIMENTS_DIR);
+const REAL_REPLICATION_ROOT = path.join(REPO, DIRECTION_REPLICATION_ROOT_DIR);
 
 /* ============================================================================
  * Pinned canonical barriers (§42). READ-ONLY: nothing here is ever rewritten.
@@ -298,6 +397,12 @@ const CANONICAL_5H_SOURCE_COHORT_ID = "clcohort-20260919T163609Z-4d7c6dd9";
 const CANONICAL_5H_SOURCE_COHORT_DIGEST = "2a8b9ca38f6f1f9dad7a46426c9a42cece2ca9fa3722815c430d42098b9e1a04";
 const CANONICAL_5H_EVIDENCE_AS_OF = "2026-09-19T16:34:12.867Z";
 const CANONICAL_5H_EVIDENCE_CLASS = "DEVELOPMENT_CLASSIFIER_DERIVED_FEATURES";
+
+/** Phase 5I.1 — the canonical development barrier id/digest, pinned in source. */
+const CANONICAL_DEVELOPMENT_EXPERIMENT_ID = "jdir-20260920T063311Z-3a9163";
+const CANONICAL_DEVELOPMENT_METRICS_DIGEST = "984cc26dd9f247dbd625dc8c7bfb07d82600ed9a353fe7ef2bba423cc79f29ba";
+const CANARY_V1_EXPERIMENT_ID = "jdir-20260920T060810Z-3a9163";
+const CANARY_V2_EXPERIMENT_ID = "jdir-20260920T062804Z-3a9163";
 const CANONICAL_5H_SOURCE_EVIDENCE_CLASS = "DEVELOPMENT_CLASSIFIER_EVIDENCE";
 const CANONICAL_EVALUATION_CONTRACT = "4cf8ac1fa7db290acadeccf6043ec34c3239f8e3f848e9e50d8560826de85052";
 
@@ -315,6 +420,13 @@ const PHASE_5I_MODULES = Object.freeze([
   "scripts/jev/direction/settings.mjs",
   "scripts/jev/direction/fixture-provider.mjs",
   "scripts/jev/direction/runner.mjs",
+  "scripts/jev/direction/evidence.mjs",
+  "scripts/jev/direction/replication/development-barrier.mjs",
+  "scripts/jev/direction/replication/protocol.mjs",
+  "scripts/jev/direction/replication/manifest.mjs",
+  "scripts/jev/direction/replication/eligibility.mjs",
+  "scripts/jev/direction/replication/aggregate.mjs",
+  "scripts/jev/direction/replication/runner.mjs",
   "scripts/jev-direction.mjs",
 ]);
 
@@ -585,6 +697,8 @@ async function runFixtureExperiment({
   provider,
   stopAfterFirstPrediction = false,
   extraSettings = {},
+  pinResult = FIXTURE_PIN_RESULT,
+  evidenceProfile = null,
 }) {
   const settings = buildDirectionRunSettings({
     ...FIXTURE_SETTINGS_OVERRIDES,
@@ -609,9 +723,149 @@ async function runFixtureExperiment({
     budget: createJevRunBudget(maxObservations),
     questions: buildDirectionQuestions(),
     experimentId,
-    pinResult: FIXTURE_PIN_RESULT,
+    pinResult,
+    evidenceProfile,
   });
   return { result, settings, events, control };
+}
+
+/* ============================================================================
+ * Phase 5I.1 replication fixtures
+ *
+ * These exist ONLY to exercise the replication machinery END TO END inside a
+ * temp directory. They are served by the deterministic 5I fixture provider
+ * wearing the canonical identity, so that the aggregation, eligibility,
+ * independence and bootstrap LOGIC can be tested without a network, a
+ * credential, a model call, or a single artifact under the real `.evolve` tree.
+ *
+ * Nothing here can produce real evidence: every path is asserted to live under
+ * the OS temp directory, and the real replication tree is proved byte-unchanged.
+ * ==========================================================================*/
+
+/** The canonical identity, so a fixture session is otherwise indistinguishable. */
+const REPLICATION_FIXTURE_PIN_RESULT = Object.freeze({
+  resolution: Object.freeze({ provider: REQUIRED_PROVIDER }),
+  model: REQUIRED_MODEL,
+  identity: Object.freeze({ upstreamProvider: REQUIRED_UPSTREAM_PROVIDER, gatewayUsed: false, transport: "offline-fixture" }),
+  questionDigest: directionQuestionDigest(),
+  offlineFixture: false,
+  providerImplementation: REQUIRED_PROVIDER,
+  observationEndpoints: RECOMMENDED_ENDPOINT_ORDER,
+});
+
+/**
+ * The deterministic offline provider wearing the canonical identity. It answers
+ * the same frozen question set, computes the same probability from the same
+ * packet digest, and makes no network call — it simply reports the identity the
+ * protocol contract requires, so a CLEAN fixture session is constructible in a
+ * temp directory.
+ */
+function createReplicationFixtureProvider(options = {}) {
+  const base = createDirectionFixtureProvider(options);
+  return {
+    ...base,
+    name: REQUIRED_PROVIDER,
+    model: REQUIRED_MODEL,
+    implementation: REQUIRED_PROVIDER,
+    async evaluate(args) {
+      const result = await base.evaluate(args);
+      return result?.ok === true ? { ...result, model: REQUIRED_MODEL } : result;
+    },
+  };
+}
+
+/**
+ * A deterministic pseudo-random walk with regular EXACT duplicates, so the
+ * fixture produces HIGHER, LOWER and TIE outcomes across a whole 120-observation
+ * session instead of clamping to one repeated price.
+ */
+function buildFixturePriceSchedule({ length = 260, seed = 1, start = 100 } = {}) {
+  const random = mulberry32(seed);
+  const out = [];
+  let price = start;
+  for (let index = 0; index < length; index += 1) {
+    if (index > 0 && index % 13 === 0) {
+      out.push(price);
+      continue;
+    }
+    price = Number((price * (1 + (random() - 0.5) * 0.006)).toFixed(6));
+    out.push(price);
+  }
+  return out;
+}
+
+const REPLICATION_FIXTURE_PLAN = Object.freeze([
+  { experimentId: "jdir-fixture-rep-1", t0: "2026-09-21T00:00:00.000Z", seed: 11 },
+  { experimentId: "jdir-fixture-rep-2", t0: "2026-09-21T03:00:00.000Z", seed: 22 },
+  { experimentId: "jdir-fixture-rep-3", t0: "2026-09-21T06:00:00.000Z", seed: 33 },
+  // An OVERLAPPING PAIR, deliberately far away from the three clean windows: the
+  // first is clean when added, the second contaminates BOTH of them, which is the
+  // symmetric independence rule.
+  { experimentId: "jdir-fixture-rep-contaminated", t0: "2026-09-22T00:00:00.000Z", seed: 44 },
+  { experimentId: "jdir-fixture-rep-contaminated-2", t0: "2026-09-22T00:20:00.000Z", seed: 45 },
+  // Served by the DEVELOPMENT fixture (mock) provider and labelled development
+  // evidence: this session must be INELIGIBLE, never silently dropped.
+  { experimentId: "jdir-fixture-rep-ineligible", t0: "2026-09-21T09:00:00.000Z", seed: 55, development: true },
+]);
+
+async function buildReplicationFixtures() {
+  const rep = {
+    experimentsRoot: path.join(ctx.tempRoot, "replication-experiments"),
+    replicationRoot: path.join(ctx.tempRoot, "replication"),
+    developmentExperimentId: CANONICAL_DEVELOPMENT_BARRIER.experimentId,
+    developmentArtifactsPresent: false,
+    sessions: [],
+    created: null,
+    added: [],
+    snapshots: {},
+  };
+  // The pins every session is checked against. They are derived from the FROZEN
+  // protocol contract, exactly the way `--replication-create` derives them.
+  rep.expected = {
+    ...createReplicationManifest({
+      replicationId: "jrep-expected-pins",
+      development: {
+        experimentId: CANONICAL_DEVELOPMENT_BARRIER.experimentId,
+        metricsDigest: CANONICAL_DEVELOPMENT_BARRIER.metricsDigest,
+        evidenceClass: CANONICAL_DEVELOPMENT_BARRIER.evidenceClass,
+        phase: CANONICAL_DEVELOPMENT_BARRIER.phase,
+        requiredCleanSessions: REQUIRED_CLEAN_REPLICATION_SESSIONS,
+      },
+      protocol: REPLICATION_PROTOCOL_CONTRACT,
+    }).expected,
+    protocolDigest: REPLICATION_PROTOCOL_DIGEST,
+  };
+  ctx.replication = rep;
+
+  // The canonical development experiment is COPIED (read only) into the temp
+  // experiments root when it is present locally, so the barrier verification runs
+  // against real artifacts without ever touching the real tree. Absent (CI), the
+  // barrier is still source-pinned and the replication cases still run.
+  const realDevelopmentRoot = path.join(REAL_EXPECTED_DIR, CANONICAL_DEVELOPMENT_BARRIER.experimentId);
+  rep.developmentArtifactsPresent = await exists(realDevelopmentRoot);
+  if (rep.developmentArtifactsPresent) {
+    await cp(realDevelopmentRoot, path.join(rep.experimentsRoot, CANONICAL_DEVELOPMENT_BARRIER.experimentId), {
+      recursive: true,
+    });
+  }
+
+  for (const plan of REPLICATION_FIXTURE_PLAN) {
+    const t0 = Date.parse(plan.t0);
+    const prices = buildFixturePriceSchedule({ seed: plan.seed, start: 100 + plan.seed });
+    const harness = createFixtureHarness({ t0, prices });
+    const development = plan.development === true;
+    const run = await runFixtureExperiment({
+      root: rep.experimentsRoot,
+      experimentId: plan.experimentId,
+      harness,
+      maxObservations: REPLICATION_SESSION_OBSERVATIONS,
+      provider: development ? defaultFixtureProvider() : createReplicationFixtureProvider(),
+      extraSettings: development ? {} : { "replication-session": true },
+      pinResult: development ? FIXTURE_PIN_RESULT : REPLICATION_FIXTURE_PIN_RESULT,
+      evidenceProfile: development ? null : "replication",
+    });
+    rep.sessions.push({ ...plan, t0, run });
+  }
 }
 
 /* ============================================================================
@@ -626,6 +880,8 @@ const ctx = {
   failing: null,
   lowConfidence: null,
   interrupted: null,
+  // Phase 5I.1 replication fixtures (temp tree only).
+  replication: null,
   before: {},
   after: {},
   directionRootPresentBefore: false,
@@ -706,6 +962,9 @@ async function buildFixtures() {
     stopAfterFirstPrediction: true,
   });
   ctx.interruptHarness = interruptHarness;
+
+  // ---- 6. Phase 5I.1 replication fixtures (temp tree only) -----------------
+  await buildReplicationFixtures();
 
   await loadFixtureContext();
 }
@@ -3984,6 +4243,1098 @@ test("AF16. no CLI invocation in this suite reached the network", () => {
 });
 
 /* ============================================================================
+ * PART AH — the canonical Phase 5I.0b DEVELOPMENT BARRIER (§1–§3)
+ *
+ * The completed canonical development experiment is source-pinned and verified
+ * READ ONLY. Nothing here ever rewrites it, and the development interpretation is
+ * frozen as written words — never an automated winner.
+ * ==========================================================================*/
+
+test("AH1. the canonical development barrier identity is pinned exactly", () => {
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.experimentId, CANONICAL_DEVELOPMENT_EXPERIMENT_ID, "the canonical development experiment id");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.metricsDigest, CANONICAL_DEVELOPMENT_METRICS_DIGEST, "the canonical metrics digest");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.metricsDigest.length, 64, "the digest is a SHA-256 hex string");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the development evidence class");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.phase, "5I.0b", "the development phase");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.observations, 120, "120 observations");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.valid, 120, "120 valid");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.scored, 120, "120 scored");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.higher, 62, "62 HIGHER");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.lower, 58, "58 LOWER");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.tie, 0, "0 TIE");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.outcomeWindowExclusions, 0, "0 outcome-window exclusions");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER.infrastructure.lookaheadRecomputationPairs, 7140, "7140 lookahead recomputation pairs");
+  for (const [key, expected] of [
+    ["jevOk", 120],
+    ["failed", 0],
+    ["late", 0],
+    ["retries", 0],
+    ["tamper", 0],
+    ["outcomeWindowExclusions", 0],
+    ["fallbackObservations", 0],
+  ]) {
+    assertEqual(CANONICAL_DEVELOPMENT_BARRIER.infrastructure[key], expected, `infrastructure.${key}`);
+  }
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER_DIGEST.length, 64, "the barrier has its own deterministic digest");
+  assertEqual(CANONICAL_DEVELOPMENT_BARRIER_DIGEST, digestOf(CANONICAL_DEVELOPMENT_BARRIER), "and it recomputes from the pinned object");
+  assertTrue(DEVELOPMENT_BARRIER_COMPLETED_AT_MS > DEVELOPMENT_BARRIER_LATEST_OBSERVATION_AT_MS, "the development session completed after its last observation");
+});
+
+test("AH2. the canonical metrics, relative results and timing diagnostics are pinned to the published values", () => {
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.metrics.brier, 0.2546, "Jev Brier 0.2546", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.metrics.logLoss, 0.7024, "Jev log loss 0.7024", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.metrics.accuracy, 0.5, "Jev accuracy 0.5000", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.metrics.meanPHigher, 0.4589, "mean pHigher 0.4589", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.metrics.medianPHigher, 0.465, "median pHigher 0.4650", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertDeepEqual(
+    Object.keys(CANONICAL_DEVELOPMENT_BARRIER.relative).sort(),
+    [...REPLICATION_COMPARISON_IDS].sort(),
+    "the five canonical comparisons are the five frozen baselines",
+  );
+  const neutral = CANONICAL_DEVELOPMENT_BARRIER.relative["neutral-v1"];
+  assertClose(neutral.brierDelta, 0.0046, "neutral Brier delta +0.0046", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(neutral.logLossDelta, 0.0093, "neutral log-loss delta +0.0093", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(neutral.accuracyDelta, -0.0167, "neutral accuracy delta -0.0167", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  const momentum = CANONICAL_DEVELOPMENT_BARRIER.relative["momentum-v1"];
+  assertClose(momentum.brierDelta, -0.0145, "momentum Brier delta -0.0145", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(momentum.logLossDelta, -0.0314, "momentum log-loss delta -0.0314", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(momentum.accuracyDelta, 0.0294, "momentum accuracy delta +0.0294", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.relative["mean-reversion-v1"].brierDelta, -0.0001, "mean-reversion Brier delta -0.0001", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.relative["volume-flow-imbalance-v1"].brierDelta, 0.0058, "volume-flow Brier delta +0.0058", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertClose(CANONICAL_DEVELOPMENT_BARRIER.relative["momentum-liquidity-v1"].brierDelta, -0.0021, "momentum-liquidity Brier delta -0.0021", DEVELOPMENT_BARRIER_METRIC_TOLERANCE);
+  assertDeepEqual(
+    CANONICAL_DEVELOPMENT_BARRIER.outcomeTiming,
+    { meanMs: 5977, medianMs: 6002, p95Ms: 6003, maxMs: 6005 },
+    "the outcome offset diagnostics",
+  );
+  assertDeepEqual(
+    CANONICAL_DEVELOPMENT_BARRIER.achievedHorizon,
+    { meanMs: 36118, medianMs: 36114, p95Ms: 36167, maxMs: 36204 },
+    "the achieved horizon diagnostics",
+  );
+  assertDeepEqual(
+    CANONICAL_DEVELOPMENT_BARRIER.jevLatency,
+    { meanMs: 698, medianMs: 695, p95Ms: 762, maxMs: 834 },
+    "the Jev latency diagnostics",
+  );
+  assertEqual(DEVELOPMENT_BARRIER_TIMING_TOLERANCE_MS, 1, "timing tolerances are whole-millisecond");
+});
+
+test("AH3. the development interpretation is FROZEN and emits no automated winner", () => {
+  const interpretation = CANONICAL_DEVELOPMENT_BARRIER.interpretation;
+  assertEqual(
+    interpretation.verdict,
+    "Phase 5I.0b showed no clear directional advantage for Jev over the neutral baseline.",
+    "the frozen verdict",
+  );
+  assertEqual(interpretation.scope, "This is DEVELOPMENT evidence only.", "the frozen scope");
+  assertEqual(interpretation.edge, "No persistent edge has been established.", "the frozen edge statement");
+  assertEqual(interpretation.inference, "No profitability inference is permitted.", "the frozen inference rule");
+  assertEqual(interpretation.automatedWinner, null, "there is no automated winner");
+  assertEqual(interpretation.noAutomatedWinner, true, "and that is declared");
+  assertEqual(interpretation.protocolUnchangedByResults, true, "the protocol was not modified because of the results");
+  assertEqual(interpretation.winnerFieldAbsent, true, "no winner field exists anywhere in the barrier");
+  assertExcludes(JSON.stringify(CANONICAL_DEVELOPMENT_BARRIER).toLowerCase(), "\"winner\": \"", "the barrier emits no winner label");
+});
+
+test("AH4. the replication protocol contract is deterministic and free of timestamps and ids", () => {
+  assertEqual(REPLICATION_PROTOCOL_VERSION, 1, "the protocol contract version");
+  assertEqual(REPLICATION_PROTOCOL_DIGEST.length, 64, "the protocol digest is a SHA-256 hex string");
+  assertEqual(digestOf(REPLICATION_PROTOCOL_CONTRACT), REPLICATION_PROTOCOL_DIGEST, "the digest recomputes from the frozen contract");
+  assertEqual(protocolDigestOfExperiment(null), null, "an absent experiment expresses no contract");
+  const serialized = JSON.stringify(REPLICATION_PROTOCOL_CONTRACT).toLowerCase();
+  for (const forbidden of ["timestamp", "createdat", "sessionid", "experimentid", "startedat", "finalizedat", "jdir-", "jrep-", ".evolve"]) {
+    assertExcludes(serialized, forbidden, `the protocol contract contains no ${forbidden}`);
+  }
+  for (const key of ["market", "referencePrice", "horizon", "timing", "cadence", "observationsPerSession", "forecaster", "questions", "features", "baselines", "metrics", "outcomeResolution", "staleness", "probabilitySemantics", "noThresholdRule"]) {
+    assertTrue(Object.hasOwn(REPLICATION_PROTOCOL_CONTRACT, key), `the contract covers ${key}`);
+  }
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.observationsPerSession, 120, "120 observations per session");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.cadence.samplingCadenceMs, 30_000, "30-second cadence");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.horizon.horizonSeconds, 30, "30-second horizon");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.forecaster.provider, REQUIRED_PROVIDER, "the direct provider is in the contract");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.forecaster.model, REQUIRED_MODEL, "the pinned model is in the contract");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.forecaster.gatewayUsed, false, "gateway false is in the contract");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.forecaster.mode, "shadow", "shadow mode is in the contract");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.outcomeResolution.policyVersion, 2, "outcome-resolution policy v2");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.outcomeResolution.maximumOffsetMs, 10_000, "the 10000 ms bound");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.metrics.definitionVersion, 2, "metric definition v2");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.noThresholdRule.thresholdApplied, false, "no threshold rule");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.noThresholdRule.thresholdBound, null, "no threshold bound exists");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.noThresholdRule.everyValidProbabilityRetained, true, "every valid probability is retained");
+  assertEqual(REPLICATION_PROTOCOL_CONTRACT.probabilitySemantics.retainedRaw, true, "every valid probability is retained raw");
+  assertEqual(REPLICATION_SESSION_OBSERVATIONS, 120, "the frozen session size");
+  assertEqual(REPLICATION_SESSION_CADENCE_SECONDS, 30, "the frozen session cadence");
+  assertEqual(REQUIRED_CLEAN_REPLICATION_SESSIONS, 3, "three independent CLEAN sessions");
+  assertEqual(REPLICATION_INFERENCE_UNIT, "dataset/session", "the primary inference unit is the session");
+});
+
+test("AH5. the source guard pins every value a tune would have to change (§15)", () => {
+  const guard = verifyReplicationSourceGuard();
+  assertEqual(guard.ok, true, `the live frozen constants match the source guard: ${guard.problems.join("; ")}`);
+  assertEqual(REPLICATION_SOURCE_GUARD.thresholdBound, null, "the source guard pins NO threshold bound");
+  assertEqual(REPLICATION_SOURCE_GUARD.horizonSeconds, 30, "horizon 30 s");
+  assertEqual(REPLICATION_SOURCE_GUARD.resolutionToleranceMs, 10_000, "outcome tolerance 10000 ms");
+  assertEqual(REPLICATION_SOURCE_GUARD.calibrationBinCount, CALIBRATION_BIN_COUNT, "calibration bins are pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.provider, REQUIRED_PROVIDER, "provider is pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.model, REQUIRED_MODEL, "model is pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.maxReceiptStateAgeMs, MAX_RECEIPT_STATE_AGE_MS, "staleness cutoffs are pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.maxSourceStateAgeMs, MAX_SOURCE_STATE_AGE_MS, "both staleness cutoffs are pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.baselineDefinitionVersion, BASELINE_DEFINITION_VERSION, "baseline definition pinned");
+  assertEqual(REPLICATION_SOURCE_GUARD.metricDefinitionVersion, DIRECTION_METRICS_VERSION, "metric definition pinned");
+});
+
+test("AH6. the canonical local development experiment, when present, verifies against the pinned barrier", async () => {
+  const rep = ctx.replication;
+  const root = directionExperimentRootFor(rep.experimentsRoot, CANONICAL_DEVELOPMENT_EXPERIMENT_ID);
+  if (!(await exists(root))) {
+    skip("the canonical development experiment is absent in this checkout — its read-only barrier check was skipped cleanly");
+    return;
+  }
+  const before = await metadataSnapshot(root);
+  const bundle = await readDirectionExperimentBundle(root);
+  const replay = await replayDirectionExperiment({ experimentId: CANONICAL_DEVELOPMENT_EXPERIMENT_ID, baseRoot: rep.experimentsRoot });
+  const barrier = verifyCanonicalDevelopmentBarrier({ experiment: bundle.experiment, summary: bundle.summary, replay });
+  const after = await metadataSnapshot(root);
+  assertEqual(barrier.present, true, "the barrier reports the experiment present");
+  assertEqual(barrier.ok, true, `the canonical development barrier verifies: ${barrier.problems.join("; ")}`);
+  assertEqual(Object.values(barrier.checks).every(Boolean), true, "every individual barrier check passed");
+  assertEqual(bundle.summary.metricsDigest, CANONICAL_DEVELOPMENT_METRICS_DIGEST, "the stored metrics digest is the canonical one");
+  assertEqual(replay.counts.predictions, 120, "120 predictions");
+  assertEqual(replay.counts.outcomes, 120, "120 outcomes");
+  assertEqual(replay.counts.scoredCount, 120, "120 scored");
+  assertEqual(replay.lookaheadAudit.recomputationPairs, 7140, "7140 lookahead recomputation pairs");
+  assertEqual(replay.networkCalls + replay.jevCalls, 0, "the barrier verification made no network or Jev call");
+  assertDeepEqual(protocolContractDifferences(bundle.experiment), [], "the development experiment expresses the frozen replication contract exactly");
+  assertEqual(protocolDigestOfExperiment(bundle.experiment), REPLICATION_PROTOCOL_DIGEST, "and reproduces the frozen protocol digest");
+  assertDeepEqual(after, before, "the canonical development experiment is byte-unchanged by the barrier verification");
+});
+
+test("AH7. the barrier reports absence cleanly instead of failing, and never invents evidence", () => {
+  const absent = verifyCanonicalDevelopmentBarrier({ experiment: null, summary: null, replay: null });
+  assertEqual(absent.present, false, "an absent experiment is reported as absent");
+  assertEqual(absent.ok, true, "and skipping it is not a failure");
+  assertDeepEqual(absent.problems, [], "with zero problems");
+  const partial = verifyCanonicalDevelopmentBarrier({
+    experiment: { experimentId: "something-else", evidenceClass: DIRECTION_EVIDENCE_CLASS },
+    summary: null,
+    replay: null,
+  });
+  assertEqual(partial.present, true, "a present-but-wrong experiment IS reported");
+  assertEqual(partial.ok, false, "and it FAILS rather than being skipped");
+  assertTrue(partial.problems.length > 0, "with explicit problems");
+});
+
+/* ============================================================================
+ * PART AI — replication session eligibility (§5, §7, §11, §15)
+ * ==========================================================================*/
+
+/** Derive one fixture session's record exactly the way `--replication-add` does. */
+async function deriveFixtureSession(experimentId, otherSessions = []) {
+  const rep = ctx.replication;
+  return deriveReplicationSessionRecord({ sessionId: experimentId, baseRoot: rep.experimentsRoot, expected: rep.expected, otherSessions });
+}
+
+/** A representative CLEAN fixture session bundle, for pure eligibility cases. */
+async function fixtureSessionBundle(experimentId) {
+  const rep = ctx.replication;
+  const root = directionExperimentRootFor(rep.experimentsRoot, experimentId);
+  const bundle = await readDirectionExperimentBundle(root);
+  const replay = await replayDirectionExperiment({ experimentId, baseRoot: rep.experimentsRoot });
+  return { bundle, replay, protocol: verifyReplicationProtocol(bundle.experiment) };
+}
+
+function evaluateMutated({ bundle, replay, protocol, sessionId, mutate, otherSessions = [] }) {
+  const experiment = { ...bundle.experiment, ...(mutate ?? {}) };
+  return evaluateReplicationSession({
+    sessionId,
+    experiment,
+    summary: { ...bundle.summary, ...(mutate?.summary ?? {}) },
+    predictions: bundle.predictions,
+    outcomes: bundle.outcomes,
+    replay,
+    // The protocol is re-derived from the MUTATED experiment, exactly the way
+    // `--replication-add` re-derives it from the stored one.
+    protocol: mutate?.protocol ?? verifyReplicationProtocol(experiment) ?? protocol,
+    expected: ctx.replication.expected,
+    otherSessions,
+  });
+}
+
+test("AI1. a fresh, direct, frozen-protocol session is CLEAN and starts after the development barrier", async () => {
+  const derived = await deriveFixtureSession("jdir-fixture-rep-1");
+  assertEqual(derived.ok, true, "the fixture session derives");
+  assertEqual(derived.record.status, SESSION_STATUS.CLEAN, `session 1 is CLEAN: ${JSON.stringify(derived.record.reasons)}`);
+  assertDeepEqual(derived.record.reasons, [], "with zero reasons");
+  assertEqual(Object.values(derived.record.checks).every(Boolean), true, "and every individual eligibility check passed");
+  assertEqual(derived.record.timing.startsAfterDevelopment, true, "the session started after the development experiment completed");
+  assertEqual(derived.record.timing.afterLatestDevelopmentObservation, true, "and observed strictly after the development session's last observation");
+  assertEqual(derived.record.timing.developmentWindowsDisjoint, true, "with observation windows that do not overlap");
+  assertEqual(derived.record.timing.temporalOverlap, false, "so temporalOverlap is false");
+  assertEqual(derived.record.timing.developmentExperimentId, CANONICAL_DEVELOPMENT_EXPERIMENT_ID, "the session records the development experiment id");
+  assertEqual(derived.record.timing.developmentLatestObservationAt, CANONICAL_DEVELOPMENT_BARRIER.session.latestObservationAt, "and its latest observation");
+  assertEqual(derived.record.metricsDigest, derived.replay.recomputedMetricsDigest, "the session records the metrics digest of its own artifacts");
+  assertEqual(derived.record.counts.predictions, REPLICATION_SESSION_OBSERVATIONS, "exactly 120 scheduled observations");
+  assertEqual(derived.record.counts.outcomes, REPLICATION_SESSION_OBSERVATIONS, "exactly 120 outcomes");
+  assertEqual(derived.record.protocolOk, true, "the session reproduces the frozen protocol digest");
+  assertEqual(derived.record.protocolDigest, REPLICATION_PROTOCOL_DIGEST, "and records that digest");
+});
+
+test("AI2. the session window and overlap rule are explicit and symmetric", () => {
+  assertEqual(windowsOverlap([0, 10], [10, 20]), true, "a shared endpoint IS an overlap");
+  assertEqual(windowsOverlap([0, 9], [10, 20]), false, "a gap is not an overlap");
+  assertEqual(windowsOverlap(null, [10, 20]), false, "a missing window cannot overlap");
+  const window = sessionObservationWindow({ experiment: { startedAt: "2026-01-01T00:00:00.000Z" }, predictions: [], outcomes: [] });
+  assertEqual(window.windowMs, null, "an empty session has no observation window");
+  assertEqual(window.startedAtMs, Date.parse("2026-01-01T00:00:00.000Z"), "but its start instant is still resolved");
+});
+
+test("AI3. a session that overlaps the development experiment is CONTAMINATED, not clean", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const eligibility = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-overlapping-development",
+    mutate: { startedAt: "2026-09-20T07:00:00.000Z" },
+  });
+  assertEqual(eligibility.status, SESSION_STATUS.CONTAMINATED, "overlapping the development window contaminates the session");
+  assertEqual(eligibility.eligible, false, "and it is not eligible");
+  assertEqual(eligibility.timing.temporalOverlap, true, "temporalOverlap is true");
+  assertTrue(eligibility.contaminationReasons.length > 0, "the contamination reasons are explicit");
+  assertTrue(eligibility.reasons.some((reason) => /before the canonical development experiment completed/.test(reason)), "including the start-time rule");
+});
+
+test("AI4. a session that overlaps ANOTHER session is CONTAMINATED and preserved with reasons", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const otherWindow = sessionObservationWindow({ experiment: bundle.experiment, predictions: bundle.predictions, outcomes: bundle.outcomes });
+  const eligibility = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-second-of-overlapping-pair",
+    otherSessions: [{ sessionId: "jdir-fixture-rep-1", windowMs: otherWindow.windowMs }],
+  });
+  assertEqual(eligibility.status, SESSION_STATUS.CONTAMINATED, "overlapping another session contaminates it");
+  assertEqual(eligibility.timing.temporalOverlap, true, "temporalOverlap is true");
+  assertDeepEqual(eligibility.timing.overlappingSessionIds, ["jdir-fixture-rep-1"], "the overlapping session is named");
+  assertTrue(eligibility.reasons.some((reason) => /invalidates independence under the frozen rule/.test(reason)), "and the frozen independence rule is quoted");
+});
+
+test("AI5. mock/fixture, gateway, model and route drift each make a session INELIGIBLE", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const cases = [
+    ["fixture provider", { offlineFixture: true, providerImplementation: "direction-fixture-jev-v1" }],
+    ["mock provider", { provider: "mock-jev" }],
+    ["gateway route", { gatewayUsed: true }],
+    ["non-direct upstream", { upstreamProvider: "somewhere-else" }],
+    ["model mismatch", { model: "jev-latest" }],
+    ["different model", { model: "jev-1.12.0" }],
+    ["mode drift", { mode: "live" }],
+  ];
+  for (const [label, mutate] of cases) {
+    const eligibility = evaluateMutated({ bundle, replay, protocol, sessionId: `jdir-fixture-${label}`, mutate });
+    assertEqual(eligibility.status, SESSION_STATUS.INELIGIBLE, `${label} is INELIGIBLE`);
+    assertTrue(eligibility.reasons.length > 0, `${label} carries an explicit reason`);
+  }
+});
+
+test("AI6. development evidence can never be replication evidence", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-ineligible");
+  const eligibility = evaluateReplicationSession({
+    sessionId: "jdir-fixture-rep-ineligible",
+    experiment: bundle.experiment,
+    summary: bundle.summary,
+    predictions: bundle.predictions,
+    outcomes: bundle.outcomes,
+    replay,
+    protocol,
+    expected: ctx.replication.expected,
+  });
+  assertEqual(bundle.experiment.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the fixture really is development evidence");
+  assertEqual(eligibility.status, SESSION_STATUS.INELIGIBLE, "so it is INELIGIBLE as replication evidence");
+  assertTrue(eligibility.reasons.some((reason) => reason.includes(REPLICATION_EVIDENCE_CLASS)), "the reason names the replication class");
+  assertTrue(eligibility.reasons.some((reason) => /development evidence is never replication evidence/.test(reason)), "and refuses the substitution explicitly");
+});
+
+test("AI7. reintroducing a confidence threshold makes a session INELIGIBLE", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const thresholded = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-thresholded",
+    mutate: { summary: { noConfidenceThreshold: false } },
+  });
+  assertEqual(thresholded.status, SESSION_STATUS.INELIGIBLE, "a summary that no longer declares the no-threshold rule is INELIGIBLE");
+  const fielded = evaluateReplicationSession({
+    sessionId: "jdir-fixture-thresholded-field",
+    experiment: { ...bundle.experiment, minConfidence: 0.9 },
+    summary: bundle.summary,
+    predictions: bundle.predictions,
+    outcomes: bundle.outcomes,
+    replay,
+    protocol,
+    expected: ctx.replication.expected,
+  });
+  assertEqual(fielded.status, SESSION_STATUS.INELIGIBLE, "a threshold-shaped field on the experiment is INELIGIBLE");
+  assertTrue(fielded.reasons.some((reason) => /reintroduced a confidence threshold/.test(reason)), "with the threshold reason");
+});
+
+test("AI8. question, feature, baseline, policy, metric, horizon and cadence drift are all refused", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const drifts = [
+    ["question wording", { questionDigest: digestOf({ question: "changed" }) }],
+    ["question set", { questionSetId: "jev-microstructure-direction-v2" }],
+    ["feature definition", { featureDefinitionDigest: digestOf({ features: "changed" }) }],
+    ["baseline definition", { baselineDefinitionDigest: digestOf({ baselines: "changed" }) }],
+    ["metric definition", { metricDefinitionDigest: digestOf({ metrics: "changed" }) }],
+    ["reference price", { referencePriceDefinitionDigest: digestOf({ price: "changed" }) }],
+    ["outcome-policy version", { outcomeResolutionPolicyVersion: 1 }],
+    ["outcome-policy digest", { outcomeResolutionPolicyDigest: digestOf({ policy: "changed" }) }],
+    ["staleness policy", { stalenessPolicyDigest: digestOf({ staleness: "changed" }) }],
+    ["horizon", { horizonSeconds: 60 }],
+    ["cadence", { samplingCadenceMs: 60_000 }],
+    ["session size", { maxObservations: 60 }],
+    ["packet version", { packetVersion: 2 }],
+  ];
+  for (const [label, mutate] of drifts) {
+    const eligibility = evaluateMutated({ bundle, replay, protocol, sessionId: `jdir-fixture-drift-${label}`, mutate });
+    assertEqual(eligibility.status === SESSION_STATUS.CLEAN, false, `${label} drift cannot be CLEAN`);
+    assertTrue(
+      eligibility.reasons.some((reason) => /drifted from the frozen|not the frozen protocol shape/.test(reason)),
+      `${label} drift has an explicit frozen-pin reason (got ${JSON.stringify(eligibility.reasons)})`,
+    );
+  }
+  // A protocol digest mismatch alone is enough to refuse the session.
+  const digestDrift = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-protocol-drift",
+    mutate: { protocol: { ok: false, digest: digestOf({ protocol: "changed" }) } },
+  });
+  assertEqual(digestDrift.status, SESSION_STATUS.INELIGIBLE, "a mismatched protocol digest is INELIGIBLE");
+  assertTrue(digestDrift.reasons.some((reason) => /frozen replication protocol digest/.test(reason)), "and says so");
+});
+
+test("AI9. counts, tamper, lookahead and finalization are all hard eligibility rules", async () => {
+  const { bundle, replay, protocol } = await fixtureSessionBundle("jdir-fixture-rep-1");
+  const cases = [
+    ["invalid prediction", { replay: { ...replay, counts: { ...replay.counts, invalidPredictions: 1 } } }],
+    ["failed Jev", { replay: { ...replay, counts: { ...replay.counts, failedJevObservations: 1 } } }],
+    ["tamper", { replay: { ...replay, counts: { ...replay.counts, tamperDetected: 1 } } }],
+    ["window exclusion", { replay: { ...replay, counts: { ...replay.counts, outcomeWindowExclusions: 1 } } }],
+    ["replay integrity", { replay: { ...replay, ok: false, problems: ["digest mismatch"] } }],
+    ["lookahead", { replay: { ...replay, lookaheadAudit: { ...replay.lookaheadAudit, ok: false } } }],
+  ];
+  for (const [label, mutate] of cases) {
+    const eligibility = evaluateReplicationSession({
+      sessionId: `jdir-fixture-${label}`,
+      experiment: bundle.experiment,
+      summary: bundle.summary,
+      predictions: bundle.predictions,
+      outcomes: bundle.outcomes,
+      replay: mutate.replay,
+      protocol,
+      expected: ctx.replication.expected,
+    });
+    assertEqual(eligibility.status, SESSION_STATUS.INELIGIBLE, `${label} is INELIGIBLE`);
+    assertTrue(eligibility.reasons.length > 0, `${label} carries a reason`);
+  }
+  const unfinalized = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-unfinalized",
+    mutate: { status: "INTERRUPTED", summary: { finalized: false } },
+  });
+  assertEqual(unfinalized.status, SESSION_STATUS.INELIGIBLE, "an interrupted, unfinalized session is INELIGIBLE");
+  const winner = evaluateMutated({
+    bundle,
+    replay,
+    protocol,
+    sessionId: "jdir-fixture-winner",
+    mutate: { summary: { winner: "jev" } },
+  });
+  assertEqual(winner.status, SESSION_STATUS.INELIGIBLE, "a session that emits a winner is INELIGIBLE");
+});
+
+test("AI10. the canonical development experiment and both canaries are refused as replication evidence", () => {
+  for (const id of [CANONICAL_DEVELOPMENT_EXPERIMENT_ID, CANARY_V1_EXPERIMENT_ID, CANARY_V2_EXPERIMENT_ID]) {
+    assertTrue(PROTECTED_NON_REPLICATION_EXPERIMENT_IDS.includes(id), `${id} is protected`);
+    assertTrue(typeof protectedExperimentReason(id) === "string", `${id} has an explicit refusal reason`);
+  }
+  assertEqual(protectedExperimentReason("jdir-something-new"), null, "an ordinary session id is not protected");
+  assertTrue(protectedExperimentReason(CANONICAL_DEVELOPMENT_EXPERIMENT_ID).includes("DEVELOPMENT evidence"), "the development refusal names the class");
+  assertTrue(protectedExperimentReason(CANARY_V1_EXPERIMENT_ID).includes("canary"), "the canary refusal names the canary");
+  const eligibility = evaluateReplicationSession({ sessionId: CANONICAL_DEVELOPMENT_EXPERIMENT_ID, experiment: {}, summary: {}, predictions: [], outcomes: [], replay: {}, protocol: {}, expected: {} });
+  assertEqual(eligibility.eligible, false, "the development experiment can never be eligible");
+  assertTrue(eligibility.reasons.some((reason) => /can never be added as replication evidence/.test(reason)), "with the protected-experiment reason");
+});
+
+/* ============================================================================
+ * PART AJ — the replication wave, end to end (§9, §12–§14, §17)
+ * ==========================================================================*/
+
+test("AJ0. every replication fixture lives in a temp directory, never in .evolve", async () => {
+  const rep = ctx.replication;
+  assertTrue(rep.experimentsRoot.startsWith(tmpdir()), "the fixture experiments root is under the OS temp directory");
+  assertTrue(rep.replicationRoot.startsWith(tmpdir()), "the fixture replication root is under the OS temp directory");
+  assertTrue(!rep.experimentsRoot.includes(path.join(REPO, ".evolve")), "never inside the repository evidence tree");
+  for (const entry of rep.sessions) assertEqual(entry.run.result.ok, true, `${entry.experimentId} ran: ${entry.run.result.error ?? ""}`);
+});
+
+test("AJ1. replication-create pins the barrier + protocol digest and starts in the insufficient state", async () => {
+  const rep = ctx.replication;
+  rep.created = await replicationCreate({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    developmentExperimentId: CANONICAL_DEVELOPMENT_EXPERIMENT_ID,
+  });
+  assertEqual(rep.created.ok, true, `replication-create succeeded: ${rep.created.error ?? ""}`);
+  assertEqual(rep.created.replicationId.startsWith("jrep-"), true, `the id is a replication id (${rep.created.replicationId})`);
+  assertEqual(rep.created.status, REPLICATION_INSUFFICIENT_STATE, "a wave with no sessions is insufficient");
+  assertEqual(rep.created.cleanSessionCount, 0, "with zero clean sessions");
+  assertEqual(rep.created.launchedSessions, 0, "and it launched nothing");
+  assertEqual(rep.created.replicationProtocolDigest, REPLICATION_PROTOCOL_DIGEST, "the manifest pins the frozen protocol digest");
+  assertEqual(rep.created.developmentArtifactsPresent, rep.developmentArtifactsPresent, "it reports whether the development artifacts were present");
+  const manifest = await readReplicationManifest(replicationRootFor(rep.replicationRoot, rep.created.replicationId));
+  assertEqual(manifest.developmentExperimentId, CANONICAL_DEVELOPMENT_EXPERIMENT_ID, "the manifest references the development experiment by id");
+  assertEqual(manifest.developmentMetricsDigest, CANONICAL_DEVELOPMENT_METRICS_DIGEST, "and pins its metrics digest");
+  assertEqual(manifest.developmentOnly, false, "replication is not development evidence");
+  assertEqual(manifest.replicationOnly, true, "it IS replication evidence");
+  assertEqual(manifest.noProfitabilityInference, true, "no profitability inference");
+  assertEqual(manifest.noTradingInference, true, "no trading inference");
+  assertEqual(manifest.noDeploymentInference, true, "no deployment inference");
+  assertEqual(manifest.paperOnly, true, "paper only");
+  assertEqual(manifest.shadowOnly, true, "shadow only");
+  assertEqual(manifest.evidenceClass, REPLICATION_EVIDENCE_CLASS, "the manifest declares the replication evidence class");
+  assertEqual(manifest.manifestVersion, REPLICATION_MANIFEST_VERSION, "the manifest version");
+  assertEqual(manifest.manifestContentDigest, manifestDigestOf(manifest), "the manifest digest describes its own content");
+  assertEqual(manifest.expected.sessionSize, REPLICATION_SESSION_OBSERVATIONS, "the manifest pins the session size");
+  assertEqual(manifest.expected.requiredCleanSessions, REQUIRED_CLEAN_REPLICATION_SESSIONS, "and the required clean session count");
+  assertEqual(manifest.expected.provider, REQUIRED_PROVIDER, "and the provider");
+  assertEqual(manifest.expected.model, REQUIRED_MODEL, "and the model");
+  assertEqual(manifest.expected.gatewayUsed, false, "and the direct route");
+  assertEqual(manifest.expected.outcomeResolutionPolicyVersion, 2, "and policy v2");
+  assertEqual(manifest.expected.metricDefinitionVersion, 2, "and metric v2");
+  assertEqual(manifest.noTuningFromDevelopment, true, "no tuning from the development results");
+  assertEqual(manifest.noTuningBetweenSessions, true, "no tuning between sessions");
+  assertEqual(manifest.interruptedWaveIsIncomparable, true, "an interrupted wave is incomparable, not patched");
+  assertEqual(manifest.primaryInferenceUnit, "dataset/session", "the primary inference unit");
+  assertEqual(manifest.noObservationLevelPseudoReplication, true, "no observation-level pseudo-replication");
+  const sessionsDocument = await readReplicationSessions(replicationRootFor(rep.replicationRoot, rep.created.replicationId));
+  assertEqual(sessionsDocument.sessionCount, 0, "the wave starts with an empty sessions document");
+  assertDeepEqual(
+    sessionsDocument,
+    createSessionsDocument({ replicationId: rep.created.replicationId, sessions: [] }),
+    "the sessions document has exactly the documented shape",
+  );
+  assertEqual(replicationRootFor(rep.replicationRoot, rep.created.replicationId).startsWith(rep.replicationRoot), true, "the replication root resolves inside the tree");
+  assertEqual(isValidReplicationId(rep.created.replicationId), true, "the id is valid");
+  assertEqual(isValidReplicationId("../../etc/passwd"), false, "a traversal id is not");
+  assertEqual(isValidReplicationId("jdir-20260920T063311Z-3a9163"), false, "a jdir id is not a replication id");
+  assertThrows(() => replicationRootFor(rep.replicationRoot, "bad/id"), (error) => error.message.includes("invalid Phase 5I.1 replication id"), "the root resolver refuses a bad id");
+});
+
+test("AJ2. replication-create refuses any non-canonical development experiment", async () => {
+  const rep = ctx.replication;
+  const refusal = await replicationCreate({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    developmentExperimentId: CANARY_V2_EXPERIMENT_ID,
+  });
+  assertEqual(refusal.ok, false, "a canary cannot be the replication baseline");
+  assertTrue(refusal.error.includes(CANONICAL_DEVELOPMENT_EXPERIMENT_ID), "the refusal names the canonical development experiment");
+  const missing = await replicationCreate({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, developmentExperimentId: null });
+  assertEqual(missing.ok, false, "an absent --development is refused");
+  assertTrue(missing.error.includes("explicit --development"), "and demands an explicit id");
+  assertEqual(await readReplicationManifest(replicationRootFor(rep.replicationRoot, replicationIdFor({ developmentExperimentId: CANARY_V2_EXPERIMENT_ID }))), null, "no manifest was created for the refused baseline");
+});
+
+test("AJ3. session 1 is added as CLEAN and the wave still reports 1 clean session as insufficient", async () => {
+  const rep = ctx.replication;
+  const added = await replicationAdd({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    replicationId: rep.created.replicationId,
+    sessionId: "jdir-fixture-rep-1",
+  });
+  assertEqual(added.ok, true, `session 1 was added: ${added.error ?? ""}`);
+  assertEqual(added.sessionStatus, SESSION_STATUS.CLEAN, `session 1 is CLEAN: ${JSON.stringify(added.sessionReasons)}`);
+  assertEqual(added.cleanSessionCount, 1, "one clean session");
+  assertEqual(added.status, REPLICATION_INSUFFICIENT_STATE, "one clean session is still insufficient");
+  assertEqual(added.launchedSessions, 0, "--replication-add launched nothing");
+  assertEqual(added.networkCalls, 0, "and made zero network calls");
+  assertEqual(added.jevCalls, 0, "and zero Jev calls");
+  assertEqual(added.summary.bootstrap.available, false, "no uncertainty interval exists yet");
+  assertEqual(added.summary.bootstrap.status, REPLICATION_INSUFFICIENT_STATE, "the bootstrap reports the insufficient state");
+  assertDeepEqual(added.summary.bootstrap.comparisons, {}, "and emits no intervals");
+
+  const oneClean = await replicationStats({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  assertEqual(oneClean.ok, true, "stats read the 1-clean wave");
+  assertEqual(oneClean.summary.status, REPLICATION_INSUFFICIENT_STATE, "which is INSUFFICIENT_CLEAN_REPLICATION_SESSIONS");
+  assertEqual(oneClean.summary.cleanSessionCount, 1, "with exactly one clean session");
+});
+
+test("AJ4. an overlapping PAIR contaminates BOTH sessions, and both are preserved and excluded", async () => {
+  const rep = ctx.replication;
+  const root = replicationRootFor(rep.replicationRoot, rep.created.replicationId);
+  const first = await replicationAdd({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    replicationId: rep.created.replicationId,
+    sessionId: "jdir-fixture-rep-contaminated",
+  });
+  assertEqual(first.ok, true, `the first half of the pair is recorded: ${first.error ?? ""}`);
+  assertEqual(first.sessionStatus, SESSION_STATUS.CLEAN, "with nothing to overlap yet it is CLEAN");
+  assertEqual(first.cleanSessionCount, 2, "so the wave has two clean sessions");
+
+  const second = await replicationAdd({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    replicationId: rep.created.replicationId,
+    sessionId: "jdir-fixture-rep-contaminated-2",
+  });
+  assertEqual(second.ok, true, `the overlapping session is RECORDED, not rejected: ${second.error ?? ""}`);
+  assertEqual(second.sessionStatus, SESSION_STATUS.CONTAMINATED, "it is CONTAMINATED");
+  assertEqual(second.sessionEligible, false, "and ineligible");
+  assertEqual(second.cleanSessionCount, 1, "it does not raise the clean count");
+  assertEqual(second.totalSessionCount, 3, "but it IS in the manifest");
+  assertTrue(second.sessionReasons.some((reason) => /overlaps another session/.test(reason)), "with the overlap reason persisted");
+
+  const sessions = await readReplicationSessions(root);
+  assertEqual(sessions.sessions.length, 3, "three session records exist");
+  for (const sessionId of ["jdir-fixture-rep-contaminated", "jdir-fixture-rep-contaminated-2"]) {
+    const stored = sessions.sessions.find((entry) => entry.sessionId === sessionId);
+    assertEqual(stored.status, SESSION_STATUS.CONTAMINATED, `${sessionId} is CONTAMINATED on the record`);
+    assertEqual(stored.eligible, false, `${sessionId} is ineligible on the record`);
+    assertTrue(stored.reasons.length > 0, `${sessionId} keeps its reasons`);
+    assertEqual(second.summary.excludedSessions.some((entry) => entry.sessionId === sessionId), true, `the summary excludes ${sessionId}`);
+    assertEqual(second.summary.perSession.some((entry) => entry.sessionId === sessionId), true, `and still reports ${sessionId} per-session`);
+  }
+  const compared = Object.values(second.summary.comparisons).every((block) => block.brier.sessionCount === 1);
+  assertEqual(compared, true, "the aggregation counted only the CLEAN session");
+});
+
+test("AJ5. a mock/development session is recorded as INELIGIBLE with explicit reasons", async () => {
+  const rep = ctx.replication;
+  const added = await replicationAdd({
+    replicationRoot: rep.replicationRoot,
+    baseRoot: rep.experimentsRoot,
+    replicationId: rep.created.replicationId,
+    sessionId: "jdir-fixture-rep-ineligible",
+  });
+  assertEqual(added.ok, true, "the ineligible session is recorded, not silently discarded");
+  assertEqual(added.sessionStatus, SESSION_STATUS.INELIGIBLE, "it is INELIGIBLE");
+  assertTrue(added.sessionReasons.length > 0, "with explicit reasons");
+  assertEqual(added.cleanSessionCount, 1, "the clean count is unchanged");
+  assertEqual(added.totalSessionCount, 4, "and the session is in the manifest");
+  const stats = await replicationStats({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  assertEqual(stats.summary.excludedSessions.length, 3, "three sessions are excluded from aggregation");
+});
+
+test("AJ6. sessions 2 and 3 are added as CLEAN and the wave reaches the complete state", async () => {
+  const rep = ctx.replication;
+  for (const sessionId of ["jdir-fixture-rep-2", "jdir-fixture-rep-3"]) {
+    const added = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId, sessionId });
+    assertEqual(added.ok, true, `${sessionId} was added: ${added.error ?? ""}`);
+    assertEqual(added.sessionStatus, SESSION_STATUS.CLEAN, `${sessionId} is CLEAN: ${JSON.stringify(added.sessionReasons)}`);
+    rep.added.push(added);
+  }
+  const final = rep.added[rep.added.length - 1];
+  assertEqual(final.cleanSessionCount, REQUIRED_CLEAN_REPLICATION_SESSIONS, "three CLEAN sessions exist");
+  assertEqual(final.status, REPLICATION_COMPLETE_STATE, "and the wave reports the complete state");
+  assertEqual(final.totalSessionCount, 6, "while every added session is preserved");
+  assertEqual(final.summary.bootstrap.available, true, "the deterministic session-level bootstrap is now available");
+  assertEqual(final.summary.winner, null, "the summary emits no winner");
+  assertEqual(final.summary.noAutomatedWinner, true, "and says so");
+  assertEqual(final.summary.significanceClaimed, false, "and claims no significance");
+  assertEqual(final.summary.profitabilityInference, false, "and no profitability inference");
+  assertEqual(final.summary.tradingInference, false, "and no trading inference");
+  assertEqual(final.summary.deploymentInference, false, "and no deployment inference");
+});
+
+test("AJ7. the aggregate is equal-weighted by CLEAN session and exposes every required field", async () => {
+  const rep = ctx.replication;
+  const stats = await replicationStats({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  const summary = stats.summary;
+  assertEqual(summary.primaryInferenceUnit, "dataset/session", "the primary inference unit is the session");
+  assertEqual(summary.equalWeightedByEligibleSession, true, "equal-weighted by eligible session");
+  assertEqual(summary.noObservationLevelPseudoReplication, true, "no observation-level pseudo-replication");
+  assertEqual(summary.cleanSessionCount, 3, "three clean sessions");
+  assertEqual(summary.cleanSessionIds.length, 3, "three clean session ids");
+  assertDeepEqual(Object.keys(summary.comparisons).sort(), [...REPLICATION_COMPARISON_IDS].sort(), "one comparison bucket per frozen baseline");
+  for (const comparisonId of REPLICATION_COMPARISON_IDS) {
+    const block = summary.comparisons[comparisonId];
+    for (const metric of REPLICATION_DELTA_METRICS) {
+      const statsBlock = block[metric];
+      for (const field of ["sessionCount", "values", "mean", "median", "min", "max", "positiveCount", "negativeCount", "zeroCount"]) {
+        assertTrue(Object.hasOwn(statsBlock, field), `${comparisonId}.${metric} exposes ${field}`);
+      }
+      assertEqual(statsBlock.sessionCount, 3, `${comparisonId}.${metric} covers all three clean sessions`);
+      assertEqual(statsBlock.values.length, statsBlock.sessionCount, `${comparisonId}.${metric} keeps one value per session`);
+      assertEqual(statsBlock.sessionIds.length, statsBlock.sessionCount, `${comparisonId}.${metric} keeps the session ids alongside the values`);
+      const recomputedMean = statsBlock.values.reduce((sum, value) => sum + value, 0) / statsBlock.values.length;
+      assertClose(statsBlock.mean, recomputedMean, `${comparisonId}.${metric} mean is the equal-weighted session mean`, 1e-12);
+      assertClose(statsBlock.median, medianOf(statsBlock.values), `${comparisonId}.${metric} median matches`, 1e-12);
+      assertEqual(statsBlock.min, Math.min(...statsBlock.values), `${comparisonId}.${metric} min matches`);
+      assertEqual(statsBlock.max, Math.max(...statsBlock.values), `${comparisonId}.${metric} max matches`);
+      assertEqual(statsBlock.positiveCount + statsBlock.negativeCount + statsBlock.zeroCount, statsBlock.sessionCount, `${comparisonId}.${metric} counts partition the sessions`);
+      if (metric === "accuracy") {
+        assertEqual(statsBlock.lowerIsBetter, false, `accuracy is NOT lower-is-better`);
+        assertEqual(statsBlock.jevBetterCount, null, `accuracy carries no better/worse label`);
+      } else {
+        assertEqual(statsBlock.lowerIsBetter, true, `${metric} is lower-is-better`);
+        assertEqual(statsBlock.jevBetterCount, statsBlock.negativeCount, `${metric}: a negative delta means Jev is BETTER`);
+        assertEqual(statsBlock.baselineBetterCount, statsBlock.positiveCount, `${metric}: a positive delta means the baseline is better`);
+        assertEqual(statsBlock.equalCount, statsBlock.zeroCount, `${metric}: zero deltas are counted separately`);
+      }
+    }
+  }
+  for (const metric of REPLICATION_ABSOLUTE_METRICS) {
+    assertEqual(summary.absolute[metric].sessionCount, 3, `the absolute ${metric} covers all three sessions`);
+    assertTrue(Number.isFinite(summary.absolute[metric].mean), `the absolute ${metric} has an equal-weighted mean`);
+  }
+  assertEqual(summary.deltaSignConvention.brier, REPLICATION_DELTA_SIGN_CONVENTION.brier, "the Brier sign convention is documented");
+  assertTrue(summary.deltaSignConvention.brier.includes("negative means Jev is LOWER"), "and states the direction explicitly");
+  assertTrue(summary.deltaSignConvention.logLoss.includes("negative means Jev is LOWER"), "for log loss too");
+  assertTrue(summary.deltaSignConvention.accuracy.includes("positive means Jev is HIGHER"), "and the opposite direction for accuracy");
+  assertEqual(summary.perSession.length, 6, "every session is reported per-session, CLEAN or excluded");
+});
+
+test("AJ8. aggregation is session-level and never concatenates observations", () => {
+  const clean = [
+    { sessionId: "s1", status: SESSION_STATUS.CLEAN, metrics: { jev: { brier: 1, logLoss: 1, accuracy: 1 }, deltas: { "neutral-v1": { brier: -1, logLoss: -1, accuracy: 0 } } } },
+    { sessionId: "s2", status: SESSION_STATUS.CLEAN, metrics: { jev: { brier: 3, logLoss: 3, accuracy: 0 }, deltas: { "neutral-v1": { brier: 1, logLoss: 1, accuracy: 0 } } } },
+    { sessionId: "s3", status: SESSION_STATUS.CONTAMINATED, metrics: { jev: { brier: 999, logLoss: 999, accuracy: 999 }, deltas: { "neutral-v1": { brier: 999, logLoss: 999, accuracy: 999 } } } },
+  ];
+  const aggregation = aggregateReplicationSessions(clean, { excludedSessions: [{ sessionId: "s3", status: SESSION_STATUS.CONTAMINATED, reasons: ["overlap"] }] });
+  const block = aggregation.comparisons["neutral-v1"].brier;
+  assertEqual(block.sessionCount, 2, "the contaminated session is excluded");
+  assertEqual(block.mean, 0, "the mean is the equal-weighted session mean, not an observation-weighted one");
+  assertEqual(block.jevBetterCount, 1, "one session where Jev was better");
+  assertEqual(block.baselineBetterCount, 1, "one where the baseline was better");
+  assertEqual(aggregation.absolute.brier.mean, 2, "the equal-weighted absolute mean");
+  assertEqual(aggregation.status, REPLICATION_INSUFFICIENT_STATE, "two clean sessions are insufficient");
+  assertEqual(aggregation.bootstrap.available, false, "so no interval is emitted");
+  assertEqual(aggregation.excludedSessions.length, 1, "the excluded session is reported");
+  // A null comparison value is EXCLUDED and counted, never scored as zero.
+  const withNull = aggregateReplicationSessions(
+    [...clean.slice(0, 2), { sessionId: "s4", status: SESSION_STATUS.CLEAN, metrics: { jev: { brier: 2, logLoss: 2, accuracy: 2 }, deltas: { "neutral-v1": { brier: null, logLoss: null, accuracy: null } } } }],
+    {},
+  );
+  assertEqual(withNull.comparisons["neutral-v1"].brier.sessionCount, 2, "a null value is excluded from the comparison");
+  assertEqual(withNull.comparisons["neutral-v1"].brier.excludedSessionCount, 1, "and counted as excluded");
+  assertEqual(withNull.absolute.brier.sessionCount, 3, "while the absolute metric still covers it");
+});
+
+test("AJ9. the bootstrap is deterministic, session-level and descriptive only", () => {
+  const values = [0.1, -0.2, 0.05];
+  const first = bootstrapSessionMean(values);
+  const second = bootstrapSessionMean(values);
+  assertDeepEqual(first, second, "the same values and seed reproduce the interval byte for byte");
+  assertEqual(first.available, true, "the interval is available with three sessions");
+  assertEqual(first.seed, REPLICATION_BOOTSTRAP_SEED, "a fixed seed");
+  assertEqual(first.resamples, REPLICATION_BOOTSTRAP_RESAMPLES, "a fixed resample count");
+  assertEqual(first.prng, REPLICATION_BOOTSTRAP_PRNG, "a fixed deterministic PRNG");
+  assertEqual(first.sessionCount, 3, "it resamples SESSIONS");
+  assertClose(first.pointEstimate, meanOf(values), "the point estimate is the session mean", 1e-12);
+  assertTrue(first.lower <= first.upper, "the interval is ordered");
+  assertEqual(first.pValue, null, "no p-value is emitted");
+  assertEqual(first.significanceLabel, null, "no significance label is emitted");
+  assertEqual(first.statisticallyProven, false, "nothing is claimed to be statistically proven");
+  assertEqual(first.descriptiveOnly, true, "the interval is descriptive only");
+  assertExcludes(JSON.stringify(first).toLowerCase(), "significant", "the word significant appears nowhere");
+  assertExcludes(JSON.stringify(first).toLowerCase(), "p-value\": 0", "no p-value number is produced");
+  assertEqual(mulberry32(1)() === mulberry32(1)(), true, "the PRNG is a pure function of its seed");
+  assertEqual(bootstrapSessionMean([]).available, false, "an empty series has no interval");
+  assertEqual(bootstrapSessionMean([1, 2]).available, true, "two values still produce a descriptive interval");
+  assertEqual(REPLICATION_BOOTSTRAP_ALPHA, 0.05, "the alpha is a frozen constant");
+});
+
+test("AJ10. the stable session statistics never coerce a null into a zero", () => {
+  const stats = stableSessionStats([{ sessionId: "a", value: 1 }, { sessionId: "b", value: null }, { sessionId: "c", value: 0 }]);
+  assertEqual(stats.sessionCount, 2, "only finite values count");
+  assertEqual(stats.excludedSessionCount, 1, "the null is counted as excluded");
+  assertEqual(stats.zeroCount, 1, "an exact zero is a zero, not a missing value");
+  assertEqual(stats.positiveCount, 1, "and the positive value is counted");
+  assertDeepEqual(stats.values, [1, 0], "the raw values are preserved");
+  assertDeepEqual(stats.sessionIds, ["a", "c"], "and so are their session ids");
+  const comparison = aggregateComparison([{ sessionId: "a", value: 0 }], { lowerIsBetter: true });
+  assertEqual(comparison.jevBetterCount, 0, "a zero delta is not a Jev win");
+  assertEqual(comparison.baselineBetterCount, 0, "and not a baseline win");
+  assertEqual(comparison.equalCount, 1, "it is an equal result");
+});
+
+test("AJ11. --replication-add refuses duplicates, protected ids and unknown targets", async () => {
+  const rep = ctx.replication;
+  const duplicate = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId, sessionId: "jdir-fixture-rep-1" });
+  assertEqual(duplicate.ok, false, "a session is added exactly once");
+  assertTrue(duplicate.error.includes("already recorded"), "and the refusal says so");
+  for (const protectedId of [CANONICAL_DEVELOPMENT_EXPERIMENT_ID, CANARY_V1_EXPERIMENT_ID, CANARY_V2_EXPERIMENT_ID]) {
+    const refusal = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId, sessionId: protectedId });
+    assertEqual(refusal.ok, false, `${protectedId} is refused`);
+    assertTrue(refusal.error.length > 20, "with an explicit reason");
+  }
+  const unknownWave = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: "jrep-20260101T000000Z-abcdef", sessionId: "jdir-fixture-rep-1" });
+  assertEqual(unknownWave.ok, false, "an unknown replication id is refused");
+  const unknownSession = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId, sessionId: "jdir-not-here" });
+  assertEqual(unknownSession.ok, false, "an unknown session id is refused");
+  assertTrue(unknownSession.error.includes("no Phase 5I experiment"), "with the filesystem reason");
+  const latest = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId, sessionId: "latest" });
+  assertEqual(latest.ok, false, "there is no \"latest\"");
+  const badId = await replicationAdd({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: "../escape", sessionId: "jdir-fixture-rep-1" });
+  assertEqual(badId.ok, false, "a traversal replication id is refused");
+  const after = await readReplicationSessions(replicationRootFor(rep.replicationRoot, rep.created.replicationId));
+  assertEqual(after.sessions.length, 6, "no refused call changed the manifest");
+});
+
+test("AJ12. the offline replication replay is clean, zero-network, and rewrites nothing", async () => {
+  const rep = ctx.replication;
+  const root = replicationRootFor(rep.replicationRoot, rep.created.replicationId);
+  const before = await replicationMetadataSnapshot(root);
+  const report = await replicationReplay({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  const after = await replicationMetadataSnapshot(root);
+  assertEqual(report.ok, true, `the replication replays cleanly: ${JSON.stringify(report.problems)}`);
+  assertEqual(report.networkCalls + report.providerCalls + report.jevCalls + report.agentReachCalls + report.classifierCalls + report.deepseekCalls, 0, "zero network and zero provider calls");
+  assertEqual(report.arenaRuns + report.tradingCalls, 0, "zero Arena runs and zero trading calls");
+  assertEqual(report.launchedSessions, 0, "and it launched no session");
+  assertEqual(report.readOnly, true, "the pass is read-only");
+  assertDeepEqual(report.counts, { sessions: 6, cleanSessions: 3, contaminatedSessions: 2, ineligibleSessions: 1 }, "the recorded session statuses are exactly as derived");
+  assertEqual(report.metricsMatch, true, "the stored aggregation reproduces");
+  assertEqual(report.manifestDigestMatches, true, "the manifest digest reproduces");
+  assertEqual(report.sessionsDigestMatches, true, "the session records reproduce");
+  assertDeepEqual(after, before, "the replication tree is byte-unchanged by its own replay");
+  for (const problem of report.problems) assertTrue(!/rewrote/.test(problem), "no write problem was reported");
+});
+
+test("AJ13. the replication stats pass is read-only and reproduces the stored summary", async () => {
+  const rep = ctx.replication;
+  const root = replicationRootFor(rep.replicationRoot, rep.created.replicationId);
+  const before = await replicationMetadataSnapshot(root);
+  const stats = await replicationStats({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  const after = await replicationMetadataSnapshot(root);
+  assertEqual(stats.ok, true, "stats succeed");
+  assertEqual(stats.readOnly, true, "read-only");
+  assertEqual(stats.metricsMatch, true, "the aggregation reproduces");
+  assertEqual(stats.summary.aggregateMetricsDigest, stats.recomputedAggregateDigest, "and the digest is the recomputed one");
+  assertEqual(aggregateDigestOf(stats.summary), stats.summary.aggregateMetricsDigest, "the aggregate digest recomputes from the summary content");
+  assertEqual(sessionsDigestOf(stats.sessions) === stats.storedSummary.sessionRecordsDigest, true, "the session records digest matches the stored one");
+  const storedSessionsDoc = await readReplicationSessions(path.join(rep.replicationRoot, rep.created.replicationId));
+  for (const stored of storedSessionsDoc.sessions) {
+    assertEqual(sessionRecordDigestOf(stored), stored.recordDigest, `${stored.sessionId} has a self-describing derivation digest`);
+  }
+  assertDeepEqual(after, before, "stats wrote nothing");
+  assertEqual((await readReplicationBundle(root)).manifest.replicationProtocolDigest, REPLICATION_PROTOCOL_DIGEST, "the manifest still pins the frozen protocol");
+});
+
+/* ============================================================================
+ * PART AK — replication CLI behaviour (§17, §18)
+ * ==========================================================================*/
+
+test("AK1. the CLI documents the two evidence classes and the four replication commands", () => {
+  const help = runCli(["--help"]);
+  assertEqual(help.status, 0, "--help exits 0");
+  for (const action of DIRECTION_REPLICATION_ACTIONS) assertIncludes(help.stdout, `--${action}`, `help documents --${action}`);
+  assertIncludes(help.stdout, REPLICATION_EVIDENCE_CLASS, "help names the replication evidence class");
+  assertIncludes(help.stdout, DIRECTION_EVIDENCE_CLASS, "and the development class");
+  assertIncludes(help.stdout, "--replication-session", "and the replication-session flag");
+  assertIncludes(help.stdout, "NEVER", "and states that no replication command launches a session");
+  assertIncludes(help.stdout, "operator runs each one manually", "and that the operator runs each session");
+  const definition = runCli(["--definition"]);
+  assertEqual(definition.status, 0, "--definition exits 0");
+  assertIncludes(definition.stdout, REPLICATION_PROTOCOL_DIGEST, "--definition prints the frozen protocol digest");
+  assertIncludes(definition.stdout, CANONICAL_DEVELOPMENT_EXPERIMENT_ID, "and the canonical development experiment");
+  assertIncludes(definition.stdout, "3 independent sessions", "and the replication design");
+});
+
+test("AK2. replication actions resolve exclusively, and there is still no --latest", () => {
+  assertEqual(DIRECTION_REPLICATION_ACTIONS.length, 4, "four replication actions");
+  for (const action of DIRECTION_REPLICATION_ACTIONS) {
+    assertEqual(isReplicationAction(action), true, `${action} is a replication action`);
+    assertEqual(DIRECTION_ALL_ACTIONS.includes(action), true, `${action} resolves as an action`);
+    assertEqual(resolveDirectionAction({ [action]: true }).action, action, `${action} resolves on its own`);
+  }
+  assertEqual(DIRECTION_ACTIONS.includes("replication-create"), false, "the frozen benchmark action set is unchanged");
+  assertEqual(resolveDirectionAction({ start: true, "replication-create": true }).error !== null, true, "two actions is still an error");
+  for (const action of ["replication-add", "replication-replay", "replication-stats"]) {
+    const result = runCli([`--${action}`]);
+    assertTrue(result.status !== 0, `--${action} without --replication exits non-zero`);
+    assertIncludes(result.stderr, "explicit --replication", `--${action} demands an explicit id`);
+  }
+  for (const action of ["replication-add", "replication-replay", "replication-stats"]) {
+    const latest = runCli([`--${action}`, "--replication", "latest"]);
+    assertTrue(latest.status !== 0, `--${action} --replication latest exits non-zero`);
+    assertIncludes(latest.stderr, "never guesses which replication", `--${action} refuses latest`);
+  }
+  const createMissing = runCli(["--replication-create"]);
+  assertTrue(createMissing.status !== 0, "--replication-create without --development exits non-zero");
+  assertIncludes(createMissing.stderr, "explicit --development", "and demands an explicit development id");
+  const createWrong = runCli(["--replication-create", "--development", CANARY_V1_EXPERIMENT_ID]);
+  assertTrue(createWrong.status !== 0, "a non-canonical development id exits non-zero");
+  assertIncludes(createWrong.stderr, CANONICAL_DEVELOPMENT_EXPERIMENT_ID, "and names the canonical one");
+});
+
+test("AK3. --replication-replay / --replication-stats never require a provider or a credential", () => {
+  const env = { EVOLVE_JEV_PROVIDER: "", EVOLVE_JEV_API_KEY: "", EVOLVE_MARKET_MODE: "live" };
+  const replay = runCli(["--replication-replay", "--replication", "jrep-not-here", "--out", ctx.tempRoot], env);
+  assertEqual(replay.status, 1, "an unknown replication exits 1");
+  assertIncludes(replay.stderr, "no Phase 5I.1 replication", "and says so");
+  const stats = runCli(["--replication-stats", "--replication", "jrep-not-here", "--out", ctx.tempRoot], env);
+  assertEqual(stats.status, 1, "stats on an unknown replication exits 1");
+  assertExcludes(replay.stdout + replay.stderr, "PREDICTION_FROZEN", "no prediction was ever frozen");
+  assertExcludes(replay.stdout + replay.stderr, "Jev is disabled", "no provider resolution was attempted at all");
+});
+
+test("AK4. `--start --replication-session` refuses any non-frozen protocol value before running", () => {
+  const base = ["--start", "--replication-session", "--market", "SOL-USDC"];
+  const size = runCli([...base, "--max-observations", "60"], { EVOLVE_JEV_PROVIDER: "" });
+  assertTrue(size.status !== 0, "a non-120 session exits non-zero");
+  assertIncludes(size.stderr, "exactly 120 observations", "and names the frozen session size");
+  const cadence = runCli([...base, "--cadence-seconds", "60"], { EVOLVE_JEV_PROVIDER: "" });
+  assertTrue(cadence.status !== 0, "a non-30 s cadence exits non-zero");
+  assertIncludes(cadence.stderr, "frozen 30-second cadence", "and names the frozen cadence");
+  const tolerance = runCli([...base, "--tolerance-ms", "5000"], { EVOLVE_JEV_PROVIDER: "" });
+  assertTrue(tolerance.status !== 0, "a v1 outcome bound exits non-zero");
+  assertIncludes(tolerance.stderr, "outcome-resolution policy v2", "and names policy v2");
+  const mock = runCli([...base, "--allow-mock"], { EVOLVE_JEV_PROVIDER: "" });
+  assertTrue(mock.status !== 0, "--allow-mock exits non-zero for a replication session");
+  assertIncludes(mock.stderr, "must be genuine", "and refuses the fixture");
+  const unsafe = runCli([...base, "--allow-unsafe-model"], { EVOLVE_JEV_PROVIDER: "" });
+  assertTrue(unsafe.status !== 0, "--allow-unsafe-model exits non-zero for a replication session");
+  assertExcludes(size.stdout, "EXPERIMENT_CREATED", "nothing was created by any refusal");
+});
+
+test("AK5. the replication CLI works end to end against a temp tree, offline", async () => {
+  const rep = ctx.replication;
+  const cliExperiments = path.join(ctx.tempRoot, "cli-replication-experiments");
+  const cliReplication = path.join(ctx.tempRoot, "cli-replication");
+  await cp(rep.experimentsRoot, cliExperiments, { recursive: true });
+  const base = ["--out", cliExperiments, "--replication-out", cliReplication];
+  const env = { EVOLVE_JEV_PROVIDER: "", EVOLVE_JEV_API_KEY: "" };
+
+  const create = runCli(["--replication-create", "--development", CANONICAL_DEVELOPMENT_EXPERIMENT_ID, ...base], env);
+  assertEqual(create.status, 0, `--replication-create exits 0 (stderr: ${create.stderr})`);
+  assertIncludes(create.stdout, "jrep-", "it prints the replication id");
+  assertIncludes(create.stdout, REPLICATION_PROTOCOL_DIGEST, "and the frozen protocol digest");
+  assertExcludes(create.stdout, "PREDICTION_FROZEN", "and launched nothing");
+  const replicationId = /jrep-[A-Za-z0-9._-]+/.exec(create.stdout)?.[0] ?? null;
+  assertTrue(typeof replicationId === "string", "the replication id is readable from the output");
+
+  const add = runCli(["--replication-add", "--replication", replicationId, "--experiment", "jdir-fixture-rep-1", ...base], env);
+  assertEqual(add.status, 0, `--replication-add exits 0 (stderr: ${add.stderr})`);
+  assertIncludes(add.stdout, "CLEAN", "session 1 is CLEAN");
+  assertIncludes(add.stdout, "network           0", "with zero network calls");
+
+  const replay = runCli(["--replication-replay", "--replication", replicationId, ...base], env);
+  assertEqual(replay.status, 0, `--replication-replay exits 0 (stderr: ${replay.stderr})`);
+  assertIncludes(replay.stdout, "integrity         OK", "the replay reports integrity");
+  assertIncludes(replay.stdout, "network 0", "and zero network calls");
+  assertIncludes(replay.stdout, "launched sessions 0", "and launched nothing");
+
+  const stats = runCli(["--replication-stats", "--replication", replicationId, ...base], env);
+  assertEqual(stats.status, 0, `--replication-stats exits 0 (stderr: ${stats.stderr})`);
+  assertIncludes(stats.stdout, "INSUFFICIENT_CLEAN_REPLICATION_SESSIONS", "one clean session is insufficient");
+  assertIncludes(stats.stdout, "Jev - neutral-v1", "and the comparison block is printed");
+  assertIncludes(stats.stdout, "NO winner", "and no winner is emitted");
+  assertIncludes(stats.stdout, "Negative Brier/log-loss delta = Jev lower (better)", "and the sign convention is printed");
+
+  const json = runCli(["--replication-stats", "--replication", replicationId, ...base, "--json"], env);
+  assertEqual(json.status, 0, "--json stats exits 0");
+  const payload = JSON.parse(json.stdout);
+  assertEqual(payload.summary.primaryInferenceUnit, "dataset/session", "the JSON report keeps the session as the inference unit");
+  assertEqual(payload.networkCalls, 0, "and reports zero network calls");
+});
+
+test("AK6. a replication invocation never reaches a market config or a provider", async () => {
+  const source = await readText("scripts/jev-direction.mjs");
+  const indexOfReplication = source.indexOf("isReplicationAction(action)");
+  const indexOfMarketConfig = source.indexOf("createMarketConfig(marketEnv)");
+  const indexOfPins = source.indexOf("enforceDirectionProviderPins({ settings, envConfig })");
+  assertTrue(indexOfReplication > 0 && indexOfMarketConfig > 0 && indexOfPins > 0, "the CLI has all three stages");
+  assertTrue(indexOfReplication < indexOfMarketConfig, "the replication dispatch precedes the market config");
+  assertTrue(indexOfReplication < indexOfPins, "and precedes provider pin enforcement");
+  assertIncludes(source, "launchedSessions", "the CLI reports launched sessions");
+  assertExcludes(await readText("scripts/jev/direction/replication/runner.mjs"), "fetch(", "the replication runner makes no request");
+  assertExcludes(await readText("scripts/jev/direction/replication/runner.mjs"), "createResilientJevProvider", "and constructs no provider");
+});
+
+/* ============================================================================
+ * PART AL — isolation, no-tuning and zero authority for Phase 5I.1
+ * ==========================================================================*/
+
+test("AL1. the two evidence profiles are distinct, explicit and fail closed", () => {
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the development class");
+  assertEqual(REPLICATION_EVIDENCE_PROFILE.evidenceClass, REPLICATION_EVIDENCE_CLASS, "the replication class");
+  assertDeepEqual(DIRECTION_EVIDENCE_CLASSES, [DIRECTION_EVIDENCE_CLASS, REPLICATION_EVIDENCE_CLASS], "exactly two classes exist");
+  assertDeepEqual(Object.keys(DIRECTION_EVIDENCE_PROFILES).sort(), ["development", "replication"], "the registry holds exactly the two profiles");
+  assertEqual(evidenceProfileForClass(DIRECTION_EVIDENCE_CLASS), DEVELOPMENT_EVIDENCE_PROFILE, "the development class resolves by class");
+  assertEqual(evidenceProfileForClass(REPLICATION_EVIDENCE_CLASS), REPLICATION_EVIDENCE_PROFILE, "the replication class resolves by class");
+  assertEqual(evidenceProfileForClass("UNKNOWN_CLASS"), null, "an unknown class fails closed");
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.evidenceClass === REPLICATION_EVIDENCE_PROFILE.evidenceClass, false, "and they differ");
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.flags.developmentOnly, true, "development artifacts are developmentOnly");
+  assertEqual(REPLICATION_EVIDENCE_PROFILE.flags.developmentOnly, false, "replication artifacts are NOT");
+  assertEqual(REPLICATION_EVIDENCE_PROFILE.flags.replicationOnly, true, "replication artifacts are replicationOnly");
+  assertEqual(DIRECTION_REPLICATION_FLAGS.noProfitabilityInference, true, "no profitability inference");
+  assertEqual(DIRECTION_REPLICATION_FLAGS.noTradingInference, true, "no trading inference");
+  assertEqual(DIRECTION_REPLICATION_FLAGS.noDeploymentInference, true, "no deployment inference");
+  assertEqual(DIRECTION_REPLICATION_FLAGS.paperOnly, true, "paper only");
+  assertEqual(DIRECTION_REPLICATION_FLAGS.shadowOnly, true, "shadow only");
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.replicationStatus, "NOT_REPLICATED", "a development summary is NOT_REPLICATED");
+  assertEqual(REPLICATION_EVIDENCE_PROFILE.replicationStatus, "PENDING_WAVE_AGGREGATION", "a single session is not a wave result");
+  assertEqual(evidenceProfileForExperiment({ evidenceClass: REPLICATION_EVIDENCE_CLASS }), REPLICATION_EVIDENCE_PROFILE, "the replication class resolves");
+  assertEqual(evidenceProfileForExperiment({ evidenceClass: "SOMETHING_ELSE" }), null, "an unknown class FAILS CLOSED");
+  assertEqual(evidenceProfileById("nope"), null, "an unknown profile id fails closed");
+  assertEqual(resolveEvidenceProfile(null), DEVELOPMENT_EVIDENCE_PROFILE, "an absent profile defaults to development");
+  assertEqual(resolveEvidenceProfile("replication"), REPLICATION_EVIDENCE_PROFILE, "and a named profile resolves");
+  assertThrows(() => resolveEvidenceProfile("guessed"), (error) => error.message.includes("unknown Phase 5I evidence profile"), "an unknown profile throws rather than guessing");
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.interpretation.includes("No profitability inference is permitted."), true, "the development interpretation is frozen on the profile too");
+  assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.noAutomatedWinner, true, "with no automated winner");
+});
+
+test("AL2. the replication fixture sessions carry the replication class and nothing else changed", async () => {
+  const rep = ctx.replication;
+  for (const entry of rep.sessions) {
+    const bundle = await readDirectionExperimentBundle(directionExperimentRootFor(rep.experimentsRoot, entry.experimentId));
+    const development = entry.development === true;
+    assertEqual(bundle.experiment.evidenceClass, development ? DIRECTION_EVIDENCE_CLASS : REPLICATION_EVIDENCE_CLASS, `${entry.experimentId} declares its class`);
+    assertEqual(bundle.experiment.schemaVersion, DIRECTION_SCHEMA_VERSION, `${entry.experimentId} keeps the frozen schema version`);
+    assertEqual(bundle.experiment.phase, DIRECTION_PHASE, `${entry.experimentId} keeps the frozen phase`);
+    assertEqual(bundle.experiment.horizonSeconds, 30, `${entry.experimentId} keeps the frozen horizon`);
+    assertEqual(bundle.experiment.samplingCadenceMs, 30_000, `${entry.experimentId} keeps the frozen cadence`);
+    assertEqual(bundle.experiment.questionDigest, directionQuestionDigest(), `${entry.experimentId} keeps the frozen question digest`);
+    assertEqual(bundle.experiment.featureDefinitionDigest, DIRECTION_FEATURE_DEFINITION_DIGEST, `${entry.experimentId} keeps the frozen feature digest`);
+    assertEqual(bundle.experiment.baselineDefinitionDigest, BASELINE_DEFINITION_DIGEST, `${entry.experimentId} keeps the frozen baseline digest`);
+    assertEqual(bundle.experiment.metricDefinitionDigest, DIRECTION_METRIC_DEFINITION_DIGEST, `${entry.experimentId} keeps the frozen metric digest`);
+    assertEqual(bundle.experiment.mode, "shadow", `${entry.experimentId} stays shadow`);
+    for (const prediction of bundle.predictions) {
+      assertEqual(prediction.evidenceClass, bundle.experiment.evidenceClass, `${entry.experimentId} prediction carries the same class`);
+      assertEqual(Object.hasOwn(prediction, "threshold"), false, `${entry.experimentId} prediction carries no threshold`);
+    }
+  }
+  const replicationSession = rep.sessions.find((entry) => entry.experimentId === "jdir-fixture-rep-1");
+  const bundle = await readDirectionExperimentBundle(directionExperimentRootFor(rep.experimentsRoot, "jdir-fixture-rep-1"));
+  assertEqual(bundle.summary.evidenceScope, "REPLICATION", "a replication session summary declares the replication scope");
+  assertEqual(bundle.summary.developmentOnly, false, "and is not development evidence");
+  assertEqual(bundle.summary.noConfidenceThreshold, true, "and has no confidence threshold");
+  assertEqual(bundle.summary.winner, null, "and emits no winner");
+  assertTrue(replicationSession !== undefined, "the clean fixture session exists");
+});
+
+test("AL3. the replication summary contains no winner, no significance and no profitability field", () => {
+  const stats = ctx.replication.added[ctx.replication.added.length - 1].summary;
+  assertEqual(stats.winner, null, "no winner");
+  assertEqual(stats.noAutomatedWinner, true, "declared");
+  assertEqual(stats.significanceClaimed, false, "no significance claim");
+  assertEqual(stats.profitabilityInference, false, "no profitability inference");
+  assertEqual(stats.tradingInference, false, "no trading inference");
+  assertEqual(stats.deploymentInference, false, "no deployment inference");
+  const audit = auditNoProfitabilityFields(stats);
+  assertEqual(audit.ok, true, `no profitability-shaped field appears: ${audit.problems.join("; ")}`);
+  const serialized = JSON.stringify(stats).toLowerCase();
+  for (const token of ["pnl", "sharpe", "sortino", "profitfactor", "expectedreturn"]) {
+    assertExcludes(serialized, token, `the replication summary contains no ${token}`);
+  }
+  assertEqual(stats.bootstrap.pValueEmitted, false, "no p-value is emitted");
+  assertEqual(stats.bootstrap.significanceLabelEmitted, false, "no significance label is emitted");
+  for (const interval of Object.values(stats.bootstrap.comparisons ?? {})) {
+    assertEqual(interval.pValue, null, "no interval carries a p-value");
+    assertEqual(interval.significanceLabel, null, "no interval carries a significance label");
+    assertEqual(interval.statisticallyProven, false, "no interval claims statistical proof");
+    assertEqual(interval.descriptiveOnly, true, "every interval is descriptive only");
+  }
+  assertEqual(stats.noTuningBetweenSessions, true, "the summary records the no-tuning rule");
+  assertEqual(stats.interruptedWaveIsIncomparable, true, "and the interrupted-wave rule");
+});
+
+test("AL4. the new 5I.1 modules are inside the isolation barrier and contain no money path", async () => {
+  const modules = [
+    "scripts/jev/direction/evidence.mjs",
+    "scripts/jev/direction/replication/development-barrier.mjs",
+    "scripts/jev/direction/replication/protocol.mjs",
+    "scripts/jev/direction/replication/manifest.mjs",
+    "scripts/jev/direction/replication/eligibility.mjs",
+    "scripts/jev/direction/replication/aggregate.mjs",
+    "scripts/jev/direction/replication/runner.mjs",
+  ];
+  for (const relative of modules) {
+    assertTrue(PHASE_5I_MODULES.includes(relative), `${relative} is inside the 5I module barrier`);
+    const source = executableCode(await readText(relative));
+    for (const token of FORBIDDEN_RUNTIME_TOKENS) {
+      assertExcludes(source, token, `${relative} executable code contains no '${token}'`);
+    }
+    assertExcludes(source, "minConfidence", `${relative} has no minConfidence identifier`);
+    assertExcludes(source, "confidenceThreshold:", `${relative} assigns no confidenceThreshold`);
+    assertExcludes(await readText(relative), "arena/tournament", `${relative} does not import the Arena tournament`);
+  }
+  const engine = await readText("scripts/evolve-engine.mjs");
+  assertExcludes(engine, "jev/direction", "the engine still never imports the 5I direction modules");
+});
+
+test("AL5. replay and stats are provably zero-network and never launch a session", async () => {
+  const rep = ctx.replication;
+  const replay = await replicationReplay({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  const stats = await replicationStats({ replicationRoot: rep.replicationRoot, baseRoot: rep.experimentsRoot, replicationId: rep.created.replicationId });
+  for (const [label, report] of [["replay", replay], ["stats", stats]]) {
+    assertEqual(report.networkCalls, 0, `${label}: zero network calls`);
+    assertEqual(report.jevCalls, 0, `${label}: zero Jev calls`);
+    assertEqual(report.arenaRuns, 0, `${label}: zero Arena runs`);
+    assertEqual(report.tradingCalls, 0, `${label}: zero trading calls`);
+    assertEqual(report.launchedSessions, 0, `${label}: launched no session`);
+  }
+  const runnerSource = await readText("scripts/jev/direction/replication/runner.mjs");
+  assertIncludes(runnerSource, "NO OPERATION HERE EVER LAUNCHES A SESSION", "the runner states that it never launches a session");
+  assertIncludes(runnerSource, "READ ONLY, ZERO NETWORK", "and that the read paths are offline");
+});
+
+test("AL6. Phase 5I.1 wrote nothing under the real replication tree", async () => {
+  const now = await metadataSnapshot(REAL_REPLICATION_ROOT);
+  assertDeepEqual(now, ctx.before.realReplication, "the real replication tree is byte-unchanged");
+  assertTrue(!(ctx.tempRoot ?? "").includes(path.join(REPO, ".evolve")), "every replication fixture lives in temp");
+  assertTrue(path.join(DIRECTION_ROOT_DIR, "replication") === DIRECTION_REPLICATION_ROOT_DIR, "the replication tree is the documented path");
+  assertEqual(REPLICATION_MANIFEST_FILE, "replication.json", "the manifest file name");
+  assertEqual(REPLICATION_SESSIONS_FILE, "sessions.json", "the sessions file name");
+  assertEqual(REPLICATION_SUMMARY_FILE, "summary.json", "the summary file name");
+  assertEqual(REPLICATION_RUNNER_VERSION, 1, "the replication runner version");
+});
+
+test("AL7. the replication helpers do not duplicate raw experiment artifacts", async () => {
+  const rep = ctx.replication;
+  const sessions = await readReplicationSessions(replicationRootFor(rep.replicationRoot, rep.created.replicationId));
+  for (const session of sessions.sessions) {
+    assertEqual(session.experimentId, session.sessionId, "a session record references its experiment by id");
+    assertEqual(Object.hasOwn(session, "predictions"), false, "and stores no prediction artifacts");
+    assertEqual(Object.hasOwn(session, "outcomes"), false, "and no outcome artifacts");
+    assertEqual(Object.hasOwn(session, "metrics"), true, "it stores the derived session-level metrics");
+    assertEqual(Object.hasOwn(session.metrics, "rows"), false, "but not the observation-level rows");
+    assertEqual(session.metricsDigest.length, 64, "it pins the observation-level report by digest instead");
+    assertEqual(Object.hasOwn(session, "windowMs"), true, "and keeps the session window for the independence rule");
+  }
+  const source = await readText("scripts/jev/direction/replication/manifest.mjs");
+  assertIncludes(source, "REFERENCES existing immutable", "the storage module states the reference-only rule");
+});
+
+test("AL8. the replication builder never rewrote the development evidence it references", async () => {
+  const rep = ctx.replication;
+  const root = directionExperimentRootFor(rep.experimentsRoot, CANONICAL_DEVELOPMENT_EXPERIMENT_ID);
+  if (!(await exists(root))) {
+    skip("the canonical development experiment is absent in this checkout — its immutability check was skipped cleanly");
+    return;
+  }
+  for (const sessionId of ["jdir-fixture-rep-1", "jdir-fixture-rep-2", "jdir-fixture-rep-3"]) {
+    const bundle = await readDirectionExperimentBundle(directionExperimentRootFor(rep.experimentsRoot, sessionId));
+    assertEqual(bundle.experiment.evidenceClass, REPLICATION_EVIDENCE_CLASS, `${sessionId} is replication evidence`);
+    assertEqual(bundle.summary.replicationStatus, "PENDING_WAVE_AGGREGATION", `${sessionId} never claims a wave-level result`);
+  }
+  const development = await readDirectionExperimentBundle(root);
+  assertEqual(development.experiment.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the development experiment is still development evidence");
+  assertEqual(development.summary.evidenceScope, "DEVELOPMENT", "with its development scope intact");
+  assertEqual(development.summary.replicationStatus, "NOT_REPLICATED", "and its NOT_REPLICATED status intact");
+});
+
+/* ============================================================================
  * Runner
  * ==========================================================================*/
 
@@ -3994,6 +5345,7 @@ async function run() {
 
   ctx.before.realDirection = await metadataSnapshot(REAL_DIRECTION_ROOT);
   ctx.before.realExperiments = await metadataSnapshot(REAL_EXPECTED_DIR);
+  ctx.before.realReplication = await metadataSnapshot(REAL_REPLICATION_ROOT);
   ctx.before.directionRootPresent = await exists(REAL_DIRECTION_ROOT);
 
   try {
@@ -4022,6 +5374,7 @@ async function run() {
   const after = {
     realDirection: await metadataSnapshot(REAL_DIRECTION_ROOT),
     realExperiments: await metadataSnapshot(REAL_EXPECTED_DIR),
+    realReplication: await metadataSnapshot(REAL_REPLICATION_ROOT),
   };
   await disposeFixtures();
 
@@ -4032,7 +5385,10 @@ async function run() {
     console.log(`skipped ${skips.length} optional case(s) whose canonical evidence is absent here:`);
     for (const reason of skips) console.log(`  - ${reason}`);
   }
-  console.log(`EVOLVE Phase 5I.0b direct-TypeSafe Jev directional-prediction validation: ${passed}/${cases.length} checks passed`);
+  console.log(
+    `EVOLVE Phase 5I.0b direct-TypeSafe Jev directional-prediction + Phase 5I.1 frozen-protocol replication validation: ` +
+      `${passed}/${cases.length} checks passed`,
+  );
 
   if (failures.length > 0) {
     console.log("Failed checks:");
@@ -4044,12 +5400,18 @@ async function run() {
     console.log("the freeze instant and never moves; TIE outcomes are retained but never scored; the lookahead audit is");
     console.log("behavioural; startup divergence is a diagnostic and never called lookahead; every valid probability is retained");
     console.log("with no confidence threshold; and every routing flag stays false.");
-    console.log("NO real benchmark was run: every experiment above lived in a temp directory with an injected clock, market and provider.");
+    console.log("The Phase 5I.1 replication framework is frozen: the canonical development barrier and the replication protocol");
+    console.log("digest are source-pinned, sessions are CLEAN only when they are genuine, direct-TypeSafe, frozen-protocol,");
+    console.log("tamper-free, lookahead-clean and temporally independent of the development experiment and of each other, and the");
+    console.log("cross-session aggregate is equal-weighted by eligible SESSION with no winner and no significance claim.");
+    console.log("NO real benchmark and NO real replication session was run: every experiment above lived in a temp directory with an");
+    console.log("injected clock, market and provider, and the operator runs real sessions manually.");
   }
 
   const clean =
     canonicalJson(after.realDirection) === canonicalJson(ctx.before.realDirection) &&
-    canonicalJson(after.realExperiments) === canonicalJson(ctx.before.realExperiments);
+    canonicalJson(after.realExperiments) === canonicalJson(ctx.before.realExperiments) &&
+    canonicalJson(after.realReplication) === canonicalJson(ctx.before.realReplication);
   if (!clean) {
     console.error("FAIL: this suite modified a real .evolve evidence tree — that must never happen.");
     process.exitCode = 1;

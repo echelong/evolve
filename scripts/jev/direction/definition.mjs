@@ -719,6 +719,30 @@ export const UNAVAILABLE_FEATURE_FAMILIES_DIGEST = digestOf(UNAVAILABLE_FEATURE_
 export const DIRECTION_ACTIONS = Object.freeze(["start", "resume", "resolve", "replay", "stats"]);
 
 /**
+ * Phase 5I.1 replication actions.
+ *
+ * Deliberately a SEPARATE list from `DIRECTION_ACTIONS`: the five benchmark
+ * actions above stay exactly as frozen (adding a member there would be a change
+ * to the frozen development CLI surface), while replication adds explicit,
+ * offline-capable, ID-ONLY commands. Like every other non-start action, none of
+ * them ever guesses an id: there is no "latest" here either.
+ */
+export const DIRECTION_REPLICATION_ACTIONS = Object.freeze([
+  "replication-create",
+  "replication-add",
+  "replication-replay",
+  "replication-stats",
+]);
+
+/** Every action this CLI resolves, benchmark + replication. */
+export const DIRECTION_ALL_ACTIONS = Object.freeze([...DIRECTION_ACTIONS, ...DIRECTION_REPLICATION_ACTIONS]);
+
+/** Whether an action belongs to the Phase 5I.1 replication surface. */
+export function isReplicationAction(action) {
+  return DIRECTION_REPLICATION_ACTIONS.includes(action);
+}
+
+/**
  * Options this phase deliberately does NOT have. Supplying one is a hard error
  * rather than a silently ignored flag — a benchmark that could be nudged toward
  * looking better is not a benchmark.
@@ -766,6 +790,16 @@ export const DIRECTION_BOOLEAN_FLAGS = Object.freeze([
   "help",
   "allow-mock",
   "allow-unsafe-model",
+  // ---- Phase 5I.1 replication -------------------------------------------------
+  "replication-create",
+  "replication-add",
+  "replication-replay",
+  "replication-stats",
+  // Marks a `--start`/`--resume` run as ONE CLEAN Phase 5I.1 replication SESSION.
+  // It changes ONLY the evidence class the run declares (never the predictive
+  // protocol), and it refuses any protocol value that differs from the frozen
+  // development pins before a single observation is taken.
+  "replication-session",
 ]);
 
 export const DIRECTION_VALUE_FLAGS = Object.freeze([
@@ -780,12 +814,21 @@ export const DIRECTION_VALUE_FLAGS = Object.freeze([
   "model",
   "timeout-ms",
   "out",
+  // ---- Phase 5I.1 replication -------------------------------------------------
+  "replication",
+  "development",
+  "replication-out",
 ]);
 
 /** Resolve which single action an invocation selected. Never more than one. */
 export function resolveDirectionAction(flags = {}) {
-  const selected = DIRECTION_ACTIONS.filter((action) => flags?.[action] === true);
-  if (selected.length === 0) return { action: null, error: "exactly one of --start | --resume | --resolve | --replay | --stats is required" };
+  const selected = DIRECTION_ALL_ACTIONS.filter((action) => flags?.[action] === true);
+  if (selected.length === 0) {
+    return {
+      action: null,
+      error: `exactly one of ${DIRECTION_ALL_ACTIONS.map((action) => `--${action}`).join(" | ")} is required`,
+    };
+  }
   if (selected.length > 1) return { action: null, error: `exactly ONE action may be selected, got: ${selected.join(", ")}` };
   return { action: selected[0], error: null };
 }
