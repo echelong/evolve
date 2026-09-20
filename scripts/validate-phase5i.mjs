@@ -84,9 +84,16 @@ import {
   MAX_SOURCE_STATE_AGE_MS,
   MODEL_INTENT_DEFINITION,
   OBSERVATION_HISTORY_LIMIT,
-  OUTCOME_RESOLUTION_POLICY,
-  OUTCOME_RESOLUTION_POLICY_DIGEST,
-  OUTCOME_RESOLUTION_POLICY_VERSION,
+  CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION,
+  DEFAULT_OUTCOME_RESOLUTION_POLICY,
+  DEFAULT_OUTCOME_RESOLUTION_POLICY_DIGEST,
+  OUTCOME_RESOLUTION_POLICIES,
+  OUTCOME_RESOLUTION_POLICY_V1,
+  OUTCOME_RESOLUTION_POLICY_V1_DIGEST,
+  OUTCOME_RESOLUTION_POLICY_V2,
+  OUTCOME_RESOLUTION_POLICY_V2_DIGEST,
+  OUTCOME_RESOLUTION_POLICY_VERSION_V1,
+  OUTCOME_RESOLUTION_POLICY_VERSION_V2,
   OUTCOME_TIMESTAMP_FIELDS,
   OUTCOME_UNAVAILABLE_REASON,
   OVERRIDE_REASON_IN_5I_0B,
@@ -98,6 +105,7 @@ import {
   REQUIRED_PROVIDER,
   REQUIRED_UPSTREAM_PROVIDER,
   RESOLUTION_TOLERANCE_MS,
+  RESOLUTION_TOLERANCE_MS_V2,
   STALENESS_POLICY,
   STALENESS_POLICY_DIGEST,
   STATE_TIMESTAMP_FIELDS,
@@ -108,7 +116,11 @@ import {
   TIMESTAMP_SEMANTICS,
   UNAVAILABLE_FEATURE_FAMILIES,
   UNAVAILABLE_FEATURE_FAMILIES_DIGEST,
+  outcomeResolutionPolicyDigestFor,
+  outcomeResolutionPolicyFor,
+  outcomeResolutionPolicyForOffset,
   resolveDirectionAction,
+  resolveOutcomeOffset,
 } from "./jev/direction/definition.mjs";
 import {
   DIRECTION_QUESTION_CRITERIA,
@@ -176,9 +188,13 @@ import {
   CALIBRATION_BIN_EDGES,
   DIRECTION_METRIC_DEFINITION,
   DIRECTION_METRIC_DEFINITION_DIGEST,
+  DIRECTION_METRIC_DEFINITION_V1,
+  DIRECTION_METRIC_DEFINITION_V1_DIGEST,
+  DIRECTION_METRIC_DEFINITIONS,
   DIRECTION_METRICS_VERSION,
   FORBIDDEN_METRIC_FIELDS,
   LOG_LOSS_EPSILON,
+  METRIC_V2_ONLY_FIELDS,
   OUTCOME,
   PROBABILITY_PAIR_TOLERANCE,
   QUANTILE_METHOD,
@@ -192,9 +208,13 @@ import {
   latencyStats,
   logLoss,
   meanOf,
+  metricDefinitionDigestForVersion,
+  metricDefinitionForVersion,
   metricsDigestOf,
   outcomeLabelOf,
   percentileOf,
+  percentileStats,
+  projectMetricsToVersion,
   spreadStats,
 } from "./jev/direction/metrics.mjs";
 import {
@@ -251,6 +271,7 @@ import {
   DIRECTION_OBSERVATION_VERSION,
   POLITE_WAIT_MAX_STEPS,
   createSolDirectionObservationSource,
+  selectFirstPostTargetObservation,
 } from "./jev/direction/observation.mjs";
 
 import { JEV_PROVIDER, JEV_STATUS, NO_JEV_DECISION, jevIdentity, resolveJevConfig } from "./jev/config.mjs";
@@ -538,7 +559,7 @@ const FIXTURE_PIN_RESULT = Object.freeze({
 const FIXTURE_SETTINGS_OVERRIDES = Object.freeze({
   market: "SOL-USDC",
   "cadence-seconds": "30",
-  "tolerance-ms": "5000",
+  "tolerance-ms": "10000",
   "max-runtime-minutes": "90",
 });
 
@@ -741,7 +762,8 @@ test("A2. the historical definition digests are non-trivial and stable across re
     metrics: DIRECTION_METRIC_DEFINITION_DIGEST,
     referencePrice: REFERENCE_PRICE_DEFINITION_DIGEST,
     staleness: STALENESS_POLICY_DIGEST,
-    outcomeResolution: OUTCOME_RESOLUTION_POLICY_DIGEST,
+    outcomeResolutionV1: OUTCOME_RESOLUTION_POLICY_V1_DIGEST,
+    outcomeResolutionV2: OUTCOME_RESOLUTION_POLICY_V2_DIGEST,
     unavailableFamilies: UNAVAILABLE_FEATURE_FAMILIES_DIGEST,
   })) {
     assertTrue(/^[0-9a-f]{64}$/.test(String(value)), `${label} digest is a sha256 hex string`);
@@ -750,9 +772,11 @@ test("A2. the historical definition digests are non-trivial and stable across re
   assertEqual(DIRECTION_FEATURE_DEFINITION_DIGEST, digestOf(DIRECTION_FEATURE_DEFINITION), "the feature definition digest recomputes");
   assertEqual(BASELINE_DEFINITION_DIGEST, digestOf(BASELINE_DEFINITION), "the baseline definition digest recomputes");
   assertEqual(DIRECTION_METRIC_DEFINITION_DIGEST, digestOf(DIRECTION_METRIC_DEFINITION), "the metric definition digest recomputes");
+  assertEqual(DIRECTION_METRIC_DEFINITION_V1_DIGEST, digestOf(DIRECTION_METRIC_DEFINITION_V1), "the frozen v1 metric definition digest recomputes");
   assertEqual(REFERENCE_PRICE_DEFINITION_DIGEST, digestOf(REFERENCE_PRICE_DEFINITION), "the reference-price digest recomputes");
   assertEqual(STALENESS_POLICY_DIGEST, digestOf(STALENESS_POLICY), "the staleness-policy digest recomputes");
-  assertEqual(OUTCOME_RESOLUTION_POLICY_DIGEST, digestOf(OUTCOME_RESOLUTION_POLICY), "the outcome-policy digest recomputes");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1_DIGEST, digestOf(OUTCOME_RESOLUTION_POLICY_V1), "the outcome-policy v1 digest recomputes");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2_DIGEST, digestOf(OUTCOME_RESOLUTION_POLICY_V2), "the outcome-policy v2 digest recomputes");
   assertEqual(UNAVAILABLE_FEATURE_FAMILIES_DIGEST, digestOf(UNAVAILABLE_FEATURE_FAMILIES), "the omitted-family digest recomputes");
 });
 
@@ -761,9 +785,11 @@ test("A3. every definition version is a positive integer and the versions are di
   assertEqual(DIRECTION_PACKET_VERSION, 1, "packet version");
   assertEqual(DIRECTION_FEATURE_DEFINITION_VERSION, 1, "feature definition version");
   assertEqual(BASELINE_DEFINITION_VERSION, 1, "baseline definition version");
-  assertEqual(DIRECTION_METRICS_VERSION, 1, "metric definition version");
+  assertEqual(DIRECTION_METRICS_VERSION, 2, "metric definition version");
   assertEqual(REFERENCE_PRICE_DEFINITION_VERSION, 1, "reference price definition version");
-  assertEqual(OUTCOME_RESOLUTION_POLICY_VERSION, 1, "outcome resolution policy version");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_VERSION_V1, 1, "outcome resolution policy v1 version");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_VERSION_V2, 2, "outcome resolution policy v2 version");
+  assertEqual(CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION, 2, "new experiments pin policy v2");
   assertEqual(DIRECTION_SETTINGS_VERSION, 1, "settings version");
   assertEqual(DIRECTION_OBSERVATION_VERSION, 1, "observation version");
   assertEqual(DIRECTION_FIXTURE_PROVIDER_VERSION, 1, "offline fixture provider version");
@@ -1459,11 +1485,13 @@ test("I6. a late observation produces NO outcome artifact and is never rescored 
 });
 
 test("I7. the resolution tolerance is bounded and frozen into the manifest", () => {
-  assertEqual(RESOLUTION_TOLERANCE_MS, 5_000, "the default tolerance");
-  assertEqual(ctx.main.settings.resolutionToleranceMs, RESOLUTION_TOLERANCE_MS, "the fixture used the frozen tolerance");
-  assertEqual(ctx.experiment.resolutionToleranceMs, RESOLUTION_TOLERANCE_MS, "the manifest pins it");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.maximumOffsetMs, RESOLUTION_TOLERANCE_MS, "the policy pins the same bound");
-  assertTrue(Object.keys(OUTCOME_RESOLUTION_POLICY).length > 0, "the policy is a substantive object");
+  assertEqual(RESOLUTION_TOLERANCE_MS, 5_000, "the frozen v1 tolerance is still 5000 ms");
+  assertEqual(RESOLUTION_TOLERANCE_MS_V2, 10_000, "the frozen v2 tolerance is 10000 ms");
+  assertEqual(ctx.main.settings.resolutionToleranceMs, RESOLUTION_TOLERANCE_MS_V2, "a NEW fixture experiment uses the v2 bound");
+  assertEqual(ctx.experiment.resolutionToleranceMs, RESOLUTION_TOLERANCE_MS_V2, "the manifest pins it");
+  assertEqual(ctx.main.settings.outcomeResolutionPolicyVersion, OUTCOME_RESOLUTION_POLICY_VERSION_V2, "a new experiment pins policy v2");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.maximumOffsetMs, RESOLUTION_TOLERANCE_MS_V2, "the default policy pins the same bound");
+  assertTrue(Object.keys(DEFAULT_OUTCOME_RESOLUTION_POLICY).length > 0, "the policy is a substantive object");
   assertTrue(Number.isInteger(POLITE_WAIT_MAX_STEPS) && POLITE_WAIT_MAX_STEPS > 0, "the endpoint walk has a bounded politeness wait");
   assertTrue(POLITE_WAIT_MAX_STEPS <= 5_000, "and the bound is small enough to be a real guard");
 });
@@ -1814,15 +1842,20 @@ test("M4. the outcome never rebuilds the model input: the recorded prices come f
 });
 
 test("M5. the outcome resolution policy is frozen, digested and deterministic in time", () => {
-  assertEqual(OUTCOME_RESOLUTION_POLICY.selectionRule.length > 0, true, "the selection rule is documented");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.selectionIsLexicographicInTime, true, "selection is first-in-time");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.selectionDependsOnPredictionOrOutcomeQuality, false, "selection never depends on how good the prediction looks");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.earlierThanTargetRejected, true, "an earlier price is rejected");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.earlierThanTargetUsesEarlierPrice, false, "and is never used anyway");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.neverMovesTargetAt, true, "the target is never moved");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.offsetField, "outcomeOffsetMs = outcomeReceivedAt - targetAt", "the offset field is defined");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.selectionRule.length > 0, true, "the selection rule is documented");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.selectionIsLexicographicInTime, true, "selection is first-in-time");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.selectionDependsOnPredictionOrOutcomeQuality, false, "selection never depends on how good the prediction looks");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.earlierThanTargetRejected, true, "an earlier price is rejected");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.earlierThanTargetUsesEarlierPrice, false, "and is never used anyway");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.neverMovesTargetAt, true, "the target is never moved");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.offsetField, "outcomeOffsetMs = outcomeReceivedAt - targetAt", "the offset field is defined");
   assertEqual(OUTCOME_UNAVAILABLE_REASON, "OUTCOME_UNAVAILABLE", "the unavailable reason is frozen");
-  assertEqual(OUTCOME_RESOLUTION_POLICY.unavailableReason, OUTCOME_UNAVAILABLE_REASON, "the policy names the same reason");
+  assertEqual(DEFAULT_OUTCOME_RESOLUTION_POLICY.unavailableReason, OUTCOME_UNAVAILABLE_REASON, "the policy names the same reason");
+  // v1 and v2 share the SAME deterministic selection rule; only the bound differs.
+  for (const field of ["selectionRule", "selectionIsLexicographicInTime", "selectionDependsOnPredictionOrOutcomeQuality", "offsetField", "earlierThanTargetRejected", "neverMovesTargetAt"]) {
+    assertEqual(OUTCOME_RESOLUTION_POLICY_V1[field], OUTCOME_RESOLUTION_POLICY_V2[field], `v1 and v2 share '${field}'`);
+  }
+  assertTrue(OUTCOME_RESOLUTION_POLICY_V1.maximumOffsetMs !== OUTCOME_RESOLUTION_POLICY_V2.maximumOffsetMs, "only the bound changed");
 });
 
 test("M6. every resolved outcome received its future observation at or after targetAt", () => {
@@ -1861,7 +1894,7 @@ test("M8. an outcome can never be scored without a scorable prediction", () => {
 
 test("M9. the outcome carries the resolution policy and the zero-authority routing flags", () => {
   for (const outcome of ctx.mainOutcomes) {
-    assertDeepEqual(outcome.outcomeResolutionPolicy, OUTCOME_RESOLUTION_POLICY, `${outcome.observationId} pins the resolution policy`);
+    assertDeepEqual(outcome.outcomeResolutionPolicy, DEFAULT_OUTCOME_RESOLUTION_POLICY, `${outcome.observationId} pins the resolution policy`);
     assertEqual(outcome.jevTradingRoutingActive, false, `${outcome.observationId}: no Jev trading routing`);
     assertEqual(outcome.tradingRoutingActive, false, `${outcome.observationId}: no trading routing`);
     assertEqual(outcome.arenaRoutingActive, false, `${outcome.observationId}: no Arena routing`);
@@ -3007,7 +3040,7 @@ function defaultDirectionProviderForResume() {
 }
 
 test("AA7. the pin comparison set covers every contract element", () => {
-  for (const pin of ["provider", "model", "gatewayUsed", "mode", "horizonSeconds", "resolutionToleranceMs", "samplingCadenceMs", "maxObservations", "questionSetId", "questionDigest", "packetKind", "packetVersion", "featureDefinitionDigest", "baselineDefinitionDigest", "metricDefinitionDigest", "referencePriceDefinitionDigest", "stalenessPolicyDigest", "outcomeResolutionPolicyDigest"]) {
+  for (const pin of ["provider", "model", "gatewayUsed", "mode", "horizonSeconds", "resolutionToleranceMs", "samplingCadenceMs", "maxObservations", "questionSetId", "questionDigest", "packetKind", "packetVersion", "featureDefinitionDigest", "baselineDefinitionDigest", "metricDefinitionDigest", "referencePriceDefinitionDigest", "stalenessPolicyDigest", "outcomeResolutionPolicyDigest", "outcomeResolutionPolicyVersion"]) {
     assertTrue(PIN_COMPARISONS.includes(pin), `'${pin}' is a pinned field`);
   }
   const base = createDirectionExperiment({
@@ -3035,8 +3068,9 @@ test("AA7. the pin comparison set covers every contract element", () => {
     referencePriceDefinitionDigest: REFERENCE_PRICE_DEFINITION_DIGEST,
     stalenessPolicy: STALENESS_POLICY,
     stalenessPolicyDigest: STALENESS_POLICY_DIGEST,
-    outcomeResolutionPolicy: OUTCOME_RESOLUTION_POLICY,
-    outcomeResolutionPolicyDigest: OUTCOME_RESOLUTION_POLICY_DIGEST,
+    outcomeResolutionPolicy: DEFAULT_OUTCOME_RESOLUTION_POLICY,
+    outcomeResolutionPolicyDigest: DEFAULT_OUTCOME_RESOLUTION_POLICY_DIGEST,
+    outcomeResolutionPolicyVersion: CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION,
     unavailableFeatureFamiliesDigest: UNAVAILABLE_FEATURE_FAMILIES_DIGEST,
     offlineFixture: true,
     startedAt: FIXTURE_T0,
@@ -3102,7 +3136,7 @@ test("AB3. replay proves same-state baseline fairness and the provider pins", as
   assertEqual(report.model, "direction-fixture-jev-v1", "and the honest model");
   assertEqual(report.gatewayUsed, false, "and that no gateway was used");
   assertEqual(report.horizonSeconds, HORIZON_SECONDS, "and the frozen horizon");
-  assertDeepEqual(report.counts && Object.keys(report.counts).sort(), ["failedJevObservations", "invalidPredictions", "outcomes", "predictions", "scorablePredictions", "tamperDetected"], "the count block enumerates the artefacts");
+  assertDeepEqual(report.counts && Object.keys(report.counts).sort(), ["failedJevObservations", "invalidPredictions", "outcomeWindowExclusions", "outcomes", "predictions", "scorablePredictions", "scoredCount", "tamperDetected"], "the count block enumerates the artefacts");
 });
 
 test("AB4. TAMPER: a mutated prediction is DETECTED and scoring fails closed", async () => {
@@ -3427,6 +3461,248 @@ test("AD8. no 5I module imports a trading, Arena-scoring, DeepSeek, classifier o
   const runner = await readText("scripts/jev/direction/runner.mjs");
   assertIncludes(runner, "arena/orchestrator.mjs", "the runner reuses the EXISTING regime classifier read-only");
   assertExcludes(runner, "arenaScore", "but never touches an Arena score");
+});
+
+/* ============================================================================
+ * PART AG — outcome-resolution policy v2 + metric v2 timing/denominator diagnostics
+ *
+ * The v1 identities are FROZEN and must stay byte-identical; v2 is a NEW frozen
+ * version. None of this is selected using prediction performance.
+ * ==========================================================================*/
+
+/** The first real canary — immutable historical infrastructure evidence, when present locally. */
+const CANARY_EXPERIMENT_ID = "jdir-20260920T060810Z-3a9163";
+
+/** Pure classifier over the timestamps + a policy bound, with NO probability/direction input. */
+function classifyAt(offsetMs, targetAtMs = 1_000_000, maximumOffsetMs) {
+  return resolveOutcomeOffset({ targetAtMs, outcomeReceivedAtMs: targetAtMs + offsetMs, maximumOffsetMs });
+}
+
+test("AG1. outcome-resolution policy v1 still exists, is unchanged, and is bounded at 5000 ms", () => {
+  assertEqual(OUTCOME_RESOLUTION_POLICY_VERSION_V1, 1, "v1 is still version 1");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1.version, 1, "the v1 object declares version 1");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1.maximumOffsetMs, 5_000, "v1 is still bounded at exactly 5000 ms");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1.maximumOffsetMs, RESOLUTION_TOLERANCE_MS, "the legacy tolerance constant is still v1's bound");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1_DIGEST, digestOf(OUTCOME_RESOLUTION_POLICY_V1), "the v1 digest recomputes from the frozen object");
+});
+
+test("AG2. outcome-resolution policy v2 is exactly 10000 ms and reuses v1's selection rule", () => {
+  assertEqual(OUTCOME_RESOLUTION_POLICY_VERSION_V2, 2, "v2 is version 2");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.version, 2, "the v2 object declares version 2");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.maximumOffsetMs, 10_000, "v2 is bounded at exactly 10000 ms");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.maximumOffsetMs, RESOLUTION_TOLERANCE_MS_V2, "the v2 constant agrees");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.selectionRule, OUTCOME_RESOLUTION_POLICY_V1.selectionRule, "the selection rule is unchanged from v1");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.supersedesPolicyVersion, 1, "v2 declares it supersedes v1");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.offsetBoundTunedAgainstPredictionOutcomes, false, "the bound is NOT tuned against prediction outcomes");
+  assertTrue(OUTCOME_RESOLUTION_POLICY_V2.maximumOffsetMs < HORIZON_MS, "the bound stays well below the 30 s horizon");
+});
+
+test("AG3. v1 and v2 have DISTINCT digests and both stay resolvable forever", () => {
+  assertTrue(OUTCOME_RESOLUTION_POLICY_V1_DIGEST !== OUTCOME_RESOLUTION_POLICY_V2_DIGEST, "v1 and v2 digests differ");
+  assertTrue(/^[0-9a-f]{64}$/.test(OUTCOME_RESOLUTION_POLICY_V2_DIGEST), "the v2 digest is a sha256 hex string");
+  assertEqual(outcomeResolutionPolicyFor(1), OUTCOME_RESOLUTION_POLICY_V1, "version 1 resolves to the frozen v1 object");
+  assertEqual(outcomeResolutionPolicyFor(2), OUTCOME_RESOLUTION_POLICY_V2, "version 2 resolves to the frozen v2 object");
+  assertEqual(outcomeResolutionPolicyDigestFor(1), OUTCOME_RESOLUTION_POLICY_V1_DIGEST, "digest lookup for v1");
+  assertEqual(outcomeResolutionPolicyDigestFor(2), OUTCOME_RESOLUTION_POLICY_V2_DIGEST, "digest lookup for v2");
+  assertEqual(outcomeResolutionPolicyFor(99), null, "an unknown version fails closed");
+  assertDeepEqual(Object.keys(OUTCOME_RESOLUTION_POLICIES).sort(), ["1", "2"], "the registry lists every frozen version");
+  assertEqual(outcomeResolutionPolicyForOffset(5_000), OUTCOME_RESOLUTION_POLICY_V1, "5000 ms selects v1");
+  assertEqual(outcomeResolutionPolicyForOffset(10_000), OUTCOME_RESOLUTION_POLICY_V2, "10000 ms selects v2");
+  assertEqual(outcomeResolutionPolicyForOffset(9_000), null, "an unregistered bound selects no policy");
+});
+
+test("AG4. v2 ACCEPTS a +6003 ms outcome that v1 REJECTS, and v2 still rejects above +10000 ms", () => {
+  const v1At6003 = classifyAt(6_003, 1_000_000, OUTCOME_RESOLUTION_POLICY_V1.maximumOffsetMs);
+  assertEqual(v1At6003.outcomeOffsetMs, 6_003, "the real measured offset is preserved");
+  assertEqual(v1At6003.invalidReason, OUTCOME_UNAVAILABLE_REASON, "v1 rejects the +6003 ms observation on timing alone");
+  assertEqual(v1At6003.withinWindow, false, "v1 marks it outside the window");
+
+  const v2At6003 = classifyAt(6_003, 1_000_000, OUTCOME_RESOLUTION_POLICY_V2.maximumOffsetMs);
+  assertEqual(v2At6003.outcomeOffsetMs, 6_003, "v2 reports the same real offset");
+  assertEqual(v2At6003.invalidReason, null, "v2 accepts the +6003 ms observation");
+  assertEqual(v2At6003.withinWindow, true, "v2 marks it inside the window");
+
+  assertEqual(classifyAt(10_000, 1_000_000, 10_000).withinWindow, true, "the v2 bound is inclusive at +10000 ms");
+  const v2Above = classifyAt(10_001, 1_000_000, 10_000);
+  assertEqual(v2Above.withinWindow, false, "v2 rejects +10001 ms");
+  assertEqual(v2Above.invalidReason, OUTCOME_UNAVAILABLE_REASON, "and names OUTCOME_UNAVAILABLE");
+  assertEqual(classifyAt(-1, 1_000_000, 10_000).invalidReason, "future_reference_before_target", "a pre-target observation is never accepted by either version");
+});
+
+test("AG5. the policy choice NEVER depends on the Jev probability or the actual direction", () => {
+  // `resolveOutcomeOffset` has no probability/direction parameter at all; the
+  // same offset classifies identically regardless of what the model said.
+  for (const offsetMs of [0, 3_002, 6_003, 10_001]) {
+    const classification = classifyAt(offsetMs, 5_000_000, DEFAULT_OUTCOME_RESOLUTION_POLICY.maximumOffsetMs);
+    assertDeepEqual(classification, classifyAt(offsetMs, 5_000_000, DEFAULT_OUTCOME_RESOLUTION_POLICY.maximumOffsetMs), `offset ${offsetMs} classifies deterministically`);
+  }
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.selectionDependsOnPredictionOrOutcomeQuality, false, "v2 declares selection is outcome-quality independent");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V1.selectionDependsOnPredictionOrOutcomeQuality, false, "and so does v1");
+  assertTrue(!Object.hasOwn(OUTCOME_RESOLUTION_POLICY_V2, "pHigher") && !Object.hasOwn(OUTCOME_RESOLUTION_POLICY_V2, "actualOutcome"), "no policy field references a probability or an outcome label");
+});
+
+test("AG6. targetAt stays stateFrozenAt + 30 s under v2: the policy never moves the target", () => {
+  assertEqual(TARGET_AT_BASIS, "stateFrozenAt + horizonSeconds", "the frozen target basis is unchanged");
+  assertEqual(OUTCOME_RESOLUTION_POLICY_V2.neverMovesTargetAt, true, "v2 never moves targetAt");
+  assertTrue(ctx.mainPredictions.length > 0, "the v2 fixture froze predictions");
+  for (const prediction of ctx.mainPredictions) {
+    assertEqual(Date.parse(prediction.targetAt) - Date.parse(prediction.stateFrozenAt), HORIZON_MS, `${prediction.observationId} keeps the exact 30 s target under v2`);
+    assertEqual(prediction.targetAtBasis, TARGET_AT_BASIS, `${prediction.observationId} still declares the freeze basis`);
+  }
+  assertTrue(!Object.hasOwn(OUTCOME_RESOLUTION_POLICY_V2, "horizonSeconds"), "the widened offset bound does not touch the horizon");
+});
+
+test("AG7. achieved horizon reports the REAL offset, never a relabelled 30 s", () => {
+  assertTrue(ctx.mainOutcomes.length > 0, "the fixture resolved outcomes");
+  for (const outcome of ctx.mainOutcomes) {
+    assertEqual(outcome.achievedHorizonMs, Date.parse(outcome.outcomeReceivedAt) - Date.parse(outcome.stateObservedAt), `${outcome.observationId} achieved horizon = received - stateObserved`);
+    assertEqual(outcome.outcomeOffsetMs, Date.parse(outcome.outcomeReceivedAt) - Date.parse(outcome.targetAt), `${outcome.observationId} offset = received - target`);
+  }
+  const offsetStats = ctx.mainMetrics.outcomeOffsetStats;
+  assertTrue(offsetStats && offsetStats.count === ctx.mainOutcomes.length, "the offset stats cover every resolved outcome");
+  for (const field of ["count", "mean", "median", "p90", "p95", "max"]) {
+    assertTrue(Object.hasOwn(offsetStats, field), `outcomeOffsetStats exposes ${field}`);
+  }
+  const horizonStats = ctx.mainMetrics.achievedHorizonStats;
+  assertTrue(horizonStats && horizonStats.count === ctx.mainOutcomes.length, "the achieved-horizon stats cover every resolved outcome");
+  for (const field of ["count", "mean", "median", "p90", "p95", "max"]) {
+    assertTrue(Object.hasOwn(horizonStats, field), `achievedHorizonStats exposes ${field}`);
+  }
+  assertTrue(horizonStats.max >= HORIZON_MS, "the achieved horizon is at least the 30 s target");
+  assertEqual(percentileStats([5, 1, 3, 2, 4]).median, 3, "percentileStats median is deterministic");
+  assertEqual(percentileStats([]).count, 0, "and empty input yields a zero count");
+});
+
+test("AG8. outcome selection is the FIRST valid post-target observation", () => {
+  const selected = selectFirstPostTargetObservation({
+    targetAtMs: 1_000_000,
+    observations: [
+      { mint: BENCHMARK_MARKET.baseMint, receivedAtMs: 999_999 },
+      { mint: "SomeOtherMint111111111111111111111111111111", receivedAtMs: 1_000_001 },
+      { mint: BENCHMARK_MARKET.baseMint, receivedAtMs: 1_000_500 },
+      { mint: BENCHMARK_MARKET.baseMint, receivedAtMs: 1_003_000 },
+    ],
+  });
+  assertEqual(selected?.receivedAtMs, 1_000_500, "a pre-target and a non-base observation are skipped; the FIRST post-target base wins");
+  assertEqual(selectFirstPostTargetObservation({ targetAtMs: 1_000_000, observations: [{ mint: BENCHMARK_MARKET.baseMint, receivedAtMs: 999_999 }] }), null, "a pre-target observation is never substituted");
+  assertEqual(selectFirstPostTargetObservation({ targetAtMs: 1_000_000, observations: [{ mint: BENCHMARK_MARKET.baseMint, receivedAtMs: 1_000_000 }] })?.receivedAtMs, 1_000_000, "at exactly targetAt an observation IS selected");
+  for (const outcome of ctx.mainOutcomes) {
+    assertTrue(Date.parse(outcome.outcomeReceivedAt) >= Date.parse(outcome.targetAt), `${outcome.observationId} was received at or after targetAt`);
+  }
+});
+
+test("AG9. all-valid and scored probability statistics are reported SEPARATELY", () => {
+  const metrics = ctx.mainMetrics;
+  assertTrue(metrics.validPredictionCount > metrics.scoredCount, "the fixture has valid-but-unscored observations (ties/exclusions)");
+  assertEqual(metrics.allValidPredictionStats.count, metrics.validPredictionCount, "allValidPredictionStats covers every valid prediction");
+  assertEqual(metrics.scoredPredictionStats.count, metrics.scoredCount, "scoredPredictionStats covers only the scored sample");
+  assertTrue(!Object.hasOwn(metrics.allValidPredictionStats, "pHigher") && Object.hasOwn(metrics.allValidPredictionStats, "meanPHigher"), "the all-valid block names meanPHigher");
+  assertEqual(metrics.probabilityStats.allValidPredictions.count, metrics.allValidPredictionStats.count, "the legacy all-valid view agrees");
+  assertEqual(metrics.probabilityStats.scoredBinary.count, metrics.scoredPredictionStats.count, "the legacy scored view agrees");
+});
+
+test("AG10. every score exposes an explicit denominator (brier/logLoss/accuracy sample counts)", () => {
+  const metrics = ctx.mainMetrics;
+  assertEqual(metrics.jev.brierSampleCount, metrics.jev.sampleCount, "Jev Brier denominator is explicit");
+  assertEqual(metrics.jev.logLossSampleCount, metrics.scoredCount, "Jev log-loss denominator equals the scored sample");
+  assertEqual(metrics.jev.accuracySampleCount, metrics.scoredCount, "Jev accuracy denominator equals the scored sample");
+  for (const [baselineId, block] of Object.entries(metrics.baselines)) {
+    assertTrue(Number.isInteger(block.brierSampleCount), `${baselineId} exposes brierSampleCount`);
+    assertTrue(Number.isInteger(block.logLossSampleCount), `${baselineId} exposes logLossSampleCount`);
+    assertTrue(Number.isInteger(block.accuracySampleCount), `${baselineId} exposes accuracySampleCount`);
+    assertEqual(block.brierSampleCount, block.sampleCount, `${baselineId} Brier denominator matches its sample`);
+  }
+});
+
+test("AG11. metric v2 is a strict superset of v1 and the v1 projection reproduces the v1 shape", () => {
+  assertEqual(DIRECTION_METRICS_VERSION, 2, "the current metric definition is v2");
+  assertEqual(DIRECTION_METRIC_DEFINITION_V1.definitionVersion, 1, "v1 declares its own version");
+  assertEqual(DIRECTION_METRIC_DEFINITION_V1_DIGEST, digestOf(DIRECTION_METRIC_DEFINITION_V1), "the v1 metric digest recomputes");
+  assertTrue(DIRECTION_METRIC_DEFINITION_DIGEST !== DIRECTION_METRIC_DEFINITION_V1_DIGEST, "v1 and v2 metric definitions have distinct digests");
+  assertEqual(metricDefinitionForVersion(1), DIRECTION_METRIC_DEFINITION_V1, "version 1 resolves to the frozen v1 definition");
+  assertEqual(metricDefinitionForVersion(2), DIRECTION_METRIC_DEFINITION, "version 2 resolves to the current definition");
+  assertEqual(metricDefinitionDigestForVersion(1), DIRECTION_METRIC_DEFINITION_V1_DIGEST, "digest lookup for metric v1");
+  assertDeepEqual(Object.keys(DIRECTION_METRIC_DEFINITIONS).sort(), ["1", "2"], "the metric registry lists every frozen version");
+  for (const field of METRIC_V2_ONLY_FIELDS) {
+    assertTrue(Object.hasOwn(ctx.mainMetrics, field), `v2 metrics expose ${field}`);
+  }
+  const projected = projectMetricsToVersion(ctx.mainMetrics, 1);
+  for (const field of METRIC_V2_ONLY_FIELDS) {
+    assertTrue(!Object.hasOwn(projected, field), `the v1 projection drops ${field}`);
+  }
+  assertTrue(!Object.hasOwn(projected.jev, "brierSampleCount"), "the v1 projection drops the v2 forecaster denominators");
+  assertEqual(projected.metricDefinitionVersion, 1, "the projection declares metric v1");
+  assertEqual(projected.metricDefinitionDigest, DIRECTION_METRIC_DEFINITION_V1_DIGEST, "and pins the v1 digest");
+});
+
+test("AG12. a NEW experiment pins policy v2 + the v2 digest, and a v1-pinned experiment replays under v1", async () => {
+  // NEW fixture experiments pin v2.
+  assertEqual(ctx.experiment.outcomeResolutionPolicyVersion, 2, "the main fixture experiment pins policy v2");
+  assertEqual(ctx.experiment.outcomeResolutionPolicy.maximumOffsetMs, 10_000, "with the 10000 ms bound");
+  assertEqual(ctx.experiment.outcomeResolutionPolicyDigest, OUTCOME_RESOLUTION_POLICY_V2_DIGEST, "and the frozen v2 digest");
+
+  // A v1-pinned experiment is created explicitly and must replay with v1 semantics.
+  const harness = createFixtureHarness({ quoteToken: true });
+  const created = await runFixtureExperiment({
+    root: ctx.tempRoot,
+    experimentId: "jdir-fixture-policy-v1",
+    harness,
+    maxObservations: 3,
+    provider: defaultFixtureProvider(),
+    extraSettings: { "tolerance-ms": "5000" },
+  });
+  assertEqual(created.result.ok, true, "the v1 experiment ran");
+  assertEqual(created.settings.outcomeResolutionPolicyVersion, 1, "--tolerance-ms 5000 selects policy v1");
+  const v1Summary = JSON.parse(await readFile(path.join(directionExperimentRootFor(ctx.tempRoot, "jdir-fixture-policy-v1"), "experiment.json"), "utf8"));
+  assertEqual(v1Summary.outcomeResolutionPolicyVersion, 1, "the v1 experiment pins version 1");
+  assertEqual(v1Summary.resolutionToleranceMs, 5_000, "and the 5000 ms bound");
+
+  const v1Root = directionExperimentRootFor(ctx.tempRoot, "jdir-fixture-policy-v1");
+  const before = await metadataSnapshot(v1Root);
+  const report = await replayDirectionExperiment({ experimentId: "jdir-fixture-policy-v1", baseRoot: ctx.tempRoot });
+  const after = await metadataSnapshot(v1Root);
+  assertEqual(report.ok, true, `the v1 experiment replays cleanly: ${JSON.stringify(report.problems)}`);
+  assertEqual(report.outcomeResolutionPolicyVersion, 1, "the replay reports policy v1");
+  assertEqual(report.maximumOffsetMs, 5_000, "and the 5000 ms bound");
+  assertEqual(report.metricDefinitionVersion, DIRECTION_METRICS_VERSION, "and the metric definition version it pinned");
+  assertDeepEqual(after, before, "the v1 experiment is byte-unchanged by its own replay");
+});
+
+test("AG13. the first real canary, when present, still replays under v1 and stays byte-unchanged", async () => {
+  const root = directionExperimentRootFor(REAL_EXPECTED_DIR, CANARY_EXPERIMENT_ID);
+  if (!(await exists(root))) {
+    skip("the first real 5I canary is absent in this checkout — its immutable v1 replay case was skipped cleanly");
+    return;
+  }
+  const before = await metadataSnapshot(root);
+  const report = await replayDirectionExperiment({ experimentId: CANARY_EXPERIMENT_ID, baseRoot: REAL_EXPECTED_DIR });
+  const after = await metadataSnapshot(root);
+  assertEqual(report.ok, true, `the canary replay is clean: ${JSON.stringify(report.problems)}`);
+  assertEqual(report.networkCalls, 0, "the canary replay makes ZERO network calls");
+  assertEqual(report.jevCalls, 0, "and zero Jev calls");
+  assertEqual(report.outcomeResolutionPolicyVersion, 1, "the canary stays pinned to policy v1");
+  assertEqual(report.maximumOffsetMs, 5_000, "with the original 5000 ms bound");
+  assertEqual(report.counts.predictions, 5, "5 predictions");
+  assertEqual(report.counts.outcomes, 5, "5 outcomes");
+  assertEqual(report.counts.scoredCount, 1, "exactly 1 scored");
+  assertEqual(report.counts.outcomeWindowExclusions, 4, "and 4 outcome-window exclusions under v1");
+  assertDeepEqual(after, before, "the canary artifacts are byte-unchanged by the replay");
+
+  // The v2 diagnostics recompute OFFLINE from the same (unmodified) artifacts.
+  const bundle = await readDirectionExperimentBundle(root);
+  const v2 = evaluateDirectionExperiment({
+    experiment: bundle.experiment,
+    predictions: bundle.predictions,
+    outcomes: bundle.outcomes,
+    metricDefinitionVersion: 2,
+  });
+  assertEqual(v2.allValidPredictionStats.count, 5, "all five predictions are all-valid");
+  assertClose(v2.allValidPredictionStats.meanPHigher, 0.442, "the canary all-valid mean pHigher recomputes to 0.442", 1e-9);
+  assertClose(v2.allValidPredictionStats.medianPHigher, 0.43, "and the median to 0.43", 1e-12);
+  assertEqual(v2.scoredPredictionStats.count, 1, "while the scored sample is still the one scorable observation");
+  assertClose(v2.scoredPredictionStats.meanPHigher, 0.42, "with mean 0.42", 1e-12);
+  assertTrue(v2.outcomeOffsetStats.max >= 6_000, "the real post-target offsets (~+6 s) are visible as a timing diagnostic");
+  assertTrue(v2.achievedHorizonStats.count === bundle.outcomes.length, "the achieved-horizon diagnostic covers every outcome");
 });
 
 /* ============================================================================

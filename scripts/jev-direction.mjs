@@ -82,7 +82,8 @@ function usage() {
     `  --max-observations <n>     default 120 (bounded)`,
     `  --cadence-seconds <n>      default 30 (bounded)`,
     `  --horizon-seconds <n>      FROZEN at ${HORIZON_SECONDS}; any other value is refused`,
-    `  --tolerance-ms <n>         future-observation tolerance around targetAt (default 5000)`,
+    `  --tolerance-ms <n>         bounded post-target outcome offset. It SELECTS a frozen outcome-resolution policy by its`,
+    `                             bound (5000 -> policy v1, 10000 -> policy v2, the default for new experiments)`,
     `  --max-runtime-minutes <n>  bounded runtime per invocation (default 90)`,
     `  --provider <name>          must resolve to ${REQUIRED_PROVIDER} for canonical evidence`,
     `  --experiment <id>          explicit experiment id (REQUIRED for resume/resolve/replay/stats)`,
@@ -123,15 +124,40 @@ function printDefinition() {
 function printMetricsBlock(metrics) {
   if (!metrics) return;
   const fmt = (value, digits = 4) => (Number.isFinite(value) ? Number(value).toFixed(digits) : "n/a");
+  // Denominators are printed on EVERY score so a tiny sample can never look more
+  // meaningful than it is: a Brier of 0.1764 is shown as "(N=1)".
+  const n = (block) => block?.brierSampleCount ?? block?.sampleCount ?? 0;
+  const allValid = metrics.allValidPredictionStats ?? metrics.probabilityStats?.allValidPredictions ?? null;
+  const scoredStats = metrics.scoredPredictionStats ?? metrics.probabilityStats?.scoredBinary ?? null;
   console.log(`[jev:direction]   observations      ${metrics.observationCount} (valid ${metrics.validPredictionCount} · invalid ${metrics.invalidPredictionCount})`);
   console.log(`[jev:direction]   scored            ${metrics.scoredCount} binary · HIGHER ${metrics.higherCount} · LOWER ${metrics.lowerCount} · TIE ${metrics.tieCount} (ties excluded from binary scoring)`);
-  console.log(`[jev:direction]   Jev Brier         ${fmt(metrics.jev?.brierScore)} · log loss ${fmt(metrics.jev?.logLoss)} · accuracy ${fmt(metrics.jev?.accuracy)}`);
-  console.log(`[jev:direction]   mean pHigher      ${fmt(metrics.probabilityStats?.scoredBinary?.meanPHigher)} · median ${fmt(metrics.probabilityStats?.scoredBinary?.medianPHigher)}`);
+  console.log(
+    `[jev:direction]   Jev Brier         ${fmt(metrics.jev?.brierScore)} (N=${n(metrics.jev)}) · log loss ${fmt(metrics.jev?.logLoss)} ` +
+      `(N=${metrics.jev?.logLossSampleCount ?? metrics.jev?.sampleCount ?? 0}) · accuracy ${fmt(metrics.jev?.accuracy)} ` +
+      `(N=${metrics.jev?.accuracySampleCount ?? metrics.jev?.sampleCount ?? 0})`,
+  );
+  console.log(
+    `[jev:direction]   all-valid pHigher  mean ${fmt(allValid?.meanPHigher)} · median ${fmt(allValid?.medianPHigher)} (N=${allValid?.count ?? 0})`,
+  );
+  console.log(
+    `[jev:direction]   scored pHigher     mean ${fmt(scoredStats?.meanPHigher)} · median ${fmt(scoredStats?.medianPHigher)} (N=${scoredStats?.count ?? 0})`,
+  );
   for (const [baselineId, delta] of Object.entries(metrics.brierDeltas ?? {})) {
+    const baselineN = n(metrics.baselines?.[baselineId]);
     console.log(
-      `[jev:direction]   Δ vs ${baselineId.padEnd(26)} Brier ${fmt(delta.jevMinusBaselineBrier)} · log loss ${fmt(delta.jevMinusBaselineLogLoss)} · accuracy ${fmt(delta.jevMinusBaselineAccuracy)}`,
+      `[jev:direction]   Δ vs ${baselineId.padEnd(26)} Brier ${fmt(delta.jevMinusBaselineBrier)} (N=${baselineN}) · log loss ${fmt(delta.jevMinusBaselineLogLoss)} · accuracy ${fmt(delta.jevMinusBaselineAccuracy)}`,
     );
   }
+  // v2 timing diagnostics use count/mean/median/p90/p95/max; the legacy v1
+  // `resolutionLag` block only has count/min/mean/max — read both shapes.
+  const stat = (block, key) => block?.[key] ?? block?.[`${key}Ms`] ?? null;
+  const offsetStats = metrics.outcomeOffsetStats ?? metrics.resolutionLag ?? null;
+  const horizonStats = metrics.achievedHorizonStats ?? null;
+  const statLine = (label, block) =>
+    `[jev:direction]   ${label} mean ${fmt(stat(block, "mean"), 0)}ms · median ${fmt(stat(block, "median"), 0)}ms · ` +
+    `p90 ${fmt(stat(block, "p90"), 0)}ms · p95 ${fmt(stat(block, "p95"), 0)}ms · max ${fmt(stat(block, "max"), 0)}ms (N=${block?.count ?? 0})`;
+  if (offsetStats) console.log(statLine("outcome offset   ", offsetStats));
+  if (horizonStats) console.log(statLine("achieved horizon ", horizonStats));
   const latency = metrics.latency?.jevOkOnly ?? {};
   console.log(`[jev:direction]   latency (ok)      mean ${fmt(latency.meanMs, 0)}ms · median ${fmt(latency.medianMs, 0)}ms · p90 ${fmt(latency.p90Ms, 0)}ms · p95 ${fmt(latency.p95Ms, 0)}ms · max ${fmt(latency.maxMs, 0)}ms`);
   console.log(`[jev:direction]   retries           ${metrics.latency?.observationsWithTransportRetries ?? 0} observation(s) needed >1 transport attempt`);
@@ -219,6 +245,13 @@ async function main() {
             `${report.arenaRuns} · trading ${report.tradingCalls}`,
         );
         console.log(`[jev:direction]   provider/model    ${report.provider} / ${report.model} (gatewayUsed=${report.gatewayUsed})`);
+        console.log(
+          `[jev:direction]   resolution policy v${report.outcomeResolutionPolicyVersion ?? "?"} ` +
+            `(maximumOffsetMs=${report.maximumOffsetMs ?? "?"}) · metric definition v${report.metricDefinitionVersion ?? "?"}`,
+        );
+        console.log(
+          `[jev:direction]   scored            ${report.counts?.scoredCount ?? 0} binary · outcome-window exclusions ${report.counts?.outcomeWindowExclusions ?? 0}`,
+        );
         console.log(`[jev:direction]   counts            ${JSON.stringify(report.counts ?? {})}`);
         console.log(`[jev:direction]   checks            ${JSON.stringify(report.checks ?? {})}`);
         console.log(`[jev:direction]   lookahead         ${report.lookaheadAudit?.ok ? "clean" : "FAILED"} (${report.lookaheadAudit?.recomputationPairs ?? 0} recomputation pairs)`);

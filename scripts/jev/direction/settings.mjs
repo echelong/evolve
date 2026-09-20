@@ -22,9 +22,11 @@
 
 import {
   CADENCE_SECONDS_BOUNDS,
+  CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION,
   DEFAULT_CADENCE_SECONDS,
   DEFAULT_MAX_OBSERVATIONS,
   DEFAULT_MAX_RUNTIME_MINUTES,
+  DEFAULT_OUTCOME_RESOLUTION_POLICY,
   DIRECTION_PHASE,
   FORBIDDEN_MODEL_ALIASES,
   HORIZON_SECONDS,
@@ -37,9 +39,10 @@ import {
   REQUIRED_PROVIDER,
   REQUIRED_UPSTREAM_PROVIDER,
   RESOLUTION_TOLERANCE_BOUNDS,
-  RESOLUTION_TOLERANCE_MS,
   SUPPORTED_MARKET_IDS,
   BENCHMARK_MARKET,
+  outcomeResolutionPolicyDigestFor,
+  outcomeResolutionPolicyForOffset,
 } from "./definition.mjs";
 import { jevIdentity, requireJevProviderName, resolveJevModelName } from "../config.mjs";
 
@@ -95,11 +98,34 @@ export function buildDirectionRunSettings(args = {}) {
     MAX_RUNTIME_MINUTES_BOUNDS.min,
     MAX_RUNTIME_MINUTES_BOUNDS.max,
   );
-  const toleranceMs = clamp(
-    readInt(args["tolerance-ms"], RESOLUTION_TOLERANCE_MS),
-    RESOLUTION_TOLERANCE_BOUNDS.min,
-    RESOLUTION_TOLERANCE_BOUNDS.max,
-  );
+  // The bounded maximum outcome offset is NOT a free number: it is the bound of a
+  // FROZEN outcome-resolution policy. `--tolerance-ms` therefore selects a
+  // registered policy by its bound (5000 -> v1, 10000 -> v2); any other value is
+  // refused, because changing the offset again requires a new policy version.
+  const requestedToleranceMs =
+    args["tolerance-ms"] === undefined || String(args["tolerance-ms"]).trim() === ""
+      ? null
+      : clamp(
+          readInt(args["tolerance-ms"], DEFAULT_OUTCOME_RESOLUTION_POLICY.maximumOffsetMs),
+          RESOLUTION_TOLERANCE_BOUNDS.min,
+          RESOLUTION_TOLERANCE_BOUNDS.max,
+        );
+  let outcomeResolutionPolicy = DEFAULT_OUTCOME_RESOLUTION_POLICY;
+  let toleranceMs = outcomeResolutionPolicy.maximumOffsetMs;
+  if (requestedToleranceMs !== null) {
+    toleranceMs = requestedToleranceMs;
+    const matched = outcomeResolutionPolicyForOffset(requestedToleranceMs);
+    if (matched === null) {
+      fail(
+        problems,
+        `--tolerance-ms ${requestedToleranceMs} matches no frozen outcome-resolution policy; the bound is a policy ` +
+          `constant, not a knob (current v${CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION} = ` +
+          `${DEFAULT_OUTCOME_RESOLUTION_POLICY.maximumOffsetMs} ms). Changing it requires a NEW policy version.`,
+      );
+    } else {
+      outcomeResolutionPolicy = matched;
+    }
+  }
 
   return {
     version: DIRECTION_SETTINGS_VERSION,
@@ -114,6 +140,9 @@ export function buildDirectionRunSettings(args = {}) {
     maxRuntimeMinutes,
     maxRuntimeMs: maxRuntimeMinutes * 60_000,
     resolutionToleranceMs: toleranceMs,
+    outcomeResolutionPolicy,
+    outcomeResolutionPolicyVersion: outcomeResolutionPolicy.version,
+    outcomeResolutionPolicyDigest: outcomeResolutionPolicyDigestFor(outcomeResolutionPolicy.version),
     providerRequested: args.provider !== undefined ? String(args.provider).trim().toLowerCase() : "",
     allowMock: args["allow-mock"] === true,
     allowUnsafeModel: args["allow-unsafe-model"] === true,

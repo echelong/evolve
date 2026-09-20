@@ -23,7 +23,7 @@ import { digestOf } from "../../lib/hash.mjs";
 import { DIRECTION_PHASE } from "./definition.mjs";
 import { BASELINE_IDS } from "./baselines.mjs";
 
-export const DIRECTION_METRICS_VERSION = 1;
+export const DIRECTION_METRICS_VERSION = 2;
 
 /** Binary scoring decision rule for directional ACCURACY only (documented, frozen). */
 export const ACCURACY_DECISION_RULE = "predictedHigher = pHigher >= 0.5";
@@ -82,10 +82,37 @@ export const METRIC_FIELDS = Object.freeze([
   "accuracy",
   "meanPHigher",
   "medianPHigher",
+  "brierSampleCount",
+  "logLossSampleCount",
+  "accuracySampleCount",
+  "allValidPredictionStats",
+  "scoredPredictionStats",
   "calibrationBins",
   "brierDeltas",
+  "outcomeOffsetStats",
+  "achievedHorizonStats",
   "latency",
   "providerAttemptStatistics",
+]);
+
+/**
+ * Metric-v2-only report fields, kept in ONE place so the v1 projection is
+ * explicit rather than a scattering of special cases. An experiment pinned to
+ * metric definition v1 is recomputed with exactly these fields removed, which
+ * reproduces its stored v1 `metricsDigest` byte-for-byte.
+ */
+export const METRIC_V2_ONLY_FIELDS = Object.freeze([
+  "allValidPredictionStats",
+  "scoredPredictionStats",
+  "outcomeOffsetStats",
+  "achievedHorizonStats",
+]);
+
+/** The per-forecaster denominator fields introduced in metric definition v2. */
+export const METRIC_V2_FORECASTER_FIELDS = Object.freeze([
+  "brierSampleCount",
+  "logLossSampleCount",
+  "accuracySampleCount",
 ]);
 
 /**
@@ -135,6 +162,24 @@ export function meanOf(values) {
   return list.reduce((sum, value) => sum + value, 0) / list.length;
 }
 
+/**
+ * Generic count/mean/median/p90/p95/max statistics (used for the outcome offset
+ * and achieved-horizon timing diagnostics). Nearest-rank quantiles, exactly like
+ * `latencyStats`; these are infrastructure timing diagnostics and are NEVER used
+ * to optimize a prediction outcome.
+ */
+export function percentileStats(values) {
+  const list = (values ?? []).filter((value) => Number.isFinite(value));
+  return {
+    count: list.length,
+    mean: meanOf(list),
+    median: medianOf(list),
+    p90: percentileOf(list, 90),
+    p95: percentileOf(list, 95),
+    max: list.length > 0 ? Math.max(...list) : null,
+  };
+}
+
 /** mean / median / p90 / p95 / max latency statistics. */
 export function latencyStats(values) {
   const list = (values ?? []).filter((value) => Number.isFinite(value));
@@ -160,13 +205,13 @@ export function spreadStats(values) {
 }
 
 /**
- * The frozen metric definition. Every experiment, summary and replay pins this
- * object's digest, so a change to a formula is a NEW metric definition rather
- * than a silent edit.
+ * METRIC DEFINITION V1 — FROZEN HISTORICAL IDENTITY, byte-preserved so every
+ * experiment pinned to metric v1 recomputes its stored `metricsDigest` exactly.
+ * It is NEVER edited in place; a change is a NEW version.
  */
-export const DIRECTION_METRIC_DEFINITION = Object.freeze({
+export const DIRECTION_METRIC_DEFINITION_V1 = Object.freeze({
   phase: DIRECTION_PHASE,
-  definitionVersion: DIRECTION_METRICS_VERSION,
+  definitionVersion: 1,
   target: Object.freeze({ higher: 1, lower: 0, tie: "retained and excluded from binary scoring" }),
   brierFormula: "mean over scored binary pairs of (pHigher - o)^2",
   logLossFormula: "mean over scored binary pairs of -(o*ln(clamp(p)) + (1-o)*ln(1-clamp(p)))",
@@ -208,7 +253,104 @@ export const DIRECTION_METRIC_DEFINITION = Object.freeze({
     "PnL, no Sharpe/Sortino, no trade count, no simulated return and no deployment verdict.",
 });
 
+export const DIRECTION_METRIC_DEFINITION_V1_DIGEST = digestOf(DIRECTION_METRIC_DEFINITION_V1);
+
+/**
+ * METRIC DEFINITION V2 — the SAME scoring formulas with explicit metric
+ * DENOMINATORS (`brierSampleCount` / `logLossSampleCount` /
+ * `accuracySampleCount`), an explicit split between all-valid and scored
+ * probability statistics, and two infrastructure timing diagnostics (outcome
+ * offset + achieved horizon). Every experiment, summary and replay pins this
+ * object's digest, so a change to a formula is a NEW metric definition rather
+ * than a silent edit.
+ */
+export const DIRECTION_METRIC_DEFINITION = Object.freeze({
+  phase: DIRECTION_PHASE,
+  definitionVersion: DIRECTION_METRICS_VERSION,
+  target: Object.freeze({ higher: 1, lower: 0, tie: "retained and excluded from binary scoring" }),
+  brierFormula: "mean over scored binary pairs of (pHigher - o)^2",
+  logLossFormula: "mean over scored binary pairs of -(o*ln(clamp(p)) + (1-o)*ln(1-clamp(p)))",
+  logLossEpsilon: LOG_LOSS_EPSILON,
+  logLossClampingAppliedToStoredPredictions: false,
+  accuracyFormula: "share of scored binary pairs where (pHigher >= 0.5 ? 1 : 0) === o",
+  accuracyDecisionRule: ACCURACY_DECISION_RULE,
+  sampleDenominators: Object.freeze({
+    brierSampleCount: "scored binary pairs used by the Brier mean",
+    logLossSampleCount: "scored binary pairs used by the log-loss mean",
+    accuracySampleCount: "scored binary pairs used by the accuracy share",
+  }),
+  probabilityStatsScopes: Object.freeze({
+    allValidPredictionStats: "every valid (non-invalid) frozen prediction with a finite pHigher",
+    scoredPredictionStats: "only the binary-scorable observations",
+  }),
+  timingDiagnosticFields: Object.freeze({
+    outcomeOffsetStats: "count/mean/median/p90/p95/max of outcomeOffsetMs = outcomeReceivedAt - targetAt",
+    achievedHorizonStats:
+      "count/mean/median/p90/p95/max of achievedHorizonMs = outcomeReceivedAt - stateObservedAt (the REAL achieved horizon, never a relabelled 30 s)",
+  }),
+  timingDiagnosticsUsedToOptimizeOutcomes: false,
+  calibrationBinCount: CALIBRATION_BIN_COUNT,
+  calibrationBinEdges: CALIBRATION_BIN_EDGES,
+  calibrationBinsAreAdaptive: false,
+  quantileMethod: QUANTILE_METHOD,
+  latencyPercentiles: Object.freeze([90, 95]),
+  durationFields: Object.freeze([
+    "observationCount",
+    "validPredictionCount",
+    "invalidPredictionCount",
+    "failedJevCount",
+    "lateJevCount",
+    "staleObservationCount",
+    "outcomeUnavailableCount",
+    "scoredCount",
+    "higherCount",
+    "lowerCount",
+    "tieCount",
+    "brierScore",
+    "logLoss",
+    "accuracy",
+    "meanPHigher",
+    "medianPHigher",
+    "brierSampleCount",
+    "logLossSampleCount",
+    "accuracySampleCount",
+    "allValidPredictionStats",
+    "scoredPredictionStats",
+    "calibrationBins",
+    "brierDeltas",
+    "outcomeOffsetStats",
+    "achievedHorizonStats",
+    "latency",
+    "providerAttemptStatistics",
+  ]),
+  profitabilityFieldsIncluded: false,
+  automatedWinner: false,
+  note:
+    "Prediction-quality metrics only. Lower Brier / log loss is better, but NO automated winner is emitted. There is no " +
+    "PnL, no Sharpe/Sortino, no trade count, no simulated return and no deployment verdict.",
+});
+
 export const DIRECTION_METRIC_DEFINITION_DIGEST = digestOf(DIRECTION_METRIC_DEFINITION);
+
+/** Version -> frozen metric definition, so an old experiment recomputes under its own version. */
+export const DIRECTION_METRIC_DEFINITIONS = Object.freeze({
+  1: DIRECTION_METRIC_DEFINITION_V1,
+  2: DIRECTION_METRIC_DEFINITION,
+});
+
+export const DIRECTION_METRIC_DEFINITION_DIGESTS = Object.freeze({
+  1: DIRECTION_METRIC_DEFINITION_V1_DIGEST,
+  2: DIRECTION_METRIC_DEFINITION_DIGEST,
+});
+
+/** Resolve a frozen metric definition by version; unknown versions resolve to `null` (fail closed). */
+export function metricDefinitionForVersion(version) {
+  return DIRECTION_METRIC_DEFINITIONS[Number(version)] ?? null;
+}
+
+export function metricDefinitionDigestForVersion(version) {
+  return DIRECTION_METRIC_DEFINITION_DIGESTS[Number(version)] ?? null;
+}
 
 /**
  * The frozen validity rule for a Jev probability pair, kept next to the metrics
@@ -319,8 +461,15 @@ function pairsForBaseline(joined, baselineId) {
  * of silent.
  */
 export function scoreForecaster(pairs) {
+  // Every scoring rule below filters to the SAME scored binary pairs (finite p,
+  // o in {0,1}); the three denominators are reported EXPLICITLY anyway so a
+  // tiny sample can never look more meaningful than it is (N=1 is visible).
+  const scoredPairs = (pairs ?? []).filter((entry) => Number.isFinite(entry.p) && (entry.o === 0 || entry.o === 1));
   return {
     sampleCount: pairs.length,
+    brierSampleCount: scoredPairs.length,
+    logLossSampleCount: scoredPairs.length,
+    accuracySampleCount: scoredPairs.length,
     brierScore: brierScore(pairs),
     logLoss: logLoss(pairs),
     logLossEpsilon: LOG_LOSS_EPSILON,
@@ -351,6 +500,7 @@ export function evaluateDirectionExperiment({
   outcomes = [],
   featureStability = null,
   lookaheadAudit = null,
+  metricDefinitionVersion = DIRECTION_METRICS_VERSION,
 } = {}) {
   const joined = joinDirectionObservations({ predictions, outcomes });
 
@@ -406,7 +556,7 @@ export function evaluateDirectionExperiment({
 
   const attempts = joined.flatMap((entry) => (Array.isArray(entry.prediction.providerAttempts) ? entry.prediction.providerAttempts : []));
 
-  return {
+  const report = {
     schemaVersion: DIRECTION_METRICS_VERSION,
     metricDefinitionVersion: DIRECTION_METRICS_VERSION,
     metricDefinitionDigest: DIRECTION_METRIC_DEFINITION_DIGEST,
@@ -459,6 +609,21 @@ export function evaluateDirectionExperiment({
       ),
       baselineNeutral: probabilityStats(baselinePairs["neutral-v1"].map((entry) => entry.p)),
     },
+    // §4: the scope of a probability statistic must be EXPLICIT. The all-valid
+    // block covers every valid frozen prediction; the scored block covers only
+    // the binary-scorable observations. They differ whenever an outcome is
+    // excluded, so they are never conflated.
+    allValidPredictionStats: probabilityStats(
+      joined.filter((entry) => entry.prediction.invalid !== true).map((entry) => entry.prediction.pHigher),
+    ),
+    scoredPredictionStats: probabilityStats(scored.map((entry) => entry.prediction.pHigher)),
+    // §3: infrastructure TIMING diagnostics (never used to optimize outcomes).
+    outcomeOffsetStats: percentileStats(
+      resolved.map((entry) =>
+        Number.isFinite(entry.outcome.outcomeOffsetMs) ? entry.outcome.outcomeOffsetMs : entry.outcome.resolutionLagMs,
+      ),
+    ),
+    achievedHorizonStats: percentileStats(resolved.map((entry) => entry.outcome.achievedHorizonMs)),
     latency: {
       allPredictions: latencyStats(joined.map((entry) => entry.prediction.latencyMs)),
       jevOkOnly: latencyStats(
@@ -513,6 +678,35 @@ export function evaluateDirectionExperiment({
       "Prediction-quality metrics only. Lower Brier/log loss is better, but NO winner is emitted automatically. " +
       "No PnL, no Sharpe, no simulated returns, no trade count, and no profitability claim of any kind.",
   };
+  return projectMetricsToVersion(report, metricDefinitionVersion);
+}
+
+/**
+ * Project a freshly computed metric report onto a pinned metric-definition
+ * version. Metric v2 is a strict SUPERSET of v1 (the v2 additions are new keys
+ * only), so a v1 projection is exactly the v1-shaped object and reproduces an
+ * experiment pinned to metric v1 byte-for-byte.
+ */
+export function projectMetricsToVersion(report, version) {
+  if (Number(version) === DIRECTION_METRICS_VERSION || Number(version) >= DIRECTION_METRICS_VERSION) return report;
+  if (Number(version) !== 1) return report;
+
+  const projected = { ...report };
+  for (const field of METRIC_V2_ONLY_FIELDS) delete projected[field];
+  const projectForecaster = (block) => {
+    if (!block || typeof block !== "object") return block;
+    const next = { ...block };
+    for (const field of METRIC_V2_FORECASTER_FIELDS) delete next[field];
+    return next;
+  };
+  projected.jev = projectForecaster(report.jev);
+  projected.baselines = Object.fromEntries(
+    Object.entries(report.baselines ?? {}).map(([id, block]) => [id, projectForecaster(block)]),
+  );
+  projected.schemaVersion = 1;
+  projected.metricDefinitionVersion = 1;
+  projected.metricDefinitionDigest = DIRECTION_METRIC_DEFINITION_V1_DIGEST;
+  return projected;
 }
 
 /** Digest of a metrics report — replay recomputes the report and compares digests. */

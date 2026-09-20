@@ -46,9 +46,11 @@ import {
   FORBIDDEN_CANONICAL_PROVIDERS,
   MAX_RECEIPT_STATE_AGE_MS,
   MAX_SOURCE_STATE_AGE_MS,
-  OUTCOME_RESOLUTION_POLICY,
-  OUTCOME_RESOLUTION_POLICY_DIGEST,
+  DEFAULT_OUTCOME_RESOLUTION_POLICY,
   OUTCOME_UNAVAILABLE_REASON,
+  outcomeResolutionPolicyDigestFor,
+  outcomeResolutionPolicyFor,
+  resolveOutcomeOffset,
   REFERENCE_PRICE_DEFINITION_DIGEST,
   REFERENCE_PRICE_DEFINITION_VERSION,
   REQUIRED_MODEL,
@@ -76,6 +78,8 @@ import {
   auditNoProfitabilityFields,
   auditProbabilityPair,
   evaluateDirectionExperiment,
+  metricDefinitionDigestForVersion,
+  metricDefinitionForVersion,
   metricsDigestOf,
   outcomeLabelOf,
 } from "./metrics.mjs";
@@ -491,6 +495,12 @@ export async function resolveDirectionObservation({
   const targetAtMs = Date.parse(prediction.targetAt);
   if (!Number.isFinite(targetAtMs)) return { outcome: null, skipped: true, reason: "target_at_unparseable" };
 
+  // The bound comes from the experiment's OWN pinned policy version, never from
+  // whatever the current default happens to be. An old v1 experiment therefore
+  // resolves under exactly the rule it was frozen with.
+  const policy = outcomePolicyOf(experiment);
+  const maximumOffsetMs = policy.maximumOffsetMs;
+
   if (typeof waitFor === "function") {
     const waited = await waitFor(targetAtMs);
     if (!waited) return { outcome: null, skipped: true, reason: "interrupted_before_target" };
@@ -529,13 +539,17 @@ export async function resolveDirectionObservation({
         scorable: false,
         invalidReason: stored === null ? "prediction_artifact_missing" : "prediction_digest_mismatch",
         resolvedAt: now(),
+        outcomeResolutionPolicy: policy,
       }),
     );
     await writeDirectionOutcome(root, record);
     return { outcome: record, skipped: false, reason: "prediction_digest_mismatch" };
   }
 
-  const future = await source.observeFuture();
+  // The future reference is the FIRST genuine wrapped-SOL observation received at
+  // or after targetAt (the walk stops at it). A pre-target observation is never
+  // selected as a substitute.
+  const future = await source.observeFuture({ targetAtMs });
   if (future.ok !== true) {
     const record = withOutcomeDigest(
       buildDirectionOutcomeRecord({
@@ -545,6 +559,7 @@ export async function resolveDirectionObservation({
         invalidReason: OUTCOME_UNAVAILABLE_REASON,
         unavailableDetail: `unresolved_${future.reason ?? "future_reference_unavailable"}`,
         resolvedAt: now(),
+        outcomeResolutionPolicy: policy,
       }),
     );
     await writeDirectionOutcome(root, record);
@@ -559,9 +574,9 @@ export async function resolveDirectionObservation({
   const stateObservedMs = Date.parse(prediction.stateObservedAt);
   const achievedHorizonMs = Number.isFinite(stateObservedMs) ? outcomeReceivedAtMs - stateObservedMs : null;
 
-  let invalidReason = null;
-  if (outcomeReceivedAtMs < targetAtMs) invalidReason = "future_reference_before_target";
-  else if (resolutionLagMs > settings.resolutionToleranceMs) invalidReason = OUTCOME_UNAVAILABLE_REASON;
+  // Bounded-window decision via the ONE pure classifier: it depends only on the
+  // timestamps and the pinned policy bound — never on pHigher or the direction.
+  let invalidReason = resolveOutcomeOffset({ outcomeReceivedAtMs, targetAtMs, maximumOffsetMs }).invalidReason;
 
   // The current price comes from the FROZEN prediction artifact — the resolver
   // never re-reads (and never rebuilds) the model input.
@@ -588,6 +603,7 @@ export async function resolveDirectionObservation({
       invalidReason,
       tamperDetected: false,
       resolvedAt: now(),
+      outcomeResolutionPolicy: policy,
     }),
   );
   await writeDirectionOutcome(root, record);
@@ -597,6 +613,12 @@ export async function resolveDirectionObservation({
 /* ============================================================================
  * Experiment-level orchestration
  * ==========================================================================*/
+
+/** The frozen outcome-resolution policy an experiment is pinned to (fail-closed to the current default). */
+function outcomePolicyOf(experiment) {
+  const version = experiment?.outcomeResolutionPolicyVersion ?? experiment?.outcomeResolutionPolicy?.version ?? null;
+  return outcomeResolutionPolicyFor(version) ?? DEFAULT_OUTCOME_RESOLUTION_POLICY;
+}
 
 function pinsFromSettings({ settings, experimentId, pinResult, now }) {
   return {
@@ -630,8 +652,11 @@ function pinsFromSettings({ settings, experimentId, pinResult, now }) {
     referencePriceDefinitionDigest: REFERENCE_PRICE_DEFINITION_DIGEST,
     stalenessPolicy: STALENESS_POLICY,
     stalenessPolicyDigest: STALENESS_POLICY_DIGEST,
-    outcomeResolutionPolicy: OUTCOME_RESOLUTION_POLICY,
-    outcomeResolutionPolicyDigest: OUTCOME_RESOLUTION_POLICY_DIGEST,
+    outcomeResolutionPolicy: settings.outcomeResolutionPolicy ?? DEFAULT_OUTCOME_RESOLUTION_POLICY,
+    outcomeResolutionPolicyDigest:
+      settings.outcomeResolutionPolicyDigest ?? outcomeResolutionPolicyDigestFor(settings.outcomeResolutionPolicyVersion),
+    outcomeResolutionPolicyVersion:
+      settings.outcomeResolutionPolicyVersion ?? (settings.outcomeResolutionPolicy ?? DEFAULT_OUTCOME_RESOLUTION_POLICY).version,
     unavailableFeatureFamiliesDigest: UNAVAILABLE_FEATURE_FAMILIES_DIGEST,
     routingFlags: DIRECTION_ROUTING_FLAGS,
     startedAt: now(),
@@ -667,6 +692,7 @@ export const PIN_COMPARISONS = Object.freeze([
   "referencePriceDefinitionDigest",
   "stalenessPolicyDigest",
   "outcomeResolutionPolicyDigest",
+  "outcomeResolutionPolicyVersion",
   "unavailableFeatureFamiliesDigest",
 ]);
 
@@ -718,7 +744,18 @@ export async function finalizeDirectionSummary({ root, experiment, predictions, 
   // The SAME optional audit inputs the replay and `--stats` recompute, so the
   // written `metricsDigest` reproduces exactly on a later read.
   const { featureStability, lookaheadAudit } = collectOfflineAuditInputs(predictions);
-  const metrics = evaluateDirectionExperiment({ experiment, predictions, outcomes, featureStability, lookaheadAudit });
+  // The summary is computed under the DEFINITION VERSIONS THE EXPERIMENT PINNED,
+  // so finalizing an older experiment never silently re-scores it under the
+  // current default definitions.
+  const metricDefinitionVersion = experiment.metricDefinitionVersion ?? DIRECTION_METRICS_VERSION;
+  const metrics = evaluateDirectionExperiment({
+    experiment,
+    predictions,
+    outcomes,
+    featureStability,
+    lookaheadAudit,
+    metricDefinitionVersion,
+  });
   const profitabilityAudit = auditNoProfitabilityFields(metrics);
   if (!profitabilityAudit.ok) {
     throw new Error(
@@ -757,12 +794,13 @@ export async function finalizeDirectionSummary({ root, experiment, predictions, 
     featureDefinitionDigest: experiment.featureDefinitionDigest,
     baselineDefinitionVersion: experiment.baselineDefinitionVersion,
     baselineDefinitionDigest: experiment.baselineDefinitionDigest,
-    metricDefinitionVersion: DIRECTION_METRICS_VERSION,
-    metricDefinitionDigest: DIRECTION_METRIC_DEFINITION_DIGEST,
+    metricDefinitionVersion,
+    metricDefinitionDigest: metricDefinitionDigestForVersion(metricDefinitionVersion),
     stalenessPolicy: STALENESS_POLICY,
     stalenessPolicyDigest: STALENESS_POLICY_DIGEST,
-    outcomeResolutionPolicy: OUTCOME_RESOLUTION_POLICY,
-    outcomeResolutionPolicyDigest: OUTCOME_RESOLUTION_POLICY_DIGEST,
+    outcomeResolutionPolicy: outcomePolicyOf(experiment),
+    outcomeResolutionPolicyDigest: outcomeResolutionPolicyDigestFor(outcomePolicyOf(experiment).version),
+    outcomeResolutionPolicyVersion: outcomePolicyOf(experiment).version,
     unavailableFeatureFamiliesDigest: experiment.unavailableFeatureFamiliesDigest,
     startedAt: experiment.startedAt,
     finalizedAt: new Date().toISOString(),
@@ -913,7 +951,7 @@ export async function runDirectionBenchmark({
         break;
       }
       const targetAtMs = Date.parse(prediction.targetAt);
-      const withinWindow = Number.isFinite(targetAtMs) && now() <= targetAtMs + settings.resolutionToleranceMs;
+      const withinWindow = Number.isFinite(targetAtMs) && now() <= targetAtMs + outcomePolicyOf(experiment).maximumOffsetMs;
       if (!withinWindow) {
         // Resolved too late to be an honest reading of the frozen 30-second
         // horizon: OUTCOME_UNAVAILABLE. The prediction artifact is untouched.
@@ -937,6 +975,7 @@ export async function runDirectionBenchmark({
             unavailableDetail: "resolution_window_missed",
             tamperDetected: false,
             resolvedAt: now(),
+            outcomeResolutionPolicy: outcomePolicyOf(experiment),
           }),
         );
         await writeDirectionOutcome(root, record);
@@ -1388,7 +1427,7 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
       if (Number.isFinite(outcome.outcomeOffsetMs) && outcome.outcomeOffsetMs !== receivedMs - targetMs) {
         problems.push(`outcome ${outcome.observationId}: outcomeOffsetMs does not equal outcomeReceivedAt - targetAt`);
       }
-      if (outcome.scorable === true && Number.isFinite(outcome.resolutionLagMs) && outcome.resolutionLagMs > experiment.resolutionToleranceMs) {
+      if (outcome.scorable === true && Number.isFinite(outcome.resolutionLagMs) && outcome.resolutionLagMs > outcomePolicyOf(experiment).maximumOffsetMs) {
         problems.push(`outcome ${outcome.observationId}: scored beyond the frozen resolution tolerance`);
       }
       if (Number.isFinite(outcome.achievedHorizonMs) && Number.isFinite(Date.parse(outcome.stateObservedAt))) {
@@ -1473,6 +1512,7 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
     referencePriceDefinitionDigest: experiment.referencePriceDefinitionDigest,
     stalenessPolicyDigest: experiment.stalenessPolicyDigest,
     outcomeResolutionPolicyDigest: experiment.outcomeResolutionPolicyDigest,
+    outcomeResolutionPolicyVersion: experiment.outcomeResolutionPolicyVersion,
     unavailableFeatureFamiliesDigest: experiment.unavailableFeatureFamiliesDigest,
     market: experiment.market,
   });
@@ -1483,11 +1523,25 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
   if (experiment.stalenessPolicyDigest !== STALENESS_POLICY_DIGEST) {
     problems.push("experiment does not pin the current staleness-policy digest");
   }
-  if (experiment.outcomeResolutionPolicyDigest !== OUTCOME_RESOLUTION_POLICY_DIGEST) {
-    problems.push("experiment does not pin the current outcome-resolution-policy digest");
+  // ---- version-aware policy/definition integrity ---------------------------
+  // An old experiment is verified against the FROZEN definition it pinned, not
+  // against today's default: replaying v1 must succeed with v1 semantics.
+  const outcomePolicy = outcomePolicyOf(experiment);
+  if (outcomeResolutionPolicyFor(experiment.outcomeResolutionPolicy?.version) === null) {
+    problems.push(`experiment pins an unknown outcome-resolution policy version ${JSON.stringify(experiment.outcomeResolutionPolicy?.version ?? null)}`);
   }
-  if (experiment.metricDefinitionDigest !== DIRECTION_METRIC_DEFINITION_DIGEST) {
-    problems.push("experiment does not pin the current metric-definition digest");
+  if (experiment.outcomeResolutionPolicyDigest !== outcomeResolutionPolicyDigestFor(outcomePolicy.version)) {
+    problems.push("experiment does not pin the frozen outcome-resolution-policy digest for its own version");
+  }
+  if (digestOf(experiment.outcomeResolutionPolicy ?? null) !== experiment.outcomeResolutionPolicyDigest) {
+    problems.push("experiment outcome-resolution policy object does not match its pinned digest");
+  }
+  const metricDefinitionVersion = experiment.metricDefinitionVersion ?? DIRECTION_METRICS_VERSION;
+  if (metricDefinitionForVersion(metricDefinitionVersion) === null) {
+    problems.push(`experiment pins an unknown metric-definition version ${JSON.stringify(metricDefinitionVersion)}`);
+  }
+  if (experiment.metricDefinitionDigest !== metricDefinitionDigestForVersion(metricDefinitionVersion)) {
+    problems.push("experiment does not pin the frozen metric-definition digest for its own version");
   }
 
   // ---- canonical provider/model/transport enforcement -----------------------
@@ -1563,6 +1617,7 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
       featureViolations: lookahead.features.violations.length,
       baselineViolations: lookahead.baselines.violations.length,
     },
+    metricDefinitionVersion,
   });
   const recomputedMetricsDigest = metricsDigestOf(recomputedMetrics);
   const storedMetricsDigest = bundle.summary?.metricsDigest ?? null;
@@ -1587,10 +1642,17 @@ export async function replayDirectionExperiment({ experimentId, baseRoot = null 
     model: experiment.model,
     gatewayUsed: experiment.gatewayUsed === true,
     horizonSeconds: experiment.horizonSeconds,
+    // The policy the experiment was FROZEN with, so a replay proves which bound
+    // it applied — an old v1 experiment still reports 5000 ms.
+    outcomeResolutionPolicyVersion: experiment.outcomeResolutionPolicyVersion ?? experiment.outcomeResolutionPolicy?.version ?? null,
+    maximumOffsetMs: outcomePolicy.maximumOffsetMs,
+    metricDefinitionVersion,
     counts: {
       predictions: bundle.predictions.length,
       outcomes: bundle.outcomes.length,
       scorablePredictions: bundle.predictions.filter((entry) => entry.scorable === true).length,
+      scoredCount: bundle.outcomes.filter((entry) => entry.scorable === true).length,
+      outcomeWindowExclusions: bundle.outcomes.filter((entry) => entry.invalidReason === OUTCOME_UNAVAILABLE_REASON).length,
       invalidPredictions: bundle.predictions.filter((entry) => entry.invalid === true).length,
       failedJevObservations: bundle.predictions.filter((entry) => entry.status !== "JEV_OK").length,
       tamperDetected: bundle.outcomes.filter((entry) => entry.tamperDetected === true).length,
@@ -1658,6 +1720,7 @@ export async function directionStats({ experimentId, baseRoot = null }) {
     outcomes: bundle.outcomes,
     featureStability: offlineAudits.featureStability,
     lookaheadAudit: offlineAudits.lookaheadAudit,
+    metricDefinitionVersion: bundle.experiment.metricDefinitionVersion ?? DIRECTION_METRICS_VERSION,
   });
   const metricsDigest = metricsDigestOf(metrics);
   return {

@@ -58,6 +58,34 @@ export const DIRECTION_OBSERVATION_VERSION = 1;
 /** Bounded safety guard for the politeness wait (never an unbounded loop). */
 export const POLITE_WAIT_MAX_STEPS = 2_000;
 
+/**
+ * The ONE implementation of the frozen outcome-selection ORDER rule: return the
+ * FIRST observation that is the benchmark base mint AND was RECEIVED at or
+ * after `targetAt`. Observations received before `targetAt` are skipped, never
+ * used as a substitute. Purely temporal: it never looks at a prediction, a
+ * probability or an outcome label.
+ *
+ * @param {{ observations?: Array<{mint?: string, receivedAtMs?: number, receivedAt?: string}>, targetAtMs?: number, baseMint?: string }} options
+ * @returns {{ observation: object, receivedAtMs: number } | null}
+ */
+export function selectFirstPostTargetObservation({
+  observations = [],
+  targetAtMs,
+  baseMint = BENCHMARK_MARKET.baseMint,
+} = {}) {
+  if (!Number.isFinite(targetAtMs)) return null;
+  for (const observation of observations ?? []) {
+    if (!observation || typeof observation !== "object") continue;
+    if (baseMint !== null && observation.mint !== undefined && observation.mint !== baseMint) continue;
+    const receivedAtMs = Number.isFinite(observation.receivedAtMs)
+      ? observation.receivedAtMs
+      : Date.parse(observation.receivedAt ?? "");
+    if (!Number.isFinite(receivedAtMs)) continue;
+    if (receivedAtMs >= targetAtMs) return { observation, receivedAtMs };
+  }
+  return null;
+}
+
 function boundedHealth(health) {
   if (!health || typeof health !== "object") return null;
   return {
@@ -140,7 +168,7 @@ export function createSolDirectionObservationSource({
    * rotation order, optionally stopping early as soon as the base mint appears
    * (used for the future reference, where measurement lag matters).
    */
-  async function walkEndpoints({ stopWhenBaseFound = false } = {}) {
+  async function walkEndpoints({ stopWhenBaseFound = false, minBaseReceivedAtMs = null } = {}) {
     const cycleStartedAt = now();
     const polls = [];
     let base = null;
@@ -157,7 +185,12 @@ export function createSolDirectionObservationSource({
         at: Number.isFinite(result?.at) ? result.at : null,
       });
       for (const token of result?.tokens ?? []) {
-        if (token?.mint === market.baseMint && base === null) {
+        // The FIRST base-mint observation received at or after the target instant
+        // wins (see `selectFirstPostTargetObservation`); an earlier one is never
+        // substituted, exactly as the frozen selection rule states.
+        const receivedAt = Number.isFinite(result?.at) ? result.at : null;
+        const postTarget = minBaseReceivedAtMs === null || (receivedAt !== null && receivedAt >= minBaseReceivedAtMs);
+        if (token?.mint === market.baseMint && base === null && postTarget) {
           base = { at: result.at, endpoint: result.endpoint, token };
         }
         if (token?.mint === market.quoteMint && quote === null) {
@@ -271,8 +304,13 @@ export function createSolDirectionObservationSource({
    * as the base mint is observed, so the resolution lag stays as small as the
    * venue's own data allows. Never rebuilds or touches the Jev input.
    */
-  async function observeFuture() {
-    const probeResult = buildProbe(await walkEndpoints({ stopWhenBaseFound: true }));
+  async function observeFuture({ targetAtMs = null } = {}) {
+    const probeResult = buildProbe(
+      await walkEndpoints({
+        stopWhenBaseFound: true,
+        minBaseReceivedAtMs: Number.isFinite(targetAtMs) ? targetAtMs : null,
+      }),
+    );
     const reason = assertGenuineState(probeResult);
     if (reason !== null) {
       return refusal(reason === "reference_market_absent_from_observation" ? "future_reference_absent_from_observation" : reason, probeResult);

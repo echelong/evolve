@@ -169,6 +169,15 @@ export const TARGET_AT_BASIS = "stateFrozenAt + horizonSeconds";
  * `targetAt`.
  */
 export const RESOLUTION_TOLERANCE_MS = 5_000;
+/**
+ * Policy-v2 bound. Observed live infrastructure delivered valid post-target
+ * wrapped-SOL observations at approximately +6 s, so the v1 5 s bound excluded
+ * 4/5 of the first real canary's observations purely on data-delivery timing.
+ * 10 s keeps one additional bounded refresh margin and remains ~3x smaller than
+ * the frozen 30 s prediction horizon. It is chosen from observed delivery timing
+ * ONLY — never from prediction correctness, Brier, accuracy or direction.
+ */
+export const RESOLUTION_TOLERANCE_MS_V2 = 10_000;
 export const RESOLUTION_TOLERANCE_BOUNDS = Object.freeze({ min: 1_000, max: 60_000 });
 
 /* ============================================================================
@@ -304,16 +313,33 @@ export const STALENESS_POLICY_DIGEST = digestOf(STALENESS_POLICY);
  * Outcome resolution (versioned + digested)
  * ==========================================================================*/
 
-export const OUTCOME_RESOLUTION_POLICY_VERSION = 1;
+export const OUTCOME_RESOLUTION_POLICY_VERSION_V1 = 1;
+export const OUTCOME_RESOLUTION_POLICY_VERSION_V2 = 2;
+
+/**
+ * The version NEW experiments pin. The frozen `targetAt` semantics
+ * (`targetAt = stateFrozenAt + 30 s`) are UNCHANGED across versions — only the
+ * bounded maximum outcome offset differs.
+ */
+export const CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION = OUTCOME_RESOLUTION_POLICY_VERSION_V2;
 
 /** Reason recorded when no acceptable future observation exists in the window. */
 export const OUTCOME_UNAVAILABLE_REASON = "OUTCOME_UNAVAILABLE";
 
-export const OUTCOME_RESOLUTION_POLICY = Object.freeze({
-  version: OUTCOME_RESOLUTION_POLICY_VERSION,
-  selectionRule:
-    "the FIRST genuine wrapped-SOL observation RECEIVED at or after targetAt (endpoint walk stops as soon as the base " +
-    "mint appears, so the resolution lag is as small as the venue allows)",
+/** The deterministic selection rule, shared verbatim by every policy version. */
+const OUTCOME_SELECTION_RULE =
+  "the FIRST genuine wrapped-SOL observation RECEIVED at or after targetAt (endpoint walk stops as soon as the base " +
+  "mint appears, so the resolution lag is as small as the venue allows)";
+
+/**
+ * POLICY V1 — FROZEN HISTORICAL IDENTITY, deliberately preserved byte-for-byte.
+ * `maximumOffsetMs = 5000`. Never edited in place: any change requires a NEW
+ * version, so every experiment pinned to v1 keeps replaying under exactly this
+ * rule and reproduces its existing scorable/non-scorable outcomes.
+ */
+export const OUTCOME_RESOLUTION_POLICY_V1 = Object.freeze({
+  version: OUTCOME_RESOLUTION_POLICY_VERSION_V1,
+  selectionRule: OUTCOME_SELECTION_RULE,
   selectionIsLexicographicInTime: true,
   selectionDependsOnPredictionOrOutcomeQuality: false,
   maximumOffsetMs: RESOLUTION_TOLERANCE_MS,
@@ -328,7 +354,90 @@ export const OUTCOME_RESOLUTION_POLICY = Object.freeze({
   neverSubstitutesALaterScheduledObservationForAFailedOne: true,
 });
 
-export const OUTCOME_RESOLUTION_POLICY_DIGEST = digestOf(OUTCOME_RESOLUTION_POLICY);
+export const OUTCOME_RESOLUTION_POLICY_V1_DIGEST = digestOf(OUTCOME_RESOLUTION_POLICY_V1);
+
+/**
+ * POLICY V2 — the SAME deterministic selection rule with the bounded maximum
+ * outcome offset widened to 10000 ms. Rationale: the first real canary showed
+ * valid post-target observations arriving at ~+6 s, so the v1 5 s bound refused
+ * 4/5 of them on infrastructure timing alone. 10 s is one extra bounded refresh
+ * margin and stays far below the 30 s horizon. The bound is NOT selected from
+ * prediction performance of any kind.
+ */
+export const OUTCOME_RESOLUTION_POLICY_V2 = Object.freeze({
+  version: OUTCOME_RESOLUTION_POLICY_VERSION_V2,
+  selectionRule: OUTCOME_SELECTION_RULE,
+  selectionIsLexicographicInTime: true,
+  selectionDependsOnPredictionOrOutcomeQuality: false,
+  maximumOffsetMs: RESOLUTION_TOLERANCE_MS_V2,
+  unavailableReason: OUTCOME_UNAVAILABLE_REASON,
+  offsetField: "outcomeOffsetMs = outcomeReceivedAt - targetAt",
+  offsetPersisted: true,
+  earlierThanTargetRejected: true,
+  earlierThanTargetInvalidReason: "future_reference_before_target",
+  earlierThanTargetUsesEarlierPrice: false,
+  unresolvedInvalidReasonPrefix: "unresolved_",
+  neverMovesTargetAt: true,
+  neverSubstitutesALaterScheduledObservationForAFailedOne: true,
+  supersedesPolicyVersion: OUTCOME_RESOLUTION_POLICY_VERSION_V1,
+  offsetBoundChosenFrom:
+    "observed live infrastructure data-delivery timing (valid post-target wrapped-SOL observations arriving at ~+6 s)",
+  offsetBoundTunedAgainstPredictionOutcomes: false,
+  offsetBoundBelowHorizonMs: HORIZON_MS,
+});
+
+export const OUTCOME_RESOLUTION_POLICY_V2_DIGEST = digestOf(OUTCOME_RESOLUTION_POLICY_V2);
+
+/** Version -> frozen policy. Every version ever pinned stays resolvable forever. */
+export const OUTCOME_RESOLUTION_POLICIES = Object.freeze({
+  [OUTCOME_RESOLUTION_POLICY_VERSION_V1]: OUTCOME_RESOLUTION_POLICY_V1,
+  [OUTCOME_RESOLUTION_POLICY_VERSION_V2]: OUTCOME_RESOLUTION_POLICY_V2,
+});
+
+export const OUTCOME_RESOLUTION_POLICY_DIGESTS = Object.freeze({
+  [OUTCOME_RESOLUTION_POLICY_VERSION_V1]: OUTCOME_RESOLUTION_POLICY_V1_DIGEST,
+  [OUTCOME_RESOLUTION_POLICY_VERSION_V2]: OUTCOME_RESOLUTION_POLICY_V2_DIGEST,
+});
+
+/** The policy NEW experiments pin (v2). */
+export const DEFAULT_OUTCOME_RESOLUTION_POLICY = OUTCOME_RESOLUTION_POLICY_V2;
+export const DEFAULT_OUTCOME_RESOLUTION_POLICY_DIGEST = OUTCOME_RESOLUTION_POLICY_V2_DIGEST;
+
+/** Resolve a frozen policy by version. Unknown versions resolve to `null` (fail closed). */
+export function outcomeResolutionPolicyFor(version) {
+  const resolved = OUTCOME_RESOLUTION_POLICIES[Number(version)];
+  return resolved ?? null;
+}
+
+export function outcomeResolutionPolicyDigestFor(version) {
+  const resolved = OUTCOME_RESOLUTION_POLICY_DIGESTS[Number(version)];
+  return resolved ?? null;
+}
+
+/** The registered policy whose bound equals `maximumOffsetMs`, or `null`. */
+export function outcomeResolutionPolicyForOffset(maximumOffsetMs) {
+  for (const policy of Object.values(OUTCOME_RESOLUTION_POLICIES)) {
+    if (policy.maximumOffsetMs === maximumOffsetMs) return policy;
+  }
+  return null;
+}
+
+/**
+ * PURE offset classifier — the ONE implementation of the bounded-window rule.
+ * It depends ONLY on timestamps and the policy bound: never on the Jev
+ * probability, the model intent, or the actual direction.
+ *
+ * @returns {{ outcomeOffsetMs: number|null, invalidReason: string|null, withinWindow: boolean }}
+ */
+export function resolveOutcomeOffset({ outcomeReceivedAtMs, targetAtMs, maximumOffsetMs }) {
+  const outcomeOffsetMs =
+    Number.isFinite(outcomeReceivedAtMs) && Number.isFinite(targetAtMs) ? outcomeReceivedAtMs - targetAtMs : null;
+  let invalidReason = null;
+  if (outcomeOffsetMs === null) invalidReason = "outcome_timestamp_unavailable";
+  else if (outcomeOffsetMs < 0) invalidReason = "future_reference_before_target";
+  else if (!Number.isFinite(maximumOffsetMs) || outcomeOffsetMs > maximumOffsetMs) invalidReason = OUTCOME_UNAVAILABLE_REASON;
+  return { outcomeOffsetMs, invalidReason, withinWindow: invalidReason === null };
+}
 
 /* ============================================================================
  * Isolation: zero routing authority anywhere in Phase 5I

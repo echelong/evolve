@@ -43,7 +43,7 @@ import {
   DIRECTION_ROUTING_FLAGS,
   EXECUTED_ACTION_IN_5I_0B,
   MODEL_INTENT_DEFINITION,
-  OUTCOME_RESOLUTION_POLICY,
+  DEFAULT_OUTCOME_RESOLUTION_POLICY,
   OVERRIDE_REASON_IN_5I_0B,
   TARGET_AT_BASIS,
   DIRECTION_EXPERIMENT_FILE,
@@ -165,6 +165,7 @@ export function createDirectionExperiment({
   stalenessPolicyDigest = null,
   outcomeResolutionPolicy = null,
   outcomeResolutionPolicyDigest = null,
+  outcomeResolutionPolicyVersion = null,
   unavailableFeatureFamiliesDigest,
   routingFlags = DIRECTION_ROUTING_FLAGS,
   startedAt = Date.now(),
@@ -210,6 +211,7 @@ export function createDirectionExperiment({
     stalenessPolicyDigest,
     outcomeResolutionPolicy,
     outcomeResolutionPolicyDigest,
+    outcomeResolutionPolicyVersion,
     unavailableFeatureFamiliesDigest,
     evidenceClass: DIRECTION_EVIDENCE_CLASS,
     ...DIRECTION_DEVELOPMENT_FLAGS,
@@ -535,6 +537,7 @@ export function buildDirectionOutcomeRecord({
   unavailableDetail = null,
   tamperDetected = false,
   resolvedAt = Date.now(),
+  outcomeResolutionPolicy = DEFAULT_OUTCOME_RESOLUTION_POLICY,
 }) {
   const record = {
     schemaVersion: DIRECTION_SCHEMA_VERSION,
@@ -587,7 +590,7 @@ export function buildDirectionOutcomeRecord({
     // §24: the timing distance from target is persisted, never hidden.
     outcomeOffsetMs: Number.isFinite(outcomeOffsetMs) ? outcomeOffsetMs : Number.isFinite(resolutionLagMs) ? resolutionLagMs : null,
     tamperDetected: tamperDetected === true,
-    outcomeResolutionPolicy: OUTCOME_RESOLUTION_POLICY,
+    outcomeResolutionPolicy,
     ...DIRECTION_ROUTING_FLAGS,
     resolveNote:
       "Outcome resolution NEVER rebuilds or modifies the Jev input. The prediction artifact was frozen first and its " +
