@@ -3306,6 +3306,165 @@ documented barrier — the ids and digests above — is tracked in Git.
 npm run intelligence:classify-features -- --cohort clcohort-20260919T163609Z-4d7c6dd9
 ```
 
+## Phase 5I.0b — Direct TypeSafe Jev Short-Horizon Directional Prediction Benchmark
+
+> **Phase 5I.0b is a direct-TypeSafe Jev directional prediction benchmark.** It measures **predictive
+> information only**. It is **not** a profitability claim, **not** an execution simulator, and it gives Jev
+> **no trading authority whatsoever**.
+
+The frozen research question is:
+
+> Does direct TypeSafe Jev contain short-horizon directional information about SOL/USDC price movement beyond
+> simple deterministic baselines, using only information available before the outcome?
+
+### Scope, frozen
+
+| Element | Frozen value |
+| --- | --- |
+| Market | **SOL / USDC only** |
+| Primary horizon | **30 seconds** (`targetAt = stateFrozenAt + 30s`) |
+| Default protocol | 120 scheduled observations, 30-second cadence (~1 hour) |
+| Evidence class | `DEVELOPMENT_JEV_DIRECTION_EVIDENCE` — development evidence only |
+| Provider | `typesafe-jev` only (`upstreamProvider: typesafe-ai`, `gatewayUsed: false`, `mode: shadow`) |
+| Model | `jev-1.13.0` only |
+| Question set | `jev-microstructure-direction-v1` v1 |
+| Packet | `JEV_MICROSTRUCTURE_DIRECTION_PACKET` v1 |
+| Outcome | `HIGHER` / `LOWER` / `TIE`, ties **retained** and excluded from binary scoring |
+
+### Development evidence only
+
+5I.0b artifacts are **development** evidence. They are never called validation, out-of-sample, test or
+replication evidence, and they carry `developmentOnly`, `paperOnly`, `shadowOnly`,
+`noProfitabilityInference`, `noTradingInference`, `noDeploymentInference` and
+`noGroundTruthBeyondObservedFutureOutcome`. A later Phase 5I.1 must use **fresh unseen data** before anything
+can be described as replicated.
+
+### No confidence threshold, every valid prediction retained
+
+There is **no** runtime Jev confidence threshold in this phase. `EVOLVE_JEV_MIN_CONFIDENCE` does not exist,
+`minConfidence` is not a resolved config property, and no prediction is discarded because `pHigher` is close
+to `0.5`. Every valid probability pair is stored, and a near-neutral `pHigher = 0.500001` is retained and
+scored. Offline analysis may inspect probability bins later; the runtime never thresholds.
+
+### The question
+
+```text
+Using ONLY the frozen market state supplied with this request (information observed at or before
+stateObservedAt, with no future data), will the SOL/USDC reference price be HIGHER 30 seconds after
+stateObservedAt than its reference price at stateObservedAt?
+```
+
+Jev answers with a `noul` probability. The stored output is the raw pair `pHigher` / `pLower` with
+`pLower = 1 - pHigher`; it is **never** reduced to BUY/SELL or UP/DOWN, and Jev never chooses the horizon, the
+target definition, whether an observation is scored, or anything about risk or routing.
+
+### Reference price
+
+One deterministic, versioned definition, derived only from the frozen observation and identical for `t0` and
+for the outcome: the observed **USD reference price of the base mint in the same observation cycle** — the
+price EVOLVE already derives from its Jupiter observation, not a new parallel price feed. The exact formula,
+version and digest are printed by `npm run jev:direction -- --definition` and recorded in every experiment
+manifest. The definition is **never** optimized against 5I outcomes.
+
+### Timestamps — no collapsed clock
+
+Market time, receipt time, freeze time, model time and outcome time are **separate persisted fields**:
+`sourceEventAt`, `receivedAt`, `stateObservedAt`, `stateFrozenAt`, `predictionStartedAt`,
+`predictionCompletedAt`, `predictionFinalizedAt`, `targetAt`, `outcomeSourceEventAt`, `outcomeReceivedAt`,
+`outcomeObservedAt`. An unavailable **source** timestamp is `null` — local receipt time is never relabelled as
+venue time. The full causal chain (`sourceEventAt <= receivedAt <= stateFrozenAt <= predictionStartedAt <=
+[predictionCompletedAt] < targetAt <= outcomeReceivedAt`) is enforced, and a violation makes the observation
+invalid. Staleness is measured with **separately named** source-age and receipt-age fields against a frozen
+conservative cutoff; a stale scheduled observation stays stale and is never refreshed or replaced.
+
+### Baselines and same-state fairness
+
+Deterministic baselines (`neutral`, `momentum`, `meanReversion`, plus quote/liquidity ones where the observed
+data genuinely supports them) are computed from **the exact same frozen state** Jev receives. Every baseline
+pins the same `stateDigest`, and replay proves it. A baseline that cannot produce a real prediction from that
+state is **excluded** from its own metrics rather than scored as a fabricated `0.50` call. No coefficient is
+fitted to 5I outcomes.
+
+### Strict no-lookahead audit
+
+The lookahead audit is **behavioural**, not a source-code scan: for every historical `t0`, features and
+baselines are recomputed from history ending at `t0`, then observations occurring **after** `t0` are appended
+and the **same** `t0` value is recomputed. Any change is a **hard lookahead failure**. A separate
+**recursive/startup stability** audit recomputes the same `t0` with different valid pre-`t0` startup lengths
+(30/60/120/240/full) and reports divergence as a **diagnostic** — startup instability is never labelled
+lookahead, and warmup is never tuned against target outcomes.
+
+### Jupiter data is not L2/L3 order-book data
+
+EVOLVE observes an **aggregate** Jupiter feed. A Jupiter quote is **not** an order book. No order-book
+imbalance, CVD, queue depth, queue position, maker flow, L2 depth, L3 order or aggressive-buyer/seller volume
+concept exists in 5I — those families are declared **unavailable** with reasons instead of being approximated,
+and a static + behavioural granularity guard rejects any feature vocabulary that implies them.
+
+### Immutability, outcome attachment, replay
+
+A prediction is written **before** an outcome exists and is never mutated; its digest is frozen. The outcome
+artifact references that digest and re-verifies it, and a mismatch **fails closed** (no scoring, no
+reinterpretation). An outcome is resolved only at or after `targetAt`, from the first acceptable future
+observation within a frozen tolerance; otherwise the result is `OUTCOME_UNAVAILABLE`.
+
+```bash
+npm run jev:direction -- --replay --experiment <id>   # networkCalls: 0, jevCalls: 0, writing nothing
+npm run jev:direction -- --stats   --experiment <id>  # read-only metrics report
+```
+
+Replay and stats require **no provider and no credential**; they re-derive every identity and digest, verify
+timestamp causality, recompute features, baselines, labels and metrics, and emit explicit tamper failures for
+a mutated prediction, a mutated outcome, a foreign baseline state, an inserted future observation or a moved
+`targetAt`.
+
+### Metrics
+
+Brier score, binary log loss (with a frozen numerical epsilon used **only** for log-loss safety — stored
+probabilities are never clamped), directional accuracy, scorable/HIGHER/LOWER/TIE/failed/late/stale counts,
+mean and median `pHigher`, **fixed predeclared** calibration bins, Jev-minus-neutral and Jev-minus-baseline
+Brier and accuracy deltas, full latency stats (mean/median/p90/p95/max) and physical-attempt statistics. There
+is **no** PnL, profitability, Sharpe, Sortino, trade count, returns, expected return, deployment verdict or
+automated winner — and no "Jev wins" label.
+
+### Boundaries
+
+- No trade execution, no wallet, no signer, no transaction, no order placement, no RPC write. 5I is prediction-only.
+- No Vercel (`vercel-jev`) and no `mock-jev` fallback for canonical evidence; a failed direct call stays a failed observation.
+- No routing into Arena scoring/gates, the genome compiler, evolution, champions, deployment, Shadow League, DeepSeek, classifier.dev, Agent-Reach or Phase 5H feature routing. The routing flags are persisted all-false, with `jevPredictionActive: true` distinguished from `jevTradingRoutingActive: false`.
+- **Maker/queue simulation is deferred to a future Phase 5I.2**, and only after Phase 5I.1 replication and a genuinely granular feed (real depth, queue-ahead, placement/cancel timestamps, partial fills, fees, slippage). A touch must never imply a fill, and L2/L3 will never be manufactured from Jupiter quotes.
+- New evidence tree `.evolve/jev-direction/experiments/<experiment-id>/` — separate from Phase 5D experiment storage.
+
+### Validation
+
+```bash
+npm run validate:phase5i   # 229 offline checks, zero network, sections A–AF
+```
+
+Sections: frozen identities, question-set contract, packet whitelist, feature formulas, warmup/null
+behaviour, lookahead integrity, recursive/startup stability, reference-price contract, 30-second target
+semantics, timestamp causality, staleness rules, prediction immutability, outcome attachment, TIE semantics,
+probability validation, deterministic baselines, same-state fairness, Brier/log-loss/accuracy, calibration
+bins, latency stats, provider/model/gateway enforcement, no runtime confidence threshold,
+transport-attempt provenance, failed-prediction preservation, resume semantics, replay/tamper detection,
+data-granularity integrity, zero routing/trading authority, frozen historical evidence preservation and CLI
+behaviour. The suite never creates canonical 5I evidence: every fixture lives in a temp directory, and the
+real `.evolve/jev-direction` tree is asserted byte-unchanged at the end.
+
+### CLI
+
+```bash
+npm run jev:direction -- --start  --market SOL-USDC --max-observations 120
+npm run jev:direction -- --resume  --experiment <id>
+npm run jev:direction -- --resolve --experiment <id>
+npm run jev:direction -- --replay  --experiment <id>
+npm run jev:direction -- --stats   --experiment <id>
+```
+
+`--start` is the only action that may create an experiment; every other action requires an **explicit**
+experiment id (there is no `--latest`). Runs are bounded and resumable, never a daemon. `--start` never
+auto-runs from the dashboard, and there is no silent overwrite: reusing an existing id is refused.
+
 ## Validation
 
 ```bash
@@ -4069,6 +4228,30 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Canonical 5G.1 evidence, Wave 1, Wave 2, the frozen cohorts, six datasets and `evaluationContractDigest` all byte-unchanged
 - [x] `npm run validate:phase5h` — 139 offline checks, plus a canonical 5G.1 cross-check that agrees exactly and a READ-ONLY canonical 5H.0 barrier (`clfeat-20260919T173844Z-7a9193bb`)
 - [x] Canonical `clfeat-20260919T173844Z-7a9193bb` artifact — operator-frozen from `clcohort-20260919T163609Z-4d7c6dd9` and successfully replayed, pinned as a permanent barrier; the artifact stays local/gitignored and its values are **not** evidence about profitability or market usefulness
+
+### Phase 5I.0b checklist
+
+- [x] Frozen research question, market (SOL/USDC), 30-second primary horizon and default protocol (120 observations / 30s cadence), all versioned and pinned in the experiment manifest
+- [x] Dedicated question set `jev-microstructure-direction-v1` (one `noul` probability question) and packet `JEV_MICROSTRUCTURE_DIRECTION_PACKET` v1 — neither reuses the Phase 5D or regime question sets
+- [x] Frozen feature definition + digest with only genuinely observable pre-`t0` fields; unavailable families (order book, CVD, queue depth, maker flow, L2/L3) declared with reasons instead of approximated
+- [x] Deterministic, versioned SOL/USDC reference-price definition derived only from the frozen observation and optimized against nothing
+- [x] `pHigher` / `pLower` with `pLower = 1 - pHigher`, range and tolerance validated; never reduced to BUY/SELL
+- [x] `HIGHER` / `LOWER` / `TIE` outcomes with ties retained in provenance and excluded from binary Brier/log-loss/accuracy
+- [x] BEHAVIOURAL lookahead audit (append future observations, recompute the same `t0`, require equality) over every feature AND every baseline
+- [x] Separate recursive/startup stability audit across 30/60/120/240/full pre-`t0` histories, reported as diagnostics and never as lookahead
+- [x] Multi-timestamp provenance (`sourceEventAt` → `receivedAt` → `stateFrozenAt` → `prediction*` → `targetAt` → `outcome*`) with null-for-unknown source times, a causality check and a frozen staleness cutoff
+- [x] Deterministic event ordering where baselines and Jev consume the SAME frozen `stateDigest`; Jev never sees a fresher state
+- [x] Two-stage immutable evidence: prediction written before any outcome exists, outcome re-verifies the prediction digest, and a mismatch FAILS CLOSED
+- [x] Deterministic baselines (`neutral` + momentum/mean-reversion + quote/liquidity where supported) with no outcome-fitted coefficients and per-baseline scoping
+- [x] Offline metrics: Brier, log loss (frozen epsilon for numerical safety only), accuracy, counts, mean/median `pHigher`, fixed calibration bins, Jev-minus-baseline deltas, latency and attempt statistics — and no PnL/Sharpe/returns/winner
+- [x] Canonical evidence requires `typesafe-jev` + `jev-1.13.0` + `gatewayUsed: false` + `mode: shadow`; `vercel-jev`, `mock-jev` and gateway routes are refused, with no silent fallback
+- [x] No runtime confidence threshold: `EVOLVE_JEV_MIN_CONFIDENCE` unsupported, no `minConfidence` property, every valid low-confidence prediction retained and scorable
+- [x] Bounded, resumable CLI (`--start` / `--resume` / `--resolve` / `--replay` / `--stats`) with explicit ids, no `--latest`, no daemon, no silent overwrite, and an interruption sweep that resolves (or refuses) an already-frozen observation without rewriting it
+- [x] Replay/stats make zero network, provider, Jev, Agent-Reach, classifier, DeepSeek, Arena or trading calls; tamper tests fail closed on a mutated prediction/outcome, a foreign baseline state, an injected future observation or a moved `targetAt`
+- [x] Zero routing/trading authority: no wallet/signer/order/swap path exists and every routing flag is persisted false while `jevPredictionActive` is true
+- [x] New evidence tree `.evolve/jev-direction/`; Phase 5G.1, Phase 5H.0 (`clfeat-20260919T173844Z-7a9193bb`), Wave 1, Wave 2 and `evaluationContractDigest` all byte-unchanged
+- [x] `npm run validate:phase5i` — 229 offline checks, zero network, zero canonical 5I evidence created
+- [ ] **NOT RUN YET** — the first small real direct-TypeSafe canary (5 observations) and the 120-observation development benchmark are operator-only commands; neither has been executed, so **no canonical 5I development evidence exists** and no predictive claim is made
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

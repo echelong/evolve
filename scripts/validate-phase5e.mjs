@@ -1154,7 +1154,25 @@ test("61. the Phase 5C/5C.2/5C.3/5D validators never touch the intelligence laye
 test("62. nothing in the Arena/engine/Jev path can invoke external intelligence", async () => {
   const arenaSources = await loadSources([path.join(REPO, "scripts", "arena"), path.join(REPO, "scripts", "jev")]);
   assertTrue(arenaSources.size > 0, "the Arena/Jev modules were scanned");
+  // Phase 5I's directional benchmark is prediction-only and, by contract, DECLARES
+  // the routing flags it keeps false by name (`agentReachRoutingActive: false`)
+  // and reports `agentReachCalls: 0`. That is the guarantee this check exists to
+  // enforce, not a violation of it, so those modules are held to the stronger
+  // capability-level rule asserted immediately below instead of a name scan.
+  const directionSources = await loadSources([path.join(REPO, "scripts", "jev", "direction")]);
+  assertTrue(directionSources.size > 0, "the Phase 5I direction modules were scanned");
+  for (const file of directionSources.keys()) arenaSources.delete(file);
   assertDeepEqual(scan(arenaSources, /intelligence|agent-?reach|EVOLVE_REACH/i), [], "no Arena/Jev module references external intelligence");
+  assertDeepEqual(
+    scan(directionSources, /(?:from|import|require)\s*\(?\s*["'`][^"'`]*intelligence/i),
+    [],
+    "no Phase 5I direction module imports, requires or dynamically loads the intelligence layer",
+  );
+  assertDeepEqual(
+    scan(directionSources, /intelligence|agent-?reach|EVOLVE_REACH/i).filter((hit) => !/agentReachRoutingActive|agentReachCalls/.test(hit)),
+    [],
+    "the intelligence vocabulary appears in Phase 5I ONLY as the zero-authority routing flag or the zero-call replay counter",
+  );
   const engine = await readFile(path.join(REPO, "scripts", "evolve-engine.mjs"), "utf8").catch(() => "");
   assertTrue(!/intelligence|agent-?reach/i.test(engine), "the live engine never loads the intelligence layer");
   const dashboardState = await readFile(path.join(REPO, "scripts", "lib", "dashboard-state.mjs"), "utf8");
