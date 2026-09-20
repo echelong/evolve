@@ -57,6 +57,7 @@ import {
   REQUIRED_PROVIDER,
   SUPPORTED_MARKET_IDS,
   isReplicationAction,
+  isTemporalAction,
   resolveDirectionAction,
 } from "./jev/direction/definition.mjs";
 import {
@@ -64,6 +65,7 @@ import {
   DIRECTION_EVIDENCE_CLASSES,
   REPLICATION_EVIDENCE_CLASS,
   REPLICATION_EVIDENCE_PROFILE,
+  TEMPORAL_REPLICATION_EVIDENCE_CLASS,
 } from "./jev/direction/evidence.mjs";
 import {
   DIRECTION_REPLICATION_ROOT_DIR,
@@ -83,6 +85,21 @@ import {
   replicationReplay,
   replicationStats,
 } from "./jev/direction/replication/runner.mjs";
+import {
+  CANONICAL_REPLICATION_BARRIER,
+  DIRECTION_TEMPORAL_ROOT_DIR,
+  REQUIRED_CLEAN_TEMPORAL_SESSIONS,
+  TEMPORAL_MINIMUM_GAP_MS,
+  TEMPORAL_PHASE,
+  TEMPORAL_PROTOCOL_DIGEST,
+  TEMPORAL_SESSION_OBSERVATIONS,
+} from "./jev/direction/temporal/protocol.mjs";
+import {
+  temporalAdd,
+  temporalCreate,
+  temporalReplay,
+  temporalStats,
+} from "./jev/direction/temporal/runner.mjs";
 import { DIRECTION_QUESTION_SET_ID, DIRECTION_QUESTION_SET_VERSION, buildDirectionQuestions, directionQuestionDigest } from "./jev/direction/questions.mjs";
 import { DIRECTION_PACKET_VERSION } from "./jev/direction/packet.mjs";
 import {
@@ -127,6 +144,15 @@ function usage() {
     "  npm run jev:direction -- --replication-stats --replication <id>",
     "  (a replication command NEVER launches a session: the operator runs each one manually and reviews it first)",
     "",
+    "Phase 5I.1a TEMPORAL EXTENSION (SAME frozen protocol digest, stricter temporal independence):",
+    `  ${TEMPORAL_REPLICATION_EVIDENCE_CLASS}   one fresh session on a different UTC date`,
+    "  npm run jev:direction -- --start --temporal-session --market SOL-USDC --max-observations 120",
+    "  npm run jev:direction -- --temporal-create",
+    "  npm run jev:direction -- --temporal-add --temporal <id> --experiment <fresh-jdir-id>",
+    "  npm run jev:direction -- --temporal-replay --temporal <id>",
+    "  npm run jev:direction -- --temporal-stats --temporal <id>",
+    "  (a temporal command NEVER launches a session: the operator runs each one manually and reviews it first)",
+    "",
     "Options:",
     `  --market <id>              ${SUPPORTED_MARKET_IDS.join(" | ")} (Phase ${DIRECTION_PHASE} benchmarks exactly one market)`,
     `  --max-observations <n>     default 120 (bounded)`,
@@ -144,6 +170,10 @@ function usage() {
     "  --replication <id>         explicit replication id (REQUIRED for replication-add/replay/stats)",
     "  --development <id>         explicit development experiment id (REQUIRED for replication-create)",
     `  --replication-out <dir>    replication tree (default ${DIRECTION_REPLICATION_ROOT_DIR})`,
+    "  --temporal-session         mark this run as ONE CLEAN Phase 5I.1a temporal-extension session",
+    "  --temporal <id>            explicit temporal-extension id (REQUIRED for temporal-add/replay/stats)",
+    `  --temporal-out <dir>       temporal-extension tree (default ${DIRECTION_TEMPORAL_ROOT_DIR})`,
+    "  --canonical-replication <id>  explicit canonical Phase 5I.1 baseline (default: the pinned wave)",
     "  --definition               print the frozen definition (market, horizon, digests, omitted feature families)",
     "  --json                     machine-readable output",
     "  --help                     this help",
@@ -337,6 +367,166 @@ async function runReplicationAction(action, args) {
   console.log("[jev:direction]   evidence class    CLEAN_JEV_DIRECTION_REPLICATION_EVIDENCE — replicationOnly, paper/shadow, no profitability/trading/deployment inference");
 }
 
+/* ============================================================================
+ * Phase 5I.1a temporal-extension commands
+ *
+ * Four explicit, ID-ONLY operations. NONE of them ever launches a session, and
+ * none of them ever writes to the canonical Phase 5I.1 replication tree. The
+ * predictive protocol digest is IDENTICAL to Phase 5I.1.
+ * ==========================================================================*/
+
+function temporalContext(args) {
+  const baseRoot = args.out !== undefined && String(args.out).trim() !== "" ? String(args.out).trim() : null;
+  const temporalRoot =
+    args["temporal-out"] !== undefined && String(args["temporal-out"]).trim() !== ""
+      ? String(args["temporal-out"]).trim()
+      : null;
+  const canonicalRoot =
+    args["canonical-replication"] !== undefined && String(args["canonical-replication"]).trim() !== ""
+      ? String(args["canonical-replication"]).trim()
+      : null;
+  const temporalId = args.temporal !== undefined ? String(args.temporal).trim() : null;
+  return { baseRoot, temporalRoot, canonicalRoot, temporalId };
+}
+
+function printTemporalSessionLine(session) {
+  const jev = session.metrics?.jev ?? {};
+  console.log(
+    `[jev:direction]   ${session.sessionId}  ${String(session.status).padEnd(12)} ` +
+      `Brier ${fmt(jev.brier)} · log loss ${fmt(jev.logLoss)} · accuracy ${fmt(jev.accuracy)} ` +
+      `(N=${jev.brierSampleCount ?? 0})`,
+  );
+  console.log(
+    `[jev:direction]     UTC date ${session.utcDate ?? "n/a"} · gap ${session.gapFromPreviousEligibleSessionMs ?? "n/a"}ms · ` +
+      `overlap dev ${session.overlapWithDevelopment === true} / canonical ${session.overlapWithCanonicalReplication === true} / ` +
+      `temporal ${session.overlapWithTemporalExtensionSession === true} · protocol ${session.protocolOk === true ? "matches" : "MISMATCH"}`,
+  );
+  for (const reason of session.temporalEligibilityReasons ?? session.reasons ?? []) {
+    console.log(`[jev:direction]     reason: ${reason}`);
+  }
+}
+
+function printTemporalCombinedView(view) {
+  if (!view) return;
+  console.log(
+    `[jev:direction]   combined view     canonical ${view.canonical?.cleanSessionCount ?? 0} + temporal ` +
+      `${view.temporal?.cleanSessionCount ?? 0} = ${view.totalObservedCleanSessions ?? 0} observed clean session(s) ` +
+      `(canonical immutable ${view.canonicalResultImmutable === true})`,
+  );
+  if (view.combined) {
+    const neutral = view.combined.comparisons?.["neutral-v1"]?.brier ?? {};
+    console.log(
+      `[jev:direction]   combined neutral  Brier mean ${fmt(neutral.mean)} (n=${neutral.sessionCount ?? 0}) · ` +
+        `equal weight per clean session, observations never pooled`,
+    );
+    for (const [key, interval] of Object.entries(view.combined.bootstrap?.comparisons ?? {})) {
+      console.log(
+        `[jev:direction]     ${key.padEnd(34)} mean ${fmt(interval.pointEstimate)} · interval ` +
+          `[${fmt(interval.lower)}, ${fmt(interval.upper)}] (descriptive only)`,
+      );
+    }
+  } else {
+    console.log("[jev:direction]   combined view     unavailable: the canonical per-session detail is not present in this checkout");
+  }
+}
+
+async function runTemporalAction(action, args) {
+  const { baseRoot, temporalRoot, canonicalRoot, temporalId } = temporalContext(args);
+  const json = args.json === true;
+
+  if (action === "temporal-create") {
+    const result = await temporalCreate({ temporalRoot, canonicalRoot });
+    if (!result.ok) {
+      fail(result.error ?? "temporal-create failed", 1);
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ ...result, summary: undefined }, null, 2));
+      return;
+    }
+    console.log(`EVOLVE Phase ${TEMPORAL_PHASE} temporal extension created — ${result.temporalId}`);
+    console.log(`[jev:direction]   artifacts         ${result.root}`);
+    console.log(`[jev:direction]   canonical wave    ${result.canonicalReplicationId} (aggregate ${String(result.canonicalReplicationAggregateDigest).slice(0, 12)}…)`);
+    console.log(`[jev:direction]   protocol digest   ${result.protocolDigest} (SAME as Phase 5I.1)`);
+    console.log(`[jev:direction]   canonical tree    ${result.canonicalArtifactsPresent ? "verified READ ONLY" : "absent here — the source-pinned barrier was used"}`);
+    console.log(
+      `[jev:direction]   sessions          0 added · status ${result.status} · needs ${result.requiredCleanSessions} CLEAN temporal sessions ` +
+        `(one per UTC date, gap >= ${TEMPORAL_MINIMUM_GAP_MS} ms)`,
+    );
+    console.log("[jev:direction]   NOTHING was launched: run each session manually with --start --temporal-session, then --temporal-add.");
+    return;
+  }
+
+  if (!temporalId) {
+    fail(`--${action} requires an explicit --temporal <id>; there is NO "latest"`);
+    return;
+  }
+  if (temporalId.toLowerCase() === "latest" || temporalId.toLowerCase() === "all") {
+    fail(`--temporal ${temporalId} is refused: Phase 5I.1a never guesses which temporal extension you meant`);
+    return;
+  }
+
+  if (action === "temporal-add") {
+    const sessionId = args.experiment !== undefined ? String(args.experiment).trim() : null;
+    const result = await temporalAdd({ temporalId, sessionId, temporalRoot, baseRoot, canonicalRoot });
+    if (!result.ok) {
+      fail(result.error ?? "temporal-add failed", 1);
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ ...result, summary: undefined }, null, 2));
+      return;
+    }
+    console.log(`EVOLVE Phase ${TEMPORAL_PHASE} temporal extension ${temporalId} — added ${result.sessionId}`);
+    console.log(`[jev:direction]   session status    ${result.sessionStatus} (eligible ${result.sessionEligible})`);
+    console.log(`[jev:direction]   UTC date          ${result.utcDate ?? "n/a"} · gap from previous eligible session ${result.gapFromPreviousEligibleSessionMs ?? "n/a"}ms`);
+    console.log(`[jev:direction]   overlap           dev ${result.overlapWithDevelopment === true} · canonical ${result.overlapWithCanonicalReplication === true} · temporal ${result.overlapWithTemporalExtensionSession === true}`);
+    console.log(`[jev:direction]   network           ${result.networkCalls} · jev calls ${result.jevCalls} · launched sessions ${result.launchedSessions}`);
+    console.log(`[jev:direction]   protocol digest   ${result.protocolDigest} (${result.protocolOk ? "matches" : "MISMATCH — ineligible"})`);
+    console.log(`[jev:direction]   clean sessions    ${result.cleanSessionCount}/${REQUIRED_CLEAN_TEMPORAL_SESSIONS} · status ${result.status}`);
+    for (const reason of result.temporalEligibilityReasons ?? []) console.error(`[jev:direction]   reason            ${reason}`);
+    return;
+  }
+
+  if (action === "temporal-replay") {
+    const report = await temporalReplay({ temporalId, temporalRoot, baseRoot, canonicalRoot });
+    if (json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.log(`EVOLVE Phase ${TEMPORAL_PHASE} offline temporal-extension replay — ${temporalId}`);
+      console.log(`[jev:direction]   integrity         ${report.ok ? "OK" : "FAIL"}`);
+      console.log(`[jev:direction]   read only         yes · network ${report.networkCalls} · jev ${report.jevCalls} · arena ${report.arenaRuns} · trading ${report.tradingCalls} · launched sessions ${report.launchedSessions}`);
+      console.log(`[jev:direction]   evidence class    ${report.evidenceClass ?? "n/a"}`);
+      console.log(`[jev:direction]   canonical wave    ${report.canonicalReplicationId ?? "n/a"} (manifest ${String(report.canonicalReplicationDigest ?? "n/a").slice(0, 12)}…)`);
+      console.log(`[jev:direction]   protocol digest   ${report.protocolDigest ?? "n/a"}`);
+      console.log(`[jev:direction]   counts            ${JSON.stringify(report.counts ?? {})}`);
+      console.log(`[jev:direction]   manifest digest   ${report.manifestDigestMatches ? "reproduced" : "MISMATCH"} · session records ${report.sessionsDigestMatches ? "reproduced" : "MISMATCH"}`);
+      console.log(`[jev:direction]   aggregation       ${report.metricsMatch ? "reproduced" : "MISMATCH"}`);
+      for (const problem of report.problems ?? []) console.error(`[jev:direction]   problem           ${problem}`);
+    }
+    process.exitCode = report.ok ? 0 : 1;
+    return;
+  }
+
+  const stats = await temporalStats({ temporalId, temporalRoot, baseRoot, canonicalRoot });
+  if (!stats.ok) {
+    fail(stats.error ?? "temporal-stats failed", 1);
+    return;
+  }
+  if (json) {
+    console.log(JSON.stringify({ ...stats, storedSummary: undefined }, null, 2));
+    return;
+  }
+  console.log(`EVOLVE Phase ${TEMPORAL_PHASE} temporal-extension stats — ${temporalId} (READ ONLY, TEMPORAL-EXTENSION EVIDENCE — no profitability claim)`);
+  console.log(`[jev:direction]   evidence class    ${stats.manifest.evidenceClass}`);
+  console.log(`[jev:direction]   protocol digest   ${stats.manifest.protocolDigest} (SAME as Phase 5I.1)`);
+  console.log(`[jev:direction]   canonical wave    ${stats.manifest.canonicalReplicationId} (immutable, independently reproducible)`);
+  console.log(`[jev:direction]   aggregation       ${stats.metricsMatch ? "reproduces the stored summary" : "DOES NOT reproduce the stored summary"}`);
+  for (const session of stats.sessions ?? []) printTemporalSessionLine(session);
+  printReplicationAggregate(stats.summary);
+  printTemporalCombinedView(stats.combinedView);
+  console.log(`[jev:direction]   evidence class    ${TEMPORAL_REPLICATION_EVIDENCE_CLASS} — temporalExtensionOnly, paper/shadow, no profitability/trading/deployment inference`);
+}
+
 function printDefinition() {
   console.log(`[jev:direction] Phase ${DIRECTION_PHASE} — frozen definition`);
   console.log(`[jev:direction]   market:           ${SUPPORTED_MARKET_IDS.join(", ")}`);
@@ -351,10 +541,17 @@ function printDefinition() {
   console.log(`[jev:direction]   evidence classes: ${DIRECTION_EVIDENCE_CLASSES.join(", ")}`);
   console.log(`[jev:direction]   research tree:    ${DIRECTION_ROOT_DIR}/experiments/<experiment-id>/`);
   console.log(`[jev:direction]   replication tree: ${DIRECTION_REPLICATION_ROOT_DIR}/<replication-id>/ (Phase 5I.1)`);
+  console.log(`[jev:direction]   temporal tree:    ${DIRECTION_TEMPORAL_ROOT_DIR}/<temporal-id>/ (Phase 5I.1a)`);
   console.log(`[jev:direction]   protocol digest:  ${REPLICATION_PROTOCOL_DIGEST} (frozen replication contract)`);
+  console.log(`[jev:direction]   temporal digest:  ${TEMPORAL_PROTOCOL_DIGEST} (SAME frozen contract — unchanged)`);
   console.log(
     `[jev:direction]   replication:      ${REQUIRED_CLEAN_REPLICATION_SESSIONS} independent sessions x ` +
       `${REPLICATION_SESSION_OBSERVATIONS} observations; primary inference unit ${REPLICATION_INFERENCE_UNIT}`,
+  );
+  console.log(
+    `[jev:direction]   temporal:         ${REQUIRED_CLEAN_TEMPORAL_SESSIONS} CLEAN temporal sessions x ` +
+      `${TEMPORAL_SESSION_OBSERVATIONS} observations, one per UTC date, gap >= ${TEMPORAL_MINIMUM_GAP_MS} ms; ` +
+      `canonical wave ${CANONICAL_REPLICATION_BARRIER.replicationId} stays immutable`,
   );
   console.log(
     `[jev:direction]   development:      ${CANONICAL_DEVELOPMENT_BARRIER.experimentId} ` +
@@ -452,6 +649,15 @@ async function main() {
   // provider, even by accident.
   if (isReplicationAction(action)) {
     await runReplicationAction(action, args);
+    return;
+  }
+
+  // ---- Phase 5I.1a temporal-extension commands are also dispatched FIRST ---
+  // Same reasoning: none of them needs a provider, a credential, or a market,
+  // and none of them may ever construct one. They also NEVER touch the canonical
+  // Phase 5I.1 replication tree beyond reading it.
+  if (isTemporalAction(action)) {
+    await runTemporalAction(action, args);
     return;
   }
 

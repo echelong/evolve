@@ -282,9 +282,12 @@ import {
   DIRECTION_EVIDENCE_CLASSES,
   DIRECTION_EVIDENCE_PROFILES,
   DIRECTION_REPLICATION_FLAGS,
+  DIRECTION_TEMPORAL_REPLICATION_FLAGS,
   evidenceProfileForClass,
   REPLICATION_EVIDENCE_CLASS,
   REPLICATION_EVIDENCE_PROFILE,
+  TEMPORAL_REPLICATION_EVIDENCE_CLASS,
+  TEMPORAL_REPLICATION_EVIDENCE_PROFILE,
   evidenceProfileById,
   evidenceProfileForExperiment,
 } from "./jev/direction/evidence.mjs";
@@ -428,6 +431,11 @@ const PHASE_5I_MODULES = Object.freeze([
   "scripts/jev/direction/replication/eligibility.mjs",
   "scripts/jev/direction/replication/aggregate.mjs",
   "scripts/jev/direction/replication/runner.mjs",
+  "scripts/jev/direction/temporal/protocol.mjs",
+  "scripts/jev/direction/temporal/manifest.mjs",
+  "scripts/jev/direction/temporal/eligibility.mjs",
+  "scripts/jev/direction/temporal/aggregate.mjs",
+  "scripts/jev/direction/temporal/runner.mjs",
   "scripts/jev-direction.mjs",
 ]);
 
@@ -5167,11 +5175,30 @@ test("AK6. a replication invocation never reaches a market config or a provider"
  * PART AL — isolation, no-tuning and zero authority for Phase 5I.1
  * ==========================================================================*/
 
-test("AL1. the two evidence profiles are distinct, explicit and fail closed", () => {
+test("AL1. the evidence profiles are distinct, explicit and fail closed", () => {
   assertEqual(DEVELOPMENT_EVIDENCE_PROFILE.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the development class");
   assertEqual(REPLICATION_EVIDENCE_PROFILE.evidenceClass, REPLICATION_EVIDENCE_CLASS, "the replication class");
-  assertDeepEqual(DIRECTION_EVIDENCE_CLASSES, [DIRECTION_EVIDENCE_CLASS, REPLICATION_EVIDENCE_CLASS], "exactly two classes exist");
-  assertDeepEqual(Object.keys(DIRECTION_EVIDENCE_PROFILES).sort(), ["development", "replication"], "the registry holds exactly the two profiles");
+  assertEqual(TEMPORAL_REPLICATION_EVIDENCE_PROFILE.evidenceClass, TEMPORAL_REPLICATION_EVIDENCE_CLASS, "the temporal-extension class");
+  assertDeepEqual(
+    DIRECTION_EVIDENCE_CLASSES,
+    [DIRECTION_EVIDENCE_CLASS, REPLICATION_EVIDENCE_CLASS, TEMPORAL_REPLICATION_EVIDENCE_CLASS],
+    "three classes exist (development, canonical replication, temporal extension)",
+  );
+  assertDeepEqual(
+    Object.keys(DIRECTION_EVIDENCE_PROFILES).sort(),
+    ["development", "replication", "temporal"],
+    "the registry holds exactly the three profiles",
+  );
+  assertEqual(DIRECTION_TEMPORAL_REPLICATION_FLAGS.temporalExtensionOnly, true, "temporal artifacts declare temporalExtensionOnly");
+  assertEqual(DIRECTION_TEMPORAL_REPLICATION_FLAGS.replicationOnly, true, "temporal artifacts are still replication evidence");
+  assertEqual(DIRECTION_TEMPORAL_REPLICATION_FLAGS.developmentOnly, false, "and not development evidence");
+  assertEqual(evidenceProfileForClass(TEMPORAL_REPLICATION_EVIDENCE_CLASS), TEMPORAL_REPLICATION_EVIDENCE_PROFILE, "the temporal class resolves by class");
+  assertEqual(evidenceProfileById("temporal"), TEMPORAL_REPLICATION_EVIDENCE_PROFILE, "and by id");
+  assertEqual(
+    REPLICATION_EVIDENCE_CLASS === TEMPORAL_REPLICATION_EVIDENCE_CLASS,
+    false,
+    "the temporal class is DISTINCT from the canonical replication class",
+  );
   assertEqual(evidenceProfileForClass(DIRECTION_EVIDENCE_CLASS), DEVELOPMENT_EVIDENCE_PROFILE, "the development class resolves by class");
   assertEqual(evidenceProfileForClass(REPLICATION_EVIDENCE_CLASS), REPLICATION_EVIDENCE_PROFILE, "the replication class resolves by class");
   assertEqual(evidenceProfileForClass("UNKNOWN_CLASS"), null, "an unknown class fails closed");

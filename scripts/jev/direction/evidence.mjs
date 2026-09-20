@@ -18,6 +18,19 @@
  *                comes from the cross-session aggregation in the replication
  *                manifest (§13), and only from CLEAN sessions.
  *
+ *   temporal     CLEAN_JEV_DIRECTION_TEMPORAL_REPLICATION_EVIDENCE
+ *                developmentOnly: false, replicationOnly: true,
+ *                temporalExtensionOnly: true. The artifact is ONE fresh, unseen
+ *                session of the SAME frozen Phase 5I.0b predictive protocol, but
+ *                it belongs to the Phase 5I.1a TEMPORAL EXTENSION: it is held to
+ *                STRICTER temporal-independence rules (a different UTC calendar
+ *                date per session, a >= 6 h gap from the previous eligible
+ *                session, and no overlap with the development experiment, the
+ *                canonical Phase 5I.1 wave, or another temporal session) and is
+ *                aggregated in its OWN manifest, never appended to the canonical
+ *                Phase 5I.1 wave. It changes NO predictive semantic: the frozen
+ *                protocol digest is identical for all three classes.
+ *
  * WHY A PROFILE INSTEAD OF A SECOND PIPELINE: the predictive protocol must be
  * BYTE-IDENTICAL between development and replication. A second code path would
  * be a second protocol. The evidence class is a *labelling* dimension only — it
@@ -85,9 +98,52 @@ export const REPLICATION_EVIDENCE_PROFILE = Object.freeze({
   protocolUnchangedByResults: true,
 });
 
+/**
+ * The ONE evidence class a Phase 5I.1a temporal-extension session may carry. It
+ * is deliberately DISTINCT from the canonical replication class so a temporal
+ * session can never be added to the canonical Phase 5I.1 wave and a canonical
+ * 5I.1 session can never be added to the temporal extension.
+ */
+export const TEMPORAL_REPLICATION_EVIDENCE_CLASS = "CLEAN_JEV_DIRECTION_TEMPORAL_REPLICATION_EVIDENCE";
+
+/**
+ * Every temporal-extension artifact carries these flags, verbatim. The flag set
+ * is the replication set plus `temporalExtensionOnly`; nothing about the
+ * predictive protocol is expressed here — this is a LABELLING dimension only.
+ */
+export const DIRECTION_TEMPORAL_REPLICATION_FLAGS = Object.freeze({
+  developmentOnly: false,
+  replicationOnly: true,
+  temporalExtensionOnly: true,
+  noGroundTruthBeyondObservedFutureOutcome: true,
+  noProfitabilityInference: true,
+  noTradingInference: true,
+  noDeploymentInference: true,
+  paperOnly: true,
+  shadowOnly: true,
+});
+
+export const TEMPORAL_REPLICATION_EVIDENCE_PROFILE = Object.freeze({
+  id: "temporal",
+  evidenceClass: TEMPORAL_REPLICATION_EVIDENCE_CLASS,
+  evidenceScope: "TEMPORAL_REPLICATION",
+  // One temporal session is still a SESSION, never a wave-level result: the
+  // temporal result only ever comes from the temporal cross-session aggregation.
+  replicationStatus: "PENDING_TEMPORAL_AGGREGATION",
+  flags: DIRECTION_TEMPORAL_REPLICATION_FLAGS,
+  interpretation:
+    "One fresh, unseen TEMPORAL-EXTENSION session of the frozen Phase 5I.0b predictive protocol. It uses the same " +
+    "protocol digest as development and replication evidence, but it is held to STRICTER temporal-independence rules " +
+    "and is aggregated separately. It is paper/shadow only, it establishes nothing on its own, and no profitability, " +
+    "trading or deployment inference is permitted from it.",
+  noAutomatedWinner: true,
+  protocolUnchangedByResults: true,
+});
+
 export const DIRECTION_EVIDENCE_PROFILES = Object.freeze({
   development: DEVELOPMENT_EVIDENCE_PROFILE,
   replication: REPLICATION_EVIDENCE_PROFILE,
+  temporal: TEMPORAL_REPLICATION_EVIDENCE_PROFILE,
 });
 
 /** Resolve a profile by id. An unknown id resolves to `null` (FAIL CLOSED). */

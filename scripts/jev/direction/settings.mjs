@@ -49,6 +49,10 @@ import {
   REPLICATION_SESSION_CADENCE_SECONDS,
   REPLICATION_SESSION_OBSERVATIONS,
 } from "./replication/protocol.mjs";
+import {
+  TEMPORAL_SESSION_CADENCE_SECONDS,
+  TEMPORAL_SESSION_OBSERVATIONS,
+} from "./temporal/protocol.mjs";
 
 export const DIRECTION_SETTINGS_VERSION = 1;
 
@@ -176,11 +180,59 @@ export function buildDirectionRunSettings(args = {}) {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Phase 5I.1a TEMPORAL-EXTENSION SESSION pre-run guard (FAIL CLOSED).
+  //
+  // `--temporal-session` marks ONE run as a CLEAN TEMPORAL-EXTENSION session of
+  // the SAME frozen 5I.0b predictive protocol. It refuses every value the frozen
+  // protocol fixes, exactly like `--replication-session`, and it is mutually
+  // exclusive with it. The two flags differ ONLY in the evidence class the run
+  // declares (temporal vs replication) — never in predictive semantics.
+  // ---------------------------------------------------------------------------
+  const temporalSession = args["temporal-session"] === true;
+  if (temporalSession) {
+    if (replicationSession) {
+      fail(problems, "--temporal-session and --replication-session are mutually exclusive: a run declares exactly ONE evidence class");
+    }
+    if (args["allow-mock"] === true) {
+      fail(
+        problems,
+        `--temporal-session refuses --allow-mock: a temporal-extension session must be genuine, direct-TypeSafe ${REQUIRED_PROVIDER} ` +
+          "evidence on real observations, never an offline fixture",
+      );
+    }
+    if (args["allow-unsafe-model"] === true) {
+      fail(problems, `--temporal-session refuses --allow-unsafe-model: the pinned model '${REQUIRED_MODEL}' is not optional`);
+    }
+    if (maxObservations !== TEMPORAL_SESSION_OBSERVATIONS) {
+      fail(
+        problems,
+        `--temporal-session requires exactly ${TEMPORAL_SESSION_OBSERVATIONS} observations per session ` +
+          `(got --max-observations ${maxObservations}); a session of another size is not the frozen protocol`,
+      );
+    }
+    if (cadenceSeconds !== TEMPORAL_SESSION_CADENCE_SECONDS) {
+      fail(
+        problems,
+        `--temporal-session requires the frozen ${TEMPORAL_SESSION_CADENCE_SECONDS}-second cadence ` +
+          `(got --cadence-seconds ${cadenceSeconds})`,
+      );
+    }
+    if (requestedToleranceMs !== null && outcomeResolutionPolicy.version !== CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION) {
+      fail(
+        problems,
+        `--temporal-session requires frozen outcome-resolution policy v${CURRENT_OUTCOME_RESOLUTION_POLICY_VERSION} ` +
+          `(got --tolerance-ms ${requestedToleranceMs})`,
+      );
+    }
+  }
+
   return {
     version: DIRECTION_SETTINGS_VERSION,
     phase: DIRECTION_PHASE,
     replicationSession,
-    evidenceProfileId: replicationSession ? "replication" : "development",
+    temporalSession,
+    evidenceProfileId: temporalSession ? "temporal" : replicationSession ? "replication" : "development",
     marketId,
     market: BENCHMARK_MARKET,
     horizonSeconds: HORIZON_SECONDS,

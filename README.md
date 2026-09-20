@@ -3481,7 +3481,8 @@ these results.
 ### Validation
 
 ```bash
-npm run validate:phase5i   # 290 offline checks, zero network, sections A–AM
+npm run validate:phase5i      # 290 offline checks (5I.0b + 5I.1), zero network, sections A–AM
+npm run validate:phase5i1a    # 39 offline checks for the Phase 5I.1a temporal extension
 ```
 
 Sections: frozen identities, question-set contract, packet whitelist, feature formulas, warmup/null
@@ -3672,6 +3673,84 @@ infrastructure evidence and are **never** promoted to replication evidence, as i
 experiment itself. Phase 5H.0 (`clfeat-20260919T173844Z-7a9193bb`, digest
 `65218b38f80a344a99f12f8a98784a49250d0ec0b88cd88ea9cd795fab39312b`) and `evaluationContractDigest`
 `4cf8ac1fa7db290acadeccf6043ec34c3239f8e3f848e9e50d8560826de85052` are unchanged.
+
+## Phase 5I.1a — Temporal Replication Extension
+
+> **Phase 5I.1a is still replication, still PAPER ONLY, and it modifies nothing.** The canonical Phase 5I.1
+> wave completed 3/3 CLEAN but all three sessions happened on the **same UTC day, close together in time**.
+> Phase 5I.1a asks the same frozen question again on sessions that are **temporally independent of one
+> another and of the canonical wave**, without touching the predictive protocol.
+
+### Same protocol, stricter independence
+
+The predictive protocol is **byte-for-byte the same**: market `SOL-USDC`, direct `typesafe-jev`,
+`jev-1.13.0`, `gatewayUsed: false`, `shadow`, 30 s horizon, 30 s cadence, 120 observations/session,
+outcome-resolution **v2** (10000 ms), the same question set, feature definition, baselines, metric
+definition, reference-price definition, staleness rules and **no** confidence threshold. The protocol digest
+is **not re-frozen** — Phase 5I.1a imports the canonical digest verbatim:
+
+```text
+1cc0661cf207d861e9809b3374ff70ce3a6434a7b49acc17598d5928935a5fb3
+```
+
+What is new is the **evidence class** and the **independence rules**, both frozen in source before any
+session is run:
+
+- `CLEAN_JEV_DIRECTION_TEMPORAL_REPLICATION_EVIDENCE` — a distinct class, so a temporal session can never be
+  appended to the canonical Phase 5I.1 wave and a canonical session can never be re-labelled as temporal;
+- **a different UTC calendar date** for every temporal session;
+- **at least a 6-hour gap** between a session's start and the previous eligible session's completion;
+- **no overlap** with the Phase 5I.0b development observation window, with any canonical Phase 5I.1
+  observation, or with another Phase 5I.1a session;
+- session timing is a **calendar schedule** — never selected because Jev performed well, and never selected
+  because SOL looked bullish, bearish or volatile.
+
+A violation is preserved as `CONTAMINATED` or `INELIGIBLE` with its explicit reasons — never silently
+excluded. Independence is **symmetric**: every record is re-derived against the full session set on each add,
+so a later session can invalidate an earlier CLEAN label and the stored records always reproduce exactly.
+
+### Separately reported, plus a combined descriptive view
+
+Exactly **3 CLEAN temporal sessions** complete the extension; fewer report
+`INSUFFICIENT_CLEAN_TEMPORAL_SESSIONS` and no interval. The inference unit remains `dataset/session`,
+equal-weighted per CLEAN session, with the **same deterministic session-level bootstrap** (fixed seed
+`20260920`, 2000 resamples, sessions resampled, no p-value, no significance label, no winner, no
+profitability inference). The result is reported **separately** from the canonical wave, and a combined
+descriptive view stacks canonical 3 + temporal 3 = **6 observed clean sessions** — with the canonical
+3-session result read, never recomputed, and remaining **immutable and independently reproducible**.
+
+### Temporal tree and operator-only commands
+
+```text
+.evolve/jev-direction/temporal/<temporal-id>/
+  temporal.json   frozen manifest: canonical wave id + digests, protocol digest, independence + selection rules
+  sessions.json   one record per ADDED session — CLEAN, CONTAMINATED or INELIGIBLE, with explicit reasons
+  summary.json    the temporal aggregation, its combined view, and both digests
+```
+
+The implementation **never launches a session**, never writes to the canonical replication tree, and never
+creates an automated winner field, trading logic, a promotion to 5I.2, or a Jev cache in the predictive path.
+Cross-asset testing is deferred to a future Phase 5I.1b; this phase benchmarks SOL only.
+
+```bash
+# 1. create the temporal manifest (source-pins the canonical wave; runs nothing)
+npm run jev:direction -- --temporal-create
+
+# 2. run ONE fresh session by hand (real direct-TypeSafe Jev; 120 observations, one UTC date)
+npm run jev:direction -- --start --temporal-session \
+  --market SOL-USDC --max-observations 120
+
+# 3. review and record it (offline: reads + replays the finished session, launches nothing)
+npm run jev:direction -- --temporal-add \
+  --temporal <temporal-id> --experiment <fresh-jdir-id>
+
+# 4. verify and read the extension (both offline, zero network)
+npm run jev:direction -- --temporal-replay --temporal <temporal-id>
+npm run jev:direction -- --temporal-stats  --temporal <temporal-id>
+```
+
+See `npm run validate:phase5i1a` (39 offline checks) for the temporal-independence, protocol-preservation,
+canonical-immutability and zero-authority proof suite.
 
 ## Validation
 
@@ -4480,6 +4559,22 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Canonical wave `jrep-20260920T090716Z-97c862`: **3/3 CLEAN** sessions (`jdir-20260920T090716Z-3a9163`, `jdir-20260920T104154Z-3a9163`, `jdir-20260920T121446Z-3a9163`), replayed offline with zero network and byte-reproducible manifest, session-record and aggregation digests
 - [x] Wave description: Jev vs neutral **mixed** (better Brier/log loss in 2/3 sessions; mean deltas `-0.0011` / `-0.0021`; neutral descriptive intervals cross zero); Jev descriptively better than mean-reversion on Brier/log loss in all 3 sessions. Only three same-day sessions — **no persistent trading edge and no profitability established**
 - [x] Operator-only: the operator runs each 120-observation session manually, reviews it, and only then records it; nothing in the code launches one
+
+### Phase 5I.1a checklist
+
+- [x] Distinct `CLEAN_JEV_DIRECTION_TEMPORAL_REPLICATION_EVIDENCE` class + a SEPARATE `.evolve/jev-direction/temporal/<temporal-id>/` tree; the canonical `jrep-20260920T090716Z-97c862` manifest is never appended to
+- [x] The **same** `replicationProtocolDigest` (`1cc0661c…`), never re-frozen — plus the same SOL-USDC market, horizon, cadence, session size, question set, features, baselines, metrics, reference-price definition, staleness rules, outcome policy v2 and no-threshold rule
+- [x] Frozen-in-source independence rules: one session per UTC calendar date, ≥ 6 h gap from the previous eligible session, no overlap with the Phase 5I.0b development window, no overlap with any canonical Phase 5I.1 observation, no overlap with another Phase 5I.1a session
+- [x] Frozen-in-source selection rules: timing is a calendar schedule, never chosen from observed Jev performance and never from a bullish/bearish/volatile SOL view; a `selectionBasis` audit rejects anything else
+- [x] Violations preserved as `CONTAMINATED`/`INELIGIBLE` with explicit `temporalEligibilityReasons`; every record persists canonical replication id + digests, protocol digest, session start/completion, earliest/latest observation, `utcDate`, `gapFromPreviousEligibleSessionMs`, the three overlap flags, and the selection basis
+- [x] Full-set re-derivation on every add, so a later session can invalidate an earlier CLEAN label and the stored records reproduce exactly under `--temporal-replay`
+- [x] EXACTLY 3 CLEAN temporal sessions complete the extension; fewer report `INSUFFICIENT_CLEAN_TEMPORAL_SESSIONS` and no interval
+- [x] `dataset/session` inference unit, equal weight per CLEAN session, observations never pooled, and the SAME deterministic session-level bootstrap (seed `20260920`, 2000 resamples, descriptive only, no p-value/significance/winner/profitability)
+- [x] Combined descriptive view: canonical 3 + temporal 3 = 6 observed clean sessions, read-only and never re-scored, with the canonical 3-session result immutable and independently reproducible
+- [x] No new winner field, no promotion to 5I.2, no trading/execution logic, no JevCache in the predictive path, and SOL is never swapped for another asset (cross-asset testing deferred to 5I.1b)
+- [x] Operator-only commands (`--temporal-create` / `--temporal-add` / `--temporal-replay` / `--temporal-stats`), explicit ids, no `--latest`, offline replay/stats, and **no** automatic session launch
+- [x] Canonical preservation proven: the `jrep` manifest, all three canonical `jdir` trees, the aggregate digest `7857b787…` and `sessionRecordsDigest` `369152fd…` are byte-unchanged and the canonical wave still replays offline
+- [x] `npm run validate:phase5i1a` — 39 offline checks, zero network, zero real temporal session launched
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

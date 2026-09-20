@@ -734,12 +734,41 @@ export const DIRECTION_REPLICATION_ACTIONS = Object.freeze([
   "replication-stats",
 ]);
 
-/** Every action this CLI resolves, benchmark + replication. */
-export const DIRECTION_ALL_ACTIONS = Object.freeze([...DIRECTION_ACTIONS, ...DIRECTION_REPLICATION_ACTIONS]);
+/**
+ * Phase 5I.1a TEMPORAL-EXTENSION actions.
+ *
+ * Again a SEPARATE list: the temporal extension re-uses the frozen predictive
+ * protocol and the same offline, ID-ONLY command shape, but it aggregates in its
+ * OWN manifest with STRICTER temporal-independence rules. Nothing here ever
+ * launches a session, and nothing here ever guesses an id.
+ */
+export const DIRECTION_TEMPORAL_ACTIONS = Object.freeze([
+  "temporal-create",
+  "temporal-add",
+  "temporal-replay",
+  "temporal-stats",
+]);
+
+/** Every action this CLI resolves, benchmark + replication + temporal extension. */
+export const DIRECTION_ALL_ACTIONS = Object.freeze([
+  ...DIRECTION_ACTIONS,
+  ...DIRECTION_REPLICATION_ACTIONS,
+  ...DIRECTION_TEMPORAL_ACTIONS,
+]);
 
 /** Whether an action belongs to the Phase 5I.1 replication surface. */
 export function isReplicationAction(action) {
   return DIRECTION_REPLICATION_ACTIONS.includes(action);
+}
+
+/** Whether an action belongs to the Phase 5I.1a temporal-extension surface. */
+export function isTemporalAction(action) {
+  return DIRECTION_TEMPORAL_ACTIONS.includes(action);
+}
+
+/** Whether an action is an offline, session-launching-nothing aggregation command. */
+export function isOfflineAggregationAction(action) {
+  return isReplicationAction(action) || isTemporalAction(action);
 }
 
 /**
@@ -800,6 +829,15 @@ export const DIRECTION_BOOLEAN_FLAGS = Object.freeze([
   // protocol), and it refuses any protocol value that differs from the frozen
   // development pins before a single observation is taken.
   "replication-session",
+  // ---- Phase 5I.1a temporal extension -----------------------------------------
+  "temporal-create",
+  "temporal-add",
+  "temporal-replay",
+  "temporal-stats",
+  // Marks a `--start`/`--resume` run as ONE CLEAN Phase 5I.1a TEMPORAL-EXTENSION
+  // session. It changes ONLY the evidence class (never the predictive protocol)
+  // and is held to the stricter temporal-independence rules.
+  "temporal-session",
 ]);
 
 export const DIRECTION_VALUE_FLAGS = Object.freeze([
@@ -818,6 +856,10 @@ export const DIRECTION_VALUE_FLAGS = Object.freeze([
   "replication",
   "development",
   "replication-out",
+  // ---- Phase 5I.1a temporal extension -----------------------------------------
+  "temporal",
+  "temporal-out",
+  "canonical-replication",
 ]);
 
 /** Resolve which single action an invocation selected. Never more than one. */
