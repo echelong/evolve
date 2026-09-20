@@ -348,6 +348,7 @@ import {
   REPLICATION_BOOTSTRAP_PRNG,
   REPLICATION_BOOTSTRAP_RESAMPLES,
   REPLICATION_BOOTSTRAP_SEED,
+  REPLICATION_BOOTSTRAP_STATE,
   REPLICATION_COMPLETE_STATE,
   REPLICATION_INSUFFICIENT_STATE,
   aggregateComparison,
@@ -5140,6 +5141,7 @@ test("AK5. the replication CLI works end to end against a temp tree, offline", a
   assertIncludes(stats.stdout, "Jev - neutral-v1", "and the comparison block is printed");
   assertIncludes(stats.stdout, "NO winner", "and no winner is emitted");
   assertIncludes(stats.stdout, "Negative Brier/log-loss delta = Jev lower (better)", "and the sign convention is printed");
+  assertExcludes(stats.stdout, "undefined", "the uncertainty state is never printed as undefined");
 
   const json = runCli(["--replication-stats", "--replication", replicationId, ...base, "--json"], env);
   assertEqual(json.status, 0, "--json stats exits 0");
@@ -5332,6 +5334,186 @@ test("AL8. the replication builder never rewrote the development evidence it ref
   assertEqual(development.experiment.evidenceClass, DIRECTION_EVIDENCE_CLASS, "the development experiment is still development evidence");
   assertEqual(development.summary.evidenceScope, "DEVELOPMENT", "with its development scope intact");
   assertEqual(development.summary.replicationStatus, "NOT_REPLICATED", "and its NOT_REPLICATED status intact");
+});
+
+/* ============================================================================
+ * PART AM — the explicit bootstrap STATE LABEL (§14)
+ *
+ * The aggregation was always correct; the CLI printed `uncertainty undefined`
+ * because it read a `method` field the frozen aggregate never carried. The state
+ * is now an explicit, frozen, descriptive-only label. Nothing numeric changed:
+ * the seed, the resample count, every interval and every digest are untouched.
+ * ==========================================================================*/
+
+test("AM1. the aggregate reports an explicit descriptive bootstrap state, never undefined", () => {
+  const cleanSessions = (count) =>
+    Array.from({ length: count }, (_, index) => ({
+      sessionId: `session-${index + 1}`,
+      status: SESSION_STATUS.CLEAN,
+      metrics: {
+        jev: { brier: 0.2 + index * 0.01, logLoss: 0.6 + index * 0.01, accuracy: 0.5 },
+        deltas: Object.fromEntries(
+          REPLICATION_COMPARISON_IDS.map((id) => [
+            id,
+            { brier: -0.001 * (index + 1), logLoss: -0.002 * (index + 1), accuracy: 0.01 },
+          ]),
+        ),
+      },
+    }));
+
+  const insufficient = aggregateReplicationSessions(cleanSessions(2));
+  assertEqual(insufficient.bootstrap.available, false, "two CLEAN sessions emit no interval");
+  assertEqual(insufficient.bootstrapState, REPLICATION_INSUFFICIENT_STATE, "and report the insufficient state");
+  assertEqual(insufficient.bootstrapState, "INSUFFICIENT_CLEAN_REPLICATION_SESSIONS", "the insufficient state is the pinned literal");
+
+  const complete = aggregateReplicationSessions(cleanSessions(3));
+  assertEqual(complete.bootstrap.available, true, "three CLEAN sessions emit the descriptive interval");
+  assertEqual(complete.bootstrapState, REPLICATION_BOOTSTRAP_STATE, "and report the explicit descriptive state");
+  assertEqual(complete.bootstrapState, "DESCRIPTIVE_SESSION_BOOTSTRAP", "the descriptive state is the pinned literal");
+  assertEqual(typeof complete.bootstrapState, "string", "the state is always a string");
+  assertEqual(complete.bootstrapState === undefined, false, "the state is never undefined");
+  assertEqual(complete.bootstrap.seed, REPLICATION_BOOTSTRAP_SEED, "the bootstrap seed is unchanged");
+  assertEqual(complete.bootstrap.seed, 20260920, "and is the frozen 20260920");
+  assertEqual(complete.bootstrap.resamples, REPLICATION_BOOTSTRAP_RESAMPLES, "the resample count is unchanged");
+  assertEqual(complete.bootstrap.resamples, 2000, "and is the frozen 2000");
+  assertEqual(complete.bootstrap.pValueEmitted, false, "no p-value is emitted");
+  assertEqual(complete.bootstrap.significanceLabelEmitted, false, "no significance label is emitted");
+  assertEqual(complete.winner, null, "no winner is emitted");
+  assertEqual(complete.significanceClaimed, false, "no significance is claimed");
+  assertEqual(complete.profitabilityInference, false, "no profitability inference is made");
+});
+
+test("AM2. the replication CLI prints the explicit descriptive state, never undefined", async () => {
+  const cliExperiments = path.join(ctx.tempRoot, "cli-bootstrap-state-experiments");
+  const cliReplication = path.join(ctx.tempRoot, "cli-bootstrap-state-replication");
+  await cp(ctx.replication.experimentsRoot, cliExperiments, { recursive: true });
+  const base = ["--out", cliExperiments, "--replication-out", cliReplication];
+  const env = { EVOLVE_JEV_PROVIDER: "", EVOLVE_JEV_API_KEY: "" };
+
+  const create = runCli(["--replication-create", "--development", CANONICAL_DEVELOPMENT_EXPERIMENT_ID, ...base], env);
+  assertEqual(create.status, 0, `--replication-create exits 0 (stderr: ${create.stderr})`);
+  const replicationId = /jrep-[A-Za-z0-9._-]+/.exec(create.stdout)?.[0] ?? null;
+  assertTrue(typeof replicationId === "string", "the replication id is readable from the output");
+
+  const first = runCli(["--replication-add", "--replication", replicationId, "--experiment", "jdir-fixture-rep-1", ...base], env);
+  assertEqual(first.status, 0, `--replication-add 1 exits 0 (stderr: ${first.stderr})`);
+  const earlyStats = runCli(["--replication-stats", "--replication", replicationId, ...base], env);
+  assertEqual(earlyStats.status, 0, "--replication-stats exits 0 with one CLEAN session");
+  assertIncludes(earlyStats.stdout, "INSUFFICIENT_CLEAN_REPLICATION_SESSIONS", "one CLEAN session stays insufficient");
+  assertExcludes(earlyStats.stdout, "undefined", "and the state is never printed as undefined");
+
+  for (const sessionId of ["jdir-fixture-rep-2", "jdir-fixture-rep-3"]) {
+    const add = runCli(["--replication-add", "--replication", replicationId, "--experiment", sessionId, ...base], env);
+    assertEqual(add.status, 0, `--replication-add ${sessionId} exits 0 (stderr: ${add.stderr})`);
+  }
+
+  const stats = runCli(["--replication-stats", "--replication", replicationId, ...base], env);
+  assertEqual(stats.status, 0, `--replication-stats exits 0 with three CLEAN sessions (stderr: ${stats.stderr})`);
+  assertIncludes(stats.stdout, "DESCRIPTIVE_SESSION_BOOTSTRAP", "three CLEAN sessions report the explicit descriptive state");
+  assertExcludes(stats.stdout, "undefined", "and the state is never printed as undefined");
+  assertIncludes(stats.stdout, "seed 20260920", "the seed remains 20260920");
+  assertIncludes(stats.stdout, "resamples 2000", "the resample count remains 2000");
+  assertIncludes(stats.stdout, "p-value none", "and no p-value is emitted");
+  assertIncludes(stats.stdout, "NO winner", "no winner is emitted");
+  assertIncludes(stats.stdout, "(descriptive only)", "and the intervals are labelled descriptive only");
+});
+
+test("AM3. the canonical CLEAN replication wave replays offline, reproduces, and is byte-unchanged", async () => {
+  const canonicalReplicationId = "jrep-20260920T090716Z-97c862";
+  const canonicalSessionIds = [
+    "jdir-20260920T090716Z-3a9163",
+    "jdir-20260920T104154Z-3a9163",
+    "jdir-20260920T121446Z-3a9163",
+  ];
+  assertEqual(
+    REPLICATION_PROTOCOL_DIGEST,
+    "1cc0661cf207d861e9809b3374ff70ce3a6434a7b49acc17598d5928935a5fb3",
+    "the frozen replication protocol digest is unchanged",
+  );
+  const root = replicationRootFor(REAL_REPLICATION_ROOT, canonicalReplicationId);
+  const sessionsPresent = (
+    await Promise.all(canonicalSessionIds.map((sessionId) => exists(directionExperimentRootFor(REAL_EXPECTED_DIR, sessionId))))
+  ).every(Boolean);
+  if (!(await exists(root)) || !sessionsPresent) {
+    skip("the canonical Phase 5I.1 replication wave is absent in this checkout — its replay/immutability check was skipped cleanly");
+    return;
+  }
+
+  const replicationBefore = await metadataSnapshot(REAL_REPLICATION_ROOT);
+  const sessionBefore = {};
+  for (const sessionId of canonicalSessionIds) {
+    sessionBefore[sessionId] = await metadataSnapshot(directionExperimentRootFor(REAL_EXPECTED_DIR, sessionId));
+  }
+
+  // Roots are left at their defaults, exactly as the operator CLI does: the
+  // session record's own `root` field is part of the sessions digest, so
+  // replaying with a different base produces a different root path.
+  const replay = await replicationReplay({
+    replicationRoot: REAL_REPLICATION_ROOT,
+    replicationId: canonicalReplicationId,
+  });
+  assertEqual(replay.ok, true, `the canonical replication replays cleanly: ${JSON.stringify(replay.problems)}`);
+  assertEqual(replay.readOnly, true, "the canonical replay is read-only");
+  assertEqual(
+    replay.networkCalls + replay.providerCalls + replay.jevCalls + replay.agentReachCalls + replay.classifierCalls + replay.deepseekCalls,
+    0,
+    "zero network and zero provider calls",
+  );
+  assertEqual(replay.arenaRuns + replay.tradingCalls + replay.launchedSessions, 0, "zero Arena/trading calls and no session launched");
+  assertEqual(replay.metricsMatch, true, "the stored aggregation reproduces byte for byte — no metric value changed");
+  assertEqual(replay.manifestDigestMatches, true, "the manifest digest is unchanged");
+  assertEqual(replay.sessionsDigestMatches, true, "the session records reproduce");
+  assertEqual(replay.replicationProtocolDigest, REPLICATION_PROTOCOL_DIGEST, "the protocol digest is the frozen one");
+  assertEqual(
+    replay.replicationProtocolDigest,
+    "1cc0661cf207d861e9809b3374ff70ce3a6434a7b49acc17598d5928935a5fb3",
+    "and equals the pinned literal",
+  );
+
+  const stats = await replicationStats({
+    replicationRoot: REAL_REPLICATION_ROOT,
+    replicationId: canonicalReplicationId,
+  });
+  assertEqual(stats.ok, true, "stats read the canonical wave");
+  assertEqual(stats.summary.cleanSessionCount, 3, "3/3 CLEAN canonical sessions");
+  assertDeepEqual(stats.summary.cleanSessionIds, canonicalSessionIds, "the three canonical session ids are unchanged");
+  assertEqual(stats.summary.bootstrap.available, true, "the descriptive session bootstrap is available");
+  assertEqual(stats.summary.bootstrapState, REPLICATION_BOOTSTRAP_STATE, "and reports the explicit descriptive state");
+  assertEqual(stats.summary.bootstrapState, "DESCRIPTIVE_SESSION_BOOTSTRAP", "the state is the pinned literal");
+  assertEqual(stats.summary.bootstrapState === undefined, false, "the state is never undefined");
+  assertEqual(stats.summary.bootstrap.seed, 20260920, "the seed remains 20260920");
+  assertEqual(stats.summary.bootstrap.resamples, 2000, "the resamples remain 2000");
+  assertEqual(stats.summary.bootstrap.pValueEmitted, false, "no p-value");
+  assertEqual(stats.summary.bootstrap.significanceLabelEmitted, false, "no significance label");
+  assertEqual(stats.summary.winner, null, "no winner");
+  assertEqual(stats.summary.significanceClaimed, false, "no significance claim");
+  assertEqual(stats.summary.profitabilityInference, false, "no profitability inference");
+  assertEqual(stats.summary.tradingInference, false, "no trading inference");
+  assertEqual(stats.summary.deploymentInference, false, "no deployment inference");
+
+  const neutralBrier = stats.summary.bootstrap.comparisons["neutral-v1.brier"];
+  assertClose(neutralBrier.pointEstimate, stats.summary.comparisons["neutral-v1"].brier.mean, "the point estimate is the session mean", 1e-12);
+  assertClose(neutralBrier.lower, -0.004527500000000045, "the neutral Brier interval lower bound is unchanged", 1e-12);
+  assertClose(neutralBrier.upper, 0.0022308333333332375, "the neutral Brier interval upper bound is unchanged", 1e-12);
+  for (const [key, interval] of Object.entries(stats.summary.bootstrap.comparisons)) {
+    assertEqual(interval.pValue, null, `${key} carries no p-value`);
+    assertEqual(interval.significanceLabel, null, `${key} carries no significance label`);
+    assertEqual(interval.statisticallyProven, false, `${key} claims no statistical proof`);
+    assertEqual(interval.descriptiveOnly, true, `${key} is descriptive only`);
+  }
+
+  assertDeepEqual(
+    await metadataSnapshot(REAL_REPLICATION_ROOT),
+    replicationBefore,
+    "the canonical replication tree is byte-unchanged by the read-only replay",
+  );
+  for (const sessionId of canonicalSessionIds) {
+    assertDeepEqual(
+      await metadataSnapshot(directionExperimentRootFor(REAL_EXPECTED_DIR, sessionId)),
+      sessionBefore[sessionId],
+      `${sessionId} is byte-unchanged`,
+    );
+  }
 });
 
 /* ============================================================================

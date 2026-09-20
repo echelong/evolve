@@ -220,6 +220,7 @@ export async function buildReplicationSummary({ manifest, sessions = [], now = (
     comparisons: aggregation.comparisons,
     absolute: aggregation.absolute,
     bootstrap: aggregation.bootstrap,
+    bootstrapState: aggregation.bootstrapState,
     deltaSignConvention: aggregation.deltaSignConvention,
     comparisonsReported: REPLICATION_COMPARISON_IDS.length,
     deltaMetricsReported: REPLICATION_DELTA_METRICS.length,

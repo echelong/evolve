@@ -32,6 +32,17 @@ export const REPLICATION_INSUFFICIENT_STATE = "INSUFFICIENT_CLEAN_REPLICATION_SE
 /** The state once the designed number of CLEAN sessions exists. */
 export const REPLICATION_COMPLETE_STATE = "CLEAN_REPLICATION_SESSIONS_COMPLETE";
 
+/**
+ * The explicit, FROZEN label for the descriptive session-resampled bootstrap
+ * reported once `REQUIRED_CLEAN_REPLICATION_SESSIONS` CLEAN sessions exist (§14).
+ *
+ * It is descriptive ONLY: session-resampled, no p-value, no significance claim,
+ * no winner and no profitability inference. The label is a REPORTING state, never
+ * a metric, and it is deliberately kept OUT of the aggregate evidence digest, so
+ * naming the state can never change a stored aggregation's digest.
+ */
+export const REPLICATION_BOOTSTRAP_STATE = "DESCRIPTIVE_SESSION_BOOTSTRAP";
+
 /* ============================================================================
  * §14 deterministic PRNG + bootstrap
  * ==========================================================================*/
@@ -201,6 +212,7 @@ export function aggregateReplicationSessions(sessions = [], { status = null, exc
   };
 
   const bootstrapAvailable = clean.length >= requiredCleanSessions;
+  const bootstrapState = bootstrapAvailable ? REPLICATION_BOOTSTRAP_STATE : REPLICATION_INSUFFICIENT_STATE;
   const bootstrap = {
     status: bootstrapAvailable ? REPLICATION_COMPLETE_STATE : REPLICATION_INSUFFICIENT_STATE,
     available: bootstrapAvailable,
@@ -247,6 +259,7 @@ export function aggregateReplicationSessions(sessions = [], { status = null, exc
     comparisons,
     absolute,
     bootstrap,
+    bootstrapState,
     winner: null,
     noAutomatedWinner: true,
     significanceClaimed: false,

@@ -3481,7 +3481,7 @@ these results.
 ### Validation
 
 ```bash
-npm run validate:phase5i   # 287 offline checks, zero network, sections A–AL
+npm run validate:phase5i   # 290 offline checks, zero network, sections A–AM
 ```
 
 Sections: frozen identities, question-set contract, packet whitelist, feature formulas, warmup/null
@@ -3492,7 +3492,8 @@ bins, latency stats, provider/model/gateway enforcement, no runtime confidence t
 transport-attempt provenance, failed-prediction preservation, resume semantics, replay/tamper detection,
 data-granularity integrity, zero routing/trading authority, frozen historical evidence preservation, CLI
 behaviour, the canonical development barrier (AH), Phase 5I.1 session eligibility and drift rejection (AI),
-the replication wave end to end (AJ), the replication CLI (AK) and 5I.1 isolation/no-tuning (AL). The suite
+the replication wave end to end (AJ), the replication CLI (AK), 5I.1 isolation/no-tuning (AL) and the
+explicit descriptive bootstrap state label (AM). The suite
 never creates canonical 5I evidence and never runs a real replication session: every fixture lives in a temp
 directory, and the real `.evolve/jev-direction` tree (including its replication subtree) is asserted
 byte-unchanged at the end.
@@ -3592,10 +3593,14 @@ No winner field is ever produced, and no observation-level pseudo-replication is
 
 ### Uncertainty — descriptive only
 
-With fewer than 3 CLEAN sessions the wave reports `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS` and no interval.
-With 3 or more, a **deterministic, session-level** bootstrap (fixed `mulberry32` seed, fixed resample count)
-resamples **sessions**, never observations, and reports a percentile interval described as exactly that: an
-interval. There is **no p-value, no significance label, no "statistically proven" language**, and no verdict.
+With fewer than 3 CLEAN sessions the wave reports the explicit frozen state
+`INSUFFICIENT_CLEAN_REPLICATION_SESSIONS` and no interval. With 3 or more, the reported state is the explicit
+frozen label `DESCRIPTIVE_SESSION_BOOTSTRAP` and a **deterministic, session-level** bootstrap (fixed
+`mulberry32` seed `20260920`, fixed 2000 resamples) resamples **sessions**, never observations, and reports a
+percentile interval described as exactly that: an interval. There is **no p-value, no significance label, no
+"statistically proven" language**, no winner, and no profitability inference. The state label is a **reporting
+label only** — it is never a metric, and it is deliberately kept out of the aggregate evidence digest, so
+naming the state can never change a stored aggregation's digest.
 
 ### Replication tree and manifest
 
@@ -3640,13 +3645,25 @@ observations and then be discarded. After session 1, after session 2 and after s
 **not** modified: if infrastructure breaks, the wave is declared interrupted and incomparable rather than
 silently patched midway.
 
+### Completed canonical wave
+
+The first canonical Phase 5I.1 wave (`jrep-20260920T090716Z-97c862`) completed **3/3 CLEAN** sessions
+(`jdir-20260920T090716Z-3a9163`, `jdir-20260920T104154Z-3a9163`, `jdir-20260920T121446Z-3a9163`). Against the
+frozen **neutral** baseline the result is **mixed**: Jev was descriptively better on Brier **and** log loss in
+**2 of the 3** sessions (mean Jev−neutral Brier delta `-0.0011`; mean Jev−neutral log-loss delta `-0.0021`),
+and the neutral descriptive bootstrap intervals on both metrics **cross zero**. Against `mean-reversion-v1`
+Jev was descriptively better on Brier **and** log loss in **all 3** sessions. Only **three same-day sessions**
+were observed, so this is a small, single-day description of the frozen protocol's behaviour: **no persistent
+trading edge and no profitability has been established.** The canonical 5I.0b development result above still
+stands (no clear directional advantage over neutral, no persistent edge, no profitability inference).
+
 ### Frozen interpretation
 
 A replication session is **not** a replication result. Wave-level description comes only from the frozen
 cross-session aggregation over CLEAN sessions, and even that makes **no profitability, trading or deployment
-claim**, and establishes nothing about the future. As of this phase, **no real replication session has been
-run**, and the canonical development result above still stands: no clear directional advantage over neutral,
-no persistent edge, no profitability inference.
+claim**, and establishes nothing about the future. The completed wave above is three same-day sessions of the
+frozen protocol — it is a description, not a persistent edge, and the canonical development result still
+stands: no clear directional advantage over neutral, no persistent edge, no profitability inference.
 
 ### Preserved barriers
 
@@ -4441,7 +4458,7 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] Replay/stats make zero network, provider, Jev, Agent-Reach, classifier, DeepSeek, Arena or trading calls; tamper tests fail closed on a mutated prediction/outcome, a foreign baseline state, an injected future observation or a moved `targetAt`
 - [x] Zero routing/trading authority: no wallet/signer/order/swap path exists and every routing flag is persisted false while `jevPredictionActive` is true
 - [x] New evidence tree `.evolve/jev-direction/`; Phase 5G.1, Phase 5H.0 (`clfeat-20260919T173844Z-7a9193bb`), Wave 1, Wave 2 and `evaluationContractDigest` all byte-unchanged
-- [x] `npm run validate:phase5i` — 287 offline checks, zero network, zero canonical 5I evidence created and no real replication session launched
+- [x] `npm run validate:phase5i` — 290 offline checks, zero network, zero canonical 5I evidence created and no real replication session launched
 - [x] First real direct-TypeSafe canaries: `jdir-20260920T060810Z-3a9163` (v1 outcome policy) and `jdir-20260920T062804Z-3a9163` (v2) — immutable, operator-run, never promoted to replication evidence
 - [x] Canonical 120-observation development benchmark `jdir-20260920T063311Z-3a9163` (`metricsDigest` `984cc26dd9f247dbd625dc8c7bfb07d82600ed9a353fe7ef2bba423cc79f29ba`) — **DEVELOPMENT evidence only**: no clear advantage over the neutral baseline, no persistent edge, no profitability inference
 
@@ -4455,12 +4472,14 @@ Phase 5F.0 adds `npm run validate:phase5f` (49 offline cases):
 - [x] `mock`/fixture, gateway, model, threshold, question, feature, baseline, outcome-policy, metric, horizon and cadence drift all rejected with explicit reasons
 - [x] Session-level aggregation only: 3 independent sessions × 120 observations, never concatenated, equal-weighted by eligible session, with `sessionCount`/`values`/`mean`/`median`/`min`/`max`/positive/negative/zero and Brier/log-loss better/worse/equal counts
 - [x] Frozen sign convention (negative Brier/log-loss delta = Jev lower = better) documented and asserted
-- [x] Deterministic session-level bootstrap (fixed seed, fixed resample count) that resamples sessions, and only once 3 CLEAN sessions exist — otherwise `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS`; no p-value, no significance label, no verdict
+- [x] Deterministic session-level bootstrap (fixed seed, fixed resample count) that resamples sessions, and only once 3 CLEAN sessions exist — otherwise the explicit state `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS`; with 3 or more it reports the explicit frozen state `DESCRIPTIVE_SESSION_BOOTSTRAP`; no p-value, no significance label, no verdict
 - [x] Operator-only commands (`--replication-create` / `--replication-add` / `--replication-replay` / `--replication-stats`) with explicit ids, no `--latest`, offline replay/stats (zero network) and **no** automatic session launch
 - [x] No tuning from development and no tuning between sessions; an interrupted wave is declared incomparable rather than patched
 - [x] Zero routing/trading authority, zero wallet/signer/order/swap path, and zero automated winner
 - [x] Phase 5H.0, Wave 1, Wave 2, `evaluationContractDigest`, the canonical development experiment and both canaries all byte-unchanged
-- [ ] **NOT RUN YET** — no real Phase 5I.1 replication session has been executed. The operator runs each 120-observation session manually, reviews it, and only then records it; nothing in the code launches one
+- [x] Canonical wave `jrep-20260920T090716Z-97c862`: **3/3 CLEAN** sessions (`jdir-20260920T090716Z-3a9163`, `jdir-20260920T104154Z-3a9163`, `jdir-20260920T121446Z-3a9163`), replayed offline with zero network and byte-reproducible manifest, session-record and aggregation digests
+- [x] Wave description: Jev vs neutral **mixed** (better Brier/log loss in 2/3 sessions; mean deltas `-0.0011` / `-0.0021`; neutral descriptive intervals cross zero); Jev descriptively better than mean-reversion on Brier/log loss in all 3 sessions. Only three same-day sessions — **no persistent trading edge and no profitability established**
+- [x] Operator-only: the operator runs each 120-observation session manually, reviews it, and only then records it; nothing in the code launches one
 
 ### Phase 5 — capped mainnet pilot
 Not implemented, and not planned without explicit operator approval and out-of-sample evidence.

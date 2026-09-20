@@ -74,6 +74,10 @@ import {
 } from "./jev/direction/replication/protocol.mjs";
 import { CANONICAL_DEVELOPMENT_BARRIER } from "./jev/direction/replication/development-barrier.mjs";
 import {
+  REPLICATION_BOOTSTRAP_STATE,
+  REPLICATION_INSUFFICIENT_STATE,
+} from "./jev/direction/replication/aggregate.mjs";
+import {
   replicationAdd,
   replicationCreate,
   replicationReplay,
@@ -219,8 +223,16 @@ function printReplicationAggregate(summary) {
       `accuracy mean ${fmt(summary.absolute?.accuracy?.mean)}`,
   );
   const bootstrap = summary.bootstrap ?? {};
+  // The state label is an explicit FROZEN constant, never an undefined field:
+  // `DESCRIPTIVE_SESSION_BOOTSTRAP` once >=3 CLEAN sessions exist, otherwise
+  // `INSUFFICIENT_CLEAN_REPLICATION_SESSIONS`. Descriptive only — the intervals
+  // printed below it are session-resampled and carry no p-value, no significance
+  // claim, no winner and no profitability inference.
+  const bootstrapState =
+    summary.bootstrapState ??
+    (bootstrap.available === true ? REPLICATION_BOOTSTRAP_STATE : REPLICATION_INSUFFICIENT_STATE);
   console.log(
-    `[jev:direction]   uncertainty       ${bootstrap.available === true ? bootstrap.method : bootstrap.status} ` +
+    `[jev:direction]   uncertainty       ${bootstrapState} ` +
       `(seed ${bootstrap.seed}, resamples ${bootstrap.resamples}, p-value ${bootstrap.pValueEmitted === true ? "PRESENT" : "none"})`,
   );
   if (bootstrap.available === true) {
