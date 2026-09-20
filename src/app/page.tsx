@@ -333,6 +333,10 @@ type EvolveState = {
   // authority over trading, evolution, Arena, gates, or deployment — this
   // panel is counts/identity/health only, never prompts or raw state.
   jevShadow?: JevShadowState | null;
+  // Phase 5I-PS: the isolated Jev PAPER SHADOW demo account — a DEVELOPMENT
+  // dashboard experiment, never canonical/replication evidence. Deliberately a
+  // SEPARATE field from `jevShadow`, which remains Phase 5D supervisor health.
+  jevPaperShadow?: JevPaperShadowState | null;
   // Phase 5E: SHADOW ONLY external-intelligence state (Agent-Reach). Read-only
   // observations that are captured, frozen and replayed — never live internet
   // inside the Arena, and zero authority over anything above.
@@ -400,6 +404,126 @@ type JevShadowState = {
   questionSetVersion?: number | null;
   decisionPacketVersion?: number | null;
   paperOnly?: boolean;
+  note?: string;
+};
+
+// Phase 5I-PS: the isolated Jev PAPER SHADOW dashboard account. A DEVELOPMENT
+// experiment, deliberately separate from `jevShadow` (Phase 5D supervisor
+// health). Never canonical/replication/Arena/deployment evidence.
+type JevPaperShadowDecision = {
+  sequence: number | null;
+  scheduledAt: string | null;
+  observedAt: string | null;
+  referencePrice: number | null;
+  pHigher: number | null;
+  modelIntent: string | null;
+  action: string | null;
+  actionReason: string | null;
+  equity: number | null;
+  netPnl: number | null;
+  costs: number | null;
+  marketFeedHealth: string | null;
+};
+
+type JevPaperShadowSummary = {
+  decisions: number | null;
+  jevOk: number | null;
+  jevFailures: number | null;
+  higherCount: number | null;
+  lowerCount: number | null;
+  enterCount: number | null;
+  exitCount: number | null;
+  holdCount: number | null;
+  cashCount: number | null;
+  paperTrades: number | null;
+  winningClosedTrades: number | null;
+  losingClosedTrades: number | null;
+  startingCash: number | null;
+  endingCash: number | null;
+  endingPositionValue: number | null;
+  endingEquity: number | null;
+  grossPnl: number | null;
+  netPnl: number | null;
+  totalCosts: number | null;
+  maxDrawdown: number | null;
+  meanJevLatencyMs: number | null;
+  meanPHigher: number | null;
+  minPHigher: number | null;
+  maxPHigher: number | null;
+  summaryDigest: string | null;
+  finalizedAt: string | null;
+};
+
+type JevPaperShadowState = {
+  available: boolean;
+  label?: string;
+  accountingNote?: string;
+  exclusionNote?: string;
+  paperOnlyTag?: string;
+  root?: string;
+  purpose?: string;
+  paperOnly?: boolean;
+  shadowOnly?: boolean;
+  canonicalEvidence?: boolean;
+  replicationEvidence?: boolean;
+  temporalReplicationEvidence?: boolean;
+  arenaEligible?: boolean;
+  deploymentEligible?: boolean;
+  profitabilityInferencePermitted?: boolean;
+  tradingInferencePermitted?: boolean;
+  sessionId?: string | null;
+  status?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  upstream?: string | null;
+  gatewayUsed?: boolean;
+  mode?: string;
+  cacheEnabled?: boolean;
+  market?: string | null;
+  symbol?: string | null;
+  mint?: string | null;
+  quoteSymbol?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  lastUpdate?: string | null;
+  marketFeedHealth?: string | null;
+  pHigher?: number | null;
+  pLower?: number | null;
+  modelIntent?: string | null;
+  accountState?: string | null;
+  paperAction?: string | null;
+  actionReason?: string | null;
+  cash?: number | null;
+  positionQty?: number | null;
+  positionValue?: number | null;
+  equity?: number | null;
+  grossPnl?: number | null;
+  netPnl?: number | null;
+  unrealizedPnl?: number | null;
+  realizedPnl?: number | null;
+  costs?: number | null;
+  returnPct?: number | null;
+  maxDrawdown?: number | null;
+  entries?: number | null;
+  exits?: number | null;
+  paperTrades?: number | null;
+  winningClosedTrades?: number | null;
+  losingClosedTrades?: number | null;
+  decisions?: number | null;
+  jevCalls?: number | null;
+  jevFailures?: number | null;
+  jevOk?: number | null;
+  holdCount?: number | null;
+  cashCount?: number | null;
+  higherCount?: number | null;
+  lowerCount?: number | null;
+  meanLatencyMs?: number | null;
+  meanPHigher?: number | null;
+  minPHigher?: number | null;
+  maxPHigher?: number | null;
+  recentDecisions?: JevPaperShadowDecision[];
+  equitySeries?: Array<{ at: string | null; equity: number | null; price: number | null }>;
+  summary?: JevPaperShadowSummary | null;
   note?: string;
 };
 
@@ -1514,6 +1638,305 @@ function JevShadowPanel({ state }: { state: EvolveState }) {
         </p>
       )}
     </div>
+  );
+}
+
+function intentTone(intent: string | null | undefined) {
+  if (intent === "HIGHER") return "positive";
+  if (intent === "LOWER") return "negative";
+  return "";
+}
+
+function paperActionTone(action: string | null | undefined) {
+  if (action === "ENTER" || action === "HOLD") return "positive";
+  if (action === "EXIT") return "negative";
+  return "";
+}
+
+function JevPaperShadowPanel({ state, nowMs }: { state: EvolveState; nowMs: number }) {
+  const shadow = state.jevPaperShadow ?? null;
+  const chart = useMemo(
+    () =>
+      (shadow?.equitySeries ?? []).map((point, index) => ({
+        label: point.at ? new Date(point.at).toISOString().slice(11, 19) : `#${index}`,
+        equity: point.equity,
+        price: point.price,
+      })),
+    [shadow?.equitySeries],
+  );
+
+  if (!shadow) return null;
+
+  const paperOnlyTag = shadow.paperOnlyTag ?? "PAPER ONLY";
+  const label = shadow.label ?? "JEV PAPER SHADOW • DEVELOPMENT ONLY";
+  const accountingNote =
+    shadow.accountingNote ?? "Simulated paper accounting. Not replication evidence. Not profitability evidence.";
+  const exclusionNote =
+    shadow.exclusionNote ?? "Development dashboard experiment — excluded from replication/Arena/deployment evidence.";
+  const rows = (shadow.recentDecisions ?? []).slice(-20).reverse();
+  const evolvePopulationReturn = Number.isFinite(state.stats?.avgReturn) ? state.stats.avgReturn * 100 : null;
+  const shadowReturn = Number.isFinite(shadow.returnPct) ? (shadow.returnPct as number) * 100 : null;
+
+  return (
+    <section className="paper-shadow-section">
+      <div className="panel jev-paper-shadow-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">
+              JEV PAPER SHADOW <span className="paper-tag solid">{paperOnlyTag}</span>
+            </p>
+            <h2>{label}</h2>
+          </div>
+          <FlaskConical size={20} />
+        </div>
+
+        {shadow.available ? (
+          <>
+            <p className="health-note">
+              <strong>{accountingNote}</strong> {exclusionNote}
+            </p>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>Status</span>
+                <strong>{shadow.status ?? "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Session</span>
+                <strong className="mono">{shadow.sessionId ?? "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Provider / model</span>
+                <strong className="mono">
+                  {shadow.provider ?? "—"} / {shadow.model ?? "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Gateway used</span>
+                <strong>{shadow.gatewayUsed ? "YES (refused)" : "no"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Market</span>
+                <strong>
+                  {shadow.symbol ?? "SOL"}/{shadow.quoteSymbol ?? "USDC"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Feed health</span>
+                <strong className={shadow.marketFeedHealth === "FEED_DEGRADED" ? "negative" : "positive"}>
+                  {shadow.marketFeedHealth ?? "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Last update</span>
+                <strong>{shadow.lastUpdate ? relativeTime(shadow.lastUpdate, nowMs) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Decisions</span>
+                <strong>{shadow.decisions ?? 0}</strong>
+              </div>
+            </div>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>pHigher / pLower</span>
+                <strong className="mono">
+                  {shadow.pHigher != null ? shadow.pHigher.toFixed(4) : "—"} / {" "}
+                  {shadow.pLower != null ? shadow.pLower.toFixed(4) : "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Current intent</span>
+                <strong className={intentTone(shadow.modelIntent)}>{shadow.modelIntent ?? "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Paper action</span>
+                <strong className={paperActionTone(shadow.paperAction)}>
+                  {shadow.paperAction ?? "—"}
+                  {shadow.actionReason ? <small> · {shadow.actionReason}</small> : null}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Account</span>
+                <strong>{shadow.accountState ?? "FLAT"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Cash</span>
+                <strong>{shadow.cash != null ? money2.format(shadow.cash) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Position value</span>
+                <strong>{shadow.positionValue != null ? money2.format(shadow.positionValue) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Equity</span>
+                <strong>{shadow.equity != null ? money2.format(shadow.equity) : "—"}</strong>
+              </div>
+            </div>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>Gross P&L</span>
+                <strong className={(shadow.grossPnl ?? 0) >= 0 ? "positive" : "negative"}>
+                  {shadow.grossPnl != null ? signedMoney(shadow.grossPnl) : "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Net P&L</span>
+                <strong className={(shadow.netPnl ?? 0) >= 0 ? "positive" : "negative"}>
+                  {shadow.netPnl != null ? signedMoney(shadow.netPnl) : "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Costs</span>
+                <strong>{shadow.costs != null ? money2.format(shadow.costs) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Return</span>
+                <strong className={(shadow.returnPct ?? 0) >= 0 ? "positive" : "negative"}>
+                  {shadowReturn != null ? pct(shadowReturn) : "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Max drawdown</span>
+                <strong>{shadow.maxDrawdown != null ? `${((shadow.maxDrawdown as number) * 100).toFixed(2)}%` : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Paper trades</span>
+                <strong>{shadow.paperTrades ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Entries / exits</span>
+                <strong>
+                  {shadow.entries ?? 0} / {shadow.exits ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Winning / losing closed</span>
+                <strong>
+                  {shadow.winningClosedTrades ?? 0} / {shadow.losingClosedTrades ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Jev calls / failures</span>
+                <strong>
+                  {shadow.jevCalls ?? 0} / {shadow.jevFailures ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Mean Jev latency</span>
+                <strong>{shadow.meanLatencyMs != null ? `${shadow.meanLatencyMs}ms` : "—"}</strong>
+              </div>
+            </div>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>EVOLVE population paper return</span>
+                <strong>{evolvePopulationReturn != null ? pct(evolvePopulationReturn) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Jev paper-shadow return</span>
+                <strong>{shadowReturn != null ? pct(shadowReturn) : "—"}</strong>
+              </div>
+            </div>
+            <p className="health-note">
+              Descriptive side-by-side values only. No winner is declared, Jev is never promoted, and the comparison
+              never influences selection, evolution, Arena, or deployment.
+            </p>
+
+            <div className="chart-wrap" style={{ height: 190, marginTop: 8 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chart} margin={{ top: 10, right: 4, left: -18, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="paperShadowEquityFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="currentColor" stopOpacity={0.32} />
+                      <stop offset="100%" stopColor="currentColor" stopOpacity={0.01} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
+                  <XAxis dataKey="label" hide />
+                  <YAxis
+                    tick={{ fill: "#6f7c92", fontSize: 11 }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={54}
+                    tickFormatter={(value) => `$${Number(value).toFixed(0)}`}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#0b111c",
+                      border: "1px solid #243147",
+                      borderRadius: 12,
+                      fontSize: 12,
+                    }}
+                    formatter={(value, name) =>
+                      name === "price"
+                        ? [price(typeof value === "number" ? value : null), "SOL ref"]
+                        : [money2.format(Number(value)), "Paper equity"]
+                    }
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="equity"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                    fill="url(#paperShadowEquityFill)"
+                    isAnimationActive={false}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="health-note">
+              Paper equity over time (optionally referencing the observed SOL price in the tooltip). This is simulated
+              paper accounting, not actual account value.
+            </p>
+
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Price</th>
+                    <th>pHigher</th>
+                    <th>Intent</th>
+                    <th>Action</th>
+                    <th>Equity</th>
+                    <th>Net P&L</th>
+                    <th>Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr key={`${row.sequence}-${row.observedAt}`}>
+                      <td>{row.observedAt ? new Date(row.observedAt).toISOString().slice(11, 19) : "—"}</td>
+                      <td>{price(row.referencePrice)}</td>
+                      <td className="mono">{row.pHigher != null ? row.pHigher.toFixed(4) : "—"}</td>
+                      <td className={intentTone(row.modelIntent)}>{row.modelIntent ?? "—"}</td>
+                      <td className={paperActionTone(row.action)}>{row.action ?? "—"}</td>
+                      <td>{row.equity != null ? money2.format(row.equity) : "—"}</td>
+                      <td className={(row.netPnl ?? 0) >= 0 ? "positive" : "negative"}>
+                        {row.netPnl != null ? signedMoney(row.netPnl) : "—"}
+                      </td>
+                      <td>{row.costs != null ? money2.format(row.costs) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="health-note">
+              <strong>{paperOnlyTag}</strong> · {exclusionNote} Provider calls are read-only market observation and
+              direct TypeSafe Jev decisions. There is no wallet, no signing, no swap, no order, and no real-money
+              execution code path in this repository.
+            </p>
+          </>
+        ) : (
+          <p className="health-note">
+            {shadow.note ?? "No Jev paper-shadow session has been run in this workspace yet (npm run jev:paper)."}
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -2636,6 +3059,8 @@ function Dashboard({
           <JevShadowPanel state={state} />
         </section>
       ) : null}
+
+      {state.jevPaperShadow ? <JevPaperShadowPanel state={state} nowMs={nowMs} /> : null}
 
       {state.externalIntelligence ? (
         <section className="dashboard-grid research-grid">

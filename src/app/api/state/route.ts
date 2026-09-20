@@ -2,6 +2,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 import { readDashboardState } from "../../../../scripts/lib/dashboard-state.mjs";
+import { loadJevPaperShadowState } from "../../../../scripts/jev/paper-shadow/dashboard.mjs";
 import { sanitizeForPublic } from "../../../../scripts/lib/sanitize.mjs";
 
 export const dynamic = "force-dynamic";
@@ -20,6 +21,9 @@ export const revalidate = 0;
  *   live shadow league      -> .evolve/shadow/*.json (read-only, summarized, PAPER ONLY)
  *   research swarm memory   -> .evolve/research/ (read-only via the live state summary)
  *   Jev shadow supervisor   -> .evolve/jev/ (read-only, summarized, SHADOW ONLY, Phase 5D)
+ *   Jev paper shadow (5I-PS)-> .evolve/jev-paper-shadow/ (read-only, summarized,
+ *                              PAPER ONLY DEVELOPMENT demo; never canonical/
+ *                              replication/Arena/deployment evidence)
  *   Agent-Reach observations -> .evolve/intelligence/ (read-only, summarized,
  *                              SHADOW ONLY, Phase 5E — identity/health/counts
  *                              only; never raw social text, URLs or cookies)
@@ -65,6 +69,12 @@ const readState = readDashboardState as (options: {
   requested: string;
 }) => Promise<{ status: number; body: unknown }>;
 
+const readJevPaperShadow = loadJevPaperShadowState as (root: string) => Promise<unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export async function GET(request: Request) {
   const secrets = [process.env.JUPITER_API_KEY, process.env.HELIUS_API_KEY].filter(
     (value): value is string => typeof value === "string" && value.trim().length >= 4,
@@ -74,12 +84,22 @@ export async function GET(request: Request) {
   const configured = process.env.EVOLVE_DASHBOARD_SOURCE ?? "auto";
   const requested = (requestedParam ?? configured).toLowerCase();
 
+  const evolveRoot = path.join(process.cwd(), ".evolve");
   const { status, body } = await readState({
-    root: path.join(process.cwd(), ".evolve"),
+    root: evolveRoot,
     requested,
   });
 
-  const payload = sanitize(body, { secrets });
+  // Phase 5I-PS: attach the isolated Jev PAPER SHADOW block as its OWN field,
+  // never merged into `jevShadow` (Phase 5D supervisor health). This is a
+  // DEVELOPMENT dashboard demo — read-only, compact, paper only, and never
+  // canonical/replication/Arena/deployment evidence. It is attached here rather
+  // than inside `readDashboardState` because that module is a byte-frozen Phase
+  // 5H.0 sealed source.
+  const jevPaperShadow = await readJevPaperShadow(evolveRoot);
+  const composed = isRecord(body) ? { ...body, jevPaperShadow } : body;
+
+  const payload = sanitize(composed, { secrets });
   const stateSource =
     typeof (payload as { stateSource?: unknown })?.stateSource === "string"
       ? ((payload as { stateSource: string }).stateSource as string)

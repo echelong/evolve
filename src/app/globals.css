@@ -891,6 +891,20 @@ code {
   align-items: start;
 }
 
+/* Phase 5I-PS: the isolated Jev PAPER SHADOW dashboard account. Full width so
+   the recent-decision table has room; identical design language to other panels. */
+.paper-shadow-section {
+  margin-bottom: 12px;
+}
+
+.jev-paper-shadow-panel {
+  padding: 18px;
+}
+
+.jev-paper-shadow-panel .health-grid {
+  margin-top: 8px;
+}
+
 .research-panel,
 .oos-panel,
 .evolution-research-panel {
