@@ -12,7 +12,7 @@
  *      into a decision.
  *
  *   2. THE ASYNCHRONOUS WORKER. A separate `void`-started loop that drains the
- *      queue, freezes the SOL/USDC market state into the EXISTING Phase 5I
+ *      queue, consumes capture-time SOL inputs in the EXISTING Phase 5I
  *      directional packet, asks direct TypeSafe Jev the existing directional
  *      question, and records an agreement/disagreement judgment. It is never
  *      awaited by the simulation (`start()` returns the observer, not a
@@ -51,6 +51,7 @@ import {
 import {
   SUPERVISOR_CACHE_ENABLED,
   SUPERVISOR_CLASSIFICATION,
+  SUPERVISOR_EXECUTED_TRADE_EVIDENCE_TYPE,
   SUPERVISOR_FEATURE_DEFINITION_DIGEST,
   SUPERVISOR_FEATURE_DEFINITION_VERSION,
   SUPERVISOR_FORBIDDEN_PROVIDERS,
@@ -62,8 +63,10 @@ import {
   SUPERVISOR_MAX_DROP_RECORDS,
   SUPERVISOR_MAX_JEV_CALLS,
   SUPERVISOR_MAX_PENDING_DRAFTS,
+  SUPERVISOR_MAX_UNSUPPORTED_SAMPLE,
   SUPERVISOR_MODE,
   SUPERVISOR_PHASE,
+  SUPERVISOR_PHASE_EXTENSION,
   SUPERVISOR_QUEUE_CAPACITY,
   SUPERVISOR_QUESTION_SET_ID,
   SUPERVISOR_RECENT_ROW_LIMIT,
@@ -74,6 +77,9 @@ import {
   SUPERVISOR_REQUIRED_PROVIDER,
   SUPERVISOR_REQUIRED_UPSTREAM_PROVIDER,
   SUPERVISOR_SCHEMA_VERSION,
+  SUPERVISOR_SOL_DEDUP_RULE,
+  SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+  SUPERVISOR_SOL_QUEUE_CAPACITY,
   SUPERVISOR_STATE_PUBLISH_INTERVAL_MS,
   SUPERVISOR_SUPPORTED_MARKET_IDS,
   SUPERVISOR_SUPPORTED_MINTS,
@@ -83,22 +89,27 @@ import {
   SUPERVISOR_AGREEMENT,
   isValidSupervisorSessionId,
   supervisorSessionRootFor,
-  supervisorQuestionDigest,
 } from "./definition.mjs";
 import { createBoundedObserverQueue } from "./queue.mjs";
 import {
   agreementFor,
   buildProposalFacts,
+  buildSolOpportunityFacts,
+  deepFreeze,
   distanceFromHalfOf,
   exactlyHalfOf,
   freezeExecution,
+  freezeSolSelection,
   isSupportedMint,
   modelIntentFromProbability,
   proposalDigestOf,
+  solOpportunityDigestOf,
 } from "./tap.mjs";
 import {
   appendSupervisorJudgment,
   appendSupervisorProposal,
+  appendSupervisorSolJudgment,
+  appendSupervisorSolOpportunity,
   writeSupervisorSession,
   writeSupervisorState,
   writeSupervisorSummary,
@@ -106,12 +117,16 @@ import {
 import {
   buildSupervisorState,
   buildSupervisorSummary,
+  compactSolOpportunityRow,
   compactSupervisorRow,
   createSupervisorAggregates,
   createSupervisorCounters,
   observeLatency,
   observeProbability,
   observeProviderStatus,
+  observeSolLatency,
+  observeSolProbability,
+  observeSolProviderStatus,
   supervisorHeader,
 } from "./summary.mjs";
 
@@ -206,8 +221,8 @@ export function createSupervisorProposalObserver({
   const resolvedBaseRoot = baseRoot ?? ".evolve/jev-supervisor-observer";
   const root = sessionRoot ?? supervisorSessionRootFor(resolvedBaseRoot, sessionId);
 
-  const resolvedQuestions = questions ?? buildDirectionQuestions();
-  const questionDigest = supervisorQuestionDigest();
+  const resolvedQuestions = deepFreeze(structuredClone(questions ?? buildDirectionQuestions()));
+  const questionDigest = preOutcomeInputDigestOf(resolvedQuestions);
   const startedAtMs = now();
   const startedAt = iso(startedAtMs);
 
@@ -246,6 +261,25 @@ export function createSupervisorProposalObserver({
   let lifecycle = "RUNNING";
   let lastObserverError = null;
 
+  // ---- PS.2a SOL opportunity state (observer-only) ------------------------
+  // A SEPARATE bounded queue, a separate dedup ledger, and a separate judgment
+  // map. None of this can consume the executed-proposal queue, and none of it
+  // is ever read by the engine.
+  /** @type {Map<string, object>} */
+  const solDrafts = new Map();
+  /** jevInputDigest -> { jevJudgmentId, reuseCount, packetDigest, ... } */
+  const solJudgments = new Map();
+  const solStateSeen = new Set();
+  let solOpportunitySerial = 0;
+  let solJudgmentSerial = 0;
+  let unsupportedRecentSample = [];
+  let solDroppedRecords = [];
+  let lastSolOpportunityAt = null;
+  let lastSolJudgmentAt = null;
+  // Agent/generation dedup ledger: reset NATURALLY when the generation changes.
+  let solDedupGeneration = null;
+  let solDedupAgentIds = new Set();
+
   /**
    * Record an observer-only failure. Bounded, secret-free (it is a message, and
    * this subsystem never handles credentials), and never able to affect the
@@ -262,6 +296,11 @@ export function createSupervisorProposalObserver({
     onDrop: (draft) => recordDrop(draft, "QUEUE_FULL"),
   });
 
+  const solQueue = createBoundedObserverQueue({
+    capacity: SUPERVISOR_SOL_QUEUE_CAPACITY,
+    onDrop: (draft) => recordSolDrop(draft, "SOL_QUEUE_FULL"),
+  });
+
   const sessionRecord = {
     ...supervisorHeader({ sessionId, status: "RUNNING", updatedAt: startedAt }),
     provider: identity.provider,
@@ -271,7 +310,10 @@ export function createSupervisorProposalObserver({
     mode: SUPERVISOR_MODE,
     cacheEnabled: SUPERVISOR_CACHE_ENABLED,
     questionDigest,
+    phaseExtension: SUPERVISOR_PHASE_EXTENSION,
     queueCapacity: SUPERVISOR_QUEUE_CAPACITY,
+    solQueueCapacity: SUPERVISOR_SOL_QUEUE_CAPACITY,
+    solDedupRule: SUPERVISOR_SOL_DEDUP_RULE,
     maxJevCallsPerSession: SUPERVISOR_MAX_JEV_CALLS,
     supportedMarketIds: [...SUPERVISOR_SUPPORTED_MARKET_IDS],
     supportedMints: [...SUPERVISOR_SUPPORTED_MINTS],
@@ -328,6 +370,35 @@ export function createSupervisorProposalObserver({
     if (pendingDropLines.length < SUPERVISOR_MAX_DROP_RECORDS * 2) pendingDropLines.push(record);
   }
 
+  /**
+   * Bounded record of an UNSUPPORTED executed-trade proposal. Unsupported
+   * markets are known synchronously from the mint identity, so they are counted
+   * and sampled here and NEVER enqueued into the Jev work queue (the run-1
+   * flooding bug: 42 311 proposals, 1 097 queue drops, zero calls).
+   */
+  function recordUnsupportedSample(entry) {
+    counters.unsupportedRecentSampleCount += 1;
+    unsupportedRecentSample = [...unsupportedRecentSample, entry].slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE);
+  }
+
+  /** A SOL opportunity that could not be retained because the SOL queue was full. */
+  function recordSolDrop(draft, dropReason) {
+    counters.solQueueDropped += 1;
+    const record = {
+      recordType: "SOL_OPPORTUNITY_DROPPED",
+      evidenceType: SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+      sessionId,
+      opportunityId: draft?.opportunityId ?? null,
+      at: iso(now()),
+      dropReason,
+      agentId: draft?.opportunityFacts?.agentId ?? null,
+      note:
+        "A SOL OPPORTUNITY (not a trade) was dropped explicitly at the frozen SOL queue capacity. The paper engine " +
+        "was never slowed, blocked, or altered, and the executed-proposal queue was never touched.",
+    };
+    solDroppedRecords = [...solDroppedRecords, record].slice(-SUPERVISOR_MAX_DROP_RECORDS);
+  }
+
   async function flushDropLines() {
     if (!writeArtifacts || pendingDropLines.length === 0) return;
     await storageReady;
@@ -348,11 +419,15 @@ export function createSupervisorProposalObserver({
       counters,
       aggregates,
       queue,
+      solQueue,
       status,
       recentRows,
       droppedRecords,
+      unsupportedRecentSample,
       lastProposalAt,
       lastJudgmentAt,
+      lastSolOpportunityAt,
+      lastSolJudgmentAt,
       updatedAt: iso(now()),
       lastObserverError,
     });
@@ -384,16 +459,56 @@ export function createSupervisorProposalObserver({
       proposalSerial += 1;
       proposalsSeenByTap += 1;
       const proposalId = `${sessionId}-p${pad(proposalSerial)}`;
+      const at = Number.isFinite(facts?.at) ? facts.at : null;
+      const mint =
+        typeof facts?.market?.mint === "string"
+          ? facts.market.mint
+          : typeof facts?.position?.mint === "string"
+            ? facts.position.mint
+            : null;
+      counters.executedTradeProposals += 1;
+      if (at !== null) lastProposalAt = iso(at);
+
+      // PS.2 fix: an unsupported market is known SYNCHRONOUSLY from the mint
+      // identity. Count it and keep a bounded sample only — never enqueue it,
+      // never build a market-state projection or packet, never call Jev, and
+      // never consume a slot in the Jev evaluation queue.
+      if (!isSupportedMint(mint)) {
+        counters.unsupportedProposals += 1;
+        counters.unsupportedProposalCount = counters.unsupportedProposals;
+        recordUnsupportedSample({
+          proposalId,
+          at: iso(at),
+          action: typeof facts?.action === "string" ? facts.action : null,
+          reason: typeof facts?.reason === "string" ? facts.reason : null,
+          agentId: typeof facts?.agentId === "string" ? facts.agentId : null,
+          mint,
+          symbol:
+            typeof facts?.market?.symbol === "string"
+              ? facts.market.symbol
+              : typeof facts?.position?.symbol === "string"
+                ? facts.position.symbol
+                : null,
+          // NEVER a fabricated identity: an arbitrary asset is not SOL-USDC.
+          marketId: null,
+          supported: false,
+          unsupportedReason: SUPERVISOR_UNSUPPORTED_MARKET_REASON,
+        });
+        return Object.freeze({ proposalId, unsupported: true });
+      }
+
       const proposalFacts = buildProposalFacts(facts, { proposalId, sessionId, regimeMarketLimit });
       const draft = {
         proposalId,
         serial: proposalSerial,
         proposalFacts,
+        packetContext: freezePacketContext(proposalFacts),
         digest: proposalDigestOf(proposalFacts),
         frozenAtMs: now(),
         execution: null,
         executionAttachedAtMs: null,
       };
+      rememberObservedState(proposalFacts);
       drafts.set(proposalId, draft);
       if (drafts.size > SUPERVISOR_MAX_PENDING_DRAFTS) {
         const oldest = drafts.keys().next().value;
@@ -415,6 +530,7 @@ export function createSupervisorProposalObserver({
   function recordExecution(handle, execution) {
     if (!running) return;
     try {
+      if (handle?.unsupported === true) return; // counted at tap; never queued
       const proposalId = handle?.proposalId;
       if (typeof proposalId !== "string") return;
       const draft = drafts.get(proposalId);
@@ -429,12 +545,130 @@ export function createSupervisorProposalObserver({
   }
 
   /* ========================================================================
+   * THE PS.2a SOL OPPORTUNITY TAP — synchronous, bounded, non-throwing
+   * ======================================================================*/
+
+  /**
+   * Reset the dedup ledger the moment the generation changes, so eligibility
+   * is restored naturally for the next generation. Bounded by population size
+   * per generation. The rule NEVER consults a score, a Jev answer or a price.
+   */
+  function solDedupAllows({ agentId, generation }) {
+    if (solDedupGeneration !== generation) {
+      solDedupGeneration = generation;
+      solDedupAgentIds = new Set();
+    }
+    if (solDedupAgentIds.has(agentId)) return false;
+    solDedupAgentIds.add(agentId);
+    return true;
+  }
+
+  /**
+   * Freeze one actionable SOL observation. Returns an opaque handle, or null
+   * when it was suppressed by the agent/generation sampling rule (or when the
+   * observation was malformed). Synchronous; never awaited by the engine.
+   */
+  function observeSolOpportunity(facts) {
+    if (!running) return null;
+    try {
+      const agentId = typeof facts?.agentId === "string" ? facts.agentId : null;
+      const generation = Number.isFinite(facts?.generation) ? facts.generation : null;
+      if (agentId === null || generation === null) return null;
+      counters.solOpportunityObservations += 1;
+      if (!solDedupAllows({ agentId, generation })) {
+        counters.opportunitiesSuppressedByAgentGenerationDedup += 1;
+        return null;
+      }
+      solOpportunitySerial += 1;
+      const opportunityId = `${sessionId}-sol${pad(solOpportunitySerial)}`;
+      const opportunityFacts = buildSolOpportunityFacts(facts, { opportunityId, sessionId, regimeMarketLimit });
+      const draft = {
+        opportunityId,
+        serial: solOpportunitySerial,
+        opportunityFacts,
+        frozenJev: freezeSolJevInput(opportunityFacts),
+        digest: solOpportunityDigestOf(opportunityFacts),
+        selection: null,
+        frozenAtMs: now(),
+        selectionAttachedAtMs: null,
+      };
+      solDrafts.set(opportunityId, draft);
+      if (solDrafts.size > SUPERVISOR_MAX_PENDING_DRAFTS) {
+        const oldest = solDrafts.keys().next().value;
+        const evicted = solDrafts.get(oldest);
+        solDrafts.delete(oldest);
+        recordSolDrop(evicted, "SOL_PENDING_DRAFT_BACKSTOP");
+      }
+      counters.solOpportunityProposals += 1;
+      return Object.freeze({ opportunityId });
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+      return null;
+    }
+  }
+
+  /**
+   * Attach which market EVOLVE ACTUALLY selected for this decision. This is the
+   * observer learning a fact about a decision that was already made; it is
+   * never returned to the engine and never influences selection.
+   */
+  function recordSolSelection(handle, selection) {
+    if (!running) return;
+    try {
+      const opportunityId = handle?.opportunityId;
+      if (typeof opportunityId !== "string") return;
+      const draft = solDrafts.get(opportunityId);
+      if (draft === undefined) return;
+      solDrafts.delete(opportunityId);
+      draft.selection = freezeSolSelection(selection);
+      draft.selectionAttachedAtMs = now();
+      solQueue.push(draft);
+    } catch {
+      counters.observerFailures += 1;
+    }
+  }
+
+  /* ========================================================================
    * Worker-only: packet construction and judgment recording
    * ======================================================================*/
 
-  function buildPacketFor(proposal) {
+  // Capture-time copies only. Neither worker completion nor queue delay can
+  // change the history available to subsequent captures.
+  function freezePacketContext(proposal) {
+    return deepFreeze(structuredClone({
+      history,
+      regimeSnapshots: [...regimeSnapshots, proposal.regimeSnapshot].filter(Boolean).slice(-regimeSnapshotLimit),
+      createdAt: proposal.timestamp,
+    }));
+  }
+
+  function rememberObservedState(proposal) {
+    const state = proposal.marketState;
+    if (!Number.isFinite(state?.observedAt) || !(state?.market?.price > 0)) return;
+    history = [...history, {
+      observedAt: iso(state.observedAt), observedAtMs: state.observedAt, priceUsd: state.market.price,
+    }].slice(-historyLimit);
+    if (proposal.regimeSnapshot?.markets?.length > 0) {
+      regimeSnapshots = [...regimeSnapshots, proposal.regimeSnapshot].slice(-regimeSnapshotLimit);
+    }
+  }
+
+  function freezeSolJevInput(opportunity) {
+    try {
+      const built = buildPacketFor(opportunity, freezePacketContext(opportunity), { shared: true });
+      // Reuse the canonical Phase 5I input digest over the COMPLETE TypeSafe
+      // systemOne payload. packetDigestOf deliberately omits metadata, so it
+      // alone cannot prove that the actual supplied payload is identical.
+      const jevInput = { state: built.packet, questions: resolvedQuestions, model: SUPERVISOR_REQUIRED_MODEL };
+      return deepFreeze({ ...built, jevInput, jevInputDigest: preOutcomeInputDigestOf(jevInput), error: null });
+    } catch (error) {
+      return deepFreeze({ jevInputDigest: null, error: String(error?.message ?? error) });
+    }
+  }
+
+  function buildPacketFor(proposal, context, { shared = false } = {}) {
     const marketState = proposal.marketState;
-    const inputs = { ...marketState, history };
+    const inputs = { ...marketState, history: context.history, regimeSnapshots: context.regimeSnapshots };
     const computed = extractDirectionFeaturesFromInputs(inputs);
     const featureAudit = auditDirectionFeatures(computed.features);
     if (!featureAudit.ok) {
@@ -442,12 +676,13 @@ export function createSupervisorProposalObserver({
     }
     const warmup = warmupStatus(computed.features);
     const regime = classifyDirectionRegime(
-      [...regimeSnapshots, proposal.regimeSnapshot].filter(Boolean).slice(-regimeSnapshotLimit),
+      inputs.regimeSnapshots,
     );
+    const observationSubjectId = proposal.proposalId ?? proposal.opportunityId ?? "obs";
     const packet = buildDirectionPacket({
       experimentId: sessionId,
-      observationId: `${proposal.proposalId}-obs`,
-      observationIndex: proposal.generationTick ?? 0,
+      observationId: shared ? null : `${observationSubjectId}-obs`,
+      observationIndex: shared ? null : proposal.generationTick ?? 0,
       market: SUPERVISOR_MARKET,
       horizonSeconds: HORIZON_SECONDS,
       sourceEventAt: proposal.sourceEventAtMs === null ? null : iso(proposal.sourceEventAtMs),
@@ -466,7 +701,7 @@ export function createSupervisorProposalObserver({
         synthetic: false,
       },
       quoteObservationAvailable: Number.isFinite(marketState.quoteMarket?.price),
-      createdAt: iso(now()),
+      createdAt: context.createdAt,
       generatedBy: { phase: SUPERVISOR_PHASE, observer: SUPERVISOR_OBSERVER_VERSION, warmup },
     });
     const packetAudit = auditDirectionPacket(packet);
@@ -549,7 +784,7 @@ export function createSupervisorProposalObserver({
     } else {
       observerStartedAtMs = now();
       try {
-        const built = buildPacketFor(proposal);
+        const built = buildPacketFor(proposal, draft.packetContext);
         stateDigest = built.stateDigest;
         packetDigest = built.packetDigest;
         preOutcomeInputDigest = built.preOutcomeInputDigest;
@@ -621,7 +856,9 @@ export function createSupervisorProposalObserver({
     const proposalRecord = {
       schemaVersion: SUPERVISOR_SCHEMA_VERSION,
       recordType: "PROPOSAL",
+      evidenceType: SUPERVISOR_EXECUTED_TRADE_EVIDENCE_TYPE,
       phase: SUPERVISOR_PHASE,
+      phaseExtension: SUPERVISOR_PHASE_EXTENSION,
       kind: SUPERVISOR_KIND,
       sessionId,
       ...SUPERVISOR_CLASSIFICATION,
@@ -651,7 +888,9 @@ export function createSupervisorProposalObserver({
         ? {
             schemaVersion: SUPERVISOR_SCHEMA_VERSION,
             recordType: "JUDGMENT",
+            evidenceType: SUPERVISOR_EXECUTED_TRADE_EVIDENCE_TYPE,
             phase: SUPERVISOR_PHASE,
+            phaseExtension: SUPERVISOR_PHASE_EXTENSION,
             kind: SUPERVISOR_KIND,
             sessionId,
             ...SUPERVISOR_CLASSIFICATION,
@@ -730,14 +969,277 @@ export function createSupervisorProposalObserver({
       }
     }
 
-    // Pre-decision history only grows from genuinely observed SOL state.
-    if (jevEvaluation === "EVALUATED") {
-      history = [
-        ...history,
-        { observedAt: iso(marketState.observedAt), observedAtMs: marketState.observedAt, priceUsd: marketState.market.price },
-      ].slice(-historyLimit);
-      if (Array.isArray(proposal.regimeSnapshot?.markets) && proposal.regimeSnapshot.markets.length > 0) {
-        regimeSnapshots = [...regimeSnapshots, proposal.regimeSnapshot].slice(-regimeSnapshotLimit);
+    if (typeof onRow === "function") {
+      try {
+        onRow(row);
+      } catch {
+        /* observer-only */
+      }
+    }
+
+    await publishState({ status: lifecycle });
+  }
+
+  /* ========================================================================
+   * Worker-only: PS.2a SOL opportunity processing + complete-input judgment dedup
+   * ======================================================================*/
+
+  /**
+   * Process one frozen EVOLVE_SOL_OPPORTUNITY.
+   *
+   * Jev receives the capture-time packet and questions. At most ONE call is
+   * made per identical complete input. Every matching agent opportunity
+   * references the same judgment. This is call deduplication only:
+   * no individual opportunity record is ever merged or discarded here.
+   */
+  async function processSolOpportunity(draft) {
+    if (writeArtifacts) await storageReady;
+    const opportunity = draft.opportunityFacts;
+    const marketState = opportunity.marketState;
+    counters.solOpportunities += 1;
+
+    // Partial current-state identity remains descriptive; NEVER the reuse key.
+    const frozenJev = draft.frozenJev;
+    const jevInputDigest = frozenJev.jevInputDigest;
+    const preOutcomeInputDigest = frozenJev.preOutcomeInputDigest ?? null;
+    const stateDigest = preOutcomeInputDigestOf(marketState);
+    const marketObservationId = `${sessionId}-mob-${stateDigest.slice(0, 12)}`;
+    if (!solStateSeen.has(stateDigest)) {
+      solStateSeen.add(stateDigest);
+      counters.uniqueSolMarketStates = solStateSeen.size;
+    }
+
+    const selection = draft.selection ?? freezeSolSelection(null);
+    const solWasActuallySelected = selection.actualSelectedMint === opportunity.solMint;
+    if (solWasActuallySelected) counters.solActuallySelected += 1;
+    else counters.solNotSelected += 1;
+
+    const existing = jevInputDigest === null ? null : solJudgments.get(jevInputDigest) ?? null;
+    const judgmentReused = existing !== null;
+    let judgment = existing;
+    let judgmentReuseCount = existing?.reuseCount ?? 0;
+    let providerStatus = existing?.providerStatus ?? null;
+    let failureReason = existing?.failureReason ?? null;
+
+    const priceUsable = Number.isFinite(marketState?.market?.price) && marketState.market.price > 0;
+    const timeUsable = Number.isFinite(marketState?.observedAt);
+
+    if (judgmentReused) {
+      judgment.reuseCount += 1;
+      judgmentReuseCount = judgment.reuseCount;
+      counters.reusedJevJudgments += 1;
+    } else {
+      let pHigher = null;
+      let run = null;
+      let packetDigestValue = null;
+      let observerCompletedAtMs = null;
+
+      if (!priceUsable || !timeUsable) {
+        providerStatus = "MARKET_STATE_UNAVAILABLE";
+        failureReason = "the frozen SOL market state was not observable; no Jev call was made";
+      } else {
+        try {
+          if (frozenJev.error) throw new Error(frozenJev.error);
+          const built = frozenJev;
+          packetDigestValue = built.packetDigest;
+          if (!pins.ok) {
+            // FAIL CLOSED: no call, no fallback, an explicit observer failure.
+            providerStatus = "JEV_PIN_MISMATCH";
+            failureReason = `the supervisor observer refused to call Jev: ${pins.problems.join("; ")}`;
+          } else {
+            counters.jevCallsForSolStates += 1;
+            const decided = await jevDecide({
+              provider,
+              packet: built.packet,
+              questions: resolvedQuestions,
+              questionSetId: SUPERVISOR_QUESTION_SET_ID,
+              questionSetVersion: SUPERVISOR_QUESTION_SET_VERSION,
+              decisionPacketVersion: DIRECTION_PACKET_VERSION,
+              experimentId: sessionId,
+              root: null,
+              cacheEnabled: false,
+              budget,
+              now,
+              salt: `${sessionId}-sol${draft.serial}`,
+            });
+            run = decided.run;
+            providerStatus = run?.status ?? null;
+            const decision = decided.decision;
+            const answer = decision && typeof decision === "object" ? decision[DIRECTION_QUESTION_NAME] ?? null : null;
+            pHigher =
+              answer && answer.type === "noul" && Number.isFinite(answer.probability) ? answer.probability : null;
+            if (providerStatus !== JEV_STATUS.OK) failureReason = run?.reason ?? `Jev returned ${providerStatus}`;
+          }
+        } catch (error) {
+          providerStatus = "JEV_OBSERVER_ERROR";
+          failureReason = `observer error: ${error?.message ?? error}`;
+          noteObserverError(error);
+        }
+        observerCompletedAtMs = now();
+      }
+
+      if (providerStatus === JEV_STATUS.OK) {
+        counters.solJevOk += 1;
+        observeSolLatency(aggregates, run?.latencyMs ?? null);
+        observeSolProbability(aggregates, pHigher);
+      } else {
+        counters.solJevFailures += 1;
+      }
+      observeSolProviderStatus(aggregates, providerStatus);
+
+      solJudgmentSerial += 1;
+      judgment = {
+        jevJudgmentId: `${sessionId}-solj${pad(solJudgmentSerial)}`,
+        reuseCount: 0,
+        pHigher,
+        pLower: Number.isFinite(pHigher) ? 1 - pHigher : null,
+        modelIntent: modelIntentFromProbability(pHigher),
+        exactlyHalf: exactlyHalfOf(pHigher),
+        providerStatus,
+        failureReason,
+        stateDigest,
+        jevInputDigest,
+        preOutcomeInputDigest,
+        packetDigest: packetDigestValue,
+        marketObservationId,
+        provider: identity.provider,
+        model: identity.model,
+        upstream: identity.upstream,
+        requestId: run?.requestId ?? null,
+        latencyMs: Number.isFinite(run?.latencyMs) ? run.latencyMs : null,
+        providerAttemptCount: Number.isFinite(run?.providerAttemptCount) ? run.providerAttemptCount : null,
+        judgedAt: iso(observerCompletedAtMs),
+      };
+      if (jevInputDigest !== null) solJudgments.set(jevInputDigest, judgment);
+    }
+
+    const modelIntent = judgment?.modelIntent ?? null;
+    const exactlyHalf = judgment?.exactlyHalf === true;
+    const { agreement, agreementReason } = agreementFor({
+      directionalComparable: true,
+      evolveDirectionalIntent: opportunity.evolveDirectionalIntent,
+      modelIntent,
+    });
+    if (agreement === SUPERVISOR_AGREEMENT.AGREE) counters.solAgreementCount += 1;
+    else if (agreement === SUPERVISOR_AGREEMENT.DISAGREE) counters.solDisagreementCount += 1;
+    if (exactlyHalf) counters.solExactHalfCount += 1;
+
+    const opportunityRecord = {
+      schemaVersion: SUPERVISOR_SCHEMA_VERSION,
+      recordType: "SOL_OPPORTUNITY",
+      evidenceType: SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+      phase: SUPERVISOR_PHASE,
+      phaseExtension: SUPERVISOR_PHASE_EXTENSION,
+      kind: SUPERVISOR_KIND,
+      sessionId,
+      ...SUPERVISOR_CLASSIFICATION,
+      sequence: draft.serial,
+      isExecutedTrade: false,
+      opportunityId: opportunity.opportunityId,
+      generation: opportunity.generation,
+      generationTick: opportunity.generationTick,
+      agentId: opportunity.agentId,
+      species: opportunity.species,
+      lineageId: opportunity.lineageId,
+      researchFamilyId: opportunity.researchFamilyId,
+      timestamp: opportunity.timestamp,
+      solMint: opportunity.solMint,
+      symbol: opportunity.symbol,
+      referencePrice: opportunity.referencePrice,
+      liquidity: opportunity.liquidity,
+      solScore: opportunity.solScore,
+      agentEntryThreshold: opportunity.agentEntryThreshold,
+      scoreMargin: opportunity.scoreMargin,
+      passesGates: true,
+      actionable: true,
+      evolveDirectionalIntent: opportunity.evolveDirectionalIntent,
+      directionalComparable: true,
+      actualSelectedMint: selection.actualSelectedMint,
+      actualSelectedSymbol: selection.actualSelectedSymbol,
+      actualSelectedScore: selection.actualSelectedScore,
+      solWasActuallySelected,
+      marketObservationId,
+      stateDigest,
+      jevInputDigest,
+      preOutcomeInputDigest,
+      packetDigest: judgment?.packetDigest ?? null,
+      jevJudgmentId: judgment?.jevJudgmentId ?? null,
+      judgmentReused,
+      judgmentReuseCount,
+      pHigher: judgment?.pHigher ?? null,
+      pLower: judgment?.pLower ?? null,
+      modelIntent,
+      exactlyHalf,
+      agreement,
+      agreementReason,
+      providerStatus: judgment?.providerStatus ?? null,
+      failureReason: judgment?.failureReason ?? null,
+      confidenceThresholdApplied: false,
+      note:
+        "SOL OPPORTUNITY only: the agent independently considered SOL actionable. This is NOT an executed trade " +
+        "and the record never influenced which market EVOLVE selected.",
+    };
+
+    const solJudgmentRecord =
+      judgmentReused || judgment === null
+        ? null
+        : {
+            schemaVersion: SUPERVISOR_SCHEMA_VERSION,
+            recordType: "SOL_JUDGMENT",
+            evidenceType: SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+            phase: SUPERVISOR_PHASE,
+            phaseExtension: SUPERVISOR_PHASE_EXTENSION,
+            kind: SUPERVISOR_KIND,
+            sessionId,
+            ...SUPERVISOR_CLASSIFICATION,
+            judgmentId: judgment.jevJudgmentId,
+            marketObservationId,
+            stateDigest,
+            jevInputDigest,
+            preOutcomeInputDigest,
+            packetDigest: judgment.packetDigest,
+            provider: identity.provider,
+            model: identity.model,
+            upstream: identity.upstream,
+            gatewayUsed: false,
+            cacheEnabled: false,
+            providerStatus: judgment.providerStatus,
+            failureReason: judgment.failureReason,
+            requestId: judgment.requestId,
+            latencyMs: judgment.latencyMs,
+            providerAttemptCount: judgment.providerAttemptCount,
+            pHigher: judgment.pHigher,
+            pLower: judgment.pLower,
+            modelIntent: judgment.modelIntent,
+            exactlyHalf: judgment.exactlyHalf,
+            judgedAt: judgment.judgedAt,
+            questionSetId: SUPERVISOR_QUESTION_SET_ID,
+            questionSetVersion: SUPERVISOR_QUESTION_SET_VERSION,
+            questionDigest,
+            featureDefinitionVersion: SUPERVISOR_FEATURE_DEFINITION_VERSION,
+            featureDefinitionDigest: SUPERVISOR_FEATURE_DEFINITION_DIGEST,
+            confidenceThresholdApplied: false,
+            note:
+              "One complete frozen SOL input judgment, reused only for an identical packet, questions and model. " +
+              "Jev received pre-outcome market evidence only and this judgment has zero authority.",
+          };
+
+    lastSolOpportunityAt = opportunity.timestamp;
+    if (solJudgmentRecord !== null) lastSolJudgmentAt = judgment.judgedAt;
+    const row = compactSolOpportunityRow({
+      opportunity: opportunityRecord,
+      judgmentSummary: judgment === null ? null : { ...judgment, judgmentReused, judgmentReuseCount },
+      agreement,
+      exactlyHalf,
+    });
+    recentRows = [...recentRows, row].slice(-SUPERVISOR_RECENT_ROW_LIMIT);
+
+    if (writeArtifacts) {
+      try {
+        await appendSupervisorSolOpportunity(root, opportunityRecord);
+        if (solJudgmentRecord !== null) await appendSupervisorSolJudgment(root, solJudgmentRecord);
+      } catch (error) {
+        noteObserverError(error);
       }
     }
 
@@ -759,12 +1261,14 @@ export function createSupervisorProposalObserver({
   async function workerLoop() {
     while (running) {
       const draft = queue.shift();
-      if (draft === null) {
+      const solDraft = solQueue.shift();
+      if (draft === null && solDraft === null) {
         await sleep(SUPERVISOR_WORKER_IDLE_MS);
         continue;
       }
       try {
-        await processDraft(draft);
+        if (draft !== null) await processDraft(draft);
+        if (solDraft !== null) await processSolOpportunity(solDraft);
       } catch (error) {
         noteObserverError(error);
       }
@@ -812,8 +1316,14 @@ export function createSupervisorProposalObserver({
       counters,
       aggregates,
       queue,
+      solQueue,
       status,
       finalizedAt,
+      lastProposalAt,
+      lastJudgmentAt,
+      lastSolOpportunityAt,
+      lastSolJudgmentAt,
+      unsupportedRecentSample,
       recentRowCount: recentRows.length,
       droppedRecordCount: droppedRecords.length,
     });
@@ -832,6 +1342,8 @@ export function createSupervisorProposalObserver({
           counters: { ...counters },
           queueHighWatermark: queue.highWatermark,
           queueDropped: queue.dropped,
+          solQueueHighWatermark: solQueue.highWatermark,
+          solQueueDropped: solQueue.dropped,
           finalizeTimedOut: running,
         });
       } catch (error) {
@@ -855,7 +1367,11 @@ export function createSupervisorProposalObserver({
       pins,
       identity,
       counters: { ...counters, proposalsSeenByTap },
-      aggregates: { ...aggregates, providerStatusCounts: { ...aggregates.providerStatusCounts } },
+      aggregates: {
+        ...aggregates,
+        providerStatusCounts: { ...aggregates.providerStatusCounts },
+        solProviderStatusCounts: { ...aggregates.solProviderStatusCounts },
+      },
       queue: {
         capacity: queue.capacity,
         depth: queue.depth,
@@ -863,8 +1379,23 @@ export function createSupervisorProposalObserver({
         dropped: queue.dropped,
         pushed: queue.pushed,
       },
+      solQueue: {
+        capacity: solQueue.capacity,
+        depth: solQueue.depth,
+        highWatermark: solQueue.highWatermark,
+        dropped: solQueue.dropped,
+        pushed: solQueue.pushed,
+      },
       lastObserverError,
+      lastProposalAt,
+      lastJudgmentAt,
+      lastSolOpportunityAt,
+      lastSolJudgmentAt,
       pendingDrafts: drafts.size,
+      pendingSolDrafts: solDrafts.size,
+      unsupportedRecentSample: [...unsupportedRecentSample],
+      solDroppedRecords: [...solDroppedRecords],
+      uniqueSolMarketStates: solStateSeen.size,
       recentRows: [...recentRows],
       droppedRecords: [...droppedRecords],
       historyLength: history.length,
@@ -880,6 +1411,12 @@ export function createSupervisorProposalObserver({
     // ---- the passive tap (synchronous; called by the simulation) -----------
     freezeProposal,
     recordExecution,
+    // ---- the PS.2a SOL opportunity tap (synchronous; called by the engine) --
+    // `solMint` is the ONE market identity the engine may sample for
+    // opportunities. The engine reads it and nothing else.
+    solMint: SUPERVISOR_SUPPORTED_MINTS[0] ?? null,
+    observeSolOpportunity,
+    recordSolSelection,
     // ---- observer lifecycle ------------------------------------------------
     start,
     finalize,

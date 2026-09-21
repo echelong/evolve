@@ -340,6 +340,35 @@ export function createSimulation({
     }
   }
 
+  // --- Phase 5I-PS.2a: passive SOL opportunity tap ---------------------------
+  // The ONE market identity the attached observer declares it may sample for
+  // "this agent independently considered SOL actionable" evidence. Read ONCE,
+  // here, and used only as a pure filter inside the market-scoring loop. When
+  // no observer is attached, or it declares no sample identity, this is inert.
+  const solOpportunityMint =
+    proposalTap !== null && typeof proposalTap.solMint === "string" && proposalTap.solMint.length > 0
+      ? proposalTap.solMint
+      : null;
+
+  function freezeSolOpportunityForObserver(facts) {
+    if (proposalTap === null || solOpportunityMint === null) return null;
+    try {
+      return typeof proposalTap.observeSolOpportunity === "function" ? proposalTap.observeSolOpportunity(facts) : null;
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+      return null;
+    }
+  }
+
+  function recordSolSelectionForObserver(handle, selection) {
+    if (proposalTap === null || handle === null || handle === undefined) return;
+    try {
+      if (typeof proposalTap.recordSolSelection === "function") proposalTap.recordSolSelection(handle, selection);
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+    }
+  }
+
   // --- Phase 5A: strategy islands -------------------------------------------
   // An island is the species label used as a breeding boundary (see
   // engine/islands.mjs) rather than a new taxonomy. Disabled falls back to
@@ -962,6 +991,7 @@ export function createSimulation({
     let best = null;
     let bestScore = -Infinity;
     let eligibleCount = 0;
+    let solOpportunityHandle = null;
 
     for (const market of ctx.tradeable) {
       if (!passesGates(agent.genome, market, ctx)) continue;
@@ -972,11 +1002,48 @@ export function createSimulation({
       agent.stageEligibleMints = agent.stageEligibleMints ?? {};
       agent.stageEligibleMints[market.mint] = (agent.stageEligibleMints[market.mint] ?? 0) + 1;
       const score = scoreMarket(agent.genome, market);
+
+      // Phase 5I-PS.2a: the EXACT observation point. After gates and scoring,
+      // if the market mint is the declared SOL identity and the genome's
+      // EXISTING entry threshold is met, freeze a passive SOL opportunity.
+      // This reads `score` and the existing threshold only: `best`, `bestScore`,
+      // the comparison below and all execution are untouched, so EVOLVE's own
+      // market selection is byte-for-byte unchanged.
+      if (
+        solOpportunityHandle === null &&
+        solOpportunityMint !== null &&
+        market.mint === solOpportunityMint &&
+        score >= agent.genome.entryScoreThreshold
+      ) {
+        solOpportunityHandle = freezeSolOpportunityForObserver({
+          at: ctx.at,
+          generation,
+          generationTick,
+          agentId: agent.id,
+          species: agent.species,
+          lineageId: agent.lineageId ?? null,
+          researchFamilyId: agent.researchMeta?.familyId ?? null,
+          market,
+          universeToken: feed.universe?.get?.(market.mint) ?? null,
+          byMint: ctx.byMint,
+          solScore: score,
+          agentEntryThreshold: agent.genome.entryScoreThreshold,
+        });
+      }
+
       if (score > bestScore) {
         bestScore = score;
         best = market;
       }
     }
+
+    // The actual selection is now frozen. Report it to the observer (which by
+    // construction only ever sees `best`), then continue exactly as before.
+    recordSolSelectionForObserver(solOpportunityHandle, {
+      actualSelectedMint: best !== null ? best.mint : null,
+      actualSelectedSymbol: best !== null ? best.symbol : null,
+      actualSelectedScore: Number.isFinite(bestScore) ? bestScore : null,
+    });
 
     agent.stageOpportunities = (agent.stageOpportunities ?? 0) + ctx.tradeable.length;
     agent.stageEligibleTicks = (agent.stageEligibleTicks ?? 0) + eligibleCount;

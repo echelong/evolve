@@ -194,9 +194,12 @@ async function main() {
     console.log(`[jev:supervisor]   status           ${snapshot.status}`);
     console.log(`[jev:supervisor]   provider/model   ${pins.provider} / ${pins.model} (gatewayUsed=false)`);
     console.log(`[jev:supervisor]   market           ${SUPERVISOR_MARKET_ID}`);
-    console.log(`[jev:supervisor]   proposals        ${snapshot.counters.proposalsObserved} observed · ${snapshot.counters.supportedProposals} supported · ${snapshot.counters.unsupportedProposals} unsupported`);
+    console.log(`[jev:supervisor]   executed trades  ${snapshot.counters.executedTradeProposals} proposals · ${snapshot.counters.supportedProposals} supported · ${snapshot.counters.unsupportedProposals} unsupported (bypassed, counted, not queued)`);
     console.log(`[jev:supervisor]   Jev calls        ${snapshot.counters.jevCalls} · ok ${snapshot.counters.jevOk} · failures ${snapshot.counters.jevFailures}`);
     console.log(`[jev:supervisor]   agreement        ${snapshot.counters.agreementCount} agree · ${snapshot.counters.disagreementCount} disagree · ${snapshot.counters.exactHalfCount} exact 0.50`);
+    console.log(`[jev:supervisor]   SOL opportunit.  ${snapshot.counters.solOpportunities} captured · ${snapshot.counters.solActuallySelected} selected · ${snapshot.counters.solNotSelected} not selected`);
+    console.log(`[jev:supervisor]   SOL judgments    ${snapshot.counters.uniqueSolMarketStates} states · ${snapshot.counters.jevCallsForSolStates} calls · ${snapshot.counters.reusedJevJudgments} reused`);
+    console.log(`[jev:supervisor]   SOL agreement    ${snapshot.counters.solAgreementCount} agree · ${snapshot.counters.solDisagreementCount} disagree · ${snapshot.counters.solExactHalfCount} exact 0.50`);
     console.log(`[jev:supervisor]   queue            depth ${snapshot.queue.depth} · high water ${snapshot.queue.highWatermark} · dropped ${snapshot.queue.dropped}`);
     console.log(`[jev:supervisor]   means            pHigher ${summary?.meanPHigher ?? "n/a"} · |p-0.50| ${summary?.meanDistanceFromHalf ?? "n/a"} · latency ${summary?.meanLatencyMs ?? "n/a"}ms`);
     console.log(`[jev:supervisor]   observer failures ${snapshot.counters.observerFailures}`);

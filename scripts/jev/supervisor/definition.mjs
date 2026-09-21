@@ -54,7 +54,13 @@ import {
 } from "../direction/features.mjs";
 
 export const SUPERVISOR_PHASE = "5I-PS.2";
-export const SUPERVISOR_SCHEMA_VERSION = 1;
+/**
+ * The additive extension this schema carries. Records declare BOTH the base
+ * phase and, where relevant, this extension so a reader can always tell a
+ * PS.2 executed-trade record from a PS.2a SOL opportunity record.
+ */
+export const SUPERVISOR_PHASE_EXTENSION = "5I-PS.2a";
+export const SUPERVISOR_SCHEMA_VERSION = 2;
 export const SUPERVISOR_KIND = "JEV_SUPERVISOR_OBSERVER";
 
 /** A completely separate tree. Never a canonical 5I / Paper Shadow / Arena tree. */
@@ -62,6 +68,8 @@ export const SUPERVISOR_ROOT_DIR = path.join(".evolve", "jev-supervisor-observer
 export const SUPERVISOR_SESSION_FILE = "session.json";
 export const SUPERVISOR_PROPOSALS_FILE = "proposals.ndjson";
 export const SUPERVISOR_JUDGMENTS_FILE = "judgments.ndjson";
+export const SUPERVISOR_SOL_OPPORTUNITIES_FILE = "sol-opportunities.ndjson";
+export const SUPERVISOR_SOL_JUDGMENTS_FILE = "sol-judgments.ndjson";
 export const SUPERVISOR_STATE_FILE = "state.json";
 export const SUPERVISOR_SUMMARY_FILE = "summary.json";
 
@@ -181,6 +189,47 @@ export const SUPERVISOR_AGREEMENT = Object.freeze({
  */
 export const SUPERVISOR_AGREEMENT_NO_INTENT_REASON = "NO_JEV_INTENT";
 
+/* ============================================================================
+ * Evidence classes (PS.2 executed trades vs PS.2a SOL opportunities)
+ * ==========================================================================*/
+
+/**
+ * The two evidence classes this observer persists. They are NEVER merged:
+ *
+ *   EXECUTED_TRADE            a completed EVOLVE paper decision (PS.2)
+ *   EVOLVE_SOL_OPPORTUNITY    an agent that independently considered SOL
+ *                             actionable, even though SOL may not have been the
+ *                             token actually selected for a paper trade (PS.2a)
+ *
+ * A SOL opportunity is NOT a trade and must never be presented as one.
+ */
+export const SUPERVISOR_EVIDENCE_TYPES = Object.freeze({
+  EXECUTED_TRADE: "EXECUTED_TRADE",
+  EVOLVE_SOL_OPPORTUNITY: "EVOLVE_SOL_OPPORTUNITY",
+});
+export const SUPERVISOR_EXECUTED_TRADE_EVIDENCE_TYPE = SUPERVISOR_EVIDENCE_TYPES.EXECUTED_TRADE;
+export const SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE = SUPERVISOR_EVIDENCE_TYPES.EVOLVE_SOL_OPPORTUNITY;
+
+/**
+ * The ONE deterministic deduplication rule for SOL opportunities, declared
+ * before any live run: at most one EVOLVE_SOL_OPPORTUNITY per agent per
+ * generation, keeping the FIRST actionable SOL observation. This is an
+ * instrumentation SAMPLING rule, never a market or trading threshold, and it
+ * must not be selected on Jev output or a future price.
+ */
+export const SUPERVISOR_SOL_DEDUP_RULE =
+  "at most one EVOLVE_SOL_OPPORTUNITY per agent per generation (first actionable SOL observation kept); " +
+  "reset on generation change; never chosen from Jev output or future price";
+export const SUPERVISOR_SOL_DEDUP_SCOPE = "agent-and-generation";
+
+/**
+ * Bounded, fixed source constants for the SOL opportunity capture. Chosen in
+ * source before any run, exactly like the executed-proposal queue bounds.
+ */
+export const SUPERVISOR_SOL_QUEUE_CAPACITY = 64;
+/** Retained unsupported proposal sample (counts stay exact; storage stays tiny). */
+export const SUPERVISOR_MAX_UNSUPPORTED_SAMPLE = 16;
+
 /** The exact probability value that is `exactlyHalf`. There is no other. */
 export const SUPERVISOR_EXACT_HALF = 0.5;
 
@@ -209,6 +258,14 @@ export const SUPERVISOR_MAX_PENDING_DRAFTS = 1024;
 export const SUPERVISOR_MAX_DROP_RECORDS = 32;
 /** Bounded recent rows published to the dashboard. */
 export const SUPERVISOR_RECENT_ROW_LIMIT = 24;
+
+/** The four row kinds the dashboard distinguishes. Never a fifth. */
+export const SUPERVISOR_ROW_KINDS = Object.freeze({
+  SOL_OPPORTUNITY: "SOL OPPORTUNITY",
+  EXECUTED_ENTRY: "EXECUTED ENTRY",
+  EXECUTED_EXIT: "EXECUTED EXIT",
+  NOT_COMPARABLE: "NOT COMPARABLE",
+});
 /** Worker idle poll interval; the worker is the ONLY thing that ever waits. */
 export const SUPERVISOR_WORKER_IDLE_MS = 25;
 /** Bounded wait for in-flight observer work during Ctrl+C finalization. */

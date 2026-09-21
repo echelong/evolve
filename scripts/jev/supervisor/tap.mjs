@@ -34,8 +34,10 @@ import {
   SUPERVISOR_DIRECTIONAL_INTENTS,
   SUPERVISOR_EXACT_HALF,
   SUPERVISOR_LIFECYCLE_EXIT_REASONS,
+  SUPERVISOR_MARKET_ID,
   SUPERVISOR_QUOTE_MINT,
   SUPERVISOR_REASONS,
+  SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
   SUPERVISOR_SUPPORTED_MINTS,
 } from "./definition.mjs";
 
@@ -48,6 +50,17 @@ export const SUPERVISOR_TAP_VERSION = 1;
 /** True only for the ONE supported traded identity (wrapped SOL). */
 export function isSupportedMint(mint) {
   return typeof mint === "string" && SUPERVISOR_SUPPORTED_MINTS.includes(mint);
+}
+
+/**
+ * The truthful market identity for a proposal's market. `SOL-USDC` is permitted
+ * ONLY when the proposal market mint is the wrapped-SOL mint; for any other
+ * asset the identity is `null` (no market id is ever invented). This fixes the
+ * run-1 instrumentation bug where an arbitrary token was serialized as
+ * `marketId: "SOL-USDC"`.
+ */
+export function marketIdForMint(mint) {
+  return isSupportedMint(mint) ? SUPERVISOR_MARKET_ID : null;
 }
 
 /* ============================================================================
@@ -174,8 +187,9 @@ function finiteOrNull(value) {
  * The EXACT pre-outcome input projection this subsystem carries forward. It
  * reuses the existing frozen Phase 5I builder (`buildPreOutcomeInputs`) instead
  * of re-deriving a parallel projection, so features/digests stay comparable in
- * meaning. Only the history is added later, by the observer, from its own
- * bounded pre-decision SOL observations.
+ * meaning. The observer adds its bounded pre-decision history and regime
+ * inputs synchronously at capture; this current-state projection alone is
+ * never a complete Jev-input identity.
  */
 export function freezeMarketState({ market, token = null, quoteMarket = null, observedAt = null } = {}) {
   if (!market || typeof market !== "object") return null;
@@ -291,7 +305,9 @@ export function buildProposalFacts(
     researchFamilyId: typeof researchFamilyId === "string" ? researchFamilyId : null,
     sourceEventAtMs,
     market: {
-      marketId: mint === null ? null : "SOL-USDC",
+      // NEVER a fabricated identity: the canonical id appears only when the
+      // mint really is the wrapped-SOL mint (see `marketIdForMint`).
+      marketId: marketIdForMint(mint),
       mint,
       symbol: typeof market?.symbol === "string" ? market.symbol : position?.symbol ?? null,
       referencePrice: referencePriceValue,
@@ -320,6 +336,136 @@ export function buildProposalFacts(
 export function proposalDigestOf(facts) {
   return digestOf(facts ?? null);
 }
+
+/* ============================================================================
+ * PS.2a — SOL opportunity facts (NOT an executed trade)
+ * ==========================================================================*/
+
+/**
+ * The ONE deduplication key for agent/generation-scoped SOL opportunity
+ * sampling. Deliberately contains nothing but the identity and the generation,
+ * so the rule can never depend on a score, a price, a Jev answer or an outcome.
+ */
+export function solOpportunityDedupKey({ agentId = null, generation = null } = {}) {
+  return `${typeof agentId === "string" ? agentId : "?"}::${Number.isFinite(generation) ? generation : "?"}`;
+}
+
+/**
+ * Freeze the passive SOL opportunity observation. Built at the EXACT tap point
+ * inside the engine's market-scoring loop, where all of the following were true
+ * for one flat agent at one deterministic observation:
+ *
+ *   - new entries were allowed;
+ *   - wrapped SOL was present in the normal market universe;
+ *   - SOL passed that genome's existing `passesGates(...)`;
+ *   - `scoreMarket(genome, SOL) >= genome.entryScoreThreshold`.
+ *
+ * No new trading threshold is introduced here: `agentEntryThreshold` is the
+ * genome's EXISTING entry threshold, carried through verbatim.
+ */
+export function buildSolOpportunityFacts(
+  {
+    at = null,
+    generation = null,
+    generationTick = null,
+    agentId = null,
+    species = null,
+    lineageId = null,
+    researchFamilyId = null,
+    market = null,
+    universeToken = null,
+    byMint = null,
+    solScore = null,
+    agentEntryThreshold = null,
+  } = {},
+  { opportunityId, sessionId, regimeMarketLimit = 0 } = {},
+) {
+  const mint = typeof market?.mint === "string" ? market.mint : null;
+  const quoteMintPrice =
+    byMint && typeof byMint.get === "function" ? finiteOrNull(byMint.get(SUPERVISOR_QUOTE_MINT)?.price) : null;
+  const quoteMarket = quoteMintPrice === null ? null : { price: quoteMintPrice };
+  const observedAt = market && Number.isFinite(market.lastObservedAt) ? market.lastObservedAt : null;
+  const scoreValue = finiteOrNull(solScore);
+  const thresholdValue = finiteOrNull(agentEntryThreshold);
+  const scoreMargin = scoreValue !== null && thresholdValue !== null ? scoreValue - thresholdValue : null;
+  const sourceEventAtMs = Number.isFinite(universeToken?.tokenUpdatedAt) ? universeToken.tokenUpdatedAt : null;
+
+  const facts = {
+    opportunityId,
+    sessionId,
+    evidenceType: SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+    isExecutedTrade: false,
+    timestamp: Number.isFinite(at) ? new Date(at).toISOString() : null,
+    timestampMs: Number.isFinite(at) ? at : null,
+    opportunityFrozenAt: Number.isFinite(at) ? new Date(at).toISOString() : new Date().toISOString(),
+    generation: Number.isFinite(generation) ? generation : null,
+    generationTick: Number.isFinite(generationTick) ? generationTick : null,
+    agentId: typeof agentId === "string" ? agentId : null,
+    species: typeof species === "string" ? species : null,
+    lineageId: typeof lineageId === "string" ? lineageId : null,
+    researchFamilyId: typeof researchFamilyId === "string" ? researchFamilyId : null,
+    sourceEventAtMs,
+    // ---- the SOL observation itself (never EVOLVE's selected token) --------
+    solMint: mint,
+    symbol: typeof market?.symbol === "string" ? market.symbol : null,
+    referencePrice: finiteOrNull(market?.price),
+    liquidity: finiteOrNull(market?.liquidity),
+    solScore: scoreValue,
+    agentEntryThreshold: thresholdValue,
+    scoreMargin,
+    passesGates: true,
+    actionable: true,
+    // A SOL opportunity is ALWAYS a HIGHER directional claim, frozen before any
+    // Jev answer: it means the agent considered SOL worth entering.
+    evolveDirectionalIntent: SUPERVISOR_DIRECTIONAL_INTENTS.HIGHER,
+    directionalComparable: true,
+    // The frozen SOL/USDC market-state projection carried into the Jev packet.
+    marketState: freezeMarketState({ market, token: universeToken, quoteMarket, observedAt }),
+    regimeSnapshot: freezeRegimeSnapshot(byMint, { marketLimit: regimeMarketLimit }),
+  };
+
+  return deepFreeze(facts);
+}
+
+/** Digest of the frozen SOL opportunity observation facts. */
+export function solOpportunityDigestOf(facts) {
+  return digestOf(facts ?? null);
+}
+
+/**
+ * Freeze which market EVOLVE ACTUALLY selected for this agent's paper decision.
+ * Recorded only so the SOL opportunity can state, truthfully, whether SOL was
+ * the selected token. It is NEVER read by the engine. `solWasActuallySelected`
+ * is derived later, once the frozen `solMint` is known.
+ */
+export function freezeSolSelection(selection = null) {
+  if (!selection || typeof selection !== "object") {
+    return deepFreeze({ actualSelectedMint: null, actualSelectedSymbol: null, actualSelectedScore: null });
+  }
+  return deepFreeze({
+    actualSelectedMint: typeof selection.actualSelectedMint === "string" ? selection.actualSelectedMint : null,
+    actualSelectedSymbol: typeof selection.actualSelectedSymbol === "string" ? selection.actualSelectedSymbol : null,
+    actualSelectedScore: finiteOrNull(selection.actualSelectedScore),
+  });
+}
+
+/** Version marker for the frozen PS.2a SOL opportunity tap semantics. */
+export const SUPERVISOR_SOL_TAP_DEFINITION = Object.freeze({
+  evidenceType: SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+  isExecutedTrade: false,
+  evolveDirectionalIntent: SUPERVISOR_DIRECTIONAL_INTENTS.HIGHER,
+  directionalComparable: true,
+  scoreMarginFormula: "scoreMargin = solScore - agentEntryThreshold",
+  agentEntryThresholdIsTheExistingGenomeThreshold: true,
+  newTradingThresholdIntroduced: false,
+  dedupScope: "agent-and-generation",
+  dedupRuleResetsOnGenerationChange: true,
+  dedupDependsOnJevOutputOrFuturePrice: false,
+  jevCallDeduplicatedByFrozenMarketState: true,
+  recordInfluencesMarketSelection: false,
+  agentAnchoringSentToJev: false,
+  confidenceThresholdApplied: false,
+});
 
 /** Freeze the engine's execution result into a fixed, bounded field list. */
 export function freezeExecution(execution = null) {

@@ -104,6 +104,13 @@ const {
   SUPERVISOR_SUPPORTED_MINTS,
   SUPERVISOR_QUOTE_MINT,
   SUPERVISOR_UNSUPPORTED_MARKET_REASON,
+  SUPERVISOR_EVIDENCE_TYPES,
+  SUPERVISOR_MAX_UNSUPPORTED_SAMPLE,
+  SUPERVISOR_PHASE_EXTENSION,
+  SUPERVISOR_ROW_KINDS,
+  SUPERVISOR_SOL_DEDUP_RULE,
+  SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE,
+  SUPERVISOR_SOL_QUEUE_CAPACITY,
   assertSupervisorWriteTarget,
   isValidSupervisorSessionId,
   supervisorSessionIdFor,
@@ -111,6 +118,7 @@ const {
 } = await import("./jev/supervisor/definition.mjs");
 const {
   SUPERVISOR_TAP_DEFINITION,
+  SUPERVISOR_SOL_TAP_DEFINITION,
   agreementFor,
   buildProposalFacts,
   classifyProposal,
@@ -119,8 +127,10 @@ const {
   exactlyHalfOf,
   freezeExecution,
   isSupportedMint,
+  marketIdForMint,
   modelIntentFromProbability,
   proposalDigestOf,
+  solOpportunityDedupKey,
 } = await import("./jev/supervisor/tap.mjs");
 const { createBoundedObserverQueue } = await import("./jev/supervisor/queue.mjs");
 const {
@@ -128,6 +138,8 @@ const {
   listSupervisorSessions,
   readSupervisorLines,
   readSupervisorSession,
+  readSupervisorSolJudgments,
+  readSupervisorSolOpportunities,
   readSupervisorState,
   readSupervisorSummary,
   supervisorSummaryDigestOf,
@@ -328,6 +340,7 @@ async function runFixtureSimulation({
   ticks = 48,
   priceAt = lifecyclePriceAt,
   yieldsPerTick = 0,
+  feed: feedOverride = null,
 } = {}) {
   const config = createMarketConfig(
     {
@@ -341,7 +354,7 @@ async function runFixtureSimulation({
   const random = createSeededRandom(seedLabel);
   let clock = BASE_AT;
   const now = () => clock;
-  const feed = createFixtureFeed({ priceAt });
+  const feed = feedOverride ?? createFixtureFeed({ priceAt });
   const simulation = createSimulation({
     config,
     feed,
@@ -383,16 +396,17 @@ function assertEngineIdentical(baseline, candidate, label) {
 
 /** A deterministic fixture TypeSafe-shaped provider. NEVER touches the network. */
 function fixtureProvider({ probability = 0.62, behavior = "ok", onEvaluate = null, reason = null } = {}) {
-  const calls = { count: 0, packets: [] };
+  const calls = { count: 0, packets: [], payloads: [] };
   const provider = {
     name: SUPERVISOR_REQUIRED_PROVIDER,
     model: SUPERVISOR_REQUIRED_MODEL,
     offline: false,
     external: true,
     gatewayUsed: false,
-    async evaluate({ state: packet }) {
+    async evaluate({ state: packet, questions }) {
       calls.count += 1;
       calls.packets.push(packet);
+      calls.payloads.push({ state: packet, questions, model: SUPERVISOR_REQUIRED_MODEL });
       if (typeof onEvaluate === "function") {
         const custom = await onEvaluate(packet, calls);
         if (custom !== undefined) return custom;
@@ -474,6 +488,101 @@ function proposalFacts({
   };
 }
 
+/** Tap-level SOL opportunity facts exactly as the engine hands them over. */
+function solOpportunityInput({
+  at = BASE_AT,
+  generation = 1,
+  generationTick = 1,
+  agentId = "A-SOL-1",
+  species = "Momentum",
+  lineageId = "L-SOL-1",
+  researchFamilyId = null,
+  solScore = 0.8,
+  threshold = 0.4,
+  price = 200,
+  mint = SOL_MINT,
+  symbol = "SOL",
+} = {}) {
+  const market = solMarket(at, price, { mint, symbol });
+  const token = solToken(at, price, { mint, symbol });
+  const byMint = new Map([
+    [mint, market],
+    [USDC_MINT, { mint: USDC_MINT, price: 1 }],
+  ]);
+  return {
+    at,
+    generation,
+    generationTick,
+    agentId,
+    species,
+    lineageId,
+    researchFamilyId,
+    market,
+    universeToken: token,
+    byMint,
+    solScore,
+    agentEntryThreshold: threshold,
+  };
+}
+
+/**
+ * A feed where SOL is PRESENT but STALE (it fails the freshness gate inside
+ * `passesGates`, so it is never tradeable and never scored) while another fresh
+ * market keeps the engine trading normally.
+ */
+function createGatedSolFeed() {
+  const feed = {
+    effectiveMode: "synthetic",
+    synthetic: { regime: "RISK-ON" },
+    universe: new Map(),
+    markets(at) {
+      const token = solToken(at, 200);
+      feed.universe = new Map([
+        [SOL_MINT, token],
+        [USDC_MINT, { mint: USDC_MINT, price: 1, observedAt: at, stats5m: {} }],
+      ]);
+      const staleSol = deriveMarket(
+        { ...token, observedAt: at - 30 * 60_000 },
+        { at, staleMs: 1_000, momentumReference: MOMENTUM_REFERENCE.synthetic },
+      );
+      const other = solMarket(at, 6, { mint: UNSOL_MINT, symbol: "OTHER" });
+      return [staleSol, other];
+    },
+    health() {
+      return { allowNewEntries: true, degraded: false, source: "synthetic", label: "SYNTHETIC MARKET \u2022 PAPER MONEY" };
+    },
+  };
+  return feed;
+}
+
+/**
+ * A feed with TWO fresh, tradeable markets: wrapped SOL and another asset. SOL
+ * can be actionable for an agent while the OTHER token is the higher-scoring
+ * market — exactly the case PS.2a exists to observe.
+ */
+function createTwoMarketFeed() {
+  let step = 0;
+  const feed = {
+    effectiveMode: "synthetic",
+    synthetic: { regime: "RISK-ON" },
+    universe: new Map(),
+    markets(at) {
+      step += 1;
+      const solPrice = 200 + (step % 3);
+      const token = solToken(at, solPrice);
+      feed.universe = new Map([
+        [SOL_MINT, token],
+        [USDC_MINT, { mint: USDC_MINT, price: 1, observedAt: at, stats5m: {} }],
+      ]);
+      return [solMarket(at, solPrice), solMarket(at, 6, { mint: UNSOL_MINT, symbol: "OTHER" })];
+    },
+    health() {
+      return { allowNewEntries: true, degraded: false, source: "synthetic", label: "SYNTHETIC MARKET \u2022 PAPER MONEY" };
+    },
+  };
+  return feed;
+}
+
 const ENTRY_EXECUTION = {
   executed: true,
   blocked: false,
@@ -501,13 +610,20 @@ const EXIT_EXECUTION = {
   costBps: 25,
 };
 
-async function settleObserver(observer, { timeoutMs = 8_000, expected = null } = {}) {
+async function settleObserver(observer, { timeoutMs = 8_000, expected = null, expectedSol = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   let stable = 0;
   while (Date.now() < deadline) {
     const snapshot = observer.snapshot();
     const processed = snapshot.counters.proposalsObserved;
-    const done = snapshot.queue.depth === 0 && snapshot.pendingDrafts === 0 && (expected === null || processed >= expected);
+    const solProcessed = snapshot.counters.solOpportunities;
+    const done =
+      snapshot.queue.depth === 0 &&
+      snapshot.pendingDrafts === 0 &&
+      snapshot.solQueue.depth === 0 &&
+      snapshot.pendingSolDrafts === 0 &&
+      (expected === null || processed >= expected) &&
+      (expectedSol === null || solProcessed >= expectedSol);
     if (done) {
       stable += 1;
       if (stable >= 3) return snapshot;
@@ -553,6 +669,7 @@ async function observeOne({
 
 const PAPER_SHADOW_SESSION_ID = "jpaper-20260920T154342Z-4734bb";
 const PRESERVATION_BEFORE = await snapshotPreservationTargets({ sessionId: PAPER_SHADOW_SESSION_ID });
+const SUPERVISOR_SESSIONS_BEFORE = await listSupervisorSessions(SUPERVISOR_ROOT_DIR);
 const TREES_BEFORE = {
   supervisor: await snapshotTree(SUPERVISOR_ROOT_DIR),
   paperShadow: await snapshotTree(PAPER_SHADOW_ROOT_DIR),
@@ -1031,24 +1148,34 @@ await test("STOP/TAKE/TIME capture: lifecycle exits are NOT directionally compar
   assertEqual(result.summary.jevCalls, 3, "a lifecycle exit is still observed, just never agree/disagree");
 });
 
-await test("unsupported market: EVOLVE normal, NO Jev call, explicit unsupported counter", async () => {
+await test("unsupported market: counted + sampled, NO proposal record, NO Jev call, no queue use", async () => {
   const { provider, calls } = fixtureProvider();
   const facts = proposalFacts({ mint: UNSOL_MINT, symbol: "BONK", agentId: "A-PS2-BONK" });
   const result = await observeOne({ sessionId: "jsup-fixture-unsupported", provider, facts });
-  const record = result.proposals.records[0];
-  assertEqual(record.supported, false);
-  assertEqual(record.supportedMarketId, null);
-  assertEqual(record.unsupportedReason, SUPERVISOR_UNSUPPORTED_MARKET_REASON);
-  assertEqual(record.jevEvaluation, "UNSUPPORTED_MARKET");
-  assertEqual(record.providerStatus, null);
-  assertEqual(record.pHigher, null);
-  assertEqual(calls.count, 0, "another asset is NEVER reinterpreted through the SOL question set");
+  assertEqual(result.proposals.records.length, 0, "an unsupported proposal is never written as a full proposal record");
   assertEqual(result.judgments.records.length, 0, "no judgment may exist for an unsupported market");
+  assertEqual(calls.count, 0, "another asset is NEVER reinterpreted through the SOL question set");
+  const snapshot = result.snapshot;
+  assertEqual(snapshot.counters.executedTradeProposals, 1);
+  assertEqual(snapshot.counters.unsupportedProposals, 1);
+  assertEqual(snapshot.counters.unsupportedProposalCount, 1);
+  assertEqual(snapshot.counters.unsupportedRecentSampleCount, 1);
+  assertEqual(snapshot.counters.supportedProposals, 0);
+  assertEqual(snapshot.counters.proposalsObserved, 0, "an unsupported proposal never enters the Jev work queue");
+  assertEqual(snapshot.counters.jevCalls, 0);
+  assertEqual(snapshot.queue.depth, 0);
+  assertEqual(snapshot.queue.dropped, 0, "unsupported traffic can never cause a queue drop");
+  assertEqual(snapshot.counters.jevOk + snapshot.counters.jevFailures, 0);
+  const sample = snapshot.unsupportedRecentSample;
+  assertEqual(sample.length, 1);
+  assertEqual(sample[0].mint, UNSOL_MINT);
+  assertEqual(sample[0].marketId, null, "an arbitrary asset identity is never SOL-USDC");
+  assertEqual(sample[0].supported, false);
+  assertEqual(sample[0].unsupportedReason, SUPERVISOR_UNSUPPORTED_MARKET_REASON);
   assertEqual(result.summary.unsupportedProposals, 1);
-  assertEqual(result.summary.unsupportedProposalCount, 1);
+  assertEqual(result.summary.unsupportedRecentSampleCount, 1);
   assertEqual(result.summary.supportedProposals, 0);
   assertEqual(result.summary.jevCalls, 0);
-  assertEqual(result.snapshot.counters.jevOk + result.snapshot.counters.jevFailures, 0);
 });
 
 await test("real synthetic universe: every proposal unsupported, engine trades normally, zero Jev calls", async () => {
@@ -1093,28 +1220,28 @@ await test("real synthetic universe: every proposal unsupported, engine trades n
   await settleObserver(observer);
   await observer.finalize({ status: "COMPLETE" });
   const observed = observer.snapshot();
-  assert(observed.counters.proposalsObserved > 0, "the passive tap must observe the engine's own proposals");
+  assert(observed.counters.executedTradeProposals > 0, "the passive tap must observe the engine's own proposals");
   assertEqual(observed.counters.supportedProposals, 0);
-  assertEqual(observed.counters.unsupportedProposals, observed.counters.proposalsObserved);
+  assert(observed.counters.unsupportedProposals > 0);
+  assertEqual(observed.counters.unsupportedProposals, observed.counters.executedTradeProposals);
+  assertEqual(observed.counters.proposalsObserved, 0, "unsupported work never enters the Jev queue");
+  assertEqual(observed.queue.depth, 0);
+  assertEqual(observed.queue.dropped, 0, "unsupported traffic must never cause a queue drop");
   assertEqual(observed.counters.jevCalls, 0);
   assertEqual(calls.count, 0);
+  assertEqual(observed.counters.solOpportunities, 0, "no SOL market exists in the synthetic universe");
   assertEqual(observed.counters.agreementCount + observed.counters.disagreementCount, 0);
   assert(snapshot.recentTrades.length > 0, "the paper engine must keep trading normally");
   const proposals = await readSupervisorLines(path.join(SESSION_BASE, "jsup-fixture-synthetic-universe", "proposals.ndjson"));
   const judgments = await readSupervisorLines(path.join(SESSION_BASE, "jsup-fixture-synthetic-universe", "judgments.ndjson"));
+  assertEqual(proposals.records.length, 0, "no full market-state record is written for an unsupported proposal");
   assertEqual(judgments.records.length, 0);
-  const observedRecords = proposals.records.filter((record) => record.recordType === "PROPOSAL");
-  assert(observedRecords.length > 0);
-  for (const record of observedRecords) {
-    assertEqual(record.supported, false);
-    assertEqual(record.jevEvaluation, "UNSUPPORTED_MARKET");
-    assertEqual(record.proposal.market.mint === SOL_MINT, false);
-    assertEqual(record.providerStatus, null);
-  }
-  // If the fixed queue cap was reached, the drops must be explicit records —
-  // never silent loss and never a slowed engine.
-  for (const drop of proposals.records.filter((record) => record.recordType === "PROPOSAL_DROPPED")) {
-    assertEqual(drop.dropReason, "QUEUE_FULL");
+  const sample = observed.unsupportedRecentSample;
+  assert(sample.length > 0);
+  assertEqual(sample.length <= SUPERVISOR_MAX_UNSUPPORTED_SAMPLE, true, "the unsupported sample stays bounded");
+  for (const entry of sample) {
+    assertEqual(entry.marketId, null, "an arbitrary asset is never serialized as SOL-USDC");
+    assertEqual(entry.supported, false);
   }
 });
 
@@ -1307,7 +1434,11 @@ await test("equivalence: observer disabled vs enabled (deterministic fixture obs
   // and the fixed queue cap may drop work — explicitly, and in counted form.
   assertEqual(snapshot.counters.proposalsObserved + snapshot.queue.dropped, seen, "every proposal is observed or explicitly dropped");
   assert(snapshot.counters.jevCalls > 0, "the fixture provider must have been asked");
-  assertEqual(calls.count, snapshot.counters.jevCalls);
+  assertEqual(
+    calls.count,
+    snapshot.counters.jevCalls + snapshot.counters.jevCallsForSolStates,
+    "total provider calls = executed-trade calls + SOL-state calls",
+  );
   const droppedRecords = snapshot.droppedRecords ?? [];
   for (const drop of droppedRecords) assertEqual(drop.dropReason, "QUEUE_FULL");
   assert(snapshot.counters.supportedProposals > 0, "the SOL fixture proposals must be supported");
@@ -1464,7 +1595,11 @@ await test("equivalence: an interleaved run processes every proposal and still c
   const snapshot = observer.snapshot();
   assertEqual(snapshot.counters.proposalsObserved, seen, "an interleaved engine lets the observer keep up");
   assertEqual(snapshot.queue.dropped, 0, "no drop is needed when the engine yields between ticks");
-  assertEqual(calls.count, snapshot.counters.jevCalls);
+  assertEqual(
+    calls.count,
+    snapshot.counters.jevCalls + snapshot.counters.jevCallsForSolStates,
+    "total provider calls = executed-trade calls + SOL-state calls",
+  );
   assert(snapshot.counters.jevOk > 0);
   // With nothing dropped, the linkage is exact: every executed paper trade has
   // a retained, executed exit proposal with the SAME agent and the SAME
@@ -1495,6 +1630,578 @@ await test("equivalence: an interleaved run processes every proposal and still c
   );
 });
 
+/* ============================================================================
+ * 5b. Phase 5I-PS.2a — SOL opportunity capture, dedup and unsupported bypass
+ * ==========================================================================*/
+
+async function runSolFixture({
+  sessionId,
+  provider,
+  seedLabel = "ps2a-sol",
+  populationSize = 24,
+  generationTicks = 20,
+  ticks = 60,
+  yieldsPerTick = 6,
+  feed = null,
+} = {}) {
+  const observer = observerFor({ sessionId, provider });
+  observer.start();
+  const run = await runFixtureSimulation({ observer, seedLabel, populationSize, generationTicks, ticks, yieldsPerTick, feed });
+  const seen = observer.snapshot().counters.proposalsSeenByTap;
+  const expectedSol = observer.snapshot().counters.solOpportunityProposals;
+  await settleObserver(observer, { expected: seen, expectedSol, timeoutMs: 20_000 });
+  await observer.finalize({ status: "COMPLETE" });
+  const root = path.join(SESSION_BASE, sessionId);
+  return {
+    observer,
+    run,
+    snapshot: observer.snapshot(),
+    summary: observer.summary(),
+    opportunities: (await readSupervisorSolOpportunities(root)).records,
+    solJudgments: (await readSupervisorSolJudgments(root)).records,
+    proposals: (await readSupervisorLines(path.join(root, "proposals.ndjson"))).records,
+  };
+}
+
+await test("frozen PS.2a definition: evidence class, dedup rule and semantics", () => {
+  assertEqual(SUPERVISOR_PHASE_EXTENSION, "5I-PS.2a");
+  assertEqual(SUPERVISOR_SOL_OPPORTUNITY_EVIDENCE_TYPE, "EVOLVE_SOL_OPPORTUNITY");
+  assertEqual(SUPERVISOR_EVIDENCE_TYPES.EXECUTED_TRADE, "EXECUTED_TRADE");
+  assertEqual(SUPERVISOR_EVIDENCE_TYPES.EVOLVE_SOL_OPPORTUNITY, "EVOLVE_SOL_OPPORTUNITY");
+  assert(SUPERVISOR_SOL_QUEUE_CAPACITY > 0);
+  assert(SUPERVISOR_MAX_UNSUPPORTED_SAMPLE > 0);
+  assertEqual(SUPERVISOR_ROW_KINDS.SOL_OPPORTUNITY, "SOL OPPORTUNITY");
+  assertEqual(SUPERVISOR_ROW_KINDS.EXECUTED_ENTRY, "EXECUTED ENTRY");
+  assertEqual(SUPERVISOR_ROW_KINDS.EXECUTED_EXIT, "EXECUTED EXIT");
+  assertEqual(SUPERVISOR_ROW_KINDS.NOT_COMPARABLE, "NOT COMPARABLE");
+  assertIncludes(SUPERVISOR_SOL_DEDUP_RULE, "at most one EVOLVE_SOL_OPPORTUNITY per agent per generation");
+  assertIncludes(SUPERVISOR_SOL_DEDUP_RULE, "first actionable SOL observation kept");
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.isExecutedTrade, false);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.evolveDirectionalIntent, "HIGHER");
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.directionalComparable, true);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.newTradingThresholdIntroduced, false);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.agentEntryThresholdIsTheExistingGenomeThreshold, true);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.recordInfluencesMarketSelection, false);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.agentAnchoringSentToJev, false);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.dedupDependsOnJevOutputOrFuturePrice, false);
+  assertEqual(SUPERVISOR_SOL_TAP_DEFINITION.confidenceThresholdApplied, false);
+});
+
+await test("market identity: SOL-USDC only for the wrapped-SOL mint; arbitrary assets stay null", () => {
+  assertEqual(marketIdForMint(SOL_MINT), "SOL-USDC");
+  assertEqual(marketIdForMint(UNSOL_MINT), null);
+  assertEqual(marketIdForMint(null), null);
+  // REMARC/Stamp-style unsupported proposals: a real non-SOL mint can NEVER be
+  // serialized with the canonical SOL market id.
+  const remarcMint = "REMARCFixtureMint11111111111111111111111111111";
+  const stampMint = "StampFixtureMint111111111111111111111111111111";
+  for (const [mint, symbol] of [[remarcMint, "REMARC"], [stampMint, "STAMP"]]) {
+    const facts = buildProposalFacts(
+      {
+        action: "ENTER_LONG",
+        reason: "ENTRY_SIGNAL",
+        at: BASE_AT,
+        agentId: `A-${symbol}`,
+        market: solMarket(BASE_AT, 200, { mint, symbol }),
+        byMint: new Map(),
+      },
+      { proposalId: `jsup-frozen-${symbol}`, sessionId: "jsup-frozen" },
+    );
+    assertEqual(facts.market.mint, mint);
+    assertEqual(facts.market.marketId, null, `an unsupported ${symbol} proposal may never serialize as SOL-USDC`);
+  }
+  const solFacts = buildProposalFacts(
+    { action: "ENTER_LONG", reason: "ENTRY_SIGNAL", at: BASE_AT, agentId: "A-SOL", market: solMarket(BASE_AT, 200), byMint: new Map() },
+    { proposalId: "jsup-frozen-sol", sessionId: "jsup-frozen" },
+  );
+  assertEqual(solFacts.market.marketId, "SOL-USDC", "the wrapped-SOL proposal keeps the canonical identity");
+});
+
+await test("SOL tap point: strictly after passesGates + scoring, threshold-exact, comparison untouched", () => {
+  const src = SIMULATION_SOURCE;
+  const stepIdx = src.indexOf("function stepAgent");
+  const gateIdx = src.indexOf("if (!passesGates(agent.genome, market, ctx)) continue;", stepIdx);
+  const scoreIdx = src.indexOf("const score = scoreMarket(agent.genome, market);", gateIdx);
+  const tapIdx = src.indexOf("solOpportunityHandle = freezeSolOpportunityForObserver(", scoreIdx);
+  const compareIdx = src.indexOf("if (score > bestScore) {", tapIdx);
+  assert(stepIdx > 0 && gateIdx > stepIdx && scoreIdx > gateIdx && tapIdx > scoreIdx, "the tap must sit after gates and scoring");
+  assert(compareIdx > tapIdx, "the tap must not disturb the best/bestScore comparison");
+  assertIncludes(src, "market.mint === solOpportunityMint &&");
+  assertIncludes(src, "score >= agent.genome.entryScoreThreshold");
+  assertIncludes(src, "let solOpportunityHandle = null;");
+  assertIncludes(src, "bestScore = score;");
+  assertIncludes(src, "best = market;");
+  assertIncludes(src, "const solOpportunityMint =");
+});
+
+await test("SOL opportunity dedup: one per agent per generation, first kept, reset next generation", async () => {
+  const { provider } = fixtureProvider({ probability: 0.62 });
+  const sessionId = "jsup-fixture-sol-dedup";
+  const observer = observerFor({ sessionId, provider });
+  observer.start();
+  const first = observer.observeSolOpportunity(solOpportunityInput({ generation: 1, agentId: "A-DEDUP", solScore: 0.9 }));
+  observer.recordSolSelection(first, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.9 });
+  const repeated = observer.observeSolOpportunity(solOpportunityInput({ at: BASE_AT + 1_000, generation: 1, agentId: "A-DEDUP", solScore: 0.7 }));
+  assertEqual(repeated, null, "a repeated actionable SOL observation for the same agent/generation is suppressed");
+  const nextGen = observer.observeSolOpportunity(solOpportunityInput({ at: BASE_AT + 2_000, generation: 2, agentId: "A-DEDUP", solScore: 0.8 }));
+  assert(nextGen !== null, "the next generation is eligible again");
+  observer.recordSolSelection(nextGen, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  const live = observer.snapshot();
+  assertEqual(live.counters.solOpportunityObservations, 3);
+  assertEqual(live.counters.solOpportunityProposals, 2);
+  assertEqual(live.counters.opportunitiesSuppressedByAgentGenerationDedup, 1);
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize({ status: "COMPLETE" });
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assertEqual(records.length, 2);
+  assertEqual(records[0].solScore, 0.9, "the FIRST actionable observation is the one kept");
+  assertEqual(records[0].generation, 1);
+  assertEqual(records[1].generation, 2);
+  assertEqual(solOpportunityDedupKey({ agentId: "A-DEDUP", generation: 1 }), "A-DEDUP::1");
+});
+
+await test("SOL judgment dedup: two agents on the same frozen state share ONE Jev judgment", async () => {
+  const { provider, calls } = fixtureProvider({ probability: 0.62 });
+  const sessionId = "jsup-fixture-sol-shared";
+  const observer = observerFor({ sessionId, provider });
+  observer.start();
+  const a = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-SHARE-1" }));
+  observer.recordSolSelection(a, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  const b = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-SHARE-2" }));
+  observer.recordSolSelection(b, { actualSelectedMint: UNSOL_MINT, actualSelectedSymbol: "BONK", actualSelectedScore: 0.95 });
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize({ status: "COMPLETE" });
+  const snapshot = observer.snapshot();
+  assertEqual(snapshot.counters.solOpportunities, 2);
+  assertEqual(snapshot.counters.uniqueSolMarketStates, 1);
+  assertEqual(snapshot.counters.jevCallsForSolStates, 1);
+  assertEqual(calls.count, 1, "one Jev call for the one frozen SOL state");
+  assertEqual(snapshot.counters.reusedJevJudgments, 1);
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assertEqual(records.length, 2, "call dedup never merges or discards an opportunity record");
+  assertEqual(records[0].stateDigest, records[1].stateDigest);
+  assertEqual(records[0].jevInputDigest, records[1].jevInputDigest);
+  assertEqual(records[0].jevInputDigest, digestOf(calls.payloads[0]));
+  assertEqual(records[0].jevJudgmentId, records[1].jevJudgmentId);
+  assertEqual(records[0].judgmentReused, false);
+  assertEqual(records[1].judgmentReused, true);
+  assertEqual(records[1].judgmentReuseCount, 1);
+  assertEqual(records[0].marketObservationId, records[1].marketObservationId);
+  assertEqual(records[0].agreement, "AGREE");
+  assertEqual(records[1].agreement, "AGREE");
+  assertEqual(records[0].solWasActuallySelected, true);
+  assertEqual(records[1].solWasActuallySelected, false, "BONK was selected, but SOL was still actionable");
+  assertEqual(records[1].actualSelectedMint, UNSOL_MINT);
+  const judgments = await readSupervisorSolJudgments(path.join(SESSION_BASE, sessionId));
+  assertEqual(judgments.records.length, 1);
+  assertEqual(judgments.records[0].recordType, "SOL_JUDGMENT");
+  assertEqual(judgments.records[0].evidenceType, "EVOLVE_SOL_OPPORTUNITY");
+  assertEqual(judgments.records[0].gatewayUsed, false);
+  assertEqual(judgments.records[0].cacheEnabled, false);
+});
+
+// Seed history through the real synchronous tap; never inject worker state.
+function captureHistory(observer, { at = BASE_AT - 1_000, price = 190 } = {}) {
+  const handle = observer.freezeProposal(proposalFacts({ at, price }));
+  observer.recordExecution(handle, ENTRY_EXECUTION);
+}
+
+async function frozenSolScenario({ label, afterCapture = false, delayMs = 0 } = {}) {
+  const sessionId = "jsup-fixture-frozen-input";
+  const baseRoot = path.join(SESSION_BASE, label);
+  const { provider, calls } = fixtureProvider();
+  let clock = BASE_AT;
+  const observer = observerFor({ sessionId, baseRoot, provider, now: () => clock });
+  captureHistory(observer);
+  const input = solOpportunityInput();
+  const handle = observer.observeSolOpportunity(input);
+  if (afterCapture) {
+    captureHistory(observer, { at: BASE_AT - 500, price: 80 });
+    input.market.price = 999;
+    input.universeToken.stats5m.priceChange = 999;
+    input.byMint.get(USDC_MINT).price = 99;
+  }
+  clock += delayMs;
+  observer.recordSolSelection(handle, { actualSelectedMint: SOL_MINT });
+  observer.start();
+  await settleObserver(observer, { expected: afterCapture ? 2 : 1, expectedSol: 1 });
+  await observer.finalize();
+  const record = (await readSupervisorSolOpportunities(path.join(baseRoot, sessionId))).records[0];
+  const payload = calls.payloads.find((entry) => entry.state.observationId === null);
+  assert(payload !== undefined, "the SOL payload must reach the fixture");
+  assertEqual(record.jevInputDigest, digestOf(payload), "identity hashes the exact supplied payload");
+  return { record, payload };
+}
+
+await test("SOL complete-input reuse: two agents, same nonempty frozen history", async () => {
+  const sessionId = "jsup-fixture-sol-history-shared";
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId, provider });
+  captureHistory(observer);
+  for (const agentId of ["A-HISTORY-1", "A-HISTORY-2"]) {
+    const handle = observer.observeSolOpportunity(solOpportunityInput({ agentId }));
+    observer.recordSolSelection(handle, { actualSelectedMint: SOL_MINT });
+  }
+  observer.start();
+  await settleObserver(observer, { expected: 1, expectedSol: 2 });
+  await observer.finalize();
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  const payloads = calls.payloads.filter((entry) => entry.state.observationId === null);
+  assertEqual(records.length, 2);
+  assertEqual(payloads.length, 1);
+  assertEqual(payloads[0].state.recentObservationHistory.length, 1);
+  assertEqual(records[0].jevInputDigest, records[1].jevInputDigest);
+  assertEqual(records[0].jevJudgmentId, records[1].jevJudgmentId);
+  assertEqual(records[1].judgmentReuseCount, 1);
+  assertEqual(observer.snapshot().counters.reusedJevJudgments, 1);
+});
+
+await test("SOL complete-input non-reuse: same current state, different captured history", async () => {
+  const sessionId = "jsup-fixture-sol-history-diff";
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId, provider });
+  captureHistory(observer);
+  const first = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-HIST-1" }));
+  observer.recordSolSelection(first, { actualSelectedMint: SOL_MINT });
+  captureHistory(observer, { at: BASE_AT - 500, price: 80 });
+  const second = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-HIST-2" }));
+  observer.recordSolSelection(second, { actualSelectedMint: SOL_MINT });
+  observer.start();
+  await settleObserver(observer, { expected: 2, expectedSol: 2 });
+  await observer.finalize();
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  const payloads = calls.payloads.filter((entry) => entry.state.observationId === null);
+  assertEqual(records.length, 2);
+  assertEqual(payloads.length, 2);
+  assertEqual(records[0].stateDigest, records[1].stateDigest);
+  assert(records[0].preOutcomeInputDigest !== records[1].preOutcomeInputDigest);
+  assert(records[0].jevInputDigest !== records[1].jevInputDigest);
+  assert(records[0].jevJudgmentId !== records[1].jevJudgmentId);
+  assertEqual(payloads[0].state.recentObservationHistory.length, 1);
+  assertEqual(payloads[1].state.recentObservationHistory.length, 2);
+  assertEqual(observer.snapshot().counters.reusedJevJudgments, 0);
+});
+
+await test("SOL identity excludes agent score, threshold, species and selected token", async () => {
+  const sessionId = "jsup-fixture-sol-metadata";
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId, provider });
+  for (const [index, agentId] of ["A-META-1", "A-META-2"].entries()) {
+    const handle = observer.observeSolOpportunity(solOpportunityInput({
+      agentId, solScore: index ? 0.99 : 0.6, threshold: index ? 0.7 : 0.4,
+      species: index ? "OtherSpecies" : "Momentum", generationTick: index + 1,
+    }));
+    observer.recordSolSelection(handle, { actualSelectedMint: index ? UNSOL_MINT : SOL_MINT });
+  }
+  observer.start();
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize();
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assertEqual(records.length, 2);
+  assertEqual(calls.count, 1);
+  assertEqual(records[0].jevInputDigest, records[1].jevInputDigest);
+  assertEqual(records[0].jevJudgmentId, records[1].jevJudgmentId);
+  assert(records[0].scoreMargin !== records[1].scoreMargin);
+  for (const forbidden of ["agentId", "species", "solScore", "agentEntryThreshold", "scoreMargin", "actualSelected", "evolveDirectionalIntent"]) {
+    assertExcludes(JSON.stringify(calls.payloads), forbidden);
+  }
+});
+
+await test("SOL capture freezes history and caller-owned state before asynchronous processing", async () => {
+  const baseline = await frozenSolScenario({ label: "freeze-baseline" });
+  const changed = await frozenSolScenario({ label: "freeze-mutated", afterCapture: true });
+  assertEqual(JSON.stringify(changed.payload), JSON.stringify(baseline.payload));
+  assertEqual(changed.record.jevInputDigest, baseline.record.jevInputDigest);
+  assertEqual(changed.record.packetDigest, baseline.record.packetDigest);
+  assertEqual(Object.isFrozen(changed.payload.state.recentObservationHistory[0]), true);
+});
+
+await test("SOL queue delay cannot alter packet bytes or complete-input digest", async () => {
+  const immediate = await frozenSolScenario({ label: "queue-immediate" });
+  const delayed = await frozenSolScenario({ label: "queue-delayed", delayMs: 86_400_000 });
+  assertEqual(JSON.stringify(delayed.payload), JSON.stringify(immediate.payload));
+  assertEqual(delayed.record.jevInputDigest, immediate.record.jevInputDigest);
+  assertEqual(delayed.record.packetDigest, immediate.record.packetDigest);
+});
+
+await test("SOL identity includes frozen regime inputs even when current SOL state matches", async () => {
+  const sessionId = "jsup-fixture-sol-regime-input";
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId, provider });
+  for (const [index, agentId] of ["A-REGIME-1", "A-REGIME-2"].entries()) {
+    const input = solOpportunityInput({ agentId });
+    input.byMint.set(UNSOL_MINT, solMarket(BASE_AT, index ? 80 : 20, { mint: UNSOL_MINT, symbol: "OTHER" }));
+    const handle = observer.observeSolOpportunity(input);
+    observer.recordSolSelection(handle, { actualSelectedMint: SOL_MINT });
+  }
+  observer.start();
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize();
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assertEqual(records.length, 2);
+  assertEqual(records[0].stateDigest, records[1].stateDigest);
+  assert(records[0].preOutcomeInputDigest !== records[1].preOutcomeInputDigest);
+  assert(records[0].jevInputDigest !== records[1].jevInputDigest);
+  assertEqual(calls.count, 2);
+  assertEqual(observer.snapshot().counters.reusedJevJudgments, 0);
+});
+
+await test("SOL question payload is copied and frozen before caller mutation", async () => {
+  const { buildDirectionQuestions } = await import("./jev/direction/questions.mjs");
+  const questions = buildDirectionQuestions();
+  const before = JSON.stringify(questions);
+  const { provider, calls } = fixtureProvider();
+  const sessionId = "jsup-fixture-sol-frozen-questions";
+  const observer = observerFor({ sessionId, provider, questions });
+  const first = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-Q-1" }));
+  observer.recordSolSelection(first, { actualSelectedMint: SOL_MINT });
+  questions[DIRECTION_QUESTION_NAME] = { type: "noul", question: "mutated question" };
+  const second = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-Q-2" }));
+  observer.recordSolSelection(second, { actualSelectedMint: SOL_MINT });
+  observer.start();
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize();
+  assertEqual(calls.count, 1);
+  assertEqual(JSON.stringify(calls.payloads[0].questions), before);
+  assertEqual(Object.isFrozen(calls.payloads[0].questions), true);
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assertEqual(records[0].jevInputDigest, digestOf(calls.payloads[0]));
+  assertEqual(records[1].jevInputDigest, records[0].jevInputDigest);
+});
+
+await test("SOL judgment dedup: a changed SOL state produces a separate Jev judgment", async () => {
+  const { provider, calls } = fixtureProvider({ probability: 0.62 });
+  const sessionId = "jsup-fixture-sol-statechange";
+  const observer = observerFor({ sessionId, provider });
+  observer.start();
+  const a = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-STATE-1", price: 200 }));
+  observer.recordSolSelection(a, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  const b = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-STATE-2", price: 260 }));
+  observer.recordSolSelection(b, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize({ status: "COMPLETE" });
+  const snapshot = observer.snapshot();
+  assertEqual(snapshot.counters.uniqueSolMarketStates, 2);
+  assertEqual(snapshot.counters.jevCallsForSolStates, 2);
+  assertEqual(snapshot.counters.reusedJevJudgments, 0);
+  assertEqual(calls.count, 2);
+  const records = (await readSupervisorSolOpportunities(path.join(SESSION_BASE, sessionId))).records;
+  assert(records[0].stateDigest !== records[1].stateDigest, "a changed SOL state changes the digest");
+  assert(records[0].jevJudgmentId !== records[1].jevJudgmentId, "a changed SOL state triggers a separate judgment");
+});
+
+await test("SOL dedup is decided by agent/generation only, never by the Jev answer", async () => {
+  const { provider } = fixtureProvider({ behavior: "fail" });
+  const observer = observerFor({ sessionId: "jsup-fixture-sol-dedup-fail", provider });
+  observer.start();
+  const a = observer.observeSolOpportunity(solOpportunityInput({ agentId: "A-NOJEV" }));
+  observer.recordSolSelection(a, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  const b = observer.observeSolOpportunity(solOpportunityInput({ at: BASE_AT + 5_000, generation: 2, agentId: "A-NOJEV" }));
+  assert(b !== null, "eligibility is decided by agent/generation, never by the failing Jev result");
+  observer.recordSolSelection(b, { actualSelectedMint: SOL_MINT, actualSelectedSymbol: "SOL", actualSelectedScore: 0.8 });
+  await settleObserver(observer, { expectedSol: 2 });
+  await observer.finalize({ status: "COMPLETE" });
+  assertEqual(observer.snapshot().counters.solOpportunityProposals, 2);
+});
+
+await test("SOL opportunity captured: exact fields, one per agent/generation, threshold-exact", async () => {
+  const { provider } = fixtureProvider({ probability: 0.62 });
+  const result = await runSolFixture({ sessionId: "jsup-fixture-sol-captured", provider, seedLabel: "ps2a-captured" });
+  const records = result.opportunities;
+  assert(records.length > 0, "the SOL fixture must produce at least one actionable SOL opportunity");
+  assertEqual(result.snapshot.counters.solOpportunities, records.length);
+  assertEqual(result.snapshot.counters.solOpportunityProposals, records.length);
+  const seenKeys = new Set();
+  for (const record of records) {
+    assertEqual(record.recordType, "SOL_OPPORTUNITY");
+    assertEqual(record.evidenceType, "EVOLVE_SOL_OPPORTUNITY");
+    assertEqual(record.isExecutedTrade, false);
+    assertEqual(record.phase, "5I-PS.2");
+    assertEqual(record.phaseExtension, "5I-PS.2a");
+    assertEqual(record.solMint, SOL_MINT);
+    assertEqual(record.passesGates, true);
+    assertEqual(record.actionable, true);
+    assertEqual(record.evolveDirectionalIntent, "HIGHER");
+    assertEqual(record.directionalComparable, true);
+    assert(record.solScore >= record.agentEntryThreshold, "below-threshold SOL is never captured");
+    assertClose(record.scoreMargin, record.solScore - record.agentEntryThreshold, 1e-9);
+    assertEqual(typeof record.timestamp, "string");
+    assert(Number.isFinite(record.generation));
+    const key = `${record.agentId}::${record.generation}`;
+    assertEqual(seenKeys.has(key), false, "at most one opportunity per agent per generation");
+    seenKeys.add(key);
+    assertEqual(typeof record.stateDigest, "string");
+    assertEqual(typeof record.packetDigest, "string");
+    assertEqual(typeof record.jevJudgmentId, "string");
+    assertEqual(typeof record.marketObservationId, "string");
+    assertEqual(Object.hasOwn(record, "actualSelectedMint"), true);
+    assertEqual(Object.hasOwn(record, "actualSelectedSymbol"), true);
+    assertEqual(Object.hasOwn(record, "actualSelectedScore"), true);
+    assertEqual(Object.hasOwn(record, "solWasActuallySelected"), true);
+    assertEqual(record.canonicalEvidence, false);
+    assertEqual(record.profitabilityInferencePermitted, false);
+  }
+  assertEqual(
+    result.snapshot.counters.solActuallySelected + result.snapshot.counters.solNotSelected,
+    records.length,
+  );
+  const generations = new Set(records.map((record) => record.generation));
+  assert(generations.size >= 2, "eligibility spans generations, and is restored on generation change");
+  assert(
+    result.snapshot.counters.opportunitiesSuppressedByAgentGenerationDedup > 0,
+    "the agent/generation dedup rule must actually suppress repeats",
+  );
+});
+
+await test("SOL gated out: a stale/gated SOL market is never captured while EVOLVE keeps trading", async () => {
+  const { provider } = fixtureProvider({ probability: 0.62 });
+  const observer = observerFor({ sessionId: "jsup-fixture-sol-gated", provider });
+  observer.start();
+  const run = await runFixtureSimulation({
+    observer,
+    feed: createGatedSolFeed(),
+    seedLabel: "ps2a-gated",
+    generationTicks: 20,
+    ticks: 60,
+    yieldsPerTick: 6,
+  });
+  const seen = observer.snapshot().counters.proposalsSeenByTap;
+  await settleObserver(observer, { expected: seen, expectedSol: 0, timeoutMs: 15_000 });
+  await observer.finalize({ status: "COMPLETE" });
+  const snapshot = observer.snapshot();
+  assertEqual(snapshot.counters.solOpportunityObservations, 0, "SOL that fails the gates is never captured");
+  assertEqual(snapshot.counters.solOpportunities, 0);
+  assertEqual(snapshot.counters.jevCallsForSolStates, 0);
+  assert(run.snapshot.recentTrades.length > 0, "EVOLVE keeps trading the other fresh market");
+  assert(
+    run.snapshot.recentTrades.every((trade) => trade.mint !== SOL_MINT),
+    "SOL is never traded while it fails the gates",
+  );
+});
+
+await test("anti-anchoring: the Jev packet carries SOL market state only, no agent/proposal facts", async () => {
+  const { provider, calls } = fixtureProvider({ probability: 0.62 });
+  const result = await runSolFixture({ sessionId: "jsup-fixture-sol-noleak", provider, seedLabel: "ps2a-noleak" });
+  assert(result.opportunities.length > 0);
+  assert(calls.packets.length > 0);
+  const agentIds = new Set(result.opportunities.map((record) => record.agentId));
+  for (const packet of calls.packets) {
+    const serialized = JSON.stringify(packet);
+    for (const leaked of [
+      "agentId",
+      "species",
+      "solScore",
+      "agentEntryThreshold",
+      "scoreMargin",
+      "actionable",
+      "actualSelected",
+      "solWasActuallySelected",
+      "evolveDirectionalIntent",
+      "passesGates",
+      "opportunityId",
+      "EVOLVE_SOL_OPPORTUNITY",
+      "SOL_OPPORTUNITY",
+    ]) {
+      assertExcludes(serialized, leaked, `the packet must not carry '${leaked}'`);
+    }
+    for (const agentId of agentIds) {
+      assertExcludes(serialized, agentId, "the packet must not name the agent");
+    }
+  }
+});
+
+await test("unsupported load: thousands bypass the Jev queue with zero calls and zero drops", async () => {
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({
+    sessionId: "jsup-fixture-unsupported-load",
+    provider,
+    sleep: (ms) => (ms > 30 ? Promise.resolve() : new Promise(() => {})),
+    finalizeTimeoutMs: 50,
+  });
+  observer.start();
+  const total = 5_000;
+  for (let index = 0; index < total; index += 1) {
+    const handle = observer.freezeProposal({
+      action: "ENTER_LONG",
+      reason: "ENTRY_SIGNAL",
+      at: BASE_AT + index,
+      generation: 1,
+      agentId: `A-UNS-${index}`,
+      market: { mint: UNSOL_MINT, symbol: "BONK" },
+    });
+    observer.recordExecution(handle, ENTRY_EXECUTION);
+  }
+  const snapshot = observer.snapshot();
+  assertEqual(snapshot.counters.executedTradeProposals, total, "the exact unsupported count is retained");
+  assertEqual(snapshot.counters.unsupportedProposals, total);
+  assertEqual(snapshot.counters.unsupportedRecentSampleCount, total);
+  assertEqual(snapshot.unsupportedRecentSample.length, SUPERVISOR_MAX_UNSUPPORTED_SAMPLE, "only a bounded recent sample is retained");
+  assertEqual(snapshot.counters.proposalsObserved, 0);
+  assertEqual(snapshot.counters.jevCalls, 0);
+  assertEqual(calls.count, 0, "unsupported traffic makes no Jev call");
+  assertEqual(snapshot.queue.depth, 0, "unsupported traffic does not consume the Jev queue");
+  assertEqual(snapshot.queue.highWatermark, 0);
+  assertEqual(snapshot.queue.dropped, 0, "unsupported traffic cannot create a queue drop");
+  assertEqual(snapshot.counters.queueDropped, 0);
+  await observer.finalize({ status: "COMPLETE" });
+  const lines = await readSupervisorLines(path.join(SESSION_BASE, "jsup-fixture-unsupported-load", "proposals.ndjson"));
+  assertEqual(lines.missing === true || lines.records.length === 0, true, "no full record is written for unsupported traffic");
+});
+
+await test("observability: summary timestamps reflect final observer state", async () => {
+  const { provider } = fixtureProvider({ probability: 0.62 });
+  const result = await observeOne({ sessionId: "jsup-fixture-summary-times", provider });
+  const proposalAt = result.proposals.records[0].proposal.timestamp;
+  const judgmentAt = result.judgments.records[0].observerCompletedAt;
+  assertEqual(result.summary.lastProposalAt, proposalAt, "the finalized summary must reflect the last proposal");
+  assertEqual(result.summary.lastJudgmentAt, judgmentAt, "the finalized summary must reflect the last judgment");
+  assertEqual(result.state.lastProposalAt, result.summary.lastProposalAt);
+  assertEqual(result.state.lastJudgmentAt, result.summary.lastJudgmentAt);
+});
+
+await test("equivalence: enabling SOL opportunity capture never changes EVOLVE selection", async () => {
+  const { provider } = fixtureProvider({ probability: 0.62 });
+  const observer = observerFor({ sessionId: "jsup-fixture-sol-equivalence", provider });
+  observer.start();
+  const enabled = await runFixtureSimulation({ observer, feed: createTwoMarketFeed(), seedLabel: "ps2a-eq", generationTicks: 20, ticks: 60, yieldsPerTick: 6 });
+  const baseline = await runFixtureSimulation({ observer: null, feed: createTwoMarketFeed(), seedLabel: "ps2a-eq", generationTicks: 20, ticks: 60 });
+  assertEngineIdentical(baseline, enabled, "SOL opportunity capture enabled");
+  assertEqual(
+    JSON.stringify(enabled.snapshot.recentTrades),
+    JSON.stringify(baseline.snapshot.recentTrades),
+    "the selected markets and fills are byte-identical",
+  );
+  const seen = observer.snapshot().counters.proposalsSeenByTap;
+  const expectedSol = observer.snapshot().counters.solOpportunityProposals;
+  await settleObserver(observer, { expected: seen, expectedSol, timeoutMs: 15_000 });
+  await observer.finalize({ status: "COMPLETE" });
+  const snapshot = observer.snapshot();
+  assert(snapshot.counters.solOpportunities > 0, "the two-market fixture must capture SOL opportunities");
+  assertEqual(
+    snapshot.counters.solActuallySelected + snapshot.counters.solNotSelected,
+    snapshot.counters.solOpportunities,
+    "every opportunity truthfully records whether SOL was selected",
+  );
+});
+
+await test("equivalence: a throwing SOL opportunity observer changes nothing", async () => {
+  const throwing = {
+    freezeProposal() {
+      return { proposalId: "sol-throwing-handle" };
+    },
+    recordExecution() {},
+    solMint: SOL_MINT,
+    observeSolOpportunity() {
+      throw new Error("observeSolOpportunity boom");
+    },
+    recordSolSelection() {
+      throw new Error("recordSolSelection boom");
+    },
+  };
+  const run = await runFixtureSimulation({ observer: throwing });
+  assertEngineIdentical(BASELINE_RUN, run, "throwing SOL observer");
+});
+
 console.log(`\n  \u2026 dashboard, settings, sanitizer and preservation proofs \u2026\n`);
 
 /* ============================================================================
@@ -1522,7 +2229,8 @@ await observeOne({
   baseRoot: DASHBOARD_BASE,
   provider: fixtureProvider({ probability: 0.5 }).provider,
 });
-assertEqual(DASHBOARD_RESULT.proposals.records.length, 7);
+assertEqual(DASHBOARD_RESULT.proposals.records.length, 6, "the unsupported BONK proposal is counted, not written");
+assertEqual(DASHBOARD_RESULT.summary.unsupportedProposals, 1, "the unsupported BONK proposal is still counted");
 assertEqual(DASHBOARD_RESULT.summary.agreementCount, 2, "both entries AGREE with Jev HIGHER");
 assertEqual(DASHBOARD_RESULT.summary.disagreementCount, 1, "a LOWER exit against Jev HIGHER DISAGREES");
 
@@ -1629,6 +2337,61 @@ await test("dashboard state is compact: no raw market state, packet or credentia
   assertEqual(unit.provider, "typesafe-jev");
   assertIncludes(unit.note, "[redacted]");
   assertExcludes(JSON.stringify(unit), FAKE_SECRET);
+});
+
+const DASHBOARD_SOL_SESSION_ID = "jsup-fixture-dashboard-sol";
+{
+  const observer = observerFor({
+    sessionId: DASHBOARD_SOL_SESSION_ID,
+    baseRoot: DASHBOARD_BASE,
+    provider: fixtureProvider({ probability: 0.62 }).provider,
+  });
+  observer.start();
+  const handle = observer.freezeProposal(proposalFacts({ at: BASE_AT, agentId: "A-DASH-SOL-ENTRY" }));
+  observer.recordExecution(handle, ENTRY_EXECUTION);
+  const solHandle = observer.observeSolOpportunity(
+    solOpportunityInput({ agentId: "A-DASH-SOL-OPP", solScore: 0.9, threshold: 0.4 }),
+  );
+  observer.recordSolSelection(solHandle, {
+    actualSelectedMint: UNSOL_MINT,
+    actualSelectedSymbol: "BONK",
+    actualSelectedScore: 0.95,
+  });
+  await settleObserver(observer, { expected: 1, expectedSol: 1, timeoutMs: 8_000 });
+  await observer.finalize({ status: "COMPLETE" });
+}
+
+await test("dashboard: PS.2a SOL opportunities and unsupported sample are exposed and separated", async () => {
+  const block = await loadJevSupervisorObserverState(DASHBOARD_ROOT, { now: () => BASE_AT });
+  assertEqual(block.available, true);
+  assertEqual(block.sessionId, DASHBOARD_SOL_SESSION_ID, "the newest session wins");
+  assertEqual(block.noAuthorityTag, "NO AUTHORITY \u2022 PAPER ONLY");
+  assertEqual(block.jevHasTradingAuthority, false);
+  assertEqual(block.executedTradeProposals, 1);
+  assertEqual(block.solOpportunities, 1);
+  assertEqual(block.solActuallySelected, 0);
+  assertEqual(block.solNotSelected, 1);
+  assertEqual(block.uniqueSolMarketStates, 1);
+  assertEqual(block.jevCallsForSolStates, 1);
+  assertEqual(block.reusedJevJudgments, 0);
+  assertEqual(block.solAgreementCount, 1);
+  assertEqual(block.unsupportedProposals, 0);
+  assertEqual(block.unsupportedRecentSampleCount, 0);
+  assert(Array.isArray(block.unsupportedRecentSample));
+  assert(Array.isArray(block.recentRows));
+  assert(block.recentRows.some((row) => row.rowKind === "SOL OPPORTUNITY"));
+  assert(block.recentRows.some((row) => row.rowKind === "EXECUTED ENTRY"));
+  const solRow = block.recentRows.find((row) => row.rowKind === "SOL OPPORTUNITY");
+  assertEqual(solRow.executed, false, "a SOL OPPORTUNITY is never presented as an executed trade");
+  assertEqual(solRow.solWasActuallySelected, false);
+  assertEqual(solRow.actualSelectedSymbol, "BONK");
+  assert(Number.isFinite(solRow.solScore));
+  assert(Number.isFinite(solRow.agentEntryThreshold));
+  assert(Number.isFinite(solRow.scoreMargin));
+  assert(Number.isFinite(block.solQueueHighWatermark));
+  assert(Number.isFinite(block.solQueueDropped));
+  assertEqual(block.winner, null);
+  assertEqual(block.supervisorScore, null);
 });
 
 /* ============================================================================
@@ -1941,11 +2704,22 @@ await test("preservation: Paper Shadow, forensics, shadow and arena trees byte-i
   }
 });
 
-await test("preservation: no live supervisor session was written in this workspace", async () => {
+await test("preservation: supervisor tree byte-identical and run-1 session preserved", async () => {
   const after = await snapshotTree(SUPERVISOR_ROOT_DIR);
   const comparison = compareSnapshots(TREES_BEFORE.supervisor, after);
   assertEqual(comparison.identical, true, `the supervisor tree must be untouched: ${JSON.stringify(comparison)}`);
-  assertEqual(after.exists, false, "no live .evolve/jev-supervisor-observer session may exist after validation");
+  const sessionsAfter = await listSupervisorSessions(SUPERVISOR_ROOT_DIR);
+  assertDeepEqual(sessionsAfter, SUPERVISOR_SESSIONS_BEFORE, "validation must not create or remove a supervisor session");
+  // The first live PS.2 session must survive byte-for-byte, including its
+  // original (now-fixed) instrumentation bugs.
+  if (SUPERVISOR_SESSIONS_BEFORE.includes("jsup-20260921T093854Z-16c76b")) {
+    const root = path.join(SUPERVISOR_ROOT_DIR, "jsup-20260921T093854Z-16c76b");
+    const summary = await readSupervisorSummary(root);
+    assertEqual(summary.sessionId, "jsup-20260921T093854Z-16c76b");
+    assertEqual(summary.schemaVersion, 1, "run #1 keeps its original schema version");
+    assertEqual(summary.unsupportedProposals, 42311, "run #1 is preserved, never rewritten");
+    assertEqual(summary.lastProposalAt, null, "run #1's original summary is preserved byte-for-byte");
+  }
 });
 
 /* ============================================================================

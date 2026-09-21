@@ -4,11 +4,16 @@
  * Layout (never anywhere else):
  *
  *   .evolve/jev-supervisor-observer/<session-id>/
- *     session.json
- *     proposals.ndjson    append-only, one immutable proposal per line
- *     judgments.ndjson    append-only, one judgment per evaluated proposal
- *     state.json          compact live state for the dashboard
- *     summary.json        finalized descriptive summary
+ *     session.json           session header + pins + isolation
+ *     proposals.ndjson       append-only, one immutable executed proposal per line
+ *     judgments.ndjson       append-only, one judgment per evaluated proposal
+ *     sol-opportunities.ndjson  append-only, one PS.2a SOL opportunity per line
+ *     sol-judgments.ndjson      append-only, one judgment per distinct complete frozen SOL Jev input
+ *     state.json             compact live state for the dashboard
+ *     summary.json           finalized descriptive summary
+ *
+ * A PS.2a SOL opportunity is NOT an executed trade: it is written to its own
+ * append-only file and never merged into proposals.ndjson.
  *
  * Every write passes the FAIL-CLOSED write-target guard first: the canonical
  * Phase 5I tree, its replication/temporal subtrees, Paper Shadow, the forensic
@@ -27,6 +32,8 @@ import {
   SUPERVISOR_PROPOSALS_FILE,
   SUPERVISOR_ROOT_DIR,
   SUPERVISOR_SESSION_FILE,
+  SUPERVISOR_SOL_JUDGMENTS_FILE,
+  SUPERVISOR_SOL_OPPORTUNITIES_FILE,
   SUPERVISOR_STATE_FILE,
   SUPERVISOR_SUMMARY_FILE,
   assertSupervisorWriteTarget,
@@ -107,6 +114,16 @@ export async function appendSupervisorJudgment(root, record) {
   await appendSupervisorLine(path.join(root, SUPERVISOR_JUDGMENTS_FILE), record);
 }
 
+/** PS.2a: one EVOLVE_SOL_OPPORTUNITY record (NOT a trade). */
+export async function appendSupervisorSolOpportunity(root, record) {
+  await appendSupervisorLine(path.join(root, SUPERVISOR_SOL_OPPORTUNITIES_FILE), record);
+}
+
+/** PS.2a: one judgment for a distinct frozen SOL market state. */
+export async function appendSupervisorSolJudgment(root, record) {
+  await appendSupervisorLine(path.join(root, SUPERVISOR_SOL_JUDGMENTS_FILE), record);
+}
+
 export async function writeSupervisorState(root, state) {
   await writeSupervisorJson(path.join(root, SUPERVISOR_STATE_FILE), state);
 }
@@ -125,6 +142,15 @@ export async function readSupervisorState(root) {
 
 export async function readSupervisorSummary(root) {
   return readSupervisorJson(path.join(root, SUPERVISOR_SUMMARY_FILE));
+}
+
+/** Read an NDJSON file defensively; malformed lines are reported, not thrown. */
+export async function readSupervisorSolOpportunities(root) {
+  return readSupervisorLines(path.join(root, SUPERVISOR_SOL_OPPORTUNITIES_FILE));
+}
+
+export async function readSupervisorSolJudgments(root) {
+  return readSupervisorLines(path.join(root, SUPERVISOR_SOL_JUDGMENTS_FILE));
 }
 
 /** Read an NDJSON file defensively; malformed lines are reported, not thrown. */
@@ -180,6 +206,8 @@ export const SUPERVISOR_WRITE_FILES = Object.freeze([
   SUPERVISOR_SESSION_FILE,
   SUPERVISOR_PROPOSALS_FILE,
   SUPERVISOR_JUDGMENTS_FILE,
+  SUPERVISOR_SOL_OPPORTUNITIES_FILE,
+  SUPERVISOR_SOL_JUDGMENTS_FILE,
   SUPERVISOR_STATE_FILE,
   SUPERVISOR_SUMMARY_FILE,
 ]);

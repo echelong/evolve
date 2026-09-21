@@ -42,6 +42,8 @@ function str(value) {
 
 function compactRow(row) {
   return {
+    rowKind: str(row?.rowKind),
+    evidenceType: str(row?.evidenceType),
     at: str(row?.at),
     agentId: str(row?.agentId),
     species: str(row?.species),
@@ -60,6 +62,18 @@ function compactRow(row) {
     executed: row?.executed === true,
     blocked: row?.blocked === true,
     jevEvaluation: str(row?.jevEvaluation),
+    // PS.2a SOL opportunity fields (null on an executed-trade row).
+    solScore: num(row?.solScore),
+    agentEntryThreshold: num(row?.agentEntryThreshold),
+    scoreMargin: num(row?.scoreMargin),
+    actualSelectedMint: str(row?.actualSelectedMint),
+    actualSelectedSymbol: str(row?.actualSelectedSymbol),
+    actualSelectedScore: num(row?.actualSelectedScore),
+    solWasActuallySelected: row?.solWasActuallySelected === true ? true : row?.solWasActuallySelected === false ? false : null,
+    judgmentReused: row?.judgmentReused === true ? true : row?.judgmentReused === false ? false : null,
+    judgmentReuseCount: num(row?.judgmentReuseCount),
+    jevJudgmentId: str(row?.jevJudgmentId),
+    marketObservationId: str(row?.marketObservationId),
   };
 }
 
@@ -117,8 +131,15 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
 
   const counters = state?.counters ?? {};
   const means = state?.means ?? {};
+  const solMeans = state?.solMeans ?? {};
   const queue = state?.queue ?? {};
+  const solQueue = state?.solQueue ?? {};
   const rows = Array.isArray(state?.recentRows) ? state.recentRows : [];
+  const unsupportedRecentSample = Array.isArray(state?.unsupportedRecentSample)
+    ? state.unsupportedRecentSample
+    : Array.isArray(summary?.unsupportedRecentSample)
+      ? summary.unsupportedRecentSample
+      : [];
   const status = str(state?.status) ?? str(summary?.status);
   const observerFailures = num(counters.observerFailures) ?? num(summary?.observerFailures);
   const queueDropped = num(queue.dropped) ?? num(summary?.queueDropped);
@@ -184,6 +205,46 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
     queueHighWatermark: num(queue.highWatermark) ?? num(summary?.queueHighWatermark),
     queueDropped,
     observerFailures,
+    // ---- PS.2a SOL opportunities (never merged with executed trades) -------
+    executedTradeProposals:
+      num(counters.executedTradeProposals) ?? num(summary?.executedTradeProposals),
+    unsupportedRecentSampleCount:
+      num(counters.unsupportedRecentSampleCount) ?? num(summary?.unsupportedRecentSampleCount),
+    unsupportedRecentSample: unsupportedRecentSample.slice(-16).map((entry) => ({
+      at: str(entry?.at),
+      agentId: str(entry?.agentId),
+      action: str(entry?.action),
+      reason: str(entry?.reason),
+      mint: str(entry?.mint),
+      symbol: str(entry?.symbol),
+      marketId: str(entry?.marketId),
+    })),
+    solOpportunityObservations:
+      num(counters.solOpportunityObservations) ?? num(summary?.solOpportunityObservations),
+    solOpportunityProposals: num(counters.solOpportunityProposals) ?? num(summary?.solOpportunityProposals),
+    solOpportunities: num(counters.solOpportunities) ?? num(summary?.solOpportunities),
+    solActuallySelected: num(counters.solActuallySelected) ?? num(summary?.solActuallySelected),
+    solNotSelected: num(counters.solNotSelected) ?? num(summary?.solNotSelected),
+    solAgreementCount: num(counters.solAgreementCount) ?? num(summary?.solAgreementCount),
+    solDisagreementCount: num(counters.solDisagreementCount) ?? num(summary?.solDisagreementCount),
+    solExactHalfCount: num(counters.solExactHalfCount) ?? num(summary?.solExactHalfCount),
+    opportunitiesSuppressedByAgentGenerationDedup:
+      num(counters.opportunitiesSuppressedByAgentGenerationDedup) ??
+      num(summary?.opportunitiesSuppressedByAgentGenerationDedup),
+    uniqueSolMarketStates: num(counters.uniqueSolMarketStates) ?? num(summary?.uniqueSolMarketStates),
+    jevCallsForSolStates: num(counters.jevCallsForSolStates) ?? num(summary?.jevCallsForSolStates),
+    reusedJevJudgments: num(counters.reusedJevJudgments) ?? num(summary?.reusedJevJudgments),
+    solJevOk: num(counters.solJevOk) ?? num(summary?.solJevOk),
+    solJevFailures: num(counters.solJevFailures) ?? num(summary?.solJevFailures),
+    solQueueCapacity: num(solQueue.capacity),
+    solQueueDepth: num(solQueue.depth),
+    solQueueHighWatermark: num(solQueue.highWatermark) ?? num(summary?.solQueueHighWatermark),
+    solQueueDropped: num(solQueue.dropped) ?? num(summary?.solQueueDropped),
+    solMeanPHigher: num(solMeans.solMeanPHigher) ?? num(summary?.solMeanPHigher),
+    solMeanLatencyMs: num(solMeans.solMeanLatencyMs) ?? num(summary?.solMeanLatencyMs),
+    lastSolOpportunityAt: str(state?.lastSolOpportunityAt),
+    lastSolJudgmentAt: str(state?.lastSolJudgmentAt),
+    solDedupRule: str(state?.solDedupRule) ?? str(summary?.solDedupRule),
     providerStatusCounts:
       state && typeof state.providerStatusCounts === "object" ? { ...state.providerStatusCounts } : null,
     winner: null,

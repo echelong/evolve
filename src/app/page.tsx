@@ -536,6 +536,8 @@ type JevPaperShadowState = {
 // has NO trading, evolution, selection, Arena or deployment authority, and it
 // is deliberately a separate field from `jevShadow` and `jevPaperShadow`.
 type JevSupervisorObserverRow = {
+  rowKind?: string | null;
+  evidenceType?: string | null;
   at: string | null;
   agentId: string | null;
   species: string | null;
@@ -554,6 +556,17 @@ type JevSupervisorObserverRow = {
   executed: boolean;
   blocked: boolean;
   jevEvaluation: string | null;
+  solScore?: number | null;
+  agentEntryThreshold?: number | null;
+  scoreMargin?: number | null;
+  actualSelectedMint?: string | null;
+  actualSelectedSymbol?: string | null;
+  actualSelectedScore?: number | null;
+  solWasActuallySelected?: boolean | null;
+  judgmentReused?: boolean | null;
+  judgmentReuseCount?: number | null;
+  jevJudgmentId?: string | null;
+  marketObservationId?: string | null;
 };
 
 type JevSupervisorObserverState = {
@@ -621,6 +634,42 @@ type JevSupervisorObserverState = {
   queueHighWatermark?: number | null;
   queueDropped?: number | null;
   observerFailures?: number | null;
+  // Phase 5I-PS.2a: SOL opportunities and unsupported-proposal instrumentation.
+  // Never merged with the executed-trade counters above.
+  executedTradeProposals?: number | null;
+  unsupportedRecentSampleCount?: number | null;
+  unsupportedRecentSample?: Array<{
+    at: string | null;
+    agentId: string | null;
+    action: string | null;
+    reason: string | null;
+    mint: string | null;
+    symbol: string | null;
+    marketId: string | null;
+  }> | null;
+  solOpportunityObservations?: number | null;
+  solOpportunityProposals?: number | null;
+  solOpportunities?: number | null;
+  solActuallySelected?: number | null;
+  solNotSelected?: number | null;
+  solAgreementCount?: number | null;
+  solDisagreementCount?: number | null;
+  solExactHalfCount?: number | null;
+  opportunitiesSuppressedByAgentGenerationDedup?: number | null;
+  uniqueSolMarketStates?: number | null;
+  jevCallsForSolStates?: number | null;
+  reusedJevJudgments?: number | null;
+  solJevOk?: number | null;
+  solJevFailures?: number | null;
+  solQueueCapacity?: number | null;
+  solQueueDepth?: number | null;
+  solQueueHighWatermark?: number | null;
+  solQueueDropped?: number | null;
+  solMeanPHigher?: number | null;
+  solMeanLatencyMs?: number | null;
+  lastSolOpportunityAt?: string | null;
+  lastSolJudgmentAt?: string | null;
+  solDedupRule?: string | null;
   providerStatusCounts?: Record<string, number> | null;
   winner: null;
   noAutomatedWinner?: boolean;
@@ -2075,6 +2124,13 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
   const rows = (observer.recentRows ?? []).slice(-24).reverse();
 
   const agreementLabel = (row: JevSupervisorObserverRow): string => {
+    if (row.rowKind === "SOL OPPORTUNITY") {
+      if (row.agreement === "AGREE") return "AGREE";
+      if (row.agreement === "DISAGREE") return "DISAGREE";
+      if (row.providerStatus === "JEV_PIN_MISMATCH") return "PIN MISMATCH";
+      if (row.pHigher == null) return "NO JEV INTENT";
+      return "—";
+    }
     if (row.action === "EXIT_LONG" && row.reason && row.reason !== "SIGNAL") return "NOT COMPARABLE";
     if (row.directionalComparable !== true) return "NOT COMPARABLE";
     if (row.agreement === "AGREE") return "AGREE";
@@ -2082,6 +2138,13 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
     if (row.jevEvaluation === "UNSUPPORTED_MARKET") return "UNSUPPORTED MARKET";
     if (row.jevEvaluation === "MARKET_STATE_UNAVAILABLE") return "NO MARKET STATE";
     return "—";
+  };
+  const rowKindLabel = (row: JevSupervisorObserverRow): string => {
+    if (row.rowKind) return row.rowKind;
+    if (row.action === "EXIT_LONG" && row.reason && row.reason !== "SIGNAL") return "NOT COMPARABLE";
+    if (row.directionalComparable !== true && row.action === "EXIT_LONG") return "NOT COMPARABLE";
+    if (row.action === "EXIT_LONG") return "EXECUTED EXIT";
+    return "EXECUTED ENTRY";
   };
   const agreementTone = (labelText: string): string => {
     if (labelText === "AGREE") return "positive";
@@ -2229,11 +2292,65 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
               </div>
             </div>
 
+            <div className="health-grid">
+              <div className="health-item">
+                <span>SOL opportunities</span>
+                <strong>{observer.solOpportunities ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>SOL selected</span>
+                <strong className="positive">{observer.solActuallySelected ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>SOL not selected</span>
+                <strong>{observer.solNotSelected ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Unique SOL states</span>
+                <strong>{observer.uniqueSolMarketStates ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Jev calls (SOL states)</span>
+                <strong>{observer.jevCallsForSolStates ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Judgments reused</span>
+                <strong>{observer.reusedJevJudgments ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>SOL agree</span>
+                <strong className="positive">{observer.solAgreementCount ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>SOL disagree</span>
+                <strong className="negative">{observer.solDisagreementCount ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Suppressed by agent/gen dedup</span>
+                <strong>{observer.opportunitiesSuppressedByAgentGenerationDedup ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Unsupported proposals</span>
+                <strong>{observer.unsupportedProposals ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Unsupported recent sample</span>
+                <strong>{observer.unsupportedRecentSample?.length ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>SOL queue high water / dropped</span>
+                <strong>
+                  {observer.solQueueHighWatermark ?? 0} / {observer.solQueueDropped ?? 0}
+                </strong>
+              </div>
+            </div>
+
             <div className="table-scroll">
               <table>
                 <thead>
                   <tr>
                     <th>Time</th>
+                    <th>Kind</th>
                     <th>Agent / species</th>
                     <th>Action</th>
                     <th>Reason</th>
@@ -2249,6 +2366,9 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
                   {rows.map((row, index) => (
                     <tr key={`${row.agentId ?? "row"}-${row.at ?? index}-${index}`}>
                       <td>{row.at ? new Date(row.at).toISOString().slice(11, 19) : "—"}</td>
+                      <td className={row.rowKind === "SOL OPPORTUNITY" ? "positive" : ""}>
+                        {rowKindLabel(row)}
+                      </td>
                       <td>
                         {row.agentId ?? "—"}
                         <small> · {row.species ?? "—"}</small>
@@ -2270,9 +2390,12 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
             </div>
 
             <p className="health-note">
-              STOP / TAKE / TIME rows are lifecycle or risk exits, so they are shown as <strong>NOT COMPARABLE</strong> rather
-              than as agreement or disagreement. No winner, no supervisor score, no profitability claim, and no policy
-              recommendation is emitted. Jev has zero authority in EVOLVE.
+              <strong>SOL OPPORTUNITY</strong> rows are <em>not</em> executed trades: they mark an agent that independently
+              considered SOL actionable, whether or not SOL was the token EVOLVE actually selected. They are kept strictly
+              separate from <strong>EXECUTED ENTRY</strong> / <strong>EXECUTED EXIT</strong> rows. STOP / TAKE / TIME rows are
+              lifecycle or risk exits, shown as <strong>NOT COMPARABLE</strong> rather than as agreement or disagreement. No
+              winner, no supervisor score, no profitability claim, and no policy recommendation is emitted. Jev has zero
+              authority in EVOLVE.
             </p>
           </>
         ) : (
