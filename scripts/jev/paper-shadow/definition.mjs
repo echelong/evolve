@@ -28,6 +28,7 @@
 import path from "node:path";
 
 import { digestOf } from "../../lib/hash.mjs";
+import { JEV_PROVIDER_UPSTREAM } from "../config.mjs";
 import {
   BENCHMARK_MARKET,
   MAX_RECEIPT_STATE_AGE_MS,
@@ -223,6 +224,20 @@ export function assertPaperShadowWriteTarget(target, baseRoot) {
     throw new Error(`refusing to write to ${target}: it is outside the paper-shadow base tree ${baseRoot}`);
   }
   return true;
+}
+
+/**
+ * The upstream identity implied by a resolved provider NAME (§15 fix).
+ *
+ * The provider objects expose `name`, `model` and `transport` — but no upstream
+ * field — so a session that read `provider?.upstream` always persisted
+ * `upstream: null` even when its route was the direct TypeSafe one. This resolves
+ * the upstream from the documented provider registry instead, so NEW sessions
+ * persist the real upstream identity. Prior captures are never rewritten.
+ */
+export function paperShadowUpstreamFor(providerName) {
+  if (providerName === null || providerName === undefined || providerName === "") return null;
+  return JEV_PROVIDER_UPSTREAM[String(providerName)] ?? null;
 }
 
 /** The route/model identity recorded on every session, never a secret. */

@@ -67,6 +67,7 @@ import {
   paperShadowCompactStamp,
   paperShadowSessionIdFor,
   paperShadowSessionRootFor,
+  paperShadowUpstreamFor,
 } from "./definition.mjs";
 import {
   PAPER_SHADOW_POLICY_DEFINITION,
@@ -332,7 +333,15 @@ export async function runPaperShadow({
     ...createPaperShadowSession({
       sessionId,
       settings,
-      identity: { provider: provider?.name ?? null, model: provider?.model ?? null, upstream: provider?.upstream ?? null },
+      // §15 fix: the provider object exposes no `upstream` field, so the upstream
+      // identity is resolved from the provider registry (an explicit field is
+      // honoured first if a future provider supplies one). NEW sessions therefore
+      // persist the real upstream identity; already-captured sessions are untouched.
+      identity: {
+        provider: provider?.name ?? null,
+        model: provider?.model ?? null,
+        upstream: provider?.upstream ?? provider?.upstreamProvider ?? paperShadowUpstreamFor(provider?.name ?? null),
+      },
       questionDigest,
       startedAt: startedAtMs,
     }),
