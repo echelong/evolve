@@ -1,0 +1,214 @@
+/**
+ * Phase 5I-PS.2 — JEV SUPERVISOR OBSERVER dashboard state.
+ *
+ * Builds the compact, bounded `jevSupervisorObserver` block consumed by
+ * `/api/state` and the dashboard panel. READ-ONLY: this module never writes
+ * anything, and it only ever reads `.evolve/jev-supervisor-observer/`.
+ *
+ * Only the compact LATEST `state.json` + `summary.json` are read. Raw proposal
+ * records, market-state projections and packet contents are NEVER exposed —
+ * `state.json` does not contain them, and this loader explicitly whitelists
+ * what it forwards.
+ *
+ * It is deliberately a SEPARATE top-level dashboard field: it is never merged
+ * with `jevShadow` (Phase 5D supervisor health) or `jevPaperShadow` (the
+ * isolated 5I-PS paper demo account).
+ *
+ * PAPER ONLY / DEVELOPMENT EVIDENCE ONLY. NO AUTHORITY.
+ */
+
+import path from "node:path";
+
+import {
+  SUPERVISOR_CLASSIFICATION,
+  SUPERVISOR_ISOLATION_STATEMENT,
+  SUPERVISOR_LABEL,
+  SUPERVISOR_NO_AUTHORITY_TAG,
+  SUPERVISOR_ROOT_DIR,
+  SUPERVISOR_STATEMENT,
+} from "./definition.mjs";
+import { listSupervisorSessions, readSupervisorState, readSupervisorSummary } from "./storage.mjs";
+
+/** A live observer whose state file has not moved for this long is reported QUIET. */
+export const SUPERVISOR_QUIET_AFTER_MS = 120_000;
+
+function num(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function str(value) {
+  return typeof value === "string" ? value : null;
+}
+
+function compactRow(row) {
+  return {
+    at: str(row?.at),
+    agentId: str(row?.agentId),
+    species: str(row?.species),
+    action: str(row?.action),
+    reason: str(row?.reason),
+    symbol: str(row?.symbol),
+    referencePrice: num(row?.referencePrice),
+    evolveDirectionalIntent: str(row?.evolveDirectionalIntent),
+    directionalComparable: row?.directionalComparable === true,
+    pHigher: num(row?.pHigher),
+    modelIntent: str(row?.modelIntent),
+    agreement: str(row?.agreement),
+    exactHalf: row?.exactHalf === true,
+    providerStatus: str(row?.providerStatus),
+    supported: row?.supported === true,
+    executed: row?.executed === true,
+    blocked: row?.blocked === true,
+    jevEvaluation: str(row?.jevEvaluation),
+  };
+}
+
+function observerHealthOf({ status, observerFailures, dropped, updatedAt, now }) {
+  if (status !== null && status !== "RUNNING") return "FINALIZED";
+  if (Number.isFinite(observerFailures) && observerFailures > 0) return "DEGRADED";
+  if (Number.isFinite(dropped) && dropped > 0) return "DEGRADED";
+  const updatedMs = Date.parse(updatedAt ?? "");
+  if (Number.isFinite(updatedMs) && now - updatedMs > SUPERVISOR_QUIET_AFTER_MS) return "QUIET";
+  return "OBSERVING";
+}
+
+/**
+ * Load the newest supervisor session's dashboard block, or an
+ * `available: false` placeholder when none has ever run in this workspace.
+ *
+ * @param {string} [root] `.evolve` root
+ * @param {{ now?: () => number }} [options]
+ */
+export async function loadJevSupervisorObserverState(root = path.join(process.cwd(), ".evolve"), { now = Date.now } = {}) {
+  const baseRoot = path.join(root, "jev-supervisor-observer");
+  const sessions = await listSupervisorSessions(baseRoot);
+
+  if (sessions.length === 0) {
+    return {
+      available: false,
+      ...SUPERVISOR_CLASSIFICATION,
+      label: SUPERVISOR_LABEL,
+      noAuthorityTag: SUPERVISOR_NO_AUTHORITY_TAG,
+      statement: SUPERVISOR_STATEMENT,
+      isolationStatement: SUPERVISOR_ISOLATION_STATEMENT,
+      root: SUPERVISOR_ROOT_DIR,
+      note: "No Jev supervisor observer session has been run in this workspace yet (npm run jev:supervisor -- --minutes 60).",
+    };
+  }
+
+  const sessionId = sessions[sessions.length - 1];
+  const sessionRoot = path.join(baseRoot, sessionId);
+  const state = await readSupervisorState(sessionRoot);
+  const summary = await readSupervisorSummary(sessionRoot);
+
+  if (!state && !summary) {
+    return {
+      available: false,
+      sessionId,
+      ...SUPERVISOR_CLASSIFICATION,
+      label: SUPERVISOR_LABEL,
+      noAuthorityTag: SUPERVISOR_NO_AUTHORITY_TAG,
+      statement: SUPERVISOR_STATEMENT,
+      isolationStatement: SUPERVISOR_ISOLATION_STATEMENT,
+      root: SUPERVISOR_ROOT_DIR,
+      note: "The newest Jev supervisor observer session has no readable state yet.",
+    };
+  }
+
+  const counters = state?.counters ?? {};
+  const means = state?.means ?? {};
+  const queue = state?.queue ?? {};
+  const rows = Array.isArray(state?.recentRows) ? state.recentRows : [];
+  const status = str(state?.status) ?? str(summary?.status);
+  const observerFailures = num(counters.observerFailures) ?? num(summary?.observerFailures);
+  const queueDropped = num(queue.dropped) ?? num(summary?.queueDropped);
+
+  return {
+    available: true,
+    ...SUPERVISOR_CLASSIFICATION,
+    label: SUPERVISOR_LABEL,
+    noAuthorityTag: SUPERVISOR_NO_AUTHORITY_TAG,
+    statement: SUPERVISOR_STATEMENT,
+    isolationStatement: SUPERVISOR_ISOLATION_STATEMENT,
+    root: SUPERVISOR_ROOT_DIR,
+    sessionId: str(state?.sessionId) ?? sessionId,
+    status,
+    provider: str(state?.provider) ?? str(summary?.provider),
+    model: str(state?.model) ?? str(summary?.model),
+    upstream: str(state?.upstream) ?? str(summary?.upstream),
+    gatewayUsed: state?.gatewayUsed === true || summary?.gatewayUsed === true,
+    mode: str(state?.mode) ?? "shadow",
+    cacheEnabled: state?.cacheEnabled === true || summary?.cacheEnabled === true,
+    market: str(state?.market?.marketId),
+    symbol: str(state?.market?.baseSymbol),
+    quoteSymbol: str(state?.market?.quoteSymbol),
+    mint: str(state?.market?.baseMint),
+    startedAt: str(state?.startedAt) ?? str(summary?.startedAt),
+    updatedAt: str(state?.updatedAt),
+    finalizedAt: str(summary?.finalizedAt),
+    lastProposalAt: str(state?.lastProposalAt),
+    lastJudgmentAt: str(state?.lastJudgmentAt),
+    observerHealth: observerHealthOf({
+      status,
+      observerFailures,
+      dropped: queueDropped,
+      updatedAt: str(state?.updatedAt),
+      now: now(),
+    }),
+    proposalsObserved: num(counters.proposalsObserved) ?? num(summary?.proposalsObserved),
+    supportedProposals: num(counters.supportedProposals) ?? num(summary?.supportedProposals),
+    unsupportedProposals: num(counters.unsupportedProposals) ?? num(summary?.unsupportedProposals),
+    marketStateUnavailableProposals:
+      num(counters.marketStateUnavailableProposals) ?? num(summary?.marketStateUnavailableProposals),
+    directionallyComparable: num(counters.directionallyComparable) ?? num(summary?.directionallyComparable),
+    notDirectionallyComparable: num(counters.notDirectionallyComparable) ?? num(summary?.notDirectionallyComparable),
+    entryComparableCount: num(counters.entryComparableCount) ?? num(summary?.entryComparableCount),
+    signalExitComparableCount: num(counters.signalExitComparableCount) ?? num(summary?.signalExitComparableCount),
+    stopObservations: num(counters.stopObservations) ?? num(summary?.stopObservations),
+    takeObservations: num(counters.takeObservations) ?? num(summary?.takeObservations),
+    timeObservations: num(counters.timeObservations) ?? num(summary?.timeObservations),
+    otherLifecycleExitObservations:
+      num(counters.otherLifecycleExitObservations) ?? num(summary?.otherLifecycleExitObservations),
+    jevCalls: num(counters.jevCalls) ?? num(summary?.jevCalls),
+    jevOk: num(counters.jevOk) ?? num(summary?.jevOk),
+    jevFailures: num(counters.jevFailures) ?? num(summary?.jevFailures),
+    agreementCount: num(counters.agreementCount) ?? num(summary?.agreementCount),
+    disagreementCount: num(counters.disagreementCount) ?? num(summary?.disagreementCount),
+    exactHalfCount: num(counters.exactHalfCount) ?? num(summary?.exactHalfCount),
+    exactHalf: num(counters.exactHalfCount) ?? num(summary?.exactHalfCount),
+    meanPHigher: num(means.meanPHigher) ?? num(summary?.meanPHigher),
+    meanDistanceFromHalf: num(means.meanDistanceFromHalf) ?? num(summary?.meanDistanceFromHalf),
+    meanLatencyMs: num(means.meanLatencyMs) ?? num(summary?.meanLatencyMs),
+    queueCapacity: num(queue.capacity),
+    queueDepth: num(queue.depth),
+    queueHighWatermark: num(queue.highWatermark) ?? num(summary?.queueHighWatermark),
+    queueDropped,
+    observerFailures,
+    providerStatusCounts:
+      state && typeof state.providerStatusCounts === "object" ? { ...state.providerStatusCounts } : null,
+    winner: null,
+    noAutomatedWinner: true,
+    supervisorScore: null,
+    recentRows: rows.slice(-24).map(compactRow),
+    summary: summary
+      ? {
+          status: str(summary.status),
+          finalizedAt: str(summary.finalizedAt),
+          proposalsObserved: num(summary.proposalsObserved),
+          jevCalls: num(summary.jevCalls),
+          jevFailures: num(summary.jevFailures),
+          agreementCount: num(summary.agreementCount),
+          disagreementCount: num(summary.disagreementCount),
+          exactHalfCount: num(summary.exactHalfCount),
+          meanPHigher: num(summary.meanPHigher),
+          meanDistanceFromHalf: num(summary.meanDistanceFromHalf),
+          meanLatencyMs: num(summary.meanLatencyMs),
+          queueHighWatermark: num(summary.queueHighWatermark),
+          queueDropped: num(summary.queueDropped),
+          observerFailures: num(summary.observerFailures),
+          summaryDigest: str(summary.summaryDigest),
+        }
+      : null,
+    note: SUPERVISOR_STATEMENT,
+  };
+}

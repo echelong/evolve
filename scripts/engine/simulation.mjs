@@ -250,7 +250,26 @@ function clampNumber(value, min, max, fallback) {
  *   marketScanLimit?: number,
  *   recordTrades?: boolean,
  *   genealogy?: object | null,
+ *   proposalObserver?: object | null,
  * }} options
+ *
+ * `proposalObserver` is the Phase 5I-PS.2 PASSIVE PROPOSAL TAP. It is optional
+ * and completely inert when absent. When supplied it must expose
+ * `freezeProposal(facts)` and `recordExecution(handle, execution)`:
+ *
+ *   - `freezeProposal` is called SYNCHRONOUSLY, immediately BEFORE the paper
+ *     execution attempt, with immutable proposal facts (who/what/why, the
+ *     observed market, the cash and intended notional). It returns an opaque
+ *     handle that only ever travels back into `recordExecution`.
+ *   - `recordExecution` is called SYNCHRONOUSLY, immediately AFTER the paper
+ *     execution attempt completed, with the fill/block facts.
+ *
+ * Neither call is ever awaited, neither may block, and NOTHING either one
+ * returns is read by any decision, execution, scoring, selection or evolution
+ * code path. The tap observes a decision that has already been made and can
+ * therefore never influence it. The CONSUMER is deliberately never named here:
+ * the engine knows exactly one thing about it, namely that it may never
+ * influence a decision.
  */
 export function createSimulation({
   config,
@@ -263,6 +282,7 @@ export function createSimulation({
   marketScanLimit = 0,
   recordTrades = false,
   genealogy = null,
+  proposalObserver = null,
 } = {}) {
   const nextId = typeof ids === "function" ? ids : (kind) => generateAgentId(kind);
   const ancestry = genealogy ?? createGenealogy({});
@@ -289,6 +309,36 @@ export function createSimulation({
   );
   const minGenerationTicks = clampNumber(evolutionOptions.minGenerationTicks, 10, 100_000, 120);
   const scanLimit = Math.max(0, Math.round(marketScanLimit));
+
+  // --- Phase 5I-PS.2: passive proposal observer tap --------------------------
+  // A single, optional, synchronous callback pair. The simulation freezes a
+  // proposal immediately before it attempts a paper execution and reports the
+  // execution result immediately after; both calls are wrapped so that a
+  // throwing/slow/malformed observer can never change engine behaviour.
+  // Deliberately NO extra `now()` call, NO extra id-factory call, and NO
+  // extra randomness: observer-on and observer-off runs therefore produce
+  // byte-identical engine output.
+  const proposalTap =
+    proposalObserver && typeof proposalObserver.freezeProposal === "function" ? proposalObserver : null;
+
+  function freezeProposalForObserver(facts) {
+    if (proposalTap === null) return null;
+    try {
+      return proposalTap.freezeProposal(facts);
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+      return null;
+    }
+  }
+
+  function recordProposalExecutionForObserver(handle, execution) {
+    if (proposalTap === null || handle === null || handle === undefined) return;
+    try {
+      proposalTap.recordExecution(handle, execution);
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+    }
+  }
 
   // --- Phase 5A: strategy islands -------------------------------------------
   // An island is the species label used as a breeding boundary (see
@@ -559,6 +609,42 @@ export function createSimulation({
     const price = market && market.price > 0 ? market.price : position.lastMarkPrice;
     const liquidity = market?.liquidity ?? position.entryLiquidity;
 
+    // Phase 5I-PS.2: freeze the EXIT proposal BEFORE the paper execution
+    // attempt. The existing deterministic exit reason is passed through
+    // verbatim (SIGNAL / STOP / TAKE / TIME / GEN-END / STAGE-END).
+    const exitHandle = freezeProposalForObserver({
+      action: "EXIT_LONG",
+      reason,
+      at: ctx.at,
+      generation,
+      generationTick,
+      agentId: agent.id,
+      species: agent.species,
+      lineageId: agent.lineageId ?? null,
+      researchFamilyId: agent.researchMeta?.familyId ?? null,
+      market: market ?? null,
+      universeToken: feed.universe?.get?.(position.mint) ?? null,
+      byMint: ctx.byMint,
+      agentScore: null,
+      entryScoreThreshold: agent.genome.entryScoreThreshold,
+      paperCashBefore: agent.cash,
+      intendedPaperNotional: null,
+      referencePrice: price,
+      liquidityUsd: liquidity,
+      position: {
+        mint: position.mint,
+        symbol: position.symbol,
+        qty: position.qty,
+        cost: position.cost,
+        entryRefPrice: position.entryRefPrice,
+        entryPrice: position.entryPrice,
+        entryLiquidity: position.entryLiquidity,
+        heldTicks: position.held,
+        entryAt: position.entryAt,
+        entryScore: position.entryScore ?? null,
+      },
+    });
+
     const fill = simulateExit({
       qty: position.qty,
       price,
@@ -570,9 +656,37 @@ export function createSimulation({
     if (!fill.ok) {
       // Keep the position and its last observed mark: never invent a price.
       agent.lastAction = `Exit blocked (${fill.reason})`;
+      recordProposalExecutionForObserver(exitHandle, {
+        executed: false,
+        blocked: true,
+        blockedReason: fill.reason,
+        fillSide: null,
+        referencePrice: finite(price, null),
+        executedPrice: null,
+        notional: null,
+        qty: position.qty,
+        feesUsd: null,
+        frictionUsd: null,
+        costBps: null,
+      });
       markToMarket(agent, ctx);
       return false;
     }
+
+    recordProposalExecutionForObserver(exitHandle, {
+      executed: true,
+      blocked: false,
+      blockedReason: null,
+      fillSide: "SELL",
+      referencePrice: fill.referencePrice,
+      executedPrice: fill.executedPrice,
+      notional: fill.grossProceeds,
+      netProceeds: fill.netProceeds,
+      qty: fill.qty,
+      feesUsd: fill.feeUsd,
+      frictionUsd: fill.frictionUsd,
+      costBps: fill.costBps,
+    });
 
     agent.cash += fill.netProceeds;
     agent.realizedPnl += fill.netProceeds - position.cost;
@@ -662,8 +776,48 @@ export function createSimulation({
       market.liquidity * config.paper.maxLiquidityFraction,
     );
 
+    // Phase 5I-PS.2: freeze the ENTRY proposal BEFORE the paper execution
+    // attempt. `market`/`universeToken`/`byMint` are handed over as observed
+    // references; the observer snapshots whatever it needs and returns at most
+    // an opaque handle.
+    const entryHandle = freezeProposalForObserver({
+      action: "ENTER_LONG",
+      reason: "ENTRY_SIGNAL",
+      at: ctx.at,
+      generation,
+      generationTick,
+      agentId: agent.id,
+      species: agent.species,
+      lineageId: agent.lineageId ?? null,
+      researchFamilyId: agent.researchMeta?.familyId ?? null,
+      market,
+      universeToken: feed.universe?.get?.(market.mint) ?? null,
+      byMint: ctx.byMint,
+      agentScore: ctx.bestScore,
+      entryScoreThreshold: genome.entryScoreThreshold,
+      paperCashBefore: agent.cash,
+      intendedPaperNotional: Number.isFinite(notional) ? notional : null,
+      referencePrice: market.price,
+      liquidityUsd: market.liquidity,
+      riskMultiplier: riskMultiplier === 1 ? null : riskMultiplier,
+      position: null,
+    });
+
     if (!Number.isFinite(notional) || notional < minOrderUsd) {
       agent.lastAction = `Size too small for ${market.symbol}`;
+      recordProposalExecutionForObserver(entryHandle, {
+        executed: false,
+        blocked: true,
+        blockedReason: "size_below_minimum_order",
+        fillSide: null,
+        referencePrice: finite(market.price, null),
+        executedPrice: null,
+        notional: Number.isFinite(notional) ? notional : null,
+        qty: null,
+        feesUsd: null,
+        frictionUsd: null,
+        costBps: null,
+      });
       return false;
     }
 
@@ -676,8 +830,35 @@ export function createSimulation({
 
     if (!fill.ok) {
       agent.lastAction = `Entry blocked (${fill.reason})`;
+      recordProposalExecutionForObserver(entryHandle, {
+        executed: false,
+        blocked: true,
+        blockedReason: fill.reason,
+        fillSide: null,
+        referencePrice: finite(market.price, null),
+        executedPrice: null,
+        notional,
+        qty: null,
+        feesUsd: null,
+        frictionUsd: null,
+        costBps: null,
+      });
       return false;
     }
+
+    recordProposalExecutionForObserver(entryHandle, {
+      executed: true,
+      blocked: false,
+      blockedReason: null,
+      fillSide: "BUY",
+      referencePrice: fill.referencePrice,
+      executedPrice: fill.executedPrice,
+      notional: fill.cashSpent,
+      qty: fill.qty,
+      feesUsd: fill.feeUsd,
+      frictionUsd: fill.frictionUsd,
+      costBps: fill.costBps,
+    });
 
     agent.cash -= fill.cashSpent;
     agent.costs += fill.frictionUsd;

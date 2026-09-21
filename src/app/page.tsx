@@ -337,6 +337,10 @@ type EvolveState = {
   // dashboard experiment, never canonical/replication evidence. Deliberately a
   // SEPARATE field from `jevShadow`, which remains Phase 5D supervisor health.
   jevPaperShadow?: JevPaperShadowState | null;
+  // Phase 5I-PS.2: the Jev SUPERVISOR OBSERVER — a passive observer of paper
+  // decisions that have already executed. NO AUTHORITY • PAPER ONLY, and a
+  // separate field from both `jevShadow` and `jevPaperShadow`.
+  jevSupervisorObserver?: JevSupervisorObserverState | null;
   // Phase 5E: SHADOW ONLY external-intelligence state (Agent-Reach). Read-only
   // observations that are captured, frozen and replayed — never live internet
   // inside the Arena, and zero authority over anything above.
@@ -524,6 +528,121 @@ type JevPaperShadowState = {
   recentDecisions?: JevPaperShadowDecision[];
   equitySeries?: Array<{ at: string | null; equity: number | null; price: number | null }>;
   summary?: JevPaperShadowSummary | null;
+  note?: string;
+};
+
+// Phase 5I-PS.2: the isolated Jev SUPERVISOR OBSERVER. It observes EVOLVE paper
+// decisions that have ALREADY executed and records agreement/disagreement. It
+// has NO trading, evolution, selection, Arena or deployment authority, and it
+// is deliberately a separate field from `jevShadow` and `jevPaperShadow`.
+type JevSupervisorObserverRow = {
+  at: string | null;
+  agentId: string | null;
+  species: string | null;
+  action: string | null;
+  reason: string | null;
+  symbol: string | null;
+  referencePrice: number | null;
+  evolveDirectionalIntent: string | null;
+  directionalComparable: boolean;
+  pHigher: number | null;
+  modelIntent: string | null;
+  agreement: string | null;
+  exactHalf: boolean;
+  providerStatus: string | null;
+  supported: boolean;
+  executed: boolean;
+  blocked: boolean;
+  jevEvaluation: string | null;
+};
+
+type JevSupervisorObserverState = {
+  available: boolean;
+  label?: string;
+  noAuthorityTag?: string;
+  statement?: string;
+  isolationStatement?: string;
+  root?: string;
+  purpose?: string;
+  developmentOnly?: boolean;
+  observerOnly?: boolean;
+  paperOnly?: boolean;
+  jevHasTradingAuthority?: boolean;
+  jevHasEvolutionAuthority?: boolean;
+  jevHasSelectionAuthority?: boolean;
+  jevHasArenaAuthority?: boolean;
+  jevHasDeploymentAuthority?: boolean;
+  canonicalEvidence?: boolean;
+  replicationEvidence?: boolean;
+  temporalReplicationEvidence?: boolean;
+  profitabilityInferencePermitted?: boolean;
+  parameterSelectionPermitted?: boolean;
+  sessionId?: string | null;
+  status?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  upstream?: string | null;
+  gatewayUsed?: boolean;
+  mode?: string;
+  cacheEnabled?: boolean;
+  market?: string | null;
+  symbol?: string | null;
+  quoteSymbol?: string | null;
+  mint?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  finalizedAt?: string | null;
+  lastProposalAt?: string | null;
+  lastJudgmentAt?: string | null;
+  observerHealth?: string | null;
+  proposalsObserved?: number | null;
+  supportedProposals?: number | null;
+  unsupportedProposals?: number | null;
+  marketStateUnavailableProposals?: number | null;
+  directionallyComparable?: number | null;
+  notDirectionallyComparable?: number | null;
+  entryComparableCount?: number | null;
+  signalExitComparableCount?: number | null;
+  stopObservations?: number | null;
+  takeObservations?: number | null;
+  timeObservations?: number | null;
+  otherLifecycleExitObservations?: number | null;
+  jevCalls?: number | null;
+  jevOk?: number | null;
+  jevFailures?: number | null;
+  agreementCount?: number | null;
+  disagreementCount?: number | null;
+  exactHalfCount?: number | null;
+  meanPHigher?: number | null;
+  meanDistanceFromHalf?: number | null;
+  meanLatencyMs?: number | null;
+  queueCapacity?: number | null;
+  queueDepth?: number | null;
+  queueHighWatermark?: number | null;
+  queueDropped?: number | null;
+  observerFailures?: number | null;
+  providerStatusCounts?: Record<string, number> | null;
+  winner: null;
+  noAutomatedWinner?: boolean;
+  supervisorScore: null;
+  recentRows?: JevSupervisorObserverRow[];
+  summary?: {
+    status: string | null;
+    finalizedAt: string | null;
+    proposalsObserved: number | null;
+    jevCalls: number | null;
+    jevFailures: number | null;
+    agreementCount: number | null;
+    disagreementCount: number | null;
+    exactHalfCount: number | null;
+    meanPHigher: number | null;
+    meanDistanceFromHalf: number | null;
+    meanLatencyMs: number | null;
+    queueHighWatermark: number | null;
+    queueDropped: number | null;
+    observerFailures: number | null;
+    summaryDigest: string | null;
+  } | null;
   note?: string;
 };
 
@@ -1940,6 +2059,232 @@ function JevPaperShadowPanel({ state, nowMs }: { state: EvolveState; nowMs: numb
   );
 }
 
+// Phase 5I-PS.2: the JEV SUPERVISOR OBSERVER panel. Always renders
+// "NO AUTHORITY • PAPER ONLY" and the frozen statement. It observes decisions
+// that have ALREADY executed, has zero authority, and is never merged with the
+// Jev shadow supervisor (Phase 5D) or the Jev paper-shadow demo (Phase 5I-PS).
+function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowMs: number }) {
+  const observer = state.jevSupervisorObserver ?? null;
+  if (!observer) return null;
+
+  const noAuthorityTag = observer.noAuthorityTag ?? "NO AUTHORITY • PAPER ONLY";
+  const label = observer.label ?? "JEV SUPERVISOR OBSERVER";
+  const statement =
+    observer.statement ??
+    "Jev observes completed EVOLVE paper decisions. It cannot approve, reject, resize, delay, or alter trades. Development evidence only.";
+  const rows = (observer.recentRows ?? []).slice(-24).reverse();
+
+  const agreementLabel = (row: JevSupervisorObserverRow): string => {
+    if (row.action === "EXIT_LONG" && row.reason && row.reason !== "SIGNAL") return "NOT COMPARABLE";
+    if (row.directionalComparable !== true) return "NOT COMPARABLE";
+    if (row.agreement === "AGREE") return "AGREE";
+    if (row.agreement === "DISAGREE") return "DISAGREE";
+    if (row.jevEvaluation === "UNSUPPORTED_MARKET") return "UNSUPPORTED MARKET";
+    if (row.jevEvaluation === "MARKET_STATE_UNAVAILABLE") return "NO MARKET STATE";
+    return "—";
+  };
+  const agreementTone = (labelText: string): string => {
+    if (labelText === "AGREE") return "positive";
+    if (labelText === "DISAGREE") return "negative";
+    return "";
+  };
+
+  return (
+    <section className="paper-shadow-section">
+      <div className="panel jev-supervisor-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">
+              {label} <span className="paper-tag solid">{noAuthorityTag}</span>
+            </p>
+            <h2>Passive observer of completed EVOLVE paper decisions</h2>
+          </div>
+          <ScanSearch size={20} />
+        </div>
+
+        {observer.available ? (
+          <>
+            <p className="health-note">
+              <strong>{statement}</strong> {observer.isolationStatement ?? ""}
+            </p>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>Session</span>
+                <strong className="mono">{observer.sessionId ?? "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Provider / model</span>
+                <strong className="mono">
+                  {observer.provider ?? "—"} / {observer.model ?? "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Observer health</span>
+                <strong className={observer.observerHealth === "DEGRADED" ? "negative" : "positive"}>
+                  {observer.observerHealth ?? "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Status</span>
+                <strong>{observer.status ?? "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Gateway used</span>
+                <strong>{observer.gatewayUsed ? "YES (refused)" : "no"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Market</span>
+                <strong>{observer.market ?? "SOL-USDC"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Last judgment</span>
+                <strong>{observer.lastJudgmentAt ? relativeTime(observer.lastJudgmentAt, nowMs) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Observer failures</span>
+                <strong className={(observer.observerFailures ?? 0) > 0 ? "negative" : ""}>
+                  {observer.observerFailures ?? 0}
+                </strong>
+              </div>
+            </div>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>Proposals observed</span>
+                <strong>{observer.proposalsObserved ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Supported</span>
+                <strong>{observer.supportedProposals ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Unsupported</span>
+                <strong>{observer.unsupportedProposals ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Jev calls</span>
+                <strong>{observer.jevCalls ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Jev failures</span>
+                <strong className={(observer.jevFailures ?? 0) > 0 ? "negative" : ""}>
+                  {observer.jevFailures ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Agreement</span>
+                <strong className="positive">{observer.agreementCount ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Disagreement</span>
+                <strong className="negative">{observer.disagreementCount ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Exact 0.50</span>
+                <strong>{observer.exactHalfCount ?? 0}</strong>
+              </div>
+            </div>
+
+            <div className="health-grid">
+              <div className="health-item">
+                <span>Mean pHigher</span>
+                <strong className="mono">{observer.meanPHigher != null ? observer.meanPHigher.toFixed(4) : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Mean |pHigher − 0.50|</span>
+                <strong className="mono">
+                  {observer.meanDistanceFromHalf != null ? observer.meanDistanceFromHalf.toFixed(4) : "—"}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Mean latency</span>
+                <strong>{observer.meanLatencyMs != null ? `${Math.round(observer.meanLatencyMs)}ms` : "—"}</strong>
+              </div>
+              <div className="health-item">
+                <span>Queue depth</span>
+                <strong>
+                  {observer.queueDepth ?? 0} / {observer.queueCapacity ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>Queue dropped</span>
+                <strong className={(observer.queueDropped ?? 0) > 0 ? "negative" : ""}>{observer.queueDropped ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Queue high water</span>
+                <strong>{observer.queueHighWatermark ?? 0}</strong>
+              </div>
+              <div className="health-item">
+                <span>Entry / signal-exit comparable</span>
+                <strong>
+                  {observer.entryComparableCount ?? 0} / {observer.signalExitComparableCount ?? 0}
+                </strong>
+              </div>
+              <div className="health-item">
+                <span>STOP / TAKE / TIME observations</span>
+                <strong>
+                  {observer.stopObservations ?? 0} / {observer.takeObservations ?? 0} / {observer.timeObservations ?? 0}
+                </strong>
+              </div>
+            </div>
+
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Agent / species</th>
+                    <th>Action</th>
+                    <th>Reason</th>
+                    <th>SOL price</th>
+                    <th>EVOLVE intent</th>
+                    <th>Jev pHigher</th>
+                    <th>Jev intent</th>
+                    <th>Agreement</th>
+                    <th>EVOLVE executed?</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, index) => (
+                    <tr key={`${row.agentId ?? "row"}-${row.at ?? index}-${index}`}>
+                      <td>{row.at ? new Date(row.at).toISOString().slice(11, 19) : "—"}</td>
+                      <td>
+                        {row.agentId ?? "—"}
+                        <small> · {row.species ?? "—"}</small>
+                      </td>
+                      <td>{row.action ?? "—"}</td>
+                      <td>{row.reason ?? "—"}</td>
+                      <td>{price(row.referencePrice)}</td>
+                      <td className={intentTone(row.evolveDirectionalIntent)}>{row.evolveDirectionalIntent ?? "—"}</td>
+                      <td className="mono">{row.pHigher != null ? row.pHigher.toFixed(4) : "—"}</td>
+                      <td className={intentTone(row.modelIntent)}>{row.modelIntent ?? "—"}</td>
+                      <td className={agreementTone(agreementLabel(row))}>{agreementLabel(row)}</td>
+                      <td className={row.executed ? "positive" : row.blocked ? "negative" : ""}>
+                        {row.executed ? "executed" : row.blocked ? "blocked" : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="health-note">
+              STOP / TAKE / TIME rows are lifecycle or risk exits, so they are shown as <strong>NOT COMPARABLE</strong> rather
+              than as agreement or disagreement. No winner, no supervisor score, no profitability claim, and no policy
+              recommendation is emitted. Jev has zero authority in EVOLVE.
+            </p>
+          </>
+        ) : (
+          <p className="health-note">
+            {observer.note ?? "No Jev supervisor observer session has been run in this workspace yet."}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function ExternalIntelligencePanel({ state }: { state: EvolveState }) {
   const intelligence = state.externalIntelligence ?? null;
   if (!intelligence) return null;
@@ -3061,6 +3406,8 @@ function Dashboard({
       ) : null}
 
       {state.jevPaperShadow ? <JevPaperShadowPanel state={state} nowMs={nowMs} /> : null}
+
+      {state.jevSupervisorObserver ? <JevSupervisorObserverPanel state={state} nowMs={nowMs} /> : null}
 
       {state.externalIntelligence ? (
         <section className="dashboard-grid research-grid">

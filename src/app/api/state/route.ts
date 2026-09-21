@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 
 import { readDashboardState } from "../../../../scripts/lib/dashboard-state.mjs";
 import { loadJevPaperShadowState } from "../../../../scripts/jev/paper-shadow/dashboard.mjs";
+import { loadJevSupervisorObserverState } from "../../../../scripts/jev/supervisor/dashboard.mjs";
 import { sanitizeForPublic } from "../../../../scripts/lib/sanitize.mjs";
 
 export const dynamic = "force-dynamic";
@@ -24,6 +25,9 @@ export const revalidate = 0;
  *   Jev paper shadow (5I-PS)-> .evolve/jev-paper-shadow/ (read-only, summarized,
  *                              PAPER ONLY DEVELOPMENT demo; never canonical/
  *                              replication/Arena/deployment evidence)
+ *   Jev supervisor (5I-PS.2)-> .evolve/jev-supervisor-observer/ (read-only,
+ *                              summarized; NO AUTHORITY • PAPER ONLY observer
+ *                              of already-completed EVOLVE paper decisions)
  *   Agent-Reach observations -> .evolve/intelligence/ (read-only, summarized,
  *                              SHADOW ONLY, Phase 5E — identity/health/counts
  *                              only; never raw social text, URLs or cookies)
@@ -70,6 +74,7 @@ const readState = readDashboardState as (options: {
 }) => Promise<{ status: number; body: unknown }>;
 
 const readJevPaperShadow = loadJevPaperShadowState as (root: string) => Promise<unknown>;
+const readJevSupervisorObserver = loadJevSupervisorObserverState as (root: string) => Promise<unknown>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -97,9 +102,18 @@ export async function GET(request: Request) {
   // than inside `readDashboardState` because that module is a byte-frozen Phase
   // 5H.0 sealed source.
   const jevPaperShadow = await readJevPaperShadow(evolveRoot);
-  const composed = isRecord(body) ? { ...body, jevPaperShadow } : body;
 
-  const payload = sanitize(composed, { secrets });
+  // Phase 5I-PS.2: attach the isolated Jev SUPERVISOR OBSERVER block as its OWN
+  // top-level field, never merged into `jevShadow` (Phase 5D supervisor health)
+  // or `jevPaperShadow` (the 5I-PS paper demo account). Read-only, compact,
+  // paper only, NO AUTHORITY: it observes decisions that already executed.
+  const jevSupervisorObserver = await readJevSupervisorObserver(evolveRoot);
+  const composed = isRecord(body) ? { ...body, jevPaperShadow } : body;
+  const withSupervisorObserver = isRecord(composed)
+    ? { ...composed, jevSupervisorObserver }
+    : composed;
+
+  const payload = sanitize(withSupervisorObserver, { secrets });
   const stateSource =
     typeof (payload as { stateSource?: unknown })?.stateSource === "string"
       ? ((payload as { stateSource: string }).stateSource as string)

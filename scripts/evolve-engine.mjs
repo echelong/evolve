@@ -51,7 +51,7 @@ export function statePaths(dir = STATE_DIR) {
  * Build a running engine (no timers started).
  * Useful for tests, smoke runs, and embedding.
  */
-export function createEngine({ config = createMarketConfig(), now, random } = {}) {
+export function createEngine({ config = createMarketConfig(), now, random, simulationOptions = null } = {}) {
   let simulation = null;
 
   const feed = createMarketFeed({
@@ -67,6 +67,10 @@ export function createEngine({ config = createMarketConfig(), now, random } = {}
     now,
     random,
     evolution: { enabled: true, ...config.evolution },
+    // Phase 5I-PS.2: additive, optional. Absent by default, so the normal
+    // engine is byte-for-byte the pre-PS.2 engine. A caller may attach the
+    // passive proposal tap (`proposalObserver`) here.
+    ...(simulationOptions ?? {}),
   });
 
   return { config, feed, simulation };
@@ -347,8 +351,13 @@ export async function persist(state, { dir = STATE_DIR } = {}) {
   await rename(paths.tempFile, paths.file);
 }
 
-export async function startEngine({ config = createMarketConfig(), dir = STATE_DIR } = {}) {
-  const { feed, simulation } = createEngine({ config });
+export async function startEngine({
+  config = createMarketConfig(),
+  dir = STATE_DIR,
+  simulationOptions = null,
+  onShutdown = null,
+} = {}) {
+  const { feed, simulation } = createEngine({ config, simulationOptions });
 
   for (const line of startupLines({ config })) console.log(line);
 
@@ -394,10 +403,24 @@ export async function startEngine({ config = createMarketConfig(), dir = STATE_D
     }
   }, config.engine.tickMs);
 
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`[EVOLVE] ${signal} received — flushing state and exiting.`);
     clearInterval(timer);
     feed.stop();
+    // Phase 5I-PS.2: an optional, awaited shutdown hook (the Jev supervisor
+    // observer uses it to finalize its OWN isolated summary). It is bounded
+    // and guarded: a hook failure can delay neither shutdown nor the paper
+    // state flush, and it has no access to any engine decision.
+    if (typeof onShutdown === "function") {
+      try {
+        await onShutdown(signal);
+      } catch (error) {
+        console.error("[EVOLVE] shutdown hook failed:", error?.message ?? error);
+      }
+    }
     try {
       await persist(snapshotWithConfig(), { dir });
     } catch {
@@ -412,7 +435,13 @@ export async function startEngine({ config = createMarketConfig(), dir = STATE_D
   console.log(`[EVOLVE] dashboard state -> ${path.join(dir, STATE_FILE)}`);
   console.log(`[EVOLVE] paper engine running: ${config.engine.population} agents`);
 
-  return { feed, simulation, timer };
+  return {
+    feed,
+    simulation,
+    timer,
+    /** Bounded stop (used by a timed supervisor run). Idempotent. */
+    stop: (reason = "STOP") => shutdown(reason),
+  };
 }
 
 /**

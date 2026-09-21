@@ -1,0 +1,247 @@
+#!/usr/bin/env node
+/**
+ * EVOLVE — JEV SUPERVISOR OBSERVER CLI (Phase 5I-PS.2).
+ *
+ *   npm run jev:supervisor -- --minutes 60
+ *
+ * Runs the NORMAL EVOLVE paper engine (dashboard state, evolution, research
+ * swarm, paper execution — all exactly as always) with a PASSIVE proposal tap
+ * attached. Immediately after each paper decision EXECUTES, an immutable
+ * proposal snapshot is pushed into a bounded queue; an in-process asynchronous
+ * worker drains that queue, asks direct TypeSafe Jev the EXISTING SOL/USDC
+ * directional question about the FROZEN MARKET STATE, and records an
+ * agreement/disagreement judgment.
+ *
+ * Jev has ZERO authority here. It cannot allow, block, alter, resize or delay
+ * a trade, and it cannot touch a genome, fitness, evolution, the Arena,
+ * research candidates, selection, Temporal 5I.1a, or canonical Phase 5I
+ * evidence. A slow, failed or malformed Jev response can only damage observer
+ * evidence — the paper engine continues normally.
+ *
+ * No wallet, no signing, no swap, no order, no RPC write, no real money.
+ * PAPER ONLY / DEVELOPMENT EVIDENCE ONLY.
+ */
+
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+
+import { parseArgs } from "./lib/args.mjs";
+import { loadEnvFiles } from "./lib/env.mjs";
+import { resolveJevConfig } from "./jev/config.mjs";
+import { createResilientJevProvider } from "./jev/provider.mjs";
+import { createMarketConfig } from "./market/config.mjs";
+import { startEngine } from "./evolve-engine.mjs";
+import {
+  SUPERVISOR_BOOLEAN_FLAGS,
+  SUPERVISOR_DEFAULT_DURATION_MINUTES,
+  SUPERVISOR_DURATION_BOUNDS,
+  SUPERVISOR_FORBIDDEN_WRITE_ROOTS,
+  SUPERVISOR_ISOLATION_STATEMENT,
+  SUPERVISOR_LABEL,
+  SUPERVISOR_MARKET_ID,
+  SUPERVISOR_MAX_JEV_CALLS,
+  SUPERVISOR_NO_AUTHORITY_TAG,
+  SUPERVISOR_QUEUE_CAPACITY,
+  SUPERVISOR_REQUIRED_MODEL,
+  SUPERVISOR_REQUIRED_PROVIDER,
+  SUPERVISOR_ROOT_DIR,
+  SUPERVISOR_STATEMENT,
+  SUPERVISOR_SUPPORTED_MARKET_IDS,
+  SUPERVISOR_VALUE_FLAGS,
+  supervisorSessionIdFor,
+  supervisorSessionRootFor,
+} from "./jev/supervisor/definition.mjs";
+import { buildSupervisorSettings, enforceSupervisorProviderPins } from "./jev/supervisor/settings.mjs";
+import { createSupervisorProposalObserver } from "./jev/supervisor/observer.mjs";
+import { ensureSupervisorDir } from "./jev/supervisor/storage.mjs";
+
+function usage() {
+  return [
+    `EVOLVE — ${SUPERVISOR_LABEL} (${SUPERVISOR_NO_AUTHORITY_TAG})`,
+    "",
+    "  npm run jev:supervisor -- --minutes 60",
+    "",
+    "Options:",
+    `  --minutes <n>       bounded run duration in minutes (default ${SUPERVISOR_DEFAULT_DURATION_MINUTES}, bounds ${SUPERVISOR_DURATION_BOUNDS.min}-${SUPERVISOR_DURATION_BOUNDS.max})`,
+    `  --market <id>       ${SUPERVISOR_SUPPORTED_MARKET_IDS.join(" | ")} (the only supported market)`,
+    "  --session <id>      explicit session id (default jsup-<UTC timestamp>-<digest>)",
+    "  --json              machine-readable result",
+    "  --help              this help",
+    "",
+    `Provider: direct TypeSafe Jev (${SUPERVISOR_REQUIRED_PROVIDER}), model ${SUPERVISOR_REQUIRED_MODEL}, gatewayUsed=false, cache disabled.`,
+    "No fallback to mock-jev, the Vercel AI Gateway, a cached answer, or another model.",
+    "",
+    `Bounded queue: ${SUPERVISOR_QUEUE_CAPACITY} proposals (fixed in source). Jev calls: at most ${SUPERVISOR_MAX_JEV_CALLS} per session.`,
+    `Isolation: writes only under ${SUPERVISOR_ROOT_DIR}/<session>/ and NEVER into ${SUPERVISOR_FORBIDDEN_WRITE_ROOTS.join(", ")}.`,
+    SUPERVISOR_STATEMENT,
+    SUPERVISOR_ISOLATION_STATEMENT,
+    "No daemon. Ctrl+C finalizes the observer summary cleanly. PAPER ONLY.",
+  ].join("\n");
+}
+
+async function main() {
+  loadEnvFiles();
+
+  const args = parseArgs(process.argv.slice(2), {
+    booleanFlags: SUPERVISOR_BOOLEAN_FLAGS,
+    valueFlags: SUPERVISOR_VALUE_FLAGS,
+  });
+  if (args.help === true) {
+    console.log(usage());
+    return;
+  }
+
+  const settings = buildSupervisorSettings(args);
+  if (settings.problems.length > 0) {
+    for (const problem of settings.problems) console.error(`[jev:supervisor] ${problem}`);
+    console.error("[jev:supervisor] nothing was started; no artifact was written and no provider was called.");
+    process.exitCode = 2;
+    return;
+  }
+
+  // ---- FAIL-CLOSED provider enforcement (direct TypeSafe only) --------------
+  const envConfig = resolveJevConfig();
+  const pins = enforceSupervisorProviderPins({ envConfig });
+  if (!pins.ok) {
+    for (const problem of pins.problems) console.error(`[jev:supervisor] ${problem}`);
+    console.error(
+      "[jev:supervisor] refusing to start: the observer requires direct TypeSafe Jev. No artifact was written and " +
+        "no provider was called. The normal paper engine can still be run with `npm run engine`.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  // ---- isolated session tree -------------------------------------------------
+  const sessionId = settings.sessionId ?? supervisorSessionIdFor({ startedAt: Date.now() });
+  const baseRoot = process.env.EVOLVE_SUPERVISOR_ROOT?.trim() || SUPERVISOR_ROOT_DIR;
+  const sessionRoot = supervisorSessionRootFor(baseRoot, sessionId);
+  await ensureSupervisorDir(sessionRoot, baseRoot);
+  const healthRoot = path.join(sessionRoot, "provider-health");
+  await mkdir(healthRoot, { recursive: true });
+
+  const resilient = createResilientJevProvider({
+    selectedProvider: pins.provider,
+    // No chain: no gateway route can ever answer as a substitute.
+    config: { ...envConfig, transportChain: [] },
+    modelOverride: null,
+    timeoutMs: envConfig.timeoutMs,
+    healthRoot,
+  });
+  const provider = resilient.provider;
+
+  const observer = createSupervisorProposalObserver({
+    sessionId,
+    sessionRoot,
+    baseRoot,
+    provider,
+    providerIdentity: {
+      provider: pins.provider,
+      model: pins.model,
+      upstream: pins.identity?.upstreamProvider ?? null,
+    },
+    onRow:
+      args.json === true
+        ? null
+        : (row) => {
+            const p = Number.isFinite(row.pHigher) ? row.pHigher.toFixed(4) : "n/a";
+            console.log(
+              `[jev:supervisor] ${String(row.action ?? "?").padEnd(9)} ${String(row.reason ?? "?").padEnd(12)} ` +
+                `${String(row.symbol ?? "?").padEnd(6)} price=${row.referencePrice ?? "n/a"} ` +
+                `evolve=${row.evolveDirectionalIntent ?? "—"} jev=${row.modelIntent ?? "—"} p=${p} ` +
+                `agreement=${row.agreement ?? "—"} executed=${row.executed ? "yes" : "no"}`,
+            );
+          },
+  });
+
+  const engineConfig = createMarketConfig();
+
+  let stopTimer = null;
+  let reported = false;
+
+  const report = () => {
+    const snapshot = observer.snapshot();
+    if (args.json === true) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            sessionId,
+            root: sessionRoot,
+            provider: pins.provider,
+            model: pins.model,
+            gatewayUsed: false,
+            cacheEnabled: false,
+            status: snapshot.status,
+            counters: snapshot.counters,
+            summary: observer.summary(),
+            queue: snapshot.queue,
+            observerFailures: snapshot.counters.observerFailures,
+            paperOnly: true,
+            developmentOnly: true,
+            jevHasTradingAuthority: false,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    const summary = observer.summary();
+    console.log("");
+    console.log(`${SUPERVISOR_LABEL} • ${SUPERVISOR_NO_AUTHORITY_TAG}`);
+    console.log(`[jev:supervisor]   artifacts        ${sessionRoot}`);
+    console.log(`[jev:supervisor]   status           ${snapshot.status}`);
+    console.log(`[jev:supervisor]   provider/model   ${pins.provider} / ${pins.model} (gatewayUsed=false)`);
+    console.log(`[jev:supervisor]   market           ${SUPERVISOR_MARKET_ID}`);
+    console.log(`[jev:supervisor]   proposals        ${snapshot.counters.proposalsObserved} observed · ${snapshot.counters.supportedProposals} supported · ${snapshot.counters.unsupportedProposals} unsupported`);
+    console.log(`[jev:supervisor]   Jev calls        ${snapshot.counters.jevCalls} · ok ${snapshot.counters.jevOk} · failures ${snapshot.counters.jevFailures}`);
+    console.log(`[jev:supervisor]   agreement        ${snapshot.counters.agreementCount} agree · ${snapshot.counters.disagreementCount} disagree · ${snapshot.counters.exactHalfCount} exact 0.50`);
+    console.log(`[jev:supervisor]   queue            depth ${snapshot.queue.depth} · high water ${snapshot.queue.highWatermark} · dropped ${snapshot.queue.dropped}`);
+    console.log(`[jev:supervisor]   means            pHigher ${summary?.meanPHigher ?? "n/a"} · |p-0.50| ${summary?.meanDistanceFromHalf ?? "n/a"} · latency ${summary?.meanLatencyMs ?? "n/a"}ms`);
+    console.log(`[jev:supervisor]   observer failures ${snapshot.counters.observerFailures}`);
+    console.log(`[jev:supervisor]   ${SUPERVISOR_STATEMENT}`);
+    console.log(`[jev:supervisor]   ${SUPERVISOR_ISOLATION_STATEMENT}`);
+  };
+
+  const onShutdown = async (signal) => {
+    if (stopTimer) clearTimeout(stopTimer);
+    stopTimer = null;
+    if (reported === true) return;
+    reported = true;
+    await observer.finalize({ status: signal === "SIGINT" || signal === "SIGTERM" ? "INTERRUPTED" : "COMPLETE" });
+    report();
+  };
+
+  let handle = null;
+  try {
+    // The worker starts FIRST so no queued proposal is ever left unobserved.
+    // `start()` returns the observer, not a promise: nothing awaits it, and the
+    // simulation below never holds a reference to it.
+    observer.start();
+    handle = await startEngine({
+      config: engineConfig,
+      simulationOptions: { proposalObserver: observer },
+      onShutdown,
+    });
+
+    console.log(`[jev:supervisor] session ${sessionId} -> ${sessionRoot}`);
+    console.log(
+      `[jev:supervisor] observing completed EVOLVE paper decisions for ${settings.durationMinutes} minute(s). ` +
+        "Jev has no authority and is not awaited by the engine.",
+    );
+
+    stopTimer = setTimeout(() => {
+      console.log("[jev:supervisor] bounded duration reached — finalizing observer summary.");
+      void handle.stop("DURATION_COMPLETE");
+    }, settings.durationMs);
+  } catch (error) {
+    await observer.finalize({ status: "FAILED" }).catch(() => {});
+    throw error;
+  }
+}
+
+main().catch((error) => {
+  console.error("[jev:supervisor] failed:", error?.stack ?? error?.message ?? error);
+  process.exitCode = 1;
+});
