@@ -23,6 +23,7 @@ import {
   SUPERVISOR_CLASSIFICATION,
   SUPERVISOR_ISOLATION_STATEMENT,
   SUPERVISOR_LABEL,
+  SUPERVISOR_MAX_UNSUPPORTED_SAMPLE,
   SUPERVISOR_NO_AUTHORITY_TAG,
   SUPERVISOR_ROOT_DIR,
   SUPERVISOR_STATEMENT,
@@ -176,6 +177,8 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
       updatedAt: str(state?.updatedAt),
       now: now(),
     }),
+    solFunnel: state?.solFunnel ?? summary?.solFunnel ?? null,
+    totalExecutionProposalsObserved: num(counters.totalExecutionProposalsObserved) ?? num(summary?.totalExecutionProposalsObserved),
     proposalsObserved: num(counters.proposalsObserved) ?? num(summary?.proposalsObserved),
     supportedProposals: num(counters.supportedProposals) ?? num(summary?.supportedProposals),
     unsupportedProposals: num(counters.unsupportedProposals) ?? num(summary?.unsupportedProposals),
@@ -210,7 +213,7 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
       num(counters.executedTradeProposals) ?? num(summary?.executedTradeProposals),
     unsupportedRecentSampleCount:
       num(counters.unsupportedRecentSampleCount) ?? num(summary?.unsupportedRecentSampleCount),
-    unsupportedRecentSample: unsupportedRecentSample.slice(-16).map((entry) => ({
+    unsupportedRecentSample: unsupportedRecentSample.slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE).map((entry) => ({
       at: str(entry?.at),
       agentId: str(entry?.agentId),
       action: str(entry?.action),

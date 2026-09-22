@@ -1,3 +1,4 @@
+import { createSolFunnel } from "./sol-funnel.mjs";
 /**
  * Phase 5I-PS.2 — Jev supervisor observer.
  *
@@ -272,6 +273,11 @@ export function createSupervisorProposalObserver({
   const solStateSeen = new Set();
   let solOpportunitySerial = 0;
   let solJudgmentSerial = 0;
+  const solFunnel = createSolFunnel();
+  function observeSolFunnel(facts) {
+    if (!running) return;
+    try { solFunnel.observe(facts); } catch (error) { noteObserverError(error); }
+  }
   let unsupportedRecentSample = [];
   let solDroppedRecords = [];
   let lastSolOpportunityAt = null;
@@ -377,8 +383,8 @@ export function createSupervisorProposalObserver({
    * flooding bug: 42 311 proposals, 1 097 queue drops, zero calls).
    */
   function recordUnsupportedSample(entry) {
-    counters.unsupportedRecentSampleCount += 1;
     unsupportedRecentSample = [...unsupportedRecentSample, entry].slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE);
+    counters.unsupportedRecentSampleCount = unsupportedRecentSample.length;
   }
 
   /** A SOL opportunity that could not be retained because the SOL queue was full. */
@@ -424,6 +430,7 @@ export function createSupervisorProposalObserver({
       recentRows,
       droppedRecords,
       unsupportedRecentSample,
+      solFunnel: solFunnel.snapshot(),
       lastProposalAt,
       lastJudgmentAt,
       lastSolOpportunityAt,
@@ -467,6 +474,7 @@ export function createSupervisorProposalObserver({
             ? facts.position.mint
             : null;
       counters.executedTradeProposals += 1;
+      counters.totalExecutionProposalsObserved += 1;
       if (at !== null) lastProposalAt = iso(at);
 
       // PS.2 fix: an unsupported market is known SYNCHRONOUSLY from the mint
@@ -577,6 +585,7 @@ export function createSupervisorProposalObserver({
       counters.solOpportunityObservations += 1;
       if (!solDedupAllows({ agentId, generation })) {
         counters.opportunitiesSuppressedByAgentGenerationDedup += 1;
+        observeSolFunnel({ kind: "suppressed", species: facts.species });
         return null;
       }
       solOpportunitySerial += 1;
@@ -600,8 +609,10 @@ export function createSupervisorProposalObserver({
         recordSolDrop(evicted, "SOL_PENDING_DRAFT_BACKSTOP");
       }
       counters.solOpportunityProposals += 1;
+      observeSolFunnel({ kind: "captured", species: facts.species });
       return Object.freeze({ opportunityId });
     } catch {
+      observeSolFunnel({ kind: "capture_error", species: facts?.species });
       // Observer-only evidence. The paper engine continues untouched.
       return null;
     }
@@ -1263,6 +1274,11 @@ export function createSupervisorProposalObserver({
       const draft = queue.shift();
       const solDraft = solQueue.shift();
       if (draft === null && solDraft === null) {
+        // Publish funnel-only sessions too: absence of opportunities is evidence.
+        if (writeArtifacts) {
+          await storageReady;
+          await publishState();
+        }
         await sleep(SUPERVISOR_WORKER_IDLE_MS);
         continue;
       }
@@ -1324,6 +1340,7 @@ export function createSupervisorProposalObserver({
       lastSolOpportunityAt,
       lastSolJudgmentAt,
       unsupportedRecentSample,
+      solFunnel: solFunnel.snapshot(),
       recentRowCount: recentRows.length,
       droppedRecordCount: droppedRecords.length,
     });
@@ -1394,6 +1411,7 @@ export function createSupervisorProposalObserver({
       pendingDrafts: drafts.size,
       pendingSolDrafts: solDrafts.size,
       unsupportedRecentSample: [...unsupportedRecentSample],
+      solFunnel: solFunnel.snapshot(),
       solDroppedRecords: [...solDroppedRecords],
       uniqueSolMarketStates: solStateSeen.size,
       recentRows: [...recentRows],
@@ -1416,6 +1434,7 @@ export function createSupervisorProposalObserver({
     // opportunities. The engine reads it and nothing else.
     solMint: SUPERVISOR_SUPPORTED_MINTS[0] ?? null,
     observeSolOpportunity,
+    observeSolFunnel,
     recordSolSelection,
     // ---- observer lifecycle ------------------------------------------------
     start,

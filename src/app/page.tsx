@@ -569,7 +569,20 @@ type JevSupervisorObserverRow = {
   marketObservationId?: string | null;
 };
 
+type SolFunnel = {
+  // `ticksWithSolObservedInUniverse` is the persisted alias of the byMint count.
+  ticksWithSolObservedInUniverse?: number; ticksWithSolInByMint: number;
+  ticksWithSolInTradeable: number;
+  solAgentEvaluations: number; solPassesGates: number; solFailsGates: number;
+  solAboveEntryThreshold: number; solBelowEntryThreshold: number;
+  solExactlyEntryThreshold?: number;
+  solOpportunityCandidatesBeforeDedup: number; solOpportunityCaptured: number;
+  solOpportunitySuppressedByAgentGenerationDedup: number;
+  gateFailureCounts: Record<string, number>;
+};
 type JevSupervisorObserverState = {
+  solFunnel?: SolFunnel | null;
+  totalExecutionProposalsObserved?: number | null;
   available: boolean;
   label?: string;
   noAuthorityTag?: string;
@@ -2214,8 +2227,8 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
 
             <div className="health-grid">
               <div className="health-item">
-                <span>Proposals observed</span>
-                <strong>{observer.proposalsObserved ?? 0}</strong>
+                <span>Total execution proposals observed</span>
+                <strong>{observer.totalExecutionProposalsObserved ?? observer.executedTradeProposals ?? observer.proposalsObserved ?? 0}</strong>
               </div>
               <div className="health-item">
                 <span>Supported</span>
@@ -2291,6 +2304,31 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
                 </strong>
               </div>
             </div>
+
+            {observer.solFunnel && (
+              <div>
+                <h3>SOL OPPORTUNITY FUNNEL</h3>
+                <div className="health-grid">
+                  {([
+                    ["SOL in universe (ticks)", "ticksWithSolObservedInUniverse"],
+                    ["SOL in tradeable (ticks)", "ticksWithSolInTradeable"],
+                    ["SOL agent evaluations", "solAgentEvaluations"],
+                    ["Passes gates", "solPassesGates"], ["Fails gates", "solFailsGates"],
+                    ["Above threshold (includes equality)", "solAboveEntryThreshold"],
+                    ["Below threshold", "solBelowEntryThreshold"],
+                    ["Exactly at threshold (actionable)", "solExactlyEntryThreshold"],
+                    ["Opportunity candidates", "solOpportunityCandidatesBeforeDedup"],
+                    ["Opportunities captured", "solOpportunityCaptured"],
+                    ["Dedup suppressed", "solOpportunitySuppressedByAgentGenerationDedup"],
+                  ] as const).map(([label, key]) => (
+                    <div className="health-item" key={key}><span>{label}</span><strong>{observer.solFunnel![key] ?? 0}</strong></div>
+                  ))}
+                </div>
+                <p>Gate failure counts (all failures; an evaluation may appear more than once): {Object.entries(observer.solFunnel.gateFailureCounts)
+                  .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6)
+                  .map(([reason, count]) => `${reason}: ${count}`).join(" · ") || "None observed"}</p>
+              </div>
+            )}
 
             <div className="health-grid">
               <div className="health-item">

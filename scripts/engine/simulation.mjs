@@ -165,47 +165,57 @@ export function scoreMarket(genome, market) {
  * Hard eligibility: an agent's genome must explicitly allow a token before it
  * is ever scored. This is where species specialization bites.
  */
-export function passesGates(genome, market, { minLiquidityUsd = 0 } = {}) {
+function* failedGateReasons(genome, market, { minLiquidityUsd = 0 } = {}) {
   const f = market?.features;
-  if (!f) return false;
-  if (market.fresh !== true) return false;
-  if (!(finite(market.price, 0) > 0)) return false;
-  if (!(finite(market.liquidity, -1) > 0)) return false;
-  if (market.liquidity < minLiquidityUsd) return false;
+  if (!f) { yield "missing_features"; return; }
+  if (market.fresh !== true) yield "market_not_fresh";
+  if (!(finite(market.price, 0) > 0)) yield "invalid_price";
+  if (!(finite(market.liquidity, -1) > 0)) yield "invalid_liquidity";
+  if (market.liquidity < minLiquidityUsd) yield "below_global_min_liquidity";
 
-  if (finite(f.liquidityQuality, 0) < genome.minLiquidityQuality) return false;
-  if (finite(f.organicScore, 0) < genome.minOrganicScore) return false;
+  if (finite(f.liquidityQuality, 0) < genome.minLiquidityQuality) yield "liquidity_quality";
+  if (finite(f.organicScore, 0) < genome.minOrganicScore) yield "organic_score";
 
-  if (genome.requireConcentrationKnown === 1 && market.topHoldersPercentage === null) return false;
+  if (genome.requireConcentrationKnown === 1 && market.topHoldersPercentage === null) yield "concentration_unknown";
   if (market.topHoldersPercentage !== null && market.topHoldersPercentage > genome.maxTopHolderPct) {
-    return false;
+    yield "top_holder_concentration";
   }
 
   if (genome.requireAuthoritySafe === 1) {
-    if (market.mintAuthorityDisabled !== true || market.freezeAuthorityDisabled !== true) return false;
+    if (market.mintAuthorityDisabled !== true) yield "mint_authority";
+    if (market.freezeAuthorityDisabled !== true) yield "freeze_authority";
   }
-  if (genome.requireVerified === 1 && market.verified !== true) return false;
+  if (genome.requireVerified === 1 && market.verified !== true) yield "verification";
 
   if (market.poolAgeMs === null) {
     const ageAware =
       genome.minPoolAgeHours > 0 ||
       genome.maxPoolAgeHours < MAX_POOL_AGE_UNBOUNDED ||
       genome.ageWeight >= 0.15;
-    if (ageAware) return false;
+    if (ageAware) yield "pool_age_unknown";
   } else {
     const ageHours = market.poolAgeMs / 3_600_000;
-    if (ageHours < genome.minPoolAgeHours) return false;
-    if (ageHours > genome.maxPoolAgeHours) return false;
+    if (ageHours < genome.minPoolAgeHours) yield "pool_too_young";
+    if (ageHours > genome.maxPoolAgeHours) yield "pool_too_old";
   }
 
-  if (finite(f.buyPressure, 0) < genome.buyPressureThreshold) return false;
+  if (finite(f.buyPressure, 0) < genome.buyPressureThreshold) yield "buy_pressure";
 
   if (genome.momentumGateEnabled === 1) {
     const momentumSignal = genome.contrarian === 1 ? -f.momentum : f.momentum;
-    if (finite(momentumSignal, 0) < genome.momentumThreshold) return false;
+    if (finite(momentumSignal, 0) < genome.momentumThreshold) yield "momentum";
   }
+}
 
-  return true;
+// One ordered rule source. The trading predicate still stops on its FIRST
+// failure. Diagnostics exhaust the same pure iterator, outside the decision.
+export function passesGates(genome, market, options) {
+  return failedGateReasons(genome, market, options).next().done;
+}
+
+export function assessGates(genome, market, options) {
+  const failedGates = [...failedGateReasons(genome, market, options)];
+  return { passes: failedGates.length === 0, firstFailedGate: failedGates[0] ?? null, failedGates };
 }
 
 export const DEFAULT_EVOLUTION = Object.freeze({
@@ -366,6 +376,19 @@ export function createSimulation({
       if (typeof proposalTap.recordSolSelection === "function") proposalTap.recordSolSelection(handle, selection);
     } catch {
       // Observer-only evidence. The paper engine continues untouched.
+    }
+  }
+
+  // PS.2b facts contain only copied scalars/diagnostic arrays. No engine
+  // references, return values, clocks, randomness, IDs or asynchronous work.
+  function observeSolFunnel(kind, makeFacts) {
+    if (proposalTap === null || solOpportunityMint === null) return;
+    try {
+      if (typeof proposalTap.observeSolFunnel === "function") {
+        proposalTap.observeSolFunnel({ kind, ...makeFacts() });
+      }
+    } catch {
+      // Diagnostic failures cannot affect the scan or the PS.2a opportunity.
     }
   }
 
@@ -993,8 +1016,16 @@ export function createSimulation({
     let eligibleCount = 0;
     let solOpportunityHandle = null;
 
+    observeSolFunnel("scan", () => ({}));
     for (const market of ctx.tradeable) {
-      if (!passesGates(agent.genome, market, ctx)) continue;
+      const gatesPass = passesGates(agent.genome, market, ctx);
+      if (market.mint === solOpportunityMint) {
+        observeSolFunnel("evaluation", () => ({
+          species: agent.species,
+          ...assessGates(agent.genome, market, ctx),
+        }));
+      }
+      if (!gatesPass) continue;
       eligibleCount += 1;
       // Phase 5A.2 diagnostics: WHY a candidate traded too few distinct
       // mints. Bounded by distinct-mint count, never by tick count, so a
@@ -1002,6 +1033,12 @@ export function createSimulation({
       agent.stageEligibleMints = agent.stageEligibleMints ?? {};
       agent.stageEligibleMints[market.mint] = (agent.stageEligibleMints[market.mint] ?? 0) + 1;
       const score = scoreMarket(agent.genome, market);
+      if (market.mint === solOpportunityMint) {
+        observeSolFunnel("score", () => ({
+          species: agent.species, solScore: score,
+          entryScoreThreshold: agent.genome.entryScoreThreshold,
+        }));
+      }
 
       // Phase 5I-PS.2a: the EXACT observation point. After gates and scoring,
       // if the market mint is the declared SOL identity and the genome's
@@ -1598,6 +1635,18 @@ export function createSimulation({
       regime: currentRegimeLabel,
     };
 
+    observeSolFunnel("tick", () => {
+      const sol = byMint.get(solOpportunityMint);
+      return {
+        at, inByMint: byMint.has(solOpportunityMint),
+        inFeedUniverse: feed.universe?.has?.(solOpportunityMint) === true,
+        inTradeable: scanned.some((market) => market.mint === solOpportunityMint),
+        fresh: sol?.fresh === true,
+        referencePrice: Number.isFinite(sol?.price) ? sol.price : null,
+        liquidity: Number.isFinite(sol?.liquidity) ? sol.liquidity : null,
+        allowNewEntries: ctx.allowNewEntries,
+      };
+    });
     for (const agent of population) {
       ctx.bestScore = null;
       agent.observations += 1;

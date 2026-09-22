@@ -25,6 +25,7 @@ import {
   SUPERVISOR_KIND,
   SUPERVISOR_LABEL,
   SUPERVISOR_MARKET,
+  SUPERVISOR_MAX_UNSUPPORTED_SAMPLE,
   SUPERVISOR_MODE,
   SUPERVISOR_NO_AUTHORITY_TAG,
   SUPERVISOR_PHASE,
@@ -45,7 +46,8 @@ export const SUPERVISOR_SUMMARY_VERSION = 1;
 export function createSupervisorCounters() {
   return {
     // ---- executed-trade proposals (PS.2) ----------------------------------
-    proposalsObserved: 0,
+    proposalsObserved: 0, // legacy: supported proposals processed by worker
+    totalExecutionProposalsObserved: 0, // all execution attempts seen by tap
     supportedProposals: 0,
     unsupportedProposals: 0,
     unsupportedProposalCount: 0, // explicit alias of `unsupportedProposals`
@@ -324,6 +326,7 @@ export function buildSupervisorState({
   recentRows = [],
   droppedRecords = [],
   unsupportedRecentSample = [],
+  solFunnel = null,
   lastProposalAt = null,
   lastJudgmentAt = null,
   lastSolOpportunityAt = null,
@@ -349,7 +352,13 @@ export function buildSupervisorState({
     questionSetVersion: SUPERVISOR_QUESTION_SET_VERSION,
     questionDigest: session?.questionDigest ?? null,
     startedAt: session?.startedAt ?? null,
-    counters: { ...counters },
+    counters: {
+      ...counters,
+      // Derived, not accumulated: the persisted count IS the bounded sample
+      // length, so it can never drift from what the artifact actually holds.
+      unsupportedRecentSampleCount: unsupportedRecentSample.slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE).length,
+    },
+    solFunnel,
     means: meansOf(aggregates),
     solMeans: solMeansOf(aggregates),
     providerStatusCounts: { ...aggregates.providerStatusCounts },
@@ -371,7 +380,9 @@ export function buildSupervisorState({
       pushed: solQueue?.pushed ?? 0,
     },
     solDedupRule: SUPERVISOR_SOL_DEDUP_RULE,
-    unsupportedRecentSample: Array.isArray(unsupportedRecentSample) ? unsupportedRecentSample.slice(-32) : [],
+    unsupportedRecentSample: Array.isArray(unsupportedRecentSample)
+      ? unsupportedRecentSample.slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE)
+      : [],
     lastSolOpportunityAt,
     lastSolJudgmentAt,
     recentRows: recentRows.slice(-24),
@@ -399,6 +410,7 @@ export function buildSupervisorSummary({
   lastSolOpportunityAt = null,
   lastSolJudgmentAt = null,
   unsupportedRecentSample = [],
+  solFunnel = null,
   recentRowCount = 0,
   droppedRecordCount = 0,
 } = {}) {
@@ -427,10 +439,13 @@ export function buildSupervisorSummary({
     finalizedAt,
     // ---- required descriptive counts ---------------------------------------
     proposalsObserved: counters.proposalsObserved,
+    totalExecutionProposalsObserved: counters.totalExecutionProposalsObserved,
+    proposalCounterSemantics: "proposalsObserved = legacy worker-processed supported proposals; totalExecutionProposalsObserved = all execution proposals at tap, including unsupported and blocked attempts; executedTradeProposals is its legacy alias, not a fill count",
+    solFunnel,
     supportedProposals: counters.supportedProposals,
     unsupportedProposals: counters.unsupportedProposals,
     unsupportedProposalCount: counters.unsupportedProposals,
-    unsupportedRecentSampleCount: counters.unsupportedRecentSampleCount,
+    unsupportedRecentSampleCount: unsupportedRecentSample.slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE).length,
     executedTradeProposals: counters.executedTradeProposals,
     marketStateUnavailableProposals: counters.marketStateUnavailableProposals,
     directionallyComparable: counters.directionallyComparable,
@@ -468,7 +483,9 @@ export function buildSupervisorSummary({
     solQueueHighWatermark: solQueue?.highWatermark ?? 0,
     solQueueDropped: solQueue?.dropped ?? counters.solQueueDropped ?? 0,
     solDedupRule: SUPERVISOR_SOL_DEDUP_RULE,
-    unsupportedRecentSample: Array.isArray(unsupportedRecentSample) ? unsupportedRecentSample.slice(-32) : [],
+    unsupportedRecentSample: Array.isArray(unsupportedRecentSample)
+      ? unsupportedRecentSample.slice(-SUPERVISOR_MAX_UNSUPPORTED_SAMPLE)
+      : [],
     lastSolOpportunityAt,
     lastSolJudgmentAt,
     meanPHigher: means.meanPHigher,

@@ -66,7 +66,7 @@ const { createSeededRandom } = await import("./lib/random.mjs");
 const { createIdFactory } = await import("./lib/ids.mjs");
 const { createMarketFeed } = await import("./market/feed.mjs");
 const { deriveMarket, MOMENTUM_REFERENCE } = await import("./market/normalize.mjs");
-const { createSimulation } = await import("./engine/simulation.mjs");
+const { createSimulation, passesGates, assessGates, scoreMarket } = await import("./engine/simulation.mjs");
 const { DIRECTION_QUESTION_NAME } = await import("./jev/direction/questions.mjs");
 const { BENCHMARK_MARKET } = await import("./jev/direction/definition.mjs");
 const { resolveJevConfig } = await import("./jev/config.mjs");
@@ -341,6 +341,7 @@ async function runFixtureSimulation({
   priceAt = lifecyclePriceAt,
   yieldsPerTick = 0,
   feed: feedOverride = null,
+  marketScanLimit = 0,
 } = {}) {
   const config = createMarketConfig(
     {
@@ -365,9 +366,12 @@ async function runFixtureSimulation({
     ids: createIdFactory(),
     evolution: { enabled: true, ...config.evolution },
     proposalObserver: observer ?? null,
+    marketScanLimit,
   });
+  const tickDigests = [];
   for (let i = 0; i < ticks; i += 1) {
     simulation.advanceTick();
+    tickDigests.push(digestOf({ snapshot: simulation.snapshot(), population: simulation.population }));
     clock += config.engine.tickMs;
     // The engine never waits for the observer. A caller may still choose to
     // yield the event loop between ticks (exactly as the CLI's tick timer does
@@ -375,7 +379,7 @@ async function runFixtureSimulation({
     // a single engine decision.
     for (let y = 0; y < yieldsPerTick; y += 1) await new Promise((resolve) => setTimeout(resolve, 0));
   }
-  return { config, simulation, snapshot: simulation.snapshot(), now };
+  return { config, simulation, snapshot: simulation.snapshot(), now, tickDigests };
 }
 
 function engineDigest(run) {
@@ -391,6 +395,7 @@ function assertEngineIdentical(baseline, candidate, label) {
     JSON.stringify(baseline.snapshot),
     `${label}: the complete EVOLVE snapshot must be byte-identical`,
   );
+  assertDeepEqual(candidate.tickDigests, baseline.tickDigests, `${label}: every tick and full population must match`);
   assertEqual(engineDigest(candidate), engineDigest(baseline), `${label}: the engine digest must be identical`);
 }
 
@@ -1720,7 +1725,7 @@ await test("market identity: SOL-USDC only for the wrapped-SOL mint; arbitrary a
 await test("SOL tap point: strictly after passesGates + scoring, threshold-exact, comparison untouched", () => {
   const src = SIMULATION_SOURCE;
   const stepIdx = src.indexOf("function stepAgent");
-  const gateIdx = src.indexOf("if (!passesGates(agent.genome, market, ctx)) continue;", stepIdx);
+  const gateIdx = src.indexOf("const gatesPass = passesGates(agent.genome, market, ctx);", stepIdx);
   const scoreIdx = src.indexOf("const score = scoreMarket(agent.genome, market);", gateIdx);
   const tapIdx = src.indexOf("solOpportunityHandle = freezeSolOpportunityForObserver(", scoreIdx);
   const compareIdx = src.indexOf("if (score > bestScore) {", tapIdx);
@@ -2097,7 +2102,7 @@ await test("anti-anchoring: the Jev packet carries SOL market state only, no age
       "actualSelected",
       "solWasActuallySelected",
       "evolveDirectionalIntent",
-      "passesGates",
+      "passesGates", "solFunnel", "gateFailureCounts", "firstFailedGate", "entryScoreThreshold", "solAgentEvaluations",
       "opportunityId",
       "EVOLVE_SOL_OPPORTUNITY",
       "SOL_OPPORTUNITY",
@@ -2134,7 +2139,8 @@ await test("unsupported load: thousands bypass the Jev queue with zero calls and
   const snapshot = observer.snapshot();
   assertEqual(snapshot.counters.executedTradeProposals, total, "the exact unsupported count is retained");
   assertEqual(snapshot.counters.unsupportedProposals, total);
-  assertEqual(snapshot.counters.unsupportedRecentSampleCount, total);
+  assertEqual(snapshot.counters.unsupportedRecentSampleCount, snapshot.unsupportedRecentSample.length);
+  assertEqual(snapshot.counters.totalExecutionProposalsObserved, total);
   assertEqual(snapshot.unsupportedRecentSample.length, SUPERVISOR_MAX_UNSUPPORTED_SAMPLE, "only a bounded recent sample is retained");
   assertEqual(snapshot.counters.proposalsObserved, 0);
   assertEqual(snapshot.counters.jevCalls, 0);
@@ -2670,6 +2676,418 @@ await test("session artifacts never contain a credential or a raw provider paylo
     }
   }
   assertEqual(NETWORK_ATTEMPTS, 0, "the whole suite must stay offline");
+});
+
+
+// Frozen HEAD 7f446dc gate predicate: test oracle only, never a runtime rule source.
+const { MAX_POOL_AGE_UNBOUNDED, randomGenome, SPECIES } = await import("./engine/genome.mjs");
+const { createSolFunnel } = await import("./jev/supervisor/sol-funnel.mjs");
+const finite = (value, fallback = 0) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function legacyPassesGates(genome, market, { minLiquidityUsd = 0 } = {}) {
+  const f = market?.features;
+  if (!f) return false;
+  if (market.fresh !== true) return false;
+  if (!(finite(market.price, 0) > 0)) return false;
+  if (!(finite(market.liquidity, -1) > 0)) return false;
+  if (market.liquidity < minLiquidityUsd) return false;
+
+  if (finite(f.liquidityQuality, 0) < genome.minLiquidityQuality) return false;
+  if (finite(f.organicScore, 0) < genome.minOrganicScore) return false;
+
+  if (genome.requireConcentrationKnown === 1 && market.topHoldersPercentage === null) return false;
+  if (market.topHoldersPercentage !== null && market.topHoldersPercentage > genome.maxTopHolderPct) {
+    return false;
+  }
+
+  if (genome.requireAuthoritySafe === 1) {
+    if (market.mintAuthorityDisabled !== true || market.freezeAuthorityDisabled !== true) return false;
+  }
+  if (genome.requireVerified === 1 && market.verified !== true) return false;
+
+  if (market.poolAgeMs === null) {
+    const ageAware =
+      genome.minPoolAgeHours > 0 ||
+      genome.maxPoolAgeHours < MAX_POOL_AGE_UNBOUNDED ||
+      genome.ageWeight >= 0.15;
+    if (ageAware) return false;
+  } else {
+    const ageHours = market.poolAgeMs / 3_600_000;
+    if (ageHours < genome.minPoolAgeHours) return false;
+    if (ageHours > genome.maxPoolAgeHours) return false;
+  }
+
+  if (finite(f.buyPressure, 0) < genome.buyPressureThreshold) return false;
+
+  if (genome.momentumGateEnabled === 1) {
+    const momentumSignal = genome.contrarian === 1 ? -f.momentum : f.momentum;
+    if (finite(momentumSignal, 0) < genome.momentumThreshold) return false;
+  }
+
+  return true;
+}
+
+function passingGateFixture() {
+  return {
+    genome: { minLiquidityQuality: 0.2, minOrganicScore: 0.2, requireConcentrationKnown: 1,
+      maxTopHolderPct: 50, requireAuthoritySafe: 1, requireVerified: 1,
+      minPoolAgeHours: 1, maxPoolAgeHours: 48, ageWeight: 0,
+      buyPressureThreshold: 0.4, momentumGateEnabled: 1, momentumThreshold: 0.1,
+      contrarian: 0, liquidityWeight: 1, entryScoreThreshold: 0.4 },
+    market: { ...solMarket(BASE_AT, 200), fresh: true, price: 200, liquidity: 1e7,
+      topHoldersPercentage: 20, mintAuthorityDisabled: true, freezeAuthorityDisabled: true,
+      verified: true, poolAgeMs: 12 * 3_600_000,
+      features: { liquidityQuality: 0.6, organicScore: 0.7, buyPressure: 0.6, momentum: 0.5 } },
+  };
+}
+const GATE_FAILURE_FIXTURES = [
+  ["missing_features", (m) => { m.features = null; }],
+  ["market_not_fresh", (m) => { m.fresh = false; }],
+  ["invalid_price", (m) => { m.price = 0; }],
+  ["invalid_liquidity", (m) => { m.liquidity = 0; }],
+  ["below_global_min_liquidity", (m) => { m.liquidity = 1; }],
+  ["liquidity_quality", (m) => { m.features.liquidityQuality = 0; }],
+  ["organic_score", (m) => { m.features.organicScore = 0; }],
+  ["concentration_unknown", (m) => { m.topHoldersPercentage = null; }],
+  ["top_holder_concentration", (m) => { m.topHoldersPercentage = 51; }],
+  ["mint_authority", (m) => { m.mintAuthorityDisabled = false; }],
+  ["freeze_authority", (m) => { m.freezeAuthorityDisabled = false; }],
+  ["verification", (m) => { m.verified = false; }],
+  ["pool_age_unknown", (m) => { m.poolAgeMs = null; }],
+  ["pool_too_young", (m) => { m.poolAgeMs = 0; }],
+  ["pool_too_old", (m) => { m.poolAgeMs = 49 * 3_600_000; }],
+  ["buy_pressure", (m) => { m.features.buyPressure = 0; }],
+  ["momentum", (m) => { m.features.momentum = 0; }],
+];
+for (const [reason, mutate] of GATE_FAILURE_FIXTURES) {
+  await test(`PS.2b gate assessment: ${reason}`, () => {
+    const { genome, market } = passingGateFixture();
+    mutate(market);
+    const assessment = assessGates(genome, market, { minLiquidityUsd: 100 });
+    assertEqual(assessment.passes, false);
+    assertEqual(assessment.firstFailedGate, reason);
+    assert(assessment.failedGates.includes(reason));
+    assertEqual(passesGates(genome, market, { minLiquidityUsd: 100 }), legacyPassesGates(genome, market, { minLiquidityUsd: 100 }));
+    const f = createSolFunnel();
+    f.observe({ kind: "evaluation", species: "Momentum", ...assessment });
+    assertEqual(f.snapshot().gateFailureCounts[reason], 1);
+  });
+}
+await test("PS.2b all failures retain first failure in original order", () => {
+  const { genome, market } = passingGateFixture();
+  market.features.organicScore = 0;
+  market.mintAuthorityDisabled = false;
+  market.freezeAuthorityDisabled = false;
+  market.features.momentum = 0;
+  assertDeepEqual(assessGates(genome, market).failedGates, ["organic_score", "mint_authority", "freeze_authority", "momentum"]);
+});
+await test("PS.2b legacy gate equivalence: boundaries, nulls, flags, contrarian and randomized cross-products", () => {
+  const values = [undefined, null, NaN, -Infinity, Infinity, -1, 0, 0.1, 0.2, 0.4, 0.5, 1, 48, 50, 100];
+  let checked = 0;
+  function check(g, m, options = {}) {
+    const expected = legacyPassesGates(g, m, options);
+    assertEqual(passesGates(g, m, options), expected);
+    assertEqual(assessGates(g, m, options).passes, expected);
+    checked++;
+  }
+  const fixture = passingGateFixture();
+  for (const value of values) {
+    check(fixture.genome, value === null || value === undefined ? value : fixture.market);
+    for (const field of Object.keys(fixture.genome)) check({ ...fixture.genome, [field]: value }, fixture.market);
+    for (const field of ["price", "liquidity", "poolAgeMs", "topHoldersPercentage", "fresh", "mintAuthorityDisabled", "freezeAuthorityDisabled", "verified"])
+      check(fixture.genome, { ...fixture.market, [field]: value });
+    for (const field of Object.keys(fixture.market.features)) check(fixture.genome, { ...fixture.market, features: { ...fixture.market.features, [field]: value } });
+  }
+  for (const [field, threshold] of [["liquidityQuality", 0.2], ["organicScore", 0.2], ["buyPressure", 0.4], ["momentum", 0.1]])
+    for (const delta of [-1e-12, 0, 1e-12]) check(fixture.genome, { ...fixture.market, features: { ...fixture.market.features, [field]: threshold + delta } });
+  for (const hours of [1 - 1e-9, 1, 1 + 1e-9, 48 - 1e-9, 48, 48 + 1e-9]) check(fixture.genome, { ...fixture.market, poolAgeMs: hours * 3_600_000 });
+  for (const ageWeight of [0.15 - 1e-12, 0.15, 0.15 + 1e-12]) check({ ...fixture.genome, minPoolAgeHours: 0, maxPoolAgeHours: MAX_POOL_AGE_UNBOUNDED, ageWeight }, { ...fixture.market, poolAgeMs: null });
+  const rng = createSeededRandom("ps2b-gate-equivalence");
+  for (let i = 0; i < 5000; i++) {
+    const genome = randomGenome(SPECIES[i % SPECIES.length], rng);
+    const market = structuredClone(fixture.market);
+    for (const field of ["price", "liquidity", "poolAgeMs", "topHoldersPercentage"]) if (rng() < 0.5) market[field] = values[Math.floor(rng() * values.length)];
+    for (const field of ["fresh", "mintAuthorityDisabled", "freezeAuthorityDisabled", "verified"]) market[field] = [true, false, null, undefined][Math.floor(rng() * 4)];
+    for (const field of Object.keys(market.features)) market.features[field] = values[Math.floor(rng() * values.length)];
+    check(genome, market, { minLiquidityUsd: values[i % values.length] });
+  }
+  assert(checked > 5400);
+});
+
+async function funnelScanFixture({ market = passingGateFixture().market, thresholdDelta = 0, species = ["Momentum", "Value"], scans = 1 } = {}) {
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-funnel", provider, writeArtifacts: false });
+  observer.start();
+  const feed = createFixtureFeed();
+  feed.markets = () => market ? [market] : [];
+  const run = await runFixtureSimulation({ observer, feed, ticks: 0, populationSize: 12 });
+  for (const [i, agent] of run.simulation.population.entries()) {
+    const { genome } = passingGateFixture();
+    agent.genome = { ...agent.genome, ...genome };
+    agent.genome.entryScoreThreshold = scoreMarket(agent.genome, passingGateFixture().market) + thresholdDelta;
+    agent.species = species[i % species.length];
+    agent.cash = 0; // block paper entry, retaining a flat scan on subsequent ticks
+  }
+  for (let i = 0; i < scans; i++) run.simulation.advanceTick();
+  await observer.finalize();
+  return { observer, funnel: observer.snapshot().solFunnel, calls };
+}
+await test("PS.2b SOL absent from byMint", async () => {
+  const { funnel } = await funnelScanFixture({ market: null });
+  assertEqual(funnel.engineTicksObserved, 1);
+  assertEqual(funnel.ticksWithoutSolInByMint, 1);
+  assertEqual(funnel.ticksWithoutSolInTradeable, 1);
+  assertEqual(funnel.solAgentEvaluations, 0);
+  assertEqual(funnel.latestPresence.referencePrice, null);
+});
+await test("PS.2b SOL present but stale and not tradeable", async () => {
+  const { market } = passingGateFixture(); market.fresh = false;
+  const { funnel } = await funnelScanFixture({ market });
+  assertEqual(funnel.ticksWithSolInByMint, 1);
+  assertEqual(funnel.ticksWithoutSolInTradeable, 1);
+  assertEqual(funnel.latestPresence.fresh, false);
+  assertEqual(funnel.latestPresence.referencePrice, 200);
+  assertEqual(funnel.latestPresence.liquidity, market.liquidity);
+  assertEqual(funnel.solAgentEvaluations, 0);
+});
+for (const [reason, mutate] of GATE_FAILURE_FIXTURES.filter(([reason]) => !["market_not_fresh", "invalid_price", "invalid_liquidity"].includes(reason))) {
+  await test(`PS.2b engine funnel gate rejection: ${reason}`, async () => {
+    const { market } = passingGateFixture(); mutate(market);
+    const { funnel } = await funnelScanFixture({ market });
+    assertEqual(funnel.solAgentEvaluations, 12);
+    assertEqual(funnel.solFailsGates, 12);
+    assertEqual(funnel.gateFailureCounts[reason], 12);
+    assertEqual(funnel.solScored, 0);
+  });
+}
+for (const [label, delta] of [["below", 0.1], ["equal", 0], ["above", -0.1]]) {
+  await test(`PS.2b engine score ${label} threshold and accounting`, async () => {
+    const { funnel, observer } = await funnelScanFixture({ thresholdDelta: delta, scans: 2 });
+    assertEqual(funnel.solPassesGates, 24);
+    assertEqual(funnel.solScored, 24);
+    assertEqual(funnel.solPassesGates, funnel.solAboveEntryThreshold + funnel.solBelowEntryThreshold);
+    assertEqual(funnel.solOpportunityCandidatesBeforeDedup, funnel.solAboveEntryThreshold);
+    assertEqual(funnel.solAgentEvaluations, funnel.solPassesGates + funnel.solFailsGates);
+    assertEqual(funnel.engineTicksObserved, funnel.ticksWithSolInTradeable + funnel.ticksWithoutSolInTradeable);
+    assertEqual(funnel.solOpportunityCandidatesBeforeDedup, funnel.solOpportunityCaptured + funnel.solOpportunitySuppressedByAgentGenerationDedup);
+    assertEqual(funnel[delta > 0 ? "scoreMarginNegative" : delta < 0 ? "scoreMarginPositive" : "scoreMarginZero"], 24);
+    assertClose(funnel.meanScoreMargin, -delta, 1e-12);
+    assertClose(funnel.medianScoreMargin, -delta, 1e-12);
+    assertEqual(funnel.solOpportunityCaptured, delta > 0 ? 0 : 12);
+    assertEqual(funnel.solOpportunitySuppressedByAgentGenerationDedup, delta > 0 ? 0 : 12);
+    assertEqual(observer.snapshot().counters.solOpportunityProposals, funnel.solOpportunityCaptured);
+    assertEqual(funnel.species.length, 2);
+    for (const row of funnel.species) {
+      assertEqual(row.solAgentEvaluations, 12);
+      assertEqual(row.solOpportunityCaptured, delta > 0 ? 0 : 6);
+    }
+  });
+}
+await test("PS.2b bounded samples and full-stream median bounds", () => {
+  const funnel = createSolFunnel(), values = [];
+  for (let i = 0; i < 10000; i++) {
+    const value = Math.sin(i) * 0.8;
+    values.push(value);
+    funnel.observe({ kind: "score", species: "Momentum", solScore: value, entryScoreThreshold: 0.4 });
+  }
+  values.sort((a,b) => a-b);
+  const snapshot = funnel.snapshot();
+  assertClose(snapshot.medianSolScore, (values[4999] + values[5000]) / 2, snapshot.medianAbsoluteErrorBound + 1e-12);
+  assertEqual(snapshot.scoreSamples.length, 32);
+  assertEqual(snapshot.solScored, 10000);
+  assert(JSON.stringify(snapshot).length < 12000);
+});
+await test("PS.2b throwing diagnostics hook preserves every tick and evolution", async () => {
+  let calls = 0;
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-throw-funnel", provider, writeArtifacts: false });
+  observer.observeSolFunnel = () => { calls++; throw new Error("diagnostic failure"); };
+  observer.start();
+  const run = await runFixtureSimulation({ observer });
+  assertEngineIdentical(BASELINE_RUN, run, "throwing PS.2b diagnostics");
+  assert(calls > 48);
+  assert(observer.snapshot().counters.solOpportunityObservations > 0);
+  await observer.finalize();
+});
+await test("PS.2b score/gate/species facts cannot enter frozen Jev packets or input digests", async () => {
+  async function capture(diagnostics) {
+    const { provider, calls } = fixtureProvider();
+    const observer = observerFor({ sessionId: "jsup-fixture-funnel-packet", provider, writeArtifacts: false });
+    observer.start();
+    if (diagnostics) {
+      observer.observeSolFunnel({ kind: "evaluation", species: "DIAGNOSTIC-SPECIES", passes: false, failedGates: ["momentum"], firstFailedGate: "momentum" });
+      observer.observeSolFunnel({ kind: "score", species: "DIAGNOSTIC-SPECIES", solScore: 0.712345, entryScoreThreshold: 0.812345 });
+    }
+    const handle = observer.observeSolOpportunity(solOpportunityInput());
+    observer.recordSolSelection(handle, { actualSelectedMint: SOL_MINT });
+    await settleObserver(observer, { expected: 0, expectedSol: 1 });
+    await observer.finalize();
+    assertEqual(calls.count, 1);
+    return calls.payloads[0];
+  }
+  const clean = await capture(false), diagnostic = await capture(true);
+  assertDeepEqual(diagnostic, clean);
+  assertEqual(digestOf(diagnostic), digestOf(clean));
+  for (const key of ["solFunnel", "failedGates", "species", "solScore", "entryScoreThreshold", "scoreMargin", "DIAGNOSTIC-SPECIES"])
+    assertExcludes(JSON.stringify(diagnostic), key);
+});
+await test("PS.2b persisted state and summary keep funnel and corrected sample counts", async () => {
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-funnel-persist", provider });
+  observer.start();
+  for (let i = 0; i < 80; i++) observer.freezeProposal(proposalFacts({ mint: UNSOL_MINT }));
+  observer.observeSolFunnel({ kind: "tick", inByMint: false, inTradeable: false });
+  await observer.finalize();
+  for (const doc of [await readSupervisorState(observer.sessionRoot), await readSupervisorSummary(observer.sessionRoot)]) {
+    assertEqual(doc.solFunnel.engineTicksObserved, 1);
+    const counters = doc.counters ?? doc;
+    assertEqual(counters.unsupportedRecentSampleCount, doc.unsupportedRecentSample.length);
+    assertEqual(counters.totalExecutionProposalsObserved, 80);
+    assertEqual(counters.proposalsObserved, 0);
+    assertEqual(counters.unsupportedProposals, 80);
+  }
+});
+await test("PS.2b spec-named counters are exact aliases of the canonical counters", () => {
+  const funnel = createSolFunnel();
+  funnel.observe({ kind: "tick", inByMint: true, inTradeable: true, fresh: true, referencePrice: 200, liquidity: 1e7 });
+  funnel.observe({ kind: "tick", inByMint: false, inTradeable: false });
+  funnel.observe({ kind: "evaluation", species: "Momentum", passes: true, failedGates: [] });
+  funnel.observe({ kind: "score", species: "Momentum", solScore: 0.5, entryScoreThreshold: 0.5 });
+  funnel.observe({ kind: "suppressed", species: "Momentum" });
+  const snapshot = funnel.snapshot();
+  assertEqual(snapshot.ticksWithSolObservedInUniverse, snapshot.ticksWithSolInByMint);
+  assertEqual(snapshot.ticksWithoutSolObservedInUniverse, snapshot.ticksWithoutSolInByMint);
+  assertEqual(
+    snapshot.opportunitiesSuppressedByAgentGenerationDedup,
+    snapshot.solOpportunitySuppressedByAgentGenerationDedup,
+  );
+  assertEqual(
+    snapshot.ticksWithSolObservedInUniverse + snapshot.ticksWithoutSolObservedInUniverse,
+    snapshot.engineTicksObserved,
+    "every observed tick is classified exactly once",
+  );
+  // Equality is ACTIONABLE: the exact bucket is a subset of above, never below.
+  assertEqual(snapshot.solExactlyEntryThreshold, 1);
+  assertEqual(snapshot.scoreMarginZero, snapshot.solExactlyEntryThreshold);
+  assertEqual(snapshot.solAboveEntryThreshold, 1, "an equal score counts as above");
+  assertEqual(snapshot.solBelowEntryThreshold, 0, "equality is never classified as below");
+  assertEqual(snapshot.solOpportunityCandidatesBeforeDedup, 1);
+});
+await test("PS.2b SOL presence diagnostics use the explicit presence vocabulary", () => {
+  const funnel = createSolFunnel();
+  funnel.observe({ kind: "tick", inByMint: true, inTradeable: false, fresh: false, referencePrice: 199.5, liquidity: 12_345 });
+  const presence = funnel.snapshot().latestPresence;
+  assertEqual(presence.solObservedInUniverse, true);
+  assertEqual(presence.solPresentInTradeable, false);
+  assertEqual(presence.solFresh, false);
+  assertEqual(presence.solReferencePrice, 199.5);
+  assertEqual(presence.solLiquidity, 12_345);
+  assertEqual(funnel.snapshot().ticksWithFreshSol, 0);
+  assertEqual(funnel.snapshot().ticksWithSolInTradeable, 0);
+});
+await test("PS.2b species aggregate independently in declaration order with no ranking", () => {
+  const funnel = createSolFunnel();
+  funnel.observe({ kind: "evaluation", species: "Momentum", passes: true, failedGates: [] });
+  funnel.observe({ kind: "score", species: "Momentum", solScore: 0.6, entryScoreThreshold: 0.4 });
+  funnel.observe({ kind: "captured", species: "Momentum" });
+  funnel.observe({ kind: "evaluation", species: "Value", passes: false, failedGates: ["momentum"], firstFailedGate: "momentum" });
+  const snapshot = funnel.snapshot();
+  assertDeepEqual(snapshot.species.map((row) => row.species), ["Momentum", "Value"], "declaration order, never sorted by result");
+  const [momentum, value] = snapshot.species;
+  assertEqual(momentum.solAgentEvaluations, 1);
+  assertEqual(momentum.solPassesGates, 1);
+  assertEqual(momentum.solFailsGates, 0);
+  assertEqual(momentum.solAboveEntryThreshold, 1);
+  assertEqual(momentum.solBelowEntryThreshold, 0);
+  assertEqual(momentum.solExactlyEntryThreshold, 0);
+  assertEqual(momentum.solOpportunityCandidatesBeforeDedup, 1);
+  assertEqual(momentum.solOpportunityCaptured, 1);
+  assertEqual(momentum.solOpportunitySuppressedByAgentGenerationDedup, 0);
+  assertEqual(value.solAgentEvaluations, 1);
+  assertEqual(value.solFailsGates, 1);
+  assertEqual(value.solOpportunityCandidatesBeforeDedup, 0);
+  assertEqual(value.solOpportunityCaptured, 0);
+  assertEqual(snapshot.gateFailureCounts.momentum, 1);
+  assertEqual(snapshot.firstFailedGateCounts.momentum, 1);
+});
+await test("PS.2b malformed funnel facts cannot corrupt aggregates or throw", () => {
+  const funnel = createSolFunnel();
+  funnel.observe({ kind: "not-a-kind", species: "Ghost" });
+  assertEqual(funnel.snapshot().species.length, 0, "an unknown kind never invents a species row");
+  funnel.observe({ kind: "evaluation", species: "Momentum", passes: false });
+  const snapshot = funnel.snapshot();
+  assertEqual(snapshot.solAgentEvaluations, 1, "the evaluation itself still counts");
+  assertEqual(snapshot.solFailsGates, 1);
+  assertEqual(Object.keys(snapshot.gateFailureCounts).length, 0, "an absent gate list contributes no gate reason");
+  funnel.observe({ kind: "score", species: "Momentum", solScore: Number.NaN, entryScoreThreshold: 0.4 });
+  assertEqual(funnel.snapshot().solNonFiniteScoreOrThreshold, 1);
+});
+await test("PS.2b SOL present in byMint but excluded from ctx.tradeable by the existing scan cap", async () => {
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-scan-cap", provider, writeArtifacts: false });
+  observer.start();
+  const sol = passingGateFixture().market;
+  sol.fresh = true;
+  sol.price = 200;
+  sol.liquidity = 1_000_000;
+  const rival = solMarket(BASE_AT, 50, { mint: UNSOL_MINT, symbol: "BONK" });
+  rival.liquidity = 50_000_000;
+  const feed = createFixtureFeed();
+  feed.markets = () => [sol, rival];
+  await runFixtureSimulation({ observer, feed, ticks: 1, populationSize: 4, marketScanLimit: 1 });
+  await observer.finalize();
+  const funnel = observer.snapshot().solFunnel;
+  assertEqual(funnel.engineTicksObserved, 1);
+  assertEqual(funnel.ticksWithSolInByMint, 1, "SOL is observed in the raw market map");
+  assertEqual(funnel.ticksWithSolInTradeable, 0, "the existing scan cap excluded SOL from ctx.tradeable");
+  assertEqual(funnel.ticksWithoutSolInTradeable, 1);
+  assertEqual(funnel.latestPresence.solObservedInUniverse, true);
+  assertEqual(funnel.latestPresence.solPresentInTradeable, false);
+  assertEqual(funnel.solAgentEvaluations, 0, "no agent can evaluate a market that is not in tradeable");
+  assertEqual(funnel.solOpportunityCandidatesBeforeDedup, 0);
+});
+await test("PS.2b persisted unsupported sample count equals the bounded sample length", async () => {
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-sample-bound", provider });
+  observer.start();
+  const total = 80;
+  for (let i = 0; i < total; i += 1) observer.freezeProposal(proposalFacts({ mint: UNSOL_MINT }));
+  await observer.finalize();
+  const state = await readSupervisorState(observer.sessionRoot);
+  const summary = await readSupervisorSummary(observer.sessionRoot);
+  for (const doc of [state, summary]) {
+    // state.json nests counters; summary.json flattens them. Both must agree.
+    const counters = doc.counters ?? doc;
+    assertEqual(doc.unsupportedRecentSample.length, SUPERVISOR_MAX_UNSUPPORTED_SAMPLE, "the sample stays bounded");
+    assertEqual(counters.unsupportedRecentSampleCount, doc.unsupportedRecentSample.length);
+    assertEqual(counters.unsupportedRecentSampleCount, SUPERVISOR_MAX_UNSUPPORTED_SAMPLE);
+  }
+  assertEqual(state.counters.unsupportedProposals, total, "the unsupported TOTAL stays exact");
+  assertEqual(state.counters.totalExecutionProposalsObserved, total);
+  assertEqual(state.counters.proposalsObserved, 0, "no unsupported proposal ever reached the worker");
+  assertEqual(state.counters.jevCalls, 0);
+  assertEqual(state.queueDropped ?? 0, 0);
+});
+await test("PS.2b dashboard exposes the funnel for a funnel-only session", async () => {
+  const root = path.join(WORKSPACE, "funnel-dashboard-root");
+  const { provider } = fixtureProvider();
+  const observer = observerFor({
+    sessionId: "jsup-fixture-funnel-dashboard",
+    baseRoot: path.join(root, "jev-supervisor-observer"),
+    provider,
+  });
+  observer.start();
+  observer.observeSolFunnel({ kind: "tick", inByMint: true, inTradeable: true, fresh: true, referencePrice: 200, liquidity: 1e7 });
+  observer.observeSolFunnel({ kind: "evaluation", species: "Momentum", passes: false, failedGates: ["pool_too_young"], firstFailedGate: "pool_too_young" });
+  await observer.finalize();
+  const block = await loadJevSupervisorObserverState(root, { now: () => BASE_AT });
+  assertEqual(block.available, true, "a session with zero proposals still publishes state");
+  assertEqual(block.noAuthorityTag, "NO AUTHORITY \u2022 PAPER ONLY");
+  assertEqual(block.solFunnel.ticksWithSolObservedInUniverse, 1);
+  assertEqual(block.solFunnel.ticksWithSolInTradeable, 1);
+  assertEqual(block.solFunnel.solFailsGates, 1);
+  assertEqual(block.solFunnel.gateFailureCounts.pool_too_young, 1);
+  assertEqual(block.totalExecutionProposalsObserved, 0);
+  assertEqual(block.jevCalls, 0);
 });
 
 /* ============================================================================
