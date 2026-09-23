@@ -3091,6 +3091,410 @@ await test("PS.2b dashboard exposes the funnel for a funnel-only session", async
 });
 
 /* ============================================================================
+ * 8c. PS.2c — SOL age-gate counterfactual (DIAGNOSTIC, NOT A TRADING RULE)
+ * ==========================================================================*/
+
+const { assessPoolAgeCounterfactual, POOL_TOO_OLD_GATE } = await import("./engine/simulation.mjs");
+const { createSolAgeCounterfactual, SOL_AGE_COUNTERFACTUAL_LABEL } = await import("./jev/supervisor/sol-age-counterfactual.mjs");
+const AGE_OLD_MS = 49 * 3_600_000;
+const tooOld = (m) => { m.poolAgeMs = AGE_OLD_MS; };
+const lowBuy = (m) => { m.features.buyPressure = 0; };
+const lowMomentum = (m) => { m.features.momentum = 0; };
+function ageFixture(...mutations) {
+  const fixture = passingGateFixture();
+  for (const mutate of mutations) mutate(fixture.market);
+  return fixture;
+}
+function cfFacts(species, fixture, options = { minLiquidityUsd: 100 }) {
+  return { kind: "age_counterfactual", species, ...assessPoolAgeCounterfactual(fixture.genome, fixture.market, options) };
+}
+
+await test("PS.2c production pool_too_old still rejects SOL; the counterfactual never touches passesGates", () => {
+  const { genome, market } = ageFixture(tooOld);
+  assertEqual(POOL_TOO_OLD_GATE, "pool_too_old");
+  assertEqual(passesGates(genome, market), false, "production rejects an age-only failure");
+  assertEqual(legacyPassesGates(genome, market), false, "the frozen pre-change oracle agrees");
+  assertDeepEqual(assessGates(genome, market).failedGates, ["pool_too_old"]);
+  const cf = assessPoolAgeCounterfactual(genome, market);
+  assertEqual(cf.productionPasses, false);
+  assertEqual(cf.counterfactualPasses, true);
+  assertEqual(passesGates(genome, market), false, "calling the diagnostic leaves the production verdict unchanged");
+  assertEqual(genome.maxPoolAgeHours, 48, "genome age bound untouched");
+  assertEqual(market.poolAgeMs, AGE_OLD_MS, "market untouched");
+});
+
+for (const [label, mutations, remaining] of [
+  ["age-only becomes a counterfactual pass", [tooOld], []],
+  ["age + buy pressure remains a failure", [tooOld, lowBuy], ["buy_pressure"]],
+  ["age + momentum remains a failure", [tooOld, lowMomentum], ["momentum"]],
+  ["age + buy pressure + momentum remains a failure", [tooOld, lowBuy, lowMomentum], ["buy_pressure", "momentum"]],
+]) {
+  await test(`PS.2c helper: ${label}`, () => {
+    const { genome, market } = ageFixture(...mutations);
+    const cf = assessPoolAgeCounterfactual(genome, market);
+    assertDeepEqual(cf.failedGates, ["pool_too_old", ...remaining], "production failure list is reported verbatim");
+    assertDeepEqual(cf.counterfactualFailedGates, remaining);
+    assertEqual(cf.counterfactualPasses, remaining.length === 0);
+    assertEqual(passesGates(genome, market), false);
+    if (remaining.length === 0) assertEqual(cf.counterfactualScore, scoreMarket(genome, market), "the EXISTING score, unchanged");
+    else assertEqual(cf.counterfactualScore, null, "no score while any non-age failure remains");
+    assertEqual(cf.entryScoreThreshold, genome.entryScoreThreshold);
+  });
+}
+
+await test("PS.2c keeps pool_too_young when both age bounds fail, and scores with the unchanged age term", () => {
+  const both = passingGateFixture();
+  both.genome.minPoolAgeHours = 100; both.genome.maxPoolAgeHours = 48; both.market.poolAgeMs = 60 * 3_600_000;
+  const cf = assessPoolAgeCounterfactual(both.genome, both.market);
+  assertDeepEqual(cf.failedGates, ["pool_too_young", "pool_too_old"]);
+  assertDeepEqual(cf.counterfactualFailedGates, ["pool_too_young"]);
+  assertEqual(cf.counterfactualScore, null);
+  const agg = createSolAgeCounterfactual();
+  agg.observe({ kind: "age_counterfactual", species: "Momentum", ...cf });
+  assertEqual(agg.snapshot().overlapCounts.POOL_AGE_PLUS_OTHER, 1);
+  const weighted = ageFixture(tooOld);
+  weighted.genome.ageWeight = 0.5; weighted.market.features.ageYouth = 0;
+  const scored = assessPoolAgeCounterfactual(weighted.genome, weighted.market);
+  assertEqual(scored.counterfactualScore, scoreMarket(weighted.genome, weighted.market));
+  assert(scored.counterfactualScore < scoreMarket({ ...weighted.genome, ageWeight: 0 }, weighted.market), "the age score term is NOT removed");
+});
+
+await test("PS.2c non-age gate failures are never removed (every gate, alone and with age)", () => {
+  for (const [reason, mutate] of GATE_FAILURE_FIXTURES) {
+    for (const withAge of [false, true]) {
+      if (reason === "pool_too_old" || (withAge && ["missing_features", "pool_age_unknown", "pool_too_young"].includes(reason))) continue;
+      const fixture = withAge ? ageFixture(mutate, tooOld) : ageFixture(mutate);
+      const options = { minLiquidityUsd: 100 };
+      const production = assessGates(fixture.genome, fixture.market, options).failedGates;
+      const cf = assessPoolAgeCounterfactual(fixture.genome, fixture.market, options);
+      assertDeepEqual(cf.failedGates, production);
+      assertDeepEqual(cf.counterfactualFailedGates, production.filter((gate) => gate !== "pool_too_old"));
+      assert(cf.counterfactualFailedGates.includes(reason), `${reason} must survive the counterfactual`);
+      assertEqual(cf.counterfactualPasses, false);
+      assertEqual(cf.counterfactualScore, null);
+      assertEqual(production.includes("pool_too_old"), withAge);
+    }
+  }
+  const rng = createSeededRandom("ps2c-counterfactual-removes-only-age");
+  for (let i = 0; i < 3000; i++) {
+    const genome = randomGenome(SPECIES[i % SPECIES.length], rng);
+    const market = structuredClone(passingGateFixture().market);
+    market.poolAgeMs = rng() * 2000 * 3_600_000;
+    for (const field of Object.keys(market.features)) market.features[field] = rng();
+    const production = assessGates(genome, market).failedGates;
+    const cf = assessPoolAgeCounterfactual(genome, market);
+    assertDeepEqual(cf.counterfactualFailedGates, production.filter((gate) => gate !== "pool_too_old"));
+    assertEqual(cf.productionPasses, passesGates(genome, market));
+    assertEqual(cf.counterfactualScore === null, cf.counterfactualFailedGates.length > 0);
+  }
+});
+
+await test("PS.2c exact overlap buckets are exclusive, exhaustive and match the dynamic combinations", () => {
+  const agg = createSolAgeCounterfactual();
+  const cases = [
+    [[tooOld], 3], [[tooOld, lowBuy], 2], [[tooOld, lowMomentum], 5],
+    [[tooOld, lowBuy, lowMomentum], 7], [[tooOld, (m) => { m.features.organicScore = 0; }], 1],
+    [[tooOld, lowBuy, (m) => { m.verified = false; }], 1], [[lowBuy], 4], [[], 2],
+  ];
+  for (const [mutations, count] of cases) for (let i = 0; i < count; i++) agg.observe(cfFacts("Momentum", ageFixture(...mutations)));
+  const s = agg.snapshot();
+  assertDeepEqual(s.overlapCounts, {
+    POOL_AGE_ONLY: 3, POOL_AGE_PLUS_BUY_PRESSURE: 2, POOL_AGE_PLUS_MOMENTUM: 5,
+    POOL_AGE_PLUS_BUY_PRESSURE_PLUS_MOMENTUM: 7, POOL_AGE_PLUS_OTHER: 2,
+  });
+  assertEqual(Object.values(s.overlapCounts).reduce((a, b) => a + b, 0), s.solFailsPoolTooOld);
+  assertDeepEqual(s.exactFailureCombinationCounts, {
+    pool_too_old: 3, "pool_too_old+buy_pressure": 2, "pool_too_old+momentum": 5,
+    "pool_too_old+buy_pressure+momentum": 7, "organic_score+pool_too_old": 1,
+    "verification+pool_too_old+buy_pressure": 1, buy_pressure: 4, PASS: 2,
+  });
+  assertEqual(s.solAgeCounterfactualEvaluations, 25);
+  assertEqual(s.solFailsPoolTooOld, 19);
+  assertEqual(s.solFailsWithoutPoolTooOld, 4);
+  assertEqual(s.solProductionPassesGates, 2);
+  assertEqual(s.solFailsOnlyPoolTooOld, 3);
+  assertEqual(s.solStillFailsWithoutPoolAge, 20);
+  assertEqual(s.solStillFailsBuyPressure, 2 + 7 + 1 + 4);
+  assertEqual(s.solStillFailsMomentum, 5 + 7);
+  assertEqual(s.solStillFailsOther, 2);
+  assertEqual(s.solPassesWithoutPoolAge, 5);
+  assertEqual(s.solAgeCounterfactualEvaluations, s.solPassesWithoutPoolAge + s.solStillFailsWithoutPoolAge);
+  assertEqual(s.solAgeCounterfactualEvaluations, s.solProductionPassesGates + s.solFailsPoolTooOld + s.solFailsWithoutPoolTooOld);
+  assertEqual(s.solPassesWithoutPoolAge, s.solFailsOnlyPoolTooOld + s.solProductionPassesGates);
+  assertEqual(s.solCounterfactualScored, s.solPassesWithoutPoolAge);
+  assertEqual(s.solCounterfactualScoredFromAgeOnly, 3);
+  assertEqual(s.solCounterfactualScoredFromProductionPass, 2);
+  assertDeepEqual(s.stillFailsGateCounts, { buy_pressure: 14, momentum: 12, organic_score: 1, verification: 1 });
+  assertEqual(s.label, "DIAGNOSTIC COUNTERFACTUAL • NOT A TRADING RULE");
+});
+
+await test("PS.2c counterfactual scoring occurs ONLY when no counterfactual failure remains", () => {
+  const agg = createSolAgeCounterfactual();
+  // A (malformed) caller supplying a score despite remaining failures is ignored.
+  agg.observe({ kind: "age_counterfactual", species: "Momentum", failedGates: ["pool_too_old", "momentum"], counterfactualScore: 0.9, entryScoreThreshold: 0.1 });
+  agg.observe({ kind: "age_counterfactual", species: "Momentum", failedGates: ["buy_pressure"], counterfactualScore: 0.9, entryScoreThreshold: 0.1 });
+  let s = agg.snapshot();
+  assertEqual(s.solCounterfactualScored, 0);
+  assertEqual(s.solCounterfactualAboveThreshold, 0);
+  assertEqual(s.solCounterfactualMeanScore, null);
+  assertEqual(s.scoredSamples.length, 0);
+  agg.observe({ kind: "age_counterfactual", species: "Momentum", failedGates: ["pool_too_old"], counterfactualScore: 0.3, entryScoreThreshold: 0.4 });
+  s = agg.snapshot();
+  assertEqual(s.solCounterfactualScored, 1);
+  assertEqual(s.scoredSamples.length, 1);
+});
+
+for (const [label, delta, above, below, exact] of [["below", 0.1, 0, 1, 0], ["exactly (>=)", 0, 1, 0, 1], ["above", -0.1, 1, 0, 0]]) {
+  await test(`PS.2c threshold classification: ${label}`, () => {
+    const fixture = ageFixture(tooOld);
+    fixture.genome.entryScoreThreshold = scoreMarket(fixture.genome, fixture.market) + delta;
+    const agg = createSolAgeCounterfactual();
+    agg.observe(cfFacts("Momentum", fixture));
+    const s = agg.snapshot();
+    assertEqual(s.solCounterfactualScored, 1);
+    assertEqual(s.solCounterfactualAboveThreshold, above);
+    assertEqual(s.solCounterfactualBelowThreshold, below);
+    assertEqual(s.solCounterfactualExactlyThreshold, exact);
+    assertEqual(s.solCounterfactualAboveThreshold + s.solCounterfactualBelowThreshold, s.solCounterfactualScored, "equality is never counted twice");
+    assertClose(s.solCounterfactualMeanMargin, -delta, 1e-12);
+    assertClose(s.solCounterfactualMedianMargin, -delta, s.medianAbsoluteErrorBound + 1e-12);
+    assertEqual(s.solCounterfactualMinScore, s.solCounterfactualMaxScore);
+    assertEqual(s.solCounterfactualMeanThreshold, fixture.genome.entryScoreThreshold);
+  });
+}
+
+await test("PS.2c species rows are descriptive, label-sorted and never ranked", () => {
+  const agg = createSolAgeCounterfactual();
+  const above = ageFixture(tooOld); above.genome.entryScoreThreshold = scoreMarket(above.genome, above.market) - 0.1;
+  const below = ageFixture(tooOld); below.genome.entryScoreThreshold = scoreMarket(below.genome, below.market) + 0.1;
+  const exact = ageFixture(tooOld); exact.genome.entryScoreThreshold = scoreMarket(exact.genome, exact.market);
+  agg.observe(cfFacts("Value", ageFixture(tooOld, lowBuy)));
+  agg.observe(cfFacts("Value", below));
+  agg.observe(cfFacts("Momentum", above));
+  agg.observe(cfFacts("Momentum", exact));
+  agg.observe(cfFacts("Momentum", ageFixture(tooOld, lowMomentum)));
+  const s = agg.snapshot();
+  assertDeepEqual(s.species.map((row) => row.species), ["Momentum", "Value"]);
+  assertDeepEqual(s.species[0], { species: "Momentum", evaluations: 3, failsOnlyPoolTooOld: 2, stillFailsWithoutPoolAge: 1, passesWithoutPoolAge: 2, aboveThreshold: 2, belowThreshold: 0, exactThreshold: 1 });
+  assertDeepEqual(s.species[1], { species: "Value", evaluations: 2, failsOnlyPoolTooOld: 1, stillFailsWithoutPoolAge: 1, passesWithoutPoolAge: 1, aboveThreshold: 0, belowThreshold: 1, exactThreshold: 0 });
+  for (const key of Object.keys(s)) assert(!/rank|best|recommend/i.test(key), `no ranking field: ${key}`);
+});
+
+await test("PS.2c malformed facts are counted, never thrown, never scored", () => {
+  const agg = createSolAgeCounterfactual();
+  for (const facts of [null, undefined, 7, {}, { failedGates: "pool_too_old" }, { failedGates: [1] }, { failedGates: [null, "pool_too_old"] }]) agg.observe(facts);
+  let s = agg.snapshot();
+  assertEqual(s.malformedFacts, 7);
+  assertEqual(s.solAgeCounterfactualEvaluations, 0);
+  assertEqual(s.species.length, 0);
+  agg.observe({ failedGates: ["pool_too_old"], counterfactualScore: Number.NaN, entryScoreThreshold: 0.4 });
+  agg.observe({ failedGates: ["pool_too_old"], counterfactualScore: "0.9", entryScoreThreshold: 0.4 });
+  s = agg.snapshot();
+  assertEqual(s.solCounterfactualNonFiniteScoreOrThreshold, 2);
+  assertEqual(s.solCounterfactualAboveThreshold + s.solCounterfactualBelowThreshold, 0);
+  assertEqual(s.species[0].species, "UNKNOWN");
+});
+
+await test("PS.2c aggregates stay bounded under large streams and many combinations", () => {
+  const agg = createSolAgeCounterfactual();
+  for (let i = 0; i < 20000; i++) {
+    agg.observe({ species: `S${i % 200}`, failedGates: i % 3 ? ["pool_too_old", `gate_${i % 150}`] : ["pool_too_old"], counterfactualScore: Math.sin(i) * 0.8, entryScoreThreshold: 0.4 });
+  }
+  const s = agg.snapshot();
+  assertEqual(s.solAgeCounterfactualEvaluations, 20000);
+  assertEqual(s.scoredSamples.length, 32);
+  assertEqual(s.species.length, 65, "64 labels plus OTHER");
+  assertEqual(Object.keys(s.exactFailureCombinationCounts).length, 65, "64 combinations plus OTHER_COMBINATION");
+  assertEqual(Object.values(s.exactFailureCombinationCounts).reduce((a, b) => a + b, 0), 20000);
+  assert(JSON.stringify(s).length < 40000);
+});
+
+/**
+ * Engine fixture: SOL fails production ONLY on pool age while its existing score
+ * clears the existing threshold; an identical rival mint passes every gate.
+ */
+async function ageCounterfactualRun({ observer = null, solMutations = [tooOld], thresholdDelta = -0.1, ticks = 6, keepCash = true } = {}) {
+  const sol = ageFixture(...solMutations).market;
+  const rival = structuredClone(passingGateFixture().market);
+  rival.mint = UNSOL_MINT; rival.symbol = "BONK";
+  const feed = createFixtureFeed();
+  feed.markets = () => [sol, rival];
+  const run = await runFixtureSimulation({ observer, feed, ticks: 0, populationSize: 12 });
+  const species = ["Momentum", "Value"];
+  for (const [i, agent] of run.simulation.population.entries()) {
+    agent.genome = { ...agent.genome, ...passingGateFixture().genome };
+    agent.genome.entryScoreThreshold = scoreMarket(agent.genome, passingGateFixture().market) + thresholdDelta;
+    agent.species = species[i % species.length];
+    if (!keepCash) agent.cash = 0;
+  }
+  const tickDigests = [];
+  for (let i = 0; i < ticks; i++) {
+    run.simulation.advanceTick();
+    tickDigests.push(digestOf({ snapshot: run.simulation.snapshot(), population: run.simulation.population }));
+  }
+  return { simulation: run.simulation, snapshot: run.simulation.snapshot(), tickDigests };
+}
+
+await test("PS.2c counterfactual eligibility produces NO PS.2a opportunity and NO Jev call", async () => {
+  const { provider, calls } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-age-cf-nojev", provider, writeArtifacts: false });
+  observer.start();
+  await ageCounterfactualRun({ observer, keepCash: false });
+  await observer.finalize();
+  const snapshot = observer.snapshot();
+  const cf = snapshot.solAgeCounterfactual;
+  assert(cf.solFailsOnlyPoolTooOld > 0, "the fixture must produce age-only failures");
+  assert(cf.solCounterfactualAboveThreshold > 0, "the fixture must produce counterfactual above-threshold evaluations");
+  assertEqual(cf.solCounterfactualAboveThreshold, cf.solAgeCounterfactualEvaluations);
+  assertEqual(snapshot.solFunnel.solPassesGates, 0, "production still rejects every SOL evaluation");
+  assertEqual(snapshot.solFunnel.solScored, 0);
+  assertEqual(snapshot.solFunnel.solOpportunityCandidatesBeforeDedup, 0);
+  assertEqual(snapshot.solFunnel.solOpportunityCaptured, 0);
+  assertEqual(snapshot.counters.solOpportunityObservations, 0);
+  assertEqual(snapshot.counters.solOpportunityProposals, 0);
+  assertEqual(snapshot.counters.jevCalls, 0);
+  assertEqual(calls.count, 0, "the provider was never invoked");
+  assertEqual(snapshot.solQueue?.pushed ?? 0, 0);
+});
+
+await test("PS.2c observer off/on and throwing/malformed PS.2c diagnostics: engine byte-equivalent", async () => {
+  const baseline = await ageCounterfactualRun({ observer: null });
+  const trades = baseline.snapshot.recentTrades;
+  assert(trades.length > 0, "the rival must actually be traded");
+  assert(trades.every((trade) => trade.mint !== SOL_MINT), "production never selects the age-rejected SOL");
+  const variants = {
+    working: (observer) => observer,
+    throwing: (observer) => {
+      const original = observer.observeSolFunnel;
+      observer.observeSolFunnel = (facts) => { if (facts.kind === "age_counterfactual") throw new Error("PS.2c failure"); return original(facts); };
+      return observer;
+    },
+    malformed: (observer) => {
+      const original = observer.observeSolFunnel;
+      observer.observeSolFunnel = (facts) => {
+        if (facts.kind !== "age_counterfactual") return original(facts);
+        facts.failedGates.push("mutated"); facts.counterfactualFailedGates.length = 0; // mutating copies only
+        original({ ...facts, failedGates: "garbage" });
+        return { best: SOL_MINT, bestScore: 99 };
+      };
+      return observer;
+    },
+  };
+  for (const [label, wrap] of Object.entries(variants)) {
+    const { provider } = fixtureProvider();
+    const observer = wrap(observerFor({ sessionId: `jsup-fixture-age-cf-${label}`, provider, writeArtifacts: false }));
+    observer.start();
+    const run = await ageCounterfactualRun({ observer });
+    assertEqual(JSON.stringify(run.snapshot), JSON.stringify(baseline.snapshot), `${label}: snapshot byte-identical`);
+    assertDeepEqual(run.tickDigests, baseline.tickDigests, `${label}: every tick and population identical`);
+    assertEqual(digestOf(run.simulation.population.map((agent) => agent.genome)), digestOf(baseline.simulation.population.map((agent) => agent.genome)));
+    await observer.finalize();
+    const cf = observer.snapshot().solAgeCounterfactual;
+    if (label === "working") assert(cf.solAgeCounterfactualEvaluations > 0);
+    if (label === "throwing") assertEqual(cf.solAgeCounterfactualEvaluations, 0);
+    if (label === "malformed") assert(cf.malformedFacts > 0 && cf.solAgeCounterfactualEvaluations === 0);
+  }
+  // The generic equivalence fixture (with generation transitions) is also unchanged.
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-age-cf-baseline", provider, writeArtifacts: false });
+  observer.start();
+  assertEngineIdentical(BASELINE_RUN, await runFixtureSimulation({ observer }), "PS.2c enabled");
+  await observer.finalize();
+});
+
+await test("PS.2c leaves PS.2b funnel counters exactly unchanged", async () => {
+  async function funnelWith(dropCounterfactual) {
+    const { provider } = fixtureProvider();
+    const observer = observerFor({ sessionId: "jsup-fixture-age-cf-funnel", provider, writeArtifacts: false });
+    if (dropCounterfactual) {
+      const original = observer.observeSolFunnel;
+      observer.observeSolFunnel = (facts) => (facts.kind === "age_counterfactual" ? undefined : original(facts));
+    }
+    observer.start();
+    await ageCounterfactualRun({ observer, solMutations: [tooOld, lowBuy], keepCash: false });
+    await observer.finalize();
+    return observer.snapshot().solFunnel;
+  }
+  const withCf = await funnelWith(false), withoutCf = await funnelWith(true);
+  assertDeepEqual(withCf, withoutCf);
+  assertEqual(withCf.gateFailureCounts.pool_too_old, withCf.solAgentEvaluations);
+  assertEqual(withCf.gateFailureCounts.buy_pressure, withCf.solAgentEvaluations);
+  for (const key of Object.keys(withCf)) assert(!/counterfactual/i.test(key), `no PS.2c key leaks into solFunnel: ${key}`);
+});
+
+await test("PS.2c facts cannot enter frozen Jev packets or change the PS.2a input digest", async () => {
+  async function capture(diagnostics) {
+    const { provider, calls } = fixtureProvider();
+    const observer = observerFor({ sessionId: "jsup-fixture-age-cf-packet", provider, writeArtifacts: false });
+    observer.start();
+    if (diagnostics) {
+      for (let i = 0; i < 50; i++) observer.observeSolFunnel(cfFacts("CF-SPECIES", ageFixture(tooOld)));
+      observer.observeSolFunnel(cfFacts("CF-SPECIES", ageFixture(tooOld, lowBuy, lowMomentum)));
+    }
+    const handle = observer.observeSolOpportunity(solOpportunityInput());
+    observer.recordSolSelection(handle, { actualSelectedMint: SOL_MINT });
+    await settleObserver(observer, { expected: 0, expectedSol: 1 });
+    await observer.finalize();
+    assertEqual(calls.count, 1, "only the genuine PS.2a opportunity reaches Jev");
+    const snapshot = observer.snapshot();
+    return { payload: calls.payloads[0], opportunities: snapshot.counters.solOpportunityProposals };
+  }
+  const clean = await capture(false), diagnostic = await capture(true);
+  assertDeepEqual(diagnostic.payload, clean.payload);
+  assertEqual(digestOf(diagnostic.payload), digestOf(clean.payload));
+  assertEqual(diagnostic.opportunities, clean.opportunities);
+  for (const key of ["solAgeCounterfactual", "counterfactual", "pool_too_old", "failedGates", "CF-SPECIES", "entryScoreThreshold"])
+    assertExcludes(JSON.stringify(diagnostic.payload), key);
+});
+
+await test("PS.2c persisted state/summary and dashboard carry the bounded aggregate", async () => {
+  const root = path.join(WORKSPACE, "age-cf-dashboard-root");
+  const { provider } = fixtureProvider();
+  const observer = observerFor({ sessionId: "jsup-fixture-age-cf-persist", baseRoot: path.join(root, "jev-supervisor-observer"), provider });
+  observer.start();
+  const above = ageFixture(tooOld); above.genome.entryScoreThreshold = scoreMarket(above.genome, above.market) - 0.05;
+  for (let i = 0; i < 5000; i++) observer.observeSolFunnel(cfFacts("Momentum", i % 2 ? above : ageFixture(tooOld, lowMomentum)));
+  await observer.finalize();
+  for (const doc of [await readSupervisorState(observer.sessionRoot), await readSupervisorSummary(observer.sessionRoot)]) {
+    assertEqual(doc.solAgeCounterfactual.solAgeCounterfactualEvaluations, 5000);
+    assertEqual(doc.solAgeCounterfactual.solFailsOnlyPoolTooOld, 2500);
+    assertEqual(doc.solAgeCounterfactual.solCounterfactualAboveThreshold, 2500);
+    assertEqual(doc.solAgeCounterfactual.overlapCounts.POOL_AGE_PLUS_MOMENTUM, 2500);
+    assertEqual(doc.solAgeCounterfactual.scoredSamples.length, 32);
+    assertEqual(doc.solFunnel.solAgentEvaluations, 0, "PS.2c never writes PS.2b counters");
+    assert(JSON.stringify(doc.solAgeCounterfactual).length < 12000);
+  }
+  const files = await readdir(observer.sessionRoot);
+  assert(!files.some((file) => /counterfactual/i.test(file)), "no per-evaluation counterfactual file");
+  const block = await loadJevSupervisorObserverState(root, { now: () => BASE_AT });
+  assertEqual(block.solAgeCounterfactual.label, SOL_AGE_COUNTERFACTUAL_LABEL);
+  assertEqual(block.solAgeCounterfactual.solPassesWithoutPoolAge, 2500);
+  assertEqual(block.jevCalls, 0);
+});
+
+await test("PS.2c dashboard labels the counterfactual as diagnostic, never as opportunities, trades or advice", async () => {
+  const start = PAGE_SOURCE.indexOf("SOL AGE-GATE COUNTERFACTUAL");
+  const end = PAGE_SOURCE.indexOf("\n            )}\n", start);
+  assert(start > 0 && end > start);
+  const panel = PAGE_SOURCE.slice(start, end);
+  assertIncludes(panel, "DIAGNOSTIC COUNTERFACTUAL • NOT A TRADING RULE");
+  for (const label of ["Evaluations", "Age-only failures", "Still blocked without age", "Would pass remaining gates", "Would be above threshold", "Would be below threshold"])
+    assertIncludes(panel, label);
+  for (const forbidden of [/opportunit/i, /\btrades?\b/i, /recommend/i, /should remove/i]) assert(!forbidden.test(panel), `forbidden framing: ${forbidden}`);
+});
+
+await test("PS.2c historical PS.2b session jsup-20260922T151045Z-063f35 is preserved as recorded", async () => {
+  const id = "jsup-20260922T151045Z-063f35";
+  if (!SUPERVISOR_SESSIONS_BEFORE.includes(id)) return;
+  const summary = await readSupervisorSummary(path.join(SUPERVISOR_ROOT_DIR, id));
+  assertEqual(summary.sessionId, id);
+  assertEqual(Object.hasOwn(summary, "solAgeCounterfactual"), false, "old artifacts are never back-filled");
+  assertEqual(summary.solFunnel.solAgentEvaluations, 54202);
+  assertDeepEqual(summary.solFunnel.gateFailureCounts, { pool_too_old: 54202, buy_pressure: 20531, momentum: 14378 });
+  assertEqual(summary.jevCalls, 0);
+});
+
+/* ============================================================================
  * 9. Preservation: canonical 5I, temporal, Paper Shadow, forensics, trees
  * ==========================================================================*/
 

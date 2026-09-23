@@ -1,4 +1,5 @@
 import { createSolFunnel } from "./sol-funnel.mjs";
+import { createSolAgeCounterfactual } from "./sol-age-counterfactual.mjs";
 /**
  * Phase 5I-PS.2 — Jev supervisor observer.
  *
@@ -274,9 +275,15 @@ export function createSupervisorProposalObserver({
   let solOpportunitySerial = 0;
   let solJudgmentSerial = 0;
   const solFunnel = createSolFunnel();
+  // PS.2c: counterfactual facts go ONLY to their own aggregate. They never
+  // reach the PS.2b funnel, the PS.2a opportunity path or the Jev queue.
+  const solAgeCounterfactual = createSolAgeCounterfactual();
   function observeSolFunnel(facts) {
     if (!running) return;
-    try { solFunnel.observe(facts); } catch (error) { noteObserverError(error); }
+    try {
+      if (facts?.kind === "age_counterfactual") solAgeCounterfactual.observe(facts);
+      else solFunnel.observe(facts);
+    } catch (error) { noteObserverError(error); }
   }
   let unsupportedRecentSample = [];
   let solDroppedRecords = [];
@@ -431,6 +438,7 @@ export function createSupervisorProposalObserver({
       droppedRecords,
       unsupportedRecentSample,
       solFunnel: solFunnel.snapshot(),
+      solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       lastProposalAt,
       lastJudgmentAt,
       lastSolOpportunityAt,
@@ -1341,6 +1349,7 @@ export function createSupervisorProposalObserver({
       lastSolJudgmentAt,
       unsupportedRecentSample,
       solFunnel: solFunnel.snapshot(),
+      solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       recentRowCount: recentRows.length,
       droppedRecordCount: droppedRecords.length,
     });
@@ -1412,6 +1421,7 @@ export function createSupervisorProposalObserver({
       pendingSolDrafts: solDrafts.size,
       unsupportedRecentSample: [...unsupportedRecentSample],
       solFunnel: solFunnel.snapshot(),
+      solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       solDroppedRecords: [...solDroppedRecords],
       uniqueSolMarketStates: solStateSeen.size,
       recentRows: [...recentRows],

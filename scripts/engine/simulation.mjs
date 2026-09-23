@@ -218,6 +218,26 @@ export function assessGates(genome, market, options) {
   return { passes: failedGates.length === 0, firstFailedGate: failedGates[0] ?? null, failedGates };
 }
 
+// Phase 5I-PS.2c — DIAGNOSTIC COUNTERFACTUAL, NOT A TRADING RULE. Reuses the
+// single shared assessment and removes ONLY `pool_too_old` from a copied
+// failure list; every other failure is kept in original order. It is not a gate
+// predicate: the engine never reads its result, it only hands copied scalars to
+// the observer tap. `passesGates` above remains the sole production rule.
+export const POOL_TOO_OLD_GATE = "pool_too_old";
+export function assessPoolAgeCounterfactual(genome, market, options) {
+  const { passes, failedGates } = assessGates(genome, market, options);
+  const counterfactualFailedGates = failedGates.filter((gate) => gate !== POOL_TOO_OLD_GATE);
+  const counterfactualPasses = counterfactualFailedGates.length === 0;
+  return {
+    productionPasses: passes,
+    failedGates,
+    counterfactualFailedGates,
+    counterfactualPasses,
+    counterfactualScore: counterfactualPasses ? scoreMarket(genome, market) : null,
+    entryScoreThreshold: genome.entryScoreThreshold,
+  };
+}
+
 export const DEFAULT_EVOLUTION = Object.freeze({
   enabled: true,
   mutationScale: 0.07,
@@ -1023,6 +1043,12 @@ export function createSimulation({
         observeSolFunnel("evaluation", () => ({
           species: agent.species,
           ...assessGates(agent.genome, market, ctx),
+        }));
+        // PS.2c: a separate protected call, so a counterfactual failure can
+        // neither alter the PS.2b fact above nor any decision below.
+        observeSolFunnel("age_counterfactual", () => ({
+          species: agent.species,
+          ...assessPoolAgeCounterfactual(agent.genome, market, ctx),
         }));
       }
       if (!gatesPass) continue;

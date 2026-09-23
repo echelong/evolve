@@ -178,6 +178,7 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
       now: now(),
     }),
     solFunnel: state?.solFunnel ?? summary?.solFunnel ?? null,
+    solAgeCounterfactual: state?.solAgeCounterfactual ?? summary?.solAgeCounterfactual ?? null,
     totalExecutionProposalsObserved: num(counters.totalExecutionProposalsObserved) ?? num(summary?.totalExecutionProposalsObserved),
     proposalsObserved: num(counters.proposalsObserved) ?? num(summary?.proposalsObserved),
     supportedProposals: num(counters.supportedProposals) ?? num(summary?.supportedProposals),

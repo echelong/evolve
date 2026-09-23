@@ -11,14 +11,14 @@ const COUNTERS = [
   "scoreMarginNegative", "scoreMarginZero", "scoreMarginPositive",
 ];
 const SAMPLE_LIMIT = 32;
-const BIN_WIDTH = 0.0001;
+export const BIN_WIDTH = 0.0001;
 const SPECIES_LIMIT = 64;
 // Kinds the engine and the PS.2a observer actually emit. Anything else is
 // ignored rather than inventing an empty species row.
 const OBSERVED_KINDS = new Set(["evaluation", "score", "captured", "suppressed", "capture_error"]);
 // scoreMarket is in [-1,1], genome entry thresholds in [0.05,0.85].
 // [-2,2] covers scores, thresholds and margins without changing any gate.
-function distribution() {
+export function distribution() {
   const bins = new Map();
   let count = 0, sum = 0, min = Infinity, max = -Infinity, outsideRange = 0;
   return {

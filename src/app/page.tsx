@@ -580,8 +580,15 @@ type SolFunnel = {
   solOpportunitySuppressedByAgentGenerationDedup: number;
   gateFailureCounts: Record<string, number>;
 };
+type SolAgeCounterfactual = {
+  label?: string;
+  solAgeCounterfactualEvaluations: number; solFailsOnlyPoolTooOld: number;
+  solStillFailsWithoutPoolAge: number; solPassesWithoutPoolAge: number;
+  solCounterfactualAboveThreshold: number; solCounterfactualBelowThreshold: number;
+};
 type JevSupervisorObserverState = {
   solFunnel?: SolFunnel | null;
+  solAgeCounterfactual?: SolAgeCounterfactual | null;
   totalExecutionProposalsObserved?: number | null;
   available: boolean;
   label?: string;
@@ -2327,6 +2334,27 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
                 <p>Gate failure counts (all failures; an evaluation may appear more than once): {Object.entries(observer.solFunnel.gateFailureCounts)
                   .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6)
                   .map(([reason, count]) => `${reason}: ${count}`).join(" · ") || "None observed"}</p>
+              </div>
+            )}
+
+            {observer.solAgeCounterfactual && (
+              <div>
+                <h3>SOL AGE-GATE COUNTERFACTUAL</h3>
+                <p><strong>DIAGNOSTIC COUNTERFACTUAL • NOT A TRADING RULE</strong> — pool_too_old is removed
+                  from a copied failure list for description only; the live gate is unchanged. The existing score, including its
+                  age term, is not altered. Above threshold does not mean SOL would be selected.</p>
+                <div className="health-grid">
+                  {([
+                    ["Evaluations", "solAgeCounterfactualEvaluations"],
+                    ["Age-only failures", "solFailsOnlyPoolTooOld"],
+                    ["Still blocked without age", "solStillFailsWithoutPoolAge"],
+                    ["Would pass remaining gates (includes production passes)", "solPassesWithoutPoolAge"],
+                    ["Would be above threshold (includes equality)", "solCounterfactualAboveThreshold"],
+                    ["Would be below threshold", "solCounterfactualBelowThreshold"],
+                  ] as const).map(([label, key]) => (
+                    <div className="health-item" key={key}><span>{label}</span><strong>{observer.solAgeCounterfactual![key] ?? 0}</strong></div>
+                  ))}
+                </div>
               </div>
             )}
 
