@@ -41,6 +41,10 @@ Historical backtests and paper results **do not** guarantee future profitability
 - Matched A/B Arena mode: equal-resource Research vs Conventional cohorts, no cloning, cohort/lineage
   attribution through evolution, cross-cohort crossover disabled, and a dedicated `ab-comparison.json`
 
+## Development Governance
+
+Substantial EVOLVE changes follow `spec/plan → implementation → independent review → fresh verification → shadow/replication when research-facing`. The native development-only governance layer records bounded plans, scope, review packages, fresh checks, and evidence preservation under `.evolve/governance/`. See [Development Governance v1](docs/DEVELOPMENT-GOVERNANCE.md).
+
 ## Run
 
 ```bash
