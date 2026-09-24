@@ -320,7 +320,11 @@ export const SUPERVISOR_FORBIDDEN_FLAGS = Object.freeze([
 ]);
 
 export const SUPERVISOR_BOOLEAN_FLAGS = Object.freeze(["help", "json"]);
-export const SUPERVISOR_VALUE_FLAGS = Object.freeze(["minutes", "market", "session"]);
+/**
+ * `cross-asset` (Phase 5I-PS.2d) opts into the cross-asset production shadow
+ * with a frozen profile name (`canary` | `full`); it carries no tunable value.
+ */
+export const SUPERVISOR_VALUE_FLAGS = Object.freeze(["minutes", "market", "session", "cross-asset"]);
 
 /* ============================================================================
  * Question-set / feature-definition identity (reused, never re-derived)

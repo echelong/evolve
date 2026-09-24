@@ -586,9 +586,29 @@ type SolAgeCounterfactual = {
   solStillFailsWithoutPoolAge: number; solPassesWithoutPoolAge: number;
   solCounterfactualAboveThreshold: number; solCounterfactualBelowThreshold: number;
 };
+// Phase 5I-PS.2d: CROSS-ASSET PRODUCTION SHADOW. Development shadow, zero
+// authority. Rows are in encounter order and are never ranked.
+type CrossAssetShadowRow = {
+  marketId: string | null; baseMint: string | null; symbol: string | null; ordinal: number | null;
+  productionOpportunities: number | null; schemaEligible: number | null; schemaIneligible: number | null;
+  suppressedDuplicateDigest: number | null; suppressedAssetCooldown: number | null;
+  suppressedPerAssetCap: number | null; suppressedGlobalCap: number | null;
+  queued: number | null; jevCalls: number | null; jevOk: number | null; jevFailures: number | null;
+};
+type CrossAssetShadow = {
+  label: string; authorityTag: string; profile: string | null;
+  pinsOk?: boolean; circuitBreakerOpen?: boolean;
+  globalMaxJevCallsPerRun: number | null; perAssetMaxJevCallsPerRun: number | null; perAssetMinSpacingMs: number | null;
+  counters: Record<string, number | null>;
+  queue: { capacity: number | null; depth: number | null; highWatermark: number | null; dropped: number | null };
+  totalAssetCount: number | null; rowsStored: number | null; rowsTruncated: number | null;
+  assetRowsShown: number; aggregateDigest: string | null;
+  assetRows: CrossAssetShadowRow[];
+};
 type JevSupervisorObserverState = {
   solFunnel?: SolFunnel | null;
   solAgeCounterfactual?: SolAgeCounterfactual | null;
+  crossAssetShadow?: CrossAssetShadow | null;
   totalExecutionProposalsObserved?: number | null;
   available: boolean;
   label?: string;
@@ -2355,6 +2375,107 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
                     <div className="health-item" key={key}><span>{label}</span><strong>{observer.solAgeCounterfactual![key] ?? 0}</strong></div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {observer.crossAssetShadow && (
+              <div>
+                <h3>{observer.crossAssetShadow.label ?? "CROSS-ASSET PRODUCTION SHADOW"}</h3>
+                <p><strong>{observer.crossAssetShadow.authorityTag ?? "DEVELOPMENT SHADOW • ZERO AUTHORITY"}</strong> — a
+                  bounded, deterministic sample of genuine EVOLVE production entry proposals across assets
+                  (profile {observer.crossAssetShadow.profile ?? "—"}, at most {observer.crossAssetShadow.globalMaxJevCallsPerRun ?? "—"} Jev
+                  calls, {observer.crossAssetShadow.perAssetMaxJevCallsPerRun ?? "—"} per asset, one per asset
+                  per {Math.round((observer.crossAssetShadow.perAssetMinSpacingMs ?? 0) / 1000)}s). Jev cannot approve, reject,
+                  resize, delay, select or veto anything. Descriptive counts only: no winner, no ranking, and no
+                  inference about returns, trading or deployment.</p>
+                <div className="health-grid">
+                  {([
+                    ["Production opportunities", "genuineProductionOpportunitiesObserved"],
+                    ["Assets observed", "uniqueAssetsObserved"],
+                    ["Schema eligible", "schemaEligible"],
+                    ["Queued", "queuedForJev"],
+                    ["Jev OK", "jevOk"],
+                    ["Jev failed", "jevFailures"],
+                    ["Suppressed by cooldown", "suppressedAssetCooldown"],
+                    ["Suppressed by duplicate", "suppressedDuplicateDigest"],
+                    ["Suppressed by per-asset cap", "suppressedPerAssetCap"],
+                    ["Suppressed by global cap", "suppressedGlobalCap"],
+                  ] as const).map(([label, key]) => (
+                    <div className="health-item" key={key}><span>{label}</span><strong>{observer.crossAssetShadow!.counters[key] ?? 0}</strong></div>
+                  ))}
+                  <div className="health-item">
+                    <span>Queue depth / high water / dropped</span>
+                    <strong>
+                      {observer.crossAssetShadow.queue.depth ?? 0} / {observer.crossAssetShadow.queue.highWatermark ?? 0} /{" "}
+                      {observer.crossAssetShadow.queue.dropped ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Jev calls made</span>
+                    <strong>{observer.crossAssetShadow.counters.jevCalls ?? 0}</strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Skipped without a call (pins / policy / breaker / transport cooldown)</span>
+                    <strong>
+                      {observer.crossAssetShadow.counters.skippedPinMismatch ?? 0} / {observer.crossAssetShadow.counters.skippedPolicyInvalid ?? 0} /{" "}
+                      {observer.crossAssetShadow.counters.skippedCircuitOpen ?? 0} / {observer.crossAssetShadow.counters.skippedTransportCooldown ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Unsent / in flight at finalize</span>
+                    <strong>
+                      {observer.crossAssetShadow.counters.unsentAtFinalize ?? 0} / {observer.crossAssetShadow.counters.inFlightAtFinalize ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Provider pins / circuit breaker</span>
+                    <strong>
+                      {observer.crossAssetShadow.pinsOk ? "pinned" : "REFUSED (no calls)"} /{" "}
+                      {observer.crossAssetShadow.circuitBreakerOpen ? "open (no calls)" : "closed"}
+                    </strong>
+                  </div>
+                </div>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Asset</th>
+                        <th>Base mint</th>
+                        <th>Opportunities</th>
+                        <th>Eligible</th>
+                        <th>Queued</th>
+                        <th>Jev OK</th>
+                        <th>Jev failed</th>
+                        <th>Cooldown</th>
+                        <th>Duplicate</th>
+                        <th>Asset cap</th>
+                        <th>Global cap</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {observer.crossAssetShadow.assetRows.map((row, index) => (
+                        <tr key={row.marketId ?? index}>
+                          <td>{row.ordinal ?? index + 1}</td>
+                          <td>{row.symbol ?? "—"}</td>
+                          <td className="mono">{row.baseMint ? `${row.baseMint.slice(0, 6)}…${row.baseMint.slice(-4)}` : "—"}</td>
+                          <td>{row.productionOpportunities ?? 0}</td>
+                          <td>{row.schemaEligible ?? 0}</td>
+                          <td>{row.queued ?? 0}</td>
+                          <td>{row.jevOk ?? 0}</td>
+                          <td>{row.jevFailures ?? 0}</td>
+                          <td>{row.suppressedAssetCooldown ?? 0}</td>
+                          <td>{row.suppressedDuplicateDigest ?? 0}</td>
+                          <td>{row.suppressedPerAssetCap ?? 0}</td>
+                          <td>{row.suppressedGlobalCap ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="health-note">Rows are listed in the order assets were first encountered — not ranked.
+                  Showing {observer.crossAssetShadow.assetRowsShown} of {observer.crossAssetShadow.totalAssetCount ?? 0} assets;
+                  every asset is counted in the totals above, and rows beyond the bound are covered by the aggregate digest.</p>
               </div>
             )}
 

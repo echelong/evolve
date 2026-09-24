@@ -1,5 +1,6 @@
 import { createSolFunnel } from "./sol-funnel.mjs";
 import { createSolAgeCounterfactual } from "./sol-age-counterfactual.mjs";
+import { createCrossAssetShadow } from "./cross-asset-observer.mjs";
 /**
  * Phase 5I-PS.2 — Jev supervisor observer.
  *
@@ -199,7 +200,13 @@ export function evaluateSupervisorProviderPins({ provider = null, upstream = nul
  *   regimeMarketLimit?: number,
  *   finalizeTimeoutMs?: number,
  *   onRow?: ((row: object) => void)|null,
+ *   crossAsset?: { profile: string, provider?: object|null, providerIdentity?: object|null,
+ *     allowOfflineValidation?: boolean }|null,
  * }} options
+ *
+ * `crossAsset` enables the Phase 5I-PS.2d cross-asset production shadow
+ * (`cross-asset-observer.mjs`). Absent/null = disabled: the observer, its
+ * artifacts and the engine tap surface are exactly the pre-PS.2d ones.
  */
 export function createSupervisorProposalObserver({
   sessionId,
@@ -216,6 +223,7 @@ export function createSupervisorProposalObserver({
   regimeMarketLimit = SUPERVISOR_REGIME_MARKET_LIMIT,
   finalizeTimeoutMs = 5_000,
   onRow = null,
+  crossAsset = null,
 } = {}) {
   if (!isValidSupervisorSessionId(sessionId)) {
     throw new Error(`invalid Jev supervisor session id '${sessionId}'`);
@@ -255,6 +263,7 @@ export function createSupervisorProposalObserver({
   let running = true;
   let finalized = false;
   let workerPromise = null;
+  let crossAssetWorkerPromise = null;
   let finalizedSummary = null;
   let finalizedStateDoc = null;
   let lastProposalAt = null;
@@ -309,6 +318,26 @@ export function createSupervisorProposalObserver({
     onDrop: (draft) => recordDrop(draft, "QUEUE_FULL"),
   });
 
+  // ---- PS.2d cross-asset production shadow (observer-only, opt-in) --------
+  // Its own queue, sampler, budget, pins and records. It never touches the
+  // executed-proposal queue, the PS.2a SOL path or their digests.
+  const crossAssetShadow =
+    crossAsset && typeof crossAsset.profile === "string"
+      ? createCrossAssetShadow({
+          sessionId,
+          root,
+          profileName: crossAsset.profile,
+          allowOfflineValidation: crossAsset.allowOfflineValidation === true,
+          provider: crossAsset.provider ?? provider,
+          providerIdentity: crossAsset.providerIdentity ?? providerIdentity,
+          evaluatePins: evaluateSupervisorProviderPins,
+          now,
+          writeArtifacts,
+          waitForStorage: () => storageReady,
+          noteObserverError,
+        })
+      : null;
+
   const solQueue = createBoundedObserverQueue({
     capacity: SUPERVISOR_SOL_QUEUE_CAPACITY,
     onDrop: (draft) => recordSolDrop(draft, "SOL_QUEUE_FULL"),
@@ -349,6 +378,7 @@ export function createSupervisorProposalObserver({
     updatedAt: startedAt,
     finalizedAt: null,
     counters: { ...counters },
+    ...(crossAssetShadow !== null ? { crossAssetShadow: crossAssetShadow.sessionBlock() } : {}),
   };
 
   // The session directory must exist before the worker appends anything, so
@@ -439,6 +469,7 @@ export function createSupervisorProposalObserver({
       unsupportedRecentSample,
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
+      crossAssetShadow: crossAssetShadow?.stateBlock() ?? null,
       lastProposalAt,
       lastJudgmentAt,
       lastSolOpportunityAt,
@@ -1301,7 +1332,28 @@ export function createSupervisorProposalObserver({
   }
 
   /**
-   * Start the asynchronous observer worker. Returns the observer (NOT a
+   * PS.2d runs on its OWN asynchronous loop, so a slow cross-asset call can
+   * never delay (or cause queue drops in) the PS.2 / PS.2a observer work.
+   */
+  async function crossAssetWorkerLoop() {
+    while (running) {
+      // The engine tick is synchronous, so whenever this loop runs every
+      // buffered tick is complete and may be sampled.
+      crossAssetShadow.flushSampling();
+      if (!crossAssetShadow.hasWork()) {
+        await sleep(SUPERVISOR_WORKER_IDLE_MS);
+        continue;
+      }
+      try {
+        await crossAssetShadow.processNext();
+      } catch (error) {
+        noteObserverError(error);
+      }
+    }
+  }
+
+  /**
+   * Start the asynchronous observer worker(s). Returns the observer (NOT a
    * promise), so no caller can await it by accident, and the simulation never
    * holds a reference to it at all.
    */
@@ -1309,6 +1361,12 @@ export function createSupervisorProposalObserver({
     if (workerPromise === null) {
       workerPromise = workerLoop();
       workerPromise.catch((error) => {
+        noteObserverError(error);
+      });
+    }
+    if (crossAssetShadow !== null && crossAssetWorkerPromise === null) {
+      crossAssetWorkerPromise = crossAssetWorkerLoop();
+      crossAssetWorkerPromise.catch((error) => {
         noteObserverError(error);
       });
     }
@@ -1323,16 +1381,29 @@ export function createSupervisorProposalObserver({
     if (finalized) return finalizedStateDoc;
     lifecycle = "FINALIZING";
     running = false;
+    crossAssetShadow?.stopAccepting();
+    let finalizeTimedOut = false;
     if (workerPromise !== null) {
+      let workersStopped = false;
       await Promise.race([
-        workerPromise.catch(() => {}),
+        Promise.all([workerPromise.catch(() => {}), crossAssetWorkerPromise?.catch(() => {})]).then(() => {
+          workersStopped = true;
+        }),
         (async () => {
           await sleep(finalizeTimeoutMs);
         })(),
       ]);
+      finalizeTimedOut = !workersStopped;
     }
     await storageReady;
     await flushDropLines();
+    if (crossAssetShadow !== null) {
+      try {
+        await crossAssetShadow.finalizeFlush();
+      } catch (error) {
+        noteObserverError(error);
+      }
+    }
 
     const finalizedAt = iso(now());
     const summary = buildSupervisorSummary({
@@ -1350,6 +1421,7 @@ export function createSupervisorProposalObserver({
       unsupportedRecentSample,
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
+      crossAssetShadow: crossAssetShadow?.summaryBlock() ?? null,
       recentRowCount: recentRows.length,
       droppedRecordCount: droppedRecords.length,
     });
@@ -1370,7 +1442,9 @@ export function createSupervisorProposalObserver({
           queueDropped: queue.dropped,
           solQueueHighWatermark: solQueue.highWatermark,
           solQueueDropped: solQueue.dropped,
-          finalizeTimedOut: running,
+          // Fixed in PS.2d: `running` is always false here, so the old value
+          // could never report a bounded-wait timeout.
+          finalizeTimedOut,
         });
       } catch (error) {
         noteObserverError(error);
@@ -1422,6 +1496,7 @@ export function createSupervisorProposalObserver({
       unsupportedRecentSample: [...unsupportedRecentSample],
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
+      crossAssetShadow: crossAssetShadow?.summaryBlock() ?? null,
       solDroppedRecords: [...solDroppedRecords],
       uniqueSolMarketStates: solStateSeen.size,
       recentRows: [...recentRows],
@@ -1446,6 +1521,17 @@ export function createSupervisorProposalObserver({
     observeSolOpportunity,
     observeSolFunnel,
     recordSolSelection,
+    // ---- the PS.2d production-entry tap (synchronous; opt-in only) ---------
+    // Declared ONLY when the cross-asset shadow is enabled, so a disabled
+    // observer exposes exactly the pre-PS.2d tap surface to the engine.
+    ...(crossAssetShadow !== null
+      ? {
+          observeProductionEntry(facts) {
+            if (!running) return;
+            crossAssetShadow.observeProductionEntry(facts);
+          },
+        }
+      : {}),
     // ---- observer lifecycle ------------------------------------------------
     start,
     finalize,

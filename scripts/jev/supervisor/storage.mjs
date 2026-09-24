@@ -9,6 +9,8 @@
  *     judgments.ndjson       append-only, one judgment per evaluated proposal
  *     sol-opportunities.ndjson  append-only, one PS.2a SOL opportunity per line
  *     sol-judgments.ndjson      append-only, one judgment per distinct complete frozen SOL Jev input
+ *     cross-asset-observations.ndjson  PS.2d only: one line per ADMITTED cross-asset
+ *                            observation (bounded by the frozen profile maximum)
  *     state.json             compact live state for the dashboard
  *     summary.json           finalized descriptive summary
  *
@@ -39,6 +41,7 @@ import {
   assertSupervisorWriteTarget,
   isValidSupervisorSessionId,
 } from "./definition.mjs";
+import { PS2D_OBSERVATIONS_FILE } from "./cross-asset-protocol.mjs";
 
 export const SUPERVISOR_STORAGE_VERSION = 1;
 
@@ -122,6 +125,15 @@ export async function appendSupervisorSolOpportunity(root, record) {
 /** PS.2a: one judgment for a distinct frozen SOL market state. */
 export async function appendSupervisorSolJudgment(root, record) {
   await appendSupervisorLine(path.join(root, SUPERVISOR_SOL_JUDGMENTS_FILE), record);
+}
+
+/** PS.2d: one admitted cross-asset observation (development shadow, zero authority). */
+export async function appendSupervisorCrossAssetObservation(root, record) {
+  await appendSupervisorLine(path.join(root, PS2D_OBSERVATIONS_FILE), record);
+}
+
+export async function readSupervisorCrossAssetObservations(root) {
+  return readSupervisorLines(path.join(root, PS2D_OBSERVATIONS_FILE));
 }
 
 export async function writeSupervisorState(root, state) {
@@ -208,6 +220,7 @@ export const SUPERVISOR_WRITE_FILES = Object.freeze([
   SUPERVISOR_JUDGMENTS_FILE,
   SUPERVISOR_SOL_OPPORTUNITIES_FILE,
   SUPERVISOR_SOL_JUDGMENTS_FILE,
+  PS2D_OBSERVATIONS_FILE,
   SUPERVISOR_STATE_FILE,
   SUPERVISOR_SUMMARY_FILE,
 ]);

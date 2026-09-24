@@ -328,6 +328,7 @@ export function buildSupervisorState({
   unsupportedRecentSample = [],
   solFunnel = null,
   solAgeCounterfactual = null,
+  crossAssetShadow = null,
   lastProposalAt = null,
   lastJudgmentAt = null,
   lastSolOpportunityAt = null,
@@ -361,6 +362,9 @@ export function buildSupervisorState({
     },
     solFunnel,
     solAgeCounterfactual,
+    // PS.2d appears ONLY in sessions that enabled it; older/disabled sessions
+    // keep exactly their previous shape.
+    ...(crossAssetShadow !== null ? { crossAssetShadow } : {}),
     means: meansOf(aggregates),
     solMeans: solMeansOf(aggregates),
     providerStatusCounts: { ...aggregates.providerStatusCounts },
@@ -414,6 +418,7 @@ export function buildSupervisorSummary({
   unsupportedRecentSample = [],
   solFunnel = null,
   solAgeCounterfactual = null,
+  crossAssetShadow = null,
   recentRowCount = 0,
   droppedRecordCount = 0,
 } = {}) {
@@ -446,6 +451,7 @@ export function buildSupervisorSummary({
     proposalCounterSemantics: "proposalsObserved = legacy worker-processed supported proposals; totalExecutionProposalsObserved = all execution proposals at tap, including unsupported and blocked attempts; executedTradeProposals is its legacy alias, not a fill count",
     solFunnel,
     solAgeCounterfactual,
+    ...(crossAssetShadow !== null ? { crossAssetShadow } : {}),
     supportedProposals: counters.supportedProposals,
     unsupportedProposals: counters.unsupportedProposals,
     unsupportedProposalCount: counters.unsupportedProposals,

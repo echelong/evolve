@@ -399,6 +399,31 @@ export function createSimulation({
     }
   }
 
+  // --- Phase 5I-PS.2d: passive production-entry tap --------------------------
+  // Fires once per FINALIZED production entry proposal (see stepAgent), for any
+  // asset. Inert unless the attached tap declares the method. The facts are
+  // built lazily from COPIES (scalars, a fresh gate assessment from the one
+  // shared rule source, a structured clone of the selected market), so the
+  // consumer never holds an engine reference. The call is protected and its
+  // return value is discarded. No clock, randomness, IDs or asynchronous work.
+  const productionEntryTap =
+    proposalTap !== null && typeof proposalTap.observeProductionEntry === "function" ? proposalTap : null;
+
+  function observeProductionEntry(makeFacts) {
+    if (productionEntryTap === null) return;
+    let facts;
+    try {
+      facts = makeFacts();
+    } catch {
+      facts = { factCopyFailed: true };
+    }
+    try {
+      productionEntryTap.observeProductionEntry(facts);
+    } catch {
+      // Observer-only evidence. The paper engine continues untouched.
+    }
+  }
+
   // PS.2b facts contain only copied scalars/diagnostic arrays. No engine
   // references, return values, clocks, randomness, IDs or asynchronous work.
   function observeSolFunnel(kind, makeFacts) {
@@ -1124,6 +1149,28 @@ export function createSimulation({
     }
 
     ctx.bestScore = bestScore;
+    // Phase 5I-PS.2d: the production entry decision is FINAL here (gates passed,
+    // unchanged argmax selection, unchanged `>=` threshold). Hand copied facts to
+    // the passive tap, then continue exactly as before. Nothing is read back.
+    observeProductionEntry(() => ({
+      source: "PRODUCTION_ENTRY_PROPOSAL",
+      action: "ENTER_LONG",
+      selection: "PRODUCTION_BEST_SCORE",
+      at: ctx.at,
+      generation,
+      generationTick,
+      agentId: agent.id,
+      species: agent.species,
+      lineageId: agent.lineageId ?? null,
+      researchFamilyId: agent.researchMeta?.familyId ?? null,
+      productionScore: bestScore,
+      entryScoreThreshold: agent.genome.entryScoreThreshold,
+      gateAssessment: assessGates(agent.genome, best, ctx),
+      eligibleMarketCount: eligibleCount,
+      tradeableMarketCount: ctx.tradeable.length,
+      engineRegime: typeof ctx.regime === "string" ? ctx.regime : null,
+      market: structuredClone(best),
+    }));
     if (!openPosition(agent, best, ctx)) {
       ctx.bestScore = null;
       agent.stageBlockedEntries = (agent.stageBlockedEntries ?? 0) + 1;

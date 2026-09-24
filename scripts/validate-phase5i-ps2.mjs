@@ -2486,7 +2486,11 @@ await test("CLI wiring: fail-closed start, bounded run, non-blocking observer, C
 
 await test("package scripts and API route / dashboard panel integration", async () => {
   assertEqual(PACKAGE_JSON.scripts["jev:supervisor"], "node scripts/jev-supervisor.mjs");
-  assertEqual(PACKAGE_JSON.scripts["validate:jev-supervisor"], "node scripts/validate-phase5i-ps2.mjs");
+  // PS.2d chains its own suite AFTER this one; both must run.
+  assertEqual(
+    PACKAGE_JSON.scripts["validate:jev-supervisor"],
+    "node scripts/validate-phase5i-ps2.mjs && node scripts/validate-phase5i-ps2d.mjs",
+  );
   assertIncludes(PACKAGE_JSON.scripts["dev:jev-supervisor"], "npm:jev:supervisor");
   assertIncludes(PACKAGE_JSON.scripts["dev:jev-supervisor"], "npm:dev");
   assertIncludes(PACKAGE_JSON.scripts.validate, "validate:jev-supervisor");

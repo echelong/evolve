@@ -43,6 +43,7 @@ import {
   SUPERVISOR_VALUE_FLAGS,
   isValidSupervisorSessionId,
 } from "./definition.mjs";
+import { PS2D_CLI_PROFILES } from "./cross-asset-protocol.mjs";
 
 export const SUPERVISOR_SETTINGS_VERSION = 1;
 
@@ -99,12 +100,25 @@ export function buildSupervisorSettings(args = {}) {
     problems.push(`invalid --session '${requestedSessionId}'; session ids look like 'jsup-<UTC timestamp>-<digest>'`);
   }
 
+  // PS.2d: a frozen profile NAME only. Absent = disabled (pre-PS.2d behaviour).
+  let crossAssetProfile = null;
+  if (args["cross-asset"] !== undefined) {
+    const requested = String(args["cross-asset"]).trim().toLowerCase();
+    if (PS2D_CLI_PROFILES.includes(requested)) crossAssetProfile = requested;
+    else {
+      problems.push(
+        `invalid --cross-asset '${requested}'; the frozen PS.2d profiles are: ${PS2D_CLI_PROFILES.join(", ")}`,
+      );
+    }
+  }
+
   return {
     version: SUPERVISOR_SETTINGS_VERSION,
     marketId,
     durationMinutes,
     durationMs: durationMinutes * 60_000,
     sessionId: requestedSessionId.length > 0 ? requestedSessionId : null,
+    crossAssetProfile,
     problems,
   };
 }

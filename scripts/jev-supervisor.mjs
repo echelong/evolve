@@ -52,7 +52,18 @@ import {
   supervisorSessionRootFor,
 } from "./jev/supervisor/definition.mjs";
 import { buildSupervisorSettings, enforceSupervisorProviderPins } from "./jev/supervisor/settings.mjs";
+import {
+  PS2D_AUTHORITY_TAG,
+  PS2D_CLI_PROFILES,
+  PS2D_LABEL,
+  PS2D_PROFILES,
+  PS2D_PROVIDER_HEALTH_DIR,
+  PS2D_TIMEOUT_MS,
+  PS2D_TRANSPORT_SETTINGS,
+  crossAssetExternalCallPolicy,
+} from "./jev/supervisor/cross-asset-protocol.mjs";
 import { createSupervisorProposalObserver } from "./jev/supervisor/observer.mjs";
+import { validateExternalPolicy } from "./governance/external-policy.mjs";
 import { ensureSupervisorDir } from "./jev/supervisor/storage.mjs";
 
 function usage() {
@@ -65,6 +76,8 @@ function usage() {
     `  --minutes <n>       bounded run duration in minutes (default ${SUPERVISOR_DEFAULT_DURATION_MINUTES}, bounds ${SUPERVISOR_DURATION_BOUNDS.min}-${SUPERVISOR_DURATION_BOUNDS.max})`,
     `  --market <id>       ${SUPERVISOR_SUPPORTED_MARKET_IDS.join(" | ")} (the only supported market)`,
     "  --session <id>      explicit session id (default jsup-<UTC timestamp>-<digest>)",
+    `  --cross-asset <p>   opt into the Phase 5I-PS.2d ${PS2D_LABEL} (${PS2D_AUTHORITY_TAG});`,
+    `                      frozen profiles: ${PS2D_CLI_PROFILES.map((name) => `${name} (max ${PS2D_PROFILES[name].globalMaxJevCallsPerRun} Jev calls)`).join(", ")}`,
     "  --json              machine-readable result",
     "  --help              this help",
     "",
@@ -112,6 +125,21 @@ async function main() {
     return;
   }
 
+  // ---- PS.2d: Governance v1 validation of the evidence-bearing call policy
+  // (no fallback, fail closed, bounded) BEFORE any artifact or provider exists.
+  if (settings.crossAssetProfile !== null) {
+    const policyValidation = validateExternalPolicy(
+      crossAssetExternalCallPolicy(PS2D_PROFILES[settings.crossAssetProfile], { provider: pins.provider, model: pins.model }),
+      { evidenceBearing: true },
+    );
+    if (policyValidation.status !== "PASS") {
+      for (const problem of policyValidation.problems) console.error(`[jev:supervisor] PS.2d policy: ${problem}`);
+      console.error("[jev:supervisor] refusing to start: the PS.2d external-call policy failed validation.");
+      process.exitCode = 2;
+      return;
+    }
+  }
+
   // ---- isolated session tree -------------------------------------------------
   const sessionId = settings.sessionId ?? supervisorSessionIdFor({ startedAt: Date.now() });
   const baseRoot = process.env.EVOLVE_SUPERVISOR_ROOT?.trim() || SUPERVISOR_ROOT_DIR;
@@ -130,6 +158,28 @@ async function main() {
   });
   const provider = resilient.provider;
 
+  // ---- PS.2d: a DEDICATED provider instance with the frozen PS.2d call policy
+  // (pinned timeout and transport attempts, empty chain = no fallback route,
+  // its own provider-health directory). Same pinned provider/model only.
+  let crossAsset = null;
+  if (settings.crossAssetProfile !== null) {
+    const crossAssetHealthRoot = path.join(sessionRoot, PS2D_PROVIDER_HEALTH_DIR);
+    await mkdir(crossAssetHealthRoot, { recursive: true });
+    const crossAssetResilient = createResilientJevProvider({
+      selectedProvider: pins.provider,
+      // Frozen PS.2d transport policy spread LAST: no env variable can override it.
+      config: { ...envConfig, transportChain: [], ...PS2D_TRANSPORT_SETTINGS },
+      modelOverride: null,
+      timeoutMs: PS2D_TIMEOUT_MS,
+      healthRoot: crossAssetHealthRoot,
+    });
+    crossAsset = {
+      profile: settings.crossAssetProfile,
+      provider: crossAssetResilient.provider,
+      providerIdentity: { provider: pins.provider, model: pins.model, upstream: pins.identity?.upstreamProvider ?? null },
+    };
+  }
+
   const observer = createSupervisorProposalObserver({
     sessionId,
     sessionRoot,
@@ -140,6 +190,7 @@ async function main() {
       model: pins.model,
       upstream: pins.identity?.upstreamProvider ?? null,
     },
+    crossAsset,
     onRow:
       args.json === true
         ? null
@@ -176,6 +227,7 @@ async function main() {
             counters: snapshot.counters,
             summary: observer.summary(),
             queue: snapshot.queue,
+            crossAssetShadow: snapshot.crossAssetShadow,
             observerFailures: snapshot.counters.observerFailures,
             paperOnly: true,
             developmentOnly: true,
@@ -202,6 +254,13 @@ async function main() {
     console.log(`[jev:supervisor]   SOL agreement    ${snapshot.counters.solAgreementCount} agree · ${snapshot.counters.solDisagreementCount} disagree · ${snapshot.counters.solExactHalfCount} exact 0.50`);
     console.log(`[jev:supervisor]   queue            depth ${snapshot.queue.depth} · high water ${snapshot.queue.highWatermark} · dropped ${snapshot.queue.dropped}`);
     console.log(`[jev:supervisor]   means            pHigher ${summary?.meanPHigher ?? "n/a"} · |p-0.50| ${summary?.meanDistanceFromHalf ?? "n/a"} · latency ${summary?.meanLatencyMs ?? "n/a"}ms`);
+    const xa = snapshot.crossAssetShadow;
+    if (xa) {
+      console.log(`[jev:supervisor]   ${xa.label} • ${xa.authorityTag} • profile ${xa.profile}`);
+      console.log(`[jev:supervisor]     opportunities  ${xa.counters.genuineProductionOpportunitiesObserved} genuine · ${xa.counters.schemaEligible} schema eligible · ${xa.counters.uniqueAssetsObserved} assets`);
+      console.log(`[jev:supervisor]     suppressed     duplicate ${xa.counters.suppressedDuplicateDigest} · cooldown ${xa.counters.suppressedAssetCooldown} · per-asset cap ${xa.counters.suppressedPerAssetCap} · global cap ${xa.counters.suppressedGlobalCap}`);
+      console.log(`[jev:supervisor]     Jev            queued ${xa.counters.queuedForJev} · calls ${xa.counters.jevCalls} (max ${xa.globalMaxJevCallsPerRun}) · ok ${xa.counters.jevOk} · failed ${xa.counters.jevFailures} · unsent ${xa.counters.unsentAtFinalize}`);
+    }
     console.log(`[jev:supervisor]   observer failures ${snapshot.counters.observerFailures}`);
     console.log(`[jev:supervisor]   ${SUPERVISOR_STATEMENT}`);
     console.log(`[jev:supervisor]   ${SUPERVISOR_ISOLATION_STATEMENT}`);

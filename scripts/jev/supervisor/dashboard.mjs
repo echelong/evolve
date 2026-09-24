@@ -29,6 +29,12 @@ import {
   SUPERVISOR_STATEMENT,
 } from "./definition.mjs";
 import { listSupervisorSessions, readSupervisorState, readSupervisorSummary } from "./storage.mjs";
+import {
+  PS2D_AUTHORITY_TAG,
+  PS2D_EVIDENCE_CLASSIFICATION,
+  PS2D_LABEL,
+  PS2D_MAX_DASHBOARD_ASSET_ROWS,
+} from "./cross-asset-protocol.mjs";
 
 /** A live observer whose state file has not moved for this long is reported QUIET. */
 export const SUPERVISOR_QUIET_AFTER_MS = 120_000;
@@ -75,6 +81,103 @@ function compactRow(row) {
     judgmentReuseCount: num(row?.judgmentReuseCount),
     jevJudgmentId: str(row?.jevJudgmentId),
     marketObservationId: str(row?.marketObservationId),
+  };
+}
+
+const CROSS_ASSET_COUNTER_FIELDS = Object.freeze([
+  "productionEntryFactsReceived",
+  "nonGenuineRejected",
+  "genuineProductionOpportunitiesObserved",
+  "uniqueAssetsObserved",
+  "schemaEligible",
+  "schemaIneligible",
+  "callsEligibleBeforeBounds",
+  "suppressedDuplicateDigest",
+  "suppressedAssetCooldown",
+  "suppressedPerAssetCap",
+  "suppressedGlobalCap",
+  "admittedBySampler",
+  "queuedForJev",
+  "queueDropped",
+  "jevCalls",
+  "jevOk",
+  "jevFailures",
+  "skippedPinMismatch",
+  "skippedPolicyInvalid",
+  "skippedCircuitOpen",
+  "skippedTransportCooldown",
+  "unsentAtFinalize",
+  "inFlightAtFinalize",
+]);
+
+const CROSS_ASSET_ROW_FIELDS = Object.freeze([
+  "ordinal",
+  "productionOpportunities",
+  "schemaEligible",
+  "schemaIneligible",
+  "suppressedDuplicateDigest",
+  "suppressedAssetCooldown",
+  "suppressedPerAssetCap",
+  "suppressedGlobalCap",
+  "queued",
+  "jevCalls",
+  "jevOk",
+  "jevFailures",
+]);
+
+/**
+ * PS.2d: compact, whitelisted CROSS-ASSET PRODUCTION SHADOW block. Present only
+ * for sessions that enabled PS.2d. Rows stay in ENCOUNTER order (never ranked)
+ * and are bounded; truncation is reported explicitly, never silently.
+ */
+function compactCrossAssetShadow(block) {
+  if (!block || typeof block !== "object") return null;
+  const counters = block.counters ?? {};
+  const queue = block.queue ?? {};
+  const rows = Array.isArray(block.assetRows) ? block.assetRows : [];
+  return {
+    label: PS2D_LABEL,
+    authorityTag: PS2D_AUTHORITY_TAG,
+    evidenceClassification: PS2D_EVIDENCE_CLASSIFICATION,
+    developmentOnly: true,
+    paperOnly: true,
+    shadowOnly: true,
+    zeroAuthority: true,
+    canonicalEvidence: false,
+    replicationEvidence: false,
+    temporalReplicationEvidence: false,
+    noProfitabilityInference: true,
+    noTradingInference: true,
+    noDeploymentInference: true,
+    noAuthorityPromotion: true,
+    profile: str(block.profile),
+    protocolDigest: str(block.protocolDigest),
+    pinsOk: block.pinsOk === true,
+    circuitBreakerOpen: block.circuitBreaker?.open === true,
+    globalMaxJevCallsPerRun: num(block.globalMaxJevCallsPerRun),
+    perAssetMaxJevCallsPerRun: num(block.perAssetMaxJevCallsPerRun),
+    perAssetMinSpacingMs: num(block.perAssetMinSpacingMs),
+    counters: Object.fromEntries(CROSS_ASSET_COUNTER_FIELDS.map((field) => [field, num(counters[field])])),
+    queue: {
+      capacity: num(queue.capacity),
+      depth: num(queue.depth),
+      highWatermark: num(queue.highWatermark),
+      dropped: num(queue.dropped),
+    },
+    assetRowOrder: str(block.assetRowOrder),
+    totalAssetCount: num(block.totalAssetCount),
+    rowsStored: num(block.rowsStored),
+    rowsTruncated: num(block.rowsTruncated),
+    aggregateDigest: str(block.aggregateDigest),
+    assetRows: rows.slice(0, PS2D_MAX_DASHBOARD_ASSET_ROWS).map((row) => ({
+      marketId: str(row?.marketId),
+      baseMint: str(row?.baseMint),
+      symbol: str(row?.symbol),
+      ...Object.fromEntries(CROSS_ASSET_ROW_FIELDS.map((field) => [field, num(row?.[field])])),
+    })),
+    assetRowsShown: Math.min(rows.length, PS2D_MAX_DASHBOARD_ASSET_ROWS),
+    winner: null,
+    assetsRanked: false,
   };
 }
 
@@ -179,6 +282,7 @@ export async function loadJevSupervisorObserverState(root = path.join(process.cw
     }),
     solFunnel: state?.solFunnel ?? summary?.solFunnel ?? null,
     solAgeCounterfactual: state?.solAgeCounterfactual ?? summary?.solAgeCounterfactual ?? null,
+    crossAssetShadow: compactCrossAssetShadow(state?.crossAssetShadow ?? summary?.crossAssetShadow ?? null),
     totalExecutionProposalsObserved: num(counters.totalExecutionProposalsObserved) ?? num(summary?.totalExecutionProposalsObserved),
     proposalsObserved: num(counters.proposalsObserved) ?? num(summary?.proposalsObserved),
     supportedProposals: num(counters.supportedProposals) ?? num(summary?.supportedProposals),
