@@ -421,23 +421,30 @@ async function runFixtureExperiment({
  * ==========================================================================*/
 
 const TEMPORAL_FIXTURE_PLAN = Object.freeze([
+  // FIXTURE CLOCK NOTE:
+  // `runner.mjs` intentionally persists summary.finalizedAt using the real
+  // wall clock, while these offline fixtures inject deterministic session
+  // clocks. Synthetic temporal-independence fixtures therefore use a fixed
+  // far-future epoch so advancing wall-clock time cannot alter their gap/date
+  // classification. Fixtures that intentionally overlap pinned development
+  // or canonical evidence remain on their real 2026 windows.
   // --- temporal-independence violations ----------------------------------------
   { experimentId: "jdir-tfx-dev-overlap", t0: "2026-09-20T06:45:00.000Z", seed: 101, expect: "CONTAMINATED", rule: "development overlap" },
   { experimentId: "jdir-tfx-canonical-overlap", t0: "2026-09-20T12:30:00.000Z", seed: 102, expect: "CONTAMINATED", rule: "canonical-wave overlap" },
   // An overlapping pair: the first is CLEAN when added, the second contaminates BOTH.
-  { experimentId: "jdir-tfx-overlap-a", t0: "2026-09-29T02:00:00.000Z", seed: 103, expect: "CONTAMINATED", addAsClean: true, rule: "session overlap" },
-  { experimentId: "jdir-tfx-overlap-b", t0: "2026-09-29T02:20:00.000Z", seed: 104, expect: "CONTAMINATED", rule: "session overlap" },
+  { experimentId: "jdir-tfx-overlap-a", t0: "2099-09-29T02:00:00.000Z", seed: 103, expect: "CONTAMINATED", addAsClean: true, rule: "session overlap" },
+  { experimentId: "jdir-tfx-overlap-b", t0: "2099-09-29T02:20:00.000Z", seed: 104, expect: "CONTAMINATED", rule: "session overlap" },
   // A same-UTC-date pair with a >= 6 h gap: isolates the different-date rule.
-  { experimentId: "jdir-tfx-date-a", t0: "2026-09-27T00:30:00.000Z", seed: 105, expect: "CONTAMINATED", addAsClean: true, rule: "same UTC date" },
-  { experimentId: "jdir-tfx-date-b", t0: "2026-09-27T09:00:00.000Z", seed: 106, expect: "CONTAMINATED", rule: "same UTC date" },
+  { experimentId: "jdir-tfx-date-a", t0: "2099-09-27T00:30:00.000Z", seed: 105, expect: "CONTAMINATED", addAsClean: true, rule: "same UTC date" },
+  { experimentId: "jdir-tfx-date-b", t0: "2099-09-27T09:00:00.000Z", seed: 106, expect: "CONTAMINATED", rule: "same UTC date" },
   // Served by the DEVELOPMENT fixture provider and labelled development evidence.
-  { experimentId: "jdir-tfx-develop", t0: "2026-09-26T12:00:00.000Z", seed: 107, development: true, expect: "INELIGIBLE", rule: "development evidence" },
+  { experimentId: "jdir-tfx-develop", t0: "2099-09-26T12:00:00.000Z", seed: 107, development: true, expect: "INELIGIBLE", rule: "development evidence" },
   // --- the three CLEAN temporal-extension sessions ------------------------------
-  { experimentId: "jdir-tfx-clean-1", t0: "2026-09-22T22:00:00.000Z", seed: 108, expect: "CLEAN" },
+  { experimentId: "jdir-tfx-clean-1", t0: "2099-09-22T22:00:00.000Z", seed: 108, expect: "CLEAN" },
   // A different UTC date but only ~1.5 h after clean-1 completed: isolates the gap rule.
-  { experimentId: "jdir-tfx-gap", t0: "2026-09-23T01:00:00.000Z", seed: 109, expect: "CONTAMINATED", rule: "minimum gap" },
-  { experimentId: "jdir-tfx-clean-2", t0: "2026-09-24T09:00:00.000Z", seed: 110, expect: "CLEAN" },
-  { experimentId: "jdir-tfx-clean-3", t0: "2026-09-25T18:00:00.000Z", seed: 111, expect: "CLEAN" },
+  { experimentId: "jdir-tfx-gap", t0: "2099-09-23T01:00:00.000Z", seed: 109, expect: "CONTAMINATED", rule: "minimum gap" },
+  { experimentId: "jdir-tfx-clean-2", t0: "2099-09-24T09:00:00.000Z", seed: 110, expect: "CLEAN" },
+  { experimentId: "jdir-tfx-clean-3", t0: "2099-09-25T18:00:00.000Z", seed: 111, expect: "CLEAN" },
 ]);
 
 /** The order sessions are ADDED, chosen so the gap rule has a previous eligible session. */
@@ -844,7 +851,7 @@ test("D3. a genuine temporal session is CLEAN and starts after the canonical wav
   assertEqual(timing.overlapWithDevelopment, false, "it does not overlap development");
   assertEqual(timing.overlapWithCanonicalReplication, false, "it does not overlap the canonical wave");
   assertEqual(timing.overlapWithTemporalExtensionSession, false, "and does not overlap another temporal session");
-  assertEqual(timing.utcDate, "2026-09-22", "its UTC date");
+  assertEqual(timing.utcDate, utcDateOf(fixture("jdir-tfx-clean-1").plan.t0), "its UTC date");
   assertEqual(timing.temporalOverlap, false, "temporalOverlap is false");
   assertEqual(derived.eligibility.selectionBasis, "calendar-schedule", "the selection basis is declared");
   assertEqual(derived.eligibility.timingNotSelectedFromObservedPerformance, true, "timing was not selected on performance");
@@ -886,8 +893,8 @@ test("E4. a session sharing a UTC calendar date is CONTAMINATED: different-date 
   assertDeepEqual(derived.eligibility.timing.sameUtcDateSessionIds, ["jdir-tfx-date-a"], "the same-date session is named");
   assertTrue(derived.eligibility.reasons.some((reason) => /different UTC date/.test(reason)), "with the different-date reason");
   // ...and the two sessions really are on the same UTC date.
-  assertEqual(utcDateOf(fixture("jdir-tfx-date-a").bundle.experiment.startedAt), "2026-09-27", "date-a is on 2026-09-27");
-  assertEqual(utcDateOf(fixture("jdir-tfx-date-b").bundle.experiment.startedAt), "2026-09-27", "date-b is on 2026-09-27");
+  assertEqual(utcDateOf(fixture("jdir-tfx-date-a").bundle.experiment.startedAt), utcDateOf(fixture("jdir-tfx-date-a").plan.t0), "date-a is on 2026-09-27");
+  assertEqual(utcDateOf(fixture("jdir-tfx-date-b").bundle.experiment.startedAt), utcDateOf(fixture("jdir-tfx-date-b").plan.t0), "date-b is on 2026-09-27");
 });
 
 test("E5. a session less than six hours after the previous eligible session is CONTAMINATED", async () => {
