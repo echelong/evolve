@@ -605,10 +605,80 @@ type CrossAssetShadow = {
   assetRowsShown: number; aggregateDigest: string | null;
   assetRows: CrossAssetShadowRow[];
 };
+// Phase 5I-PS.2e: LOCAL TEV CROSS-ASSET SHADOW. Development shadow, zero
+// authority. A temporally bounded sample of genuine production entry proposals
+// answered by the shared Local JEV stack. Rows are in encounter order and are
+// never ranked. The classifier reports option votes (sample stability), never a
+// calibrated probability.
+type LocalTevShadowRow = {
+  baseMint: string | null; marketId: string | null; symbol: string | null;
+  productionOpportunities: number | null; schemaEligible: number | null; schemaIneligible: number | null;
+  suppressedOutsideWindow: number | null; suppressedDuplicateOpportunityDigest: number | null;
+  suppressedPerAssetCap: number | null; suppressedAssetCooldown: number | null;
+  suppressedBucketCap: number | null; suppressedGlobalCap: number | null;
+  admitted: number | null; queued: number | null; queueDropped: number | null;
+  logicalCalls: number | null; primaryResults: number | null; escalatedResults: number | null;
+  fallbackResults: number | null; abstainResults: number | null;
+  failures: number | null; malformed: number | null; unavailable: number | null;
+};
+type LocalTevLatencyStats = { count: number | null; p50: number | null; p95: number | null; p99: number | null; mean: number | null };
+type LocalTevShadow = {
+  label: string; authorityTag: string; evidenceClassification: string;
+  developmentOnly: boolean; paperOnly: boolean; shadowOnly: boolean; zeroAuthority: boolean;
+  canonical: boolean; replication: boolean; temporalReplication: boolean; predictiveEvidence: boolean;
+  noProfitabilityInference: boolean; noTradingInference: boolean; noDeploymentInference: boolean; noAuthorityPromotion: boolean;
+  profile: string | null; protocolDigest: string | null;
+  classifierId: string | null; classifierFamily: string | null; classifierRuntime: string | null;
+  classifierPrimaryTier: string | null; classifierPinnedModel: string | null; classifierAvailable: boolean;
+  thinkingEnabled: boolean;
+  localJevMode: string | null; localJevReadinessStatus: string | null; localJevReady: boolean;
+  localJevPrimaryModel: string | null; typeSafeFallbackEnabled: boolean; typeSafeIsNormalProvider: boolean;
+  missingInterfaceCount: number; circuitBreakerOpen: boolean;
+  bucketCount: number | null; bucketMinutes: number | null; perBucketMaxAdmissions: number | null;
+  globalMaxAdmissions: number | null; maxLogicalCallsPerRun: number | null;
+  physicalAttemptCeilingPerLogicalCall: number | null;
+  counters: Record<string, number | null>;
+  queue: { capacity: number | null; depth: number | null; highWatermark: number | null; dropped: number | null };
+  temporal: {
+    firstAdmittedProposalAt: string | null; lastAdmittedProposalAt: string | null; admissionSpanSeconds: number | null;
+    generationRange: { min: number | null; max: number | null } | null;
+    engineTickRange: { min: number | null; max: number | null } | null;
+    opportunitySequenceRange: { min: number | null; max: number | null } | null;
+    uniqueAdmittedAssets: number | null;
+    emptyBuckets: number | null; bucketsWithAdmissions: number | null; bucketsAtCap: number | null;
+    buckets: {
+      bucketIndex: number | null; start: string | null; end: string | null;
+      eligibleOpportunities: number | null; admitted: number | null; uniqueAssets: number | null;
+      primaryResults: number | null; escalatedResults: number | null; fallbackResults: number | null;
+      abstainResults: number | null; failures: number | null; malformed: number | null;
+      unavailable: number | null; reachedCap: boolean;
+    }[];
+    sharesWithinFirst: {
+      admitted: number | null;
+      within10s: { count: number | null; share: number | null } | null;
+      within30s: { count: number | null; share: number | null } | null;
+      within60s: { count: number | null; share: number | null } | null;
+      within300s: { count: number | null; share: number | null } | null;
+    };
+    temporallyRepresentative: null;
+    representationClaim: string | null;
+  };
+  latency: {
+    primaryTevResults: LocalTevLatencyStats;
+    allLogicalRequests: LocalTevLatencyStats;
+    coldOrWarm: string | null;
+    unavailableMeasurements: string[];
+  };
+  assetRowKey: string | null; assetRowOrder: string | null;
+  totalAssetCount: number | null; rowsStored: number | null; rowsTruncated: number | null;
+  aggregateDigest: string | null; assetRowsShown: number; assetRows: LocalTevShadowRow[];
+  winner: null; assetsRanked: boolean;
+};
 type JevSupervisorObserverState = {
   solFunnel?: SolFunnel | null;
   solAgeCounterfactual?: SolAgeCounterfactual | null;
   crossAssetShadow?: CrossAssetShadow | null;
+  localTevShadow?: LocalTevShadow | null;
   totalExecutionProposalsObserved?: number | null;
   available: boolean;
   label?: string;
@@ -2476,6 +2546,211 @@ function JevSupervisorObserverPanel({ state, nowMs }: { state: EvolveState; nowM
                 <p className="health-note">Rows are listed in the order assets were first encountered — not ranked.
                   Showing {observer.crossAssetShadow.assetRowsShown} of {observer.crossAssetShadow.totalAssetCount ?? 0} assets;
                   every asset is counted in the totals above, and rows beyond the bound are covered by the aggregate digest.</p>
+              </div>
+            )}
+
+            {observer.localTevShadow && (
+              <div>
+                <h3>{observer.localTevShadow.label ?? "LOCAL TEV CROSS-ASSET SHADOW"}</h3>
+                <p><strong>DEVELOPMENT SHADOW • ZERO AUTHORITY • PAPER ONLY</strong> — a temporally distributed sample of
+                  genuine EVOLVE production entry proposals, classified by the shared Local JEV stack (profile{" "}
+                  {observer.localTevShadow.profile ?? "—"}): {observer.localTevShadow.bucketCount ?? "—"} ×{" "}
+                  {observer.localTevShadow.bucketMinutes ?? "—"}-minute buckets, at most{" "}
+                  {observer.localTevShadow.perBucketMaxAdmissions ?? "—"} admissions per bucket and{" "}
+                  {observer.localTevShadow.globalMaxAdmissions ?? "—"} per run. The primary Tev-style specialist is{" "}
+                  <strong>{observer.localTevShadow.classifierId ?? "—"}</strong> ({observer.localTevShadow.classifierRuntime ?? "—"}{" "}
+                  tier {observer.localTevShadow.classifierPrimaryTier ?? "—"}, model{" "}
+                  {observer.localTevShadow.classifierPinnedModel ?? "no pinned model"}) and is{" "}
+                  {observer.localTevShadow.classifierAvailable ? "available" : "UNAVAILABLE: no live call is made and a generic model is never substituted"}.
+                  A local vote share stays a vote share (sample stability) and is never presented as a probability{" "}
+                  (calibrated numbers are shown only if the shared stack itself reports one). Thinking is off{" "}
+                  ({observer.localTevShadow.thinkingEnabled ? "ON — unexpected" : "option-token grammar only"}), and the classifier is
+                  not a normal provider for EVOLVE ({observer.localTevShadow.typeSafeIsNormalProvider ? "unexpected" : "no"}).
+                  It cannot approve, reject, resize, delay, select or veto anything: descriptive counts only — no winner,
+                  no ranking, and no inference about returns, trading or deployment.</p>
+                <div className="health-grid">
+                  {([
+                    ["Production entry facts received", "productionEntryFactsReceived"],
+                    ["Genuine opportunities", "genuineProductionOpportunitiesObserved"],
+                    ["Schema eligible", "schemaEligible"],
+                    ["Admitted", "admitted"],
+                    ["Queued for Local JEV", "queuedForLocalJev"],
+                    ["Queue dropped", "queueDropped"],
+                    ["Logical calls", "logicalCalls"],
+                    ["Primary Tev results", "primaryResults"],
+                    ["Escalated local results", "escalatedResults"],
+                    ["TypeSafe fallback results", "fallbackResults"],
+                    ["Abstain results", "abstainResults"],
+                    ["Failures", "failures"],
+                  ] as const).map(([label, key]) => (
+                    <div className="health-item" key={key}><span>{label}</span><strong>{observer.localTevShadow!.counters[key] ?? "—"}</strong></div>
+                  ))}
+                  <div className="health-item">
+                    <span>Malformed / unavailable records</span>
+                    <strong>
+                      {observer.localTevShadow.counters.malformed ?? "—"} / {observer.localTevShadow.counters.unavailable ?? "—"}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Suppressed (window / duplicate / asset cap / cooldown / bucket cap / global cap)</span>
+                    <strong>
+                      {observer.localTevShadow.counters.suppressedOutsideWindow ?? 0} /{" "}
+                      {observer.localTevShadow.counters.suppressedDuplicateOpportunityDigest ?? 0} /{" "}
+                      {observer.localTevShadow.counters.suppressedPerAssetCap ?? 0} /{" "}
+                      {observer.localTevShadow.counters.suppressedAssetCooldown ?? 0} /{" "}
+                      {observer.localTevShadow.counters.suppressedBucketCap ?? 0} /{" "}
+                      {observer.localTevShadow.counters.suppressedGlobalCap ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Skipped without a call (policy / no classifier / Local JEV / breaker / oversize)</span>
+                    <strong>
+                      {observer.localTevShadow.counters.skippedPolicyInvalid ?? 0} /{" "}
+                      {observer.localTevShadow.counters.skippedPrimaryClassifierUnavailable ?? 0} /{" "}
+                      {observer.localTevShadow.counters.skippedLocalJevUnavailable ?? 0} /{" "}
+                      {observer.localTevShadow.counters.skippedCircuitOpen ?? 0} /{" "}
+                      {observer.localTevShadow.counters.skippedRequestTooLarge ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Queue depth / high water / dropped (capacity)</span>
+                    <strong>
+                      {observer.localTevShadow.queue.depth ?? 0} / {observer.localTevShadow.queue.highWatermark ?? 0} /{" "}
+                      {observer.localTevShadow.queue.dropped ?? 0} ({observer.localTevShadow.queue.capacity ?? 0})
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Unsent / in flight at finalize</span>
+                    <strong>
+                      {observer.localTevShadow.counters.unsentAtFinalize ?? 0} / {observer.localTevShadow.counters.inFlightAtFinalize ?? 0}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Local JEV readiness / mode</span>
+                    <strong>
+                      {observer.localTevShadow.localJevReady ? "ready" : observer.localTevShadow.localJevReadinessStatus ?? "—"} /{" "}
+                      {observer.localTevShadow.localJevMode ?? "—"}
+                      {observer.localTevShadow.missingInterfaceCount > 0
+                        ? ` (missing interface items: ${observer.localTevShadow.missingInterfaceCount})`
+                        : ""}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Circuit breaker / physical attempt ceiling per call</span>
+                    <strong>
+                      {observer.localTevShadow.circuitBreakerOpen ? "open (no calls)" : "closed"} /{" "}
+                      {observer.localTevShadow.physicalAttemptCeilingPerLogicalCall ?? "—"}
+                    </strong>
+                  </div>
+                  <div className="health-item">
+                    <span>Latency p50 / p95 (primary Tev, all logical requests)</span>
+                    <strong>
+                      {observer.localTevShadow.latency.primaryTevResults.p50 ?? "—"} /{" "}
+                      {observer.localTevShadow.latency.primaryTevResults.p95 ?? "—"} /{" "}
+                      {observer.localTevShadow.latency.allLogicalRequests.p50 ?? "—"} /{" "}
+                      {observer.localTevShadow.latency.allLogicalRequests.p95 ?? "—"}
+                    </strong>
+                  </div>
+                </div>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Start (UTC)</th>
+                        <th>Eligible</th>
+                        <th>Admitted</th>
+                        <th>Assets</th>
+                        <th>Primary</th>
+                        <th>Escalated</th>
+                        <th>Fallback</th>
+                        <th>Abstain</th>
+                        <th>Failures</th>
+                        <th>Unavailable</th>
+                        <th>At cap</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {observer.localTevShadow.temporal.buckets.map((bucket, index) => (
+                        <tr key={bucket.bucketIndex ?? index}>
+                          <td>{bucket.bucketIndex ?? index}</td>
+                          <td className="mono">{bucket.start ? new Date(bucket.start).toISOString().slice(11, 16) : "—"}</td>
+                          <td>{bucket.eligibleOpportunities ?? 0}</td>
+                          <td>{bucket.admitted ?? 0}</td>
+                          <td>{bucket.uniqueAssets ?? 0}</td>
+                          <td>{bucket.primaryResults ?? 0}</td>
+                          <td>{bucket.escalatedResults ?? 0}</td>
+                          <td>{bucket.fallbackResults ?? 0}</td>
+                          <td>{bucket.abstainResults ?? 0}</td>
+                          <td>{bucket.failures ?? 0}</td>
+                          <td>{bucket.unavailable ?? 0}</td>
+                          <td>{bucket.reachedCap ? "yes" : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="health-note">Temporal coverage: {observer.localTevShadow.temporal.bucketsWithAdmissions ?? 0} of{" "}
+                  {observer.localTevShadow.bucketCount ?? 0} buckets carry at least one admission, {observer.localTevShadow.temporal.emptyBuckets ?? 0} are empty, and{" "}
+                  {observer.localTevShadow.temporal.bucketsAtCap ?? 0} reached the per-bucket cap. Admissions span{" "}
+                  {observer.localTevShadow.temporal.admissionSpanSeconds ?? "—"}s ({observer.localTevShadow.temporal.uniqueAdmittedAssets ?? 0} assets), engine ticks{" "}
+                  {observer.localTevShadow.temporal.engineTickRange?.min ?? "—"}–{observer.localTevShadow.temporal.engineTickRange?.max ?? "—"}, generations{" "}
+                  {observer.localTevShadow.temporal.generationRange?.min ?? "—"}–{observer.localTevShadow.temporal.generationRange?.max ?? "—"}. No temporal
+                  representativeness is claimed ({observer.localTevShadow.temporal.representationClaim ?? "none"}), and no measurement the shared runtime does not
+                  provide is invented ({observer.localTevShadow.latency.unavailableMeasurements.length} reported as unavailable).</p>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Asset</th>
+                        <th>Base mint</th>
+                        <th>Opportunities</th>
+                        <th>Eligible</th>
+                        <th>Admitted</th>
+                        <th>Queued</th>
+                        <th>Logical calls</th>
+                        <th>Primary</th>
+                        <th>Escalated</th>
+                        <th>Fallback</th>
+                        <th>Abstain</th>
+                        <th>Cooldown</th>
+                        <th>Duplicate</th>
+                        <th>Asset cap</th>
+                        <th>Bucket cap</th>
+                        <th>Global cap</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {observer.localTevShadow.assetRows.map((row, index) => (
+                        <tr key={row.baseMint ?? index}>
+                          <td>{row.symbol ?? "—"}</td>
+                          <td className="mono">{row.baseMint ? `${row.baseMint.slice(0, 6)}…${row.baseMint.slice(-4)}` : "—"}</td>
+                          <td>{row.productionOpportunities ?? 0}</td>
+                          <td>{row.schemaEligible ?? 0}</td>
+                          <td>{row.admitted ?? 0}</td>
+                          <td>{row.queued ?? 0}</td>
+                          <td>{row.logicalCalls ?? 0}</td>
+                          <td>{row.primaryResults ?? 0}</td>
+                          <td>{row.escalatedResults ?? 0}</td>
+                          <td>{row.fallbackResults ?? 0}</td>
+                          <td>{row.abstainResults ?? 0}</td>
+                          <td>{row.suppressedAssetCooldown ?? 0}</td>
+                          <td>{row.suppressedDuplicateOpportunityDigest ?? 0}</td>
+                          <td>{row.suppressedPerAssetCap ?? 0}</td>
+                          <td>{row.suppressedBucketCap ?? 0}</td>
+                          <td>{row.suppressedGlobalCap ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="health-note">Rows are listed in the order assets were first encountered — not ranked. Showing{" "}
+                  {observer.localTevShadow.assetRowsShown} of {observer.localTevShadow.totalAssetCount ?? 0} assets; every asset is counted in the
+                  totals above, and rows beyond the bound are covered by the aggregate digest{" "}
+                  {observer.localTevShadow.aggregateDigest ? `${observer.localTevShadow.aggregateDigest.slice(0, 16)}…` : "—"}.
+                  Evidence class {observer.localTevShadow.evidenceClassification}, protocol digest{" "}
+                  {observer.localTevShadow.protocolDigest ? `${observer.localTevShadow.protocolDigest.slice(0, 16)}…` : "—"}. Local JEV is an observer
+                  only: it never approves, rejects, resizes, delays, selects or vetoes a proposal, and nothing here is returned to the engine.</p>
               </div>
             )}
 

@@ -323,8 +323,12 @@ export const SUPERVISOR_BOOLEAN_FLAGS = Object.freeze(["help", "json"]);
 /**
  * `cross-asset` (Phase 5I-PS.2d) opts into the cross-asset production shadow
  * with a frozen profile name (`canary` | `full`); it carries no tunable value.
+ *
+ * `local-tev` (Phase 5I-PS.2e) opts into the temporally distributed Local Tev
+ * shadow with a frozen profile name (`development`). Both shadow flags carry a
+ * profile NAME only — never a tunable number — and are mutually exclusive.
  */
-export const SUPERVISOR_VALUE_FLAGS = Object.freeze(["minutes", "market", "session", "cross-asset"]);
+export const SUPERVISOR_VALUE_FLAGS = Object.freeze(["minutes", "market", "session", "cross-asset", "local-tev"]);
 
 /* ============================================================================
  * Question-set / feature-definition identity (reused, never re-derived)

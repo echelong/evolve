@@ -1,6 +1,7 @@
 import { createSolFunnel } from "./sol-funnel.mjs";
 import { createSolAgeCounterfactual } from "./sol-age-counterfactual.mjs";
 import { createCrossAssetShadow } from "./cross-asset-observer.mjs";
+import { createLocalTevShadow } from "./local-tev-observer.mjs";
 /**
  * Phase 5I-PS.2 — Jev supervisor observer.
  *
@@ -207,6 +208,12 @@ export function evaluateSupervisorProviderPins({ provider = null, upstream = nul
  * `crossAsset` enables the Phase 5I-PS.2d cross-asset production shadow
  * (`cross-asset-observer.mjs`). Absent/null = disabled: the observer, its
  * artifacts and the engine tap surface are exactly the pre-PS.2d ones.
+ *
+ * `localTev` enables the Phase 5I-PS.2e temporally distributed Local Tev shadow
+ * (`local-tev-observer.mjs`). Absent/null = disabled: every pre-PS.2e artifact
+ * and tap surface is unchanged. The two shadows are never enabled together by
+ * the CLI (see `settings.mjs`), and each one owns its own queue, scheduler,
+ * worker loop, records and counters.
  */
 export function createSupervisorProposalObserver({
   sessionId,
@@ -224,6 +231,7 @@ export function createSupervisorProposalObserver({
   finalizeTimeoutMs = 5_000,
   onRow = null,
   crossAsset = null,
+  localTev = null,
 } = {}) {
   if (!isValidSupervisorSessionId(sessionId)) {
     throw new Error(`invalid Jev supervisor session id '${sessionId}'`);
@@ -264,6 +272,7 @@ export function createSupervisorProposalObserver({
   let finalized = false;
   let workerPromise = null;
   let crossAssetWorkerPromise = null;
+  let localTevWorkerPromise = null;
   let finalizedSummary = null;
   let finalizedStateDoc = null;
   let lastProposalAt = null;
@@ -338,6 +347,28 @@ export function createSupervisorProposalObserver({
         })
       : null;
 
+  // ---- PS.2e temporally distributed Local Tev shadow (opt-in, observer-only) --
+  // Its own scheduler, queue, worker, circuit breaker and records. It reuses the
+  // SAME passive engine tap as PS.2d but never shares its queue or digest state.
+  const localTevShadow =
+    localTev && typeof localTev.profile === "string"
+      ? createLocalTevShadow({
+          sessionId,
+          root,
+          profileName: localTev.profile,
+          allowOfflineValidation: localTev.allowOfflineValidation === true,
+          classifierPolicy: localTev.classifierPolicy,
+          localJevProjection: localTev.projection ?? null,
+          readiness: localTev.readiness ?? null,
+          transport: localTev.transport ?? null,
+          client: localTev.client ?? null,
+          now,
+          writeArtifacts,
+          waitForStorage: () => storageReady,
+          noteObserverError,
+        })
+      : null;
+
   const solQueue = createBoundedObserverQueue({
     capacity: SUPERVISOR_SOL_QUEUE_CAPACITY,
     onDrop: (draft) => recordSolDrop(draft, "SOL_QUEUE_FULL"),
@@ -379,6 +410,7 @@ export function createSupervisorProposalObserver({
     finalizedAt: null,
     counters: { ...counters },
     ...(crossAssetShadow !== null ? { crossAssetShadow: crossAssetShadow.sessionBlock() } : {}),
+    ...(localTevShadow !== null ? { localTevShadow: localTevShadow.sessionBlock() } : {}),
   };
 
   // The session directory must exist before the worker appends anything, so
@@ -470,6 +502,7 @@ export function createSupervisorProposalObserver({
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       crossAssetShadow: crossAssetShadow?.stateBlock() ?? null,
+      localTevShadow: localTevShadow?.stateBlock() ?? null,
       lastProposalAt,
       lastJudgmentAt,
       lastSolOpportunityAt,
@@ -1353,6 +1386,27 @@ export function createSupervisorProposalObserver({
   }
 
   /**
+   * PS.2e runs on its OWN asynchronous loop, so a slow Local JEV call can never
+   * delay (or cause queue drops in) the PS.2 / PS.2a / PS.2d observer work.
+   */
+  async function localTevWorkerLoop() {
+    while (running) {
+      // The engine tick is synchronous, so whenever this loop runs every
+      // buffered tick is complete and may be scheduled.
+      localTevShadow.flushSampling();
+      if (!localTevShadow.hasWork()) {
+        await sleep(SUPERVISOR_WORKER_IDLE_MS);
+        continue;
+      }
+      try {
+        await localTevShadow.processNext();
+      } catch (error) {
+        noteObserverError(error);
+      }
+    }
+  }
+
+  /**
    * Start the asynchronous observer worker(s). Returns the observer (NOT a
    * promise), so no caller can await it by accident, and the simulation never
    * holds a reference to it at all.
@@ -1370,6 +1424,12 @@ export function createSupervisorProposalObserver({
         noteObserverError(error);
       });
     }
+    if (localTevShadow !== null && localTevWorkerPromise === null) {
+      localTevWorkerPromise = localTevWorkerLoop();
+      localTevWorkerPromise.catch((error) => {
+        noteObserverError(error);
+      });
+    }
     return api;
   }
 
@@ -1382,11 +1442,16 @@ export function createSupervisorProposalObserver({
     lifecycle = "FINALIZING";
     running = false;
     crossAssetShadow?.stopAccepting();
+    localTevShadow?.stopAccepting();
     let finalizeTimedOut = false;
     if (workerPromise !== null) {
       let workersStopped = false;
       await Promise.race([
-        Promise.all([workerPromise.catch(() => {}), crossAssetWorkerPromise?.catch(() => {})]).then(() => {
+        Promise.all([
+          workerPromise.catch(() => {}),
+          crossAssetWorkerPromise?.catch(() => {}),
+          localTevWorkerPromise?.catch(() => {}),
+        ]).then(() => {
           workersStopped = true;
         }),
         (async () => {
@@ -1395,11 +1460,20 @@ export function createSupervisorProposalObserver({
       ]);
       finalizeTimedOut = !workersStopped;
     }
+    // PS.2e: an honest finalize timeout is recorded on the shadow's own block.
+    if (finalizeTimedOut && localTevShadow !== null) localTevShadow.noteFinalizeTimedOut();
     await storageReady;
     await flushDropLines();
     if (crossAssetShadow !== null) {
       try {
         await crossAssetShadow.finalizeFlush();
+      } catch (error) {
+        noteObserverError(error);
+      }
+    }
+    if (localTevShadow !== null) {
+      try {
+        await localTevShadow.finalizeFlush();
       } catch (error) {
         noteObserverError(error);
       }
@@ -1422,6 +1496,7 @@ export function createSupervisorProposalObserver({
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       crossAssetShadow: crossAssetShadow?.summaryBlock() ?? null,
+      localTevShadow: localTevShadow?.summaryBlock() ?? null,
       recentRowCount: recentRows.length,
       droppedRecordCount: droppedRecords.length,
     });
@@ -1497,6 +1572,7 @@ export function createSupervisorProposalObserver({
       solFunnel: solFunnel.snapshot(),
       solAgeCounterfactual: solAgeCounterfactual.snapshot(),
       crossAssetShadow: crossAssetShadow?.summaryBlock() ?? null,
+      localTevShadow: localTevShadow?.summaryBlock() ?? null,
       solDroppedRecords: [...solDroppedRecords],
       uniqueSolMarketStates: solStateSeen.size,
       recentRows: [...recentRows],
@@ -1521,14 +1597,17 @@ export function createSupervisorProposalObserver({
     observeSolOpportunity,
     observeSolFunnel,
     recordSolSelection,
-    // ---- the PS.2d production-entry tap (synchronous; opt-in only) ---------
-    // Declared ONLY when the cross-asset shadow is enabled, so a disabled
-    // observer exposes exactly the pre-PS.2d tap surface to the engine.
-    ...(crossAssetShadow !== null
+    // ---- the PS.2d / PS.2e production-entry tap (synchronous; opt-in only) --
+    // Declared ONLY when a production-entry shadow is enabled, so a disabled
+    // observer exposes exactly the pre-PS.2d tap surface to the engine. Each
+    // enabled shadow receives the same copied facts and the engine's return
+    // value is discarded either way.
+    ...(crossAssetShadow !== null || localTevShadow !== null
       ? {
           observeProductionEntry(facts) {
             if (!running) return;
-            crossAssetShadow.observeProductionEntry(facts);
+            crossAssetShadow?.observeProductionEntry(facts);
+            localTevShadow?.observeProductionEntry(facts);
           },
         }
       : {}),

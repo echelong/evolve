@@ -329,6 +329,7 @@ export function buildSupervisorState({
   solFunnel = null,
   solAgeCounterfactual = null,
   crossAssetShadow = null,
+  localTevShadow = null,
   lastProposalAt = null,
   lastJudgmentAt = null,
   lastSolOpportunityAt = null,
@@ -365,6 +366,8 @@ export function buildSupervisorState({
     // PS.2d appears ONLY in sessions that enabled it; older/disabled sessions
     // keep exactly their previous shape.
     ...(crossAssetShadow !== null ? { crossAssetShadow } : {}),
+    // PS.2e (Local Tev) likewise appears ONLY in sessions that enabled it.
+    ...(localTevShadow !== null ? { localTevShadow } : {}),
     means: meansOf(aggregates),
     solMeans: solMeansOf(aggregates),
     providerStatusCounts: { ...aggregates.providerStatusCounts },
@@ -419,6 +422,7 @@ export function buildSupervisorSummary({
   solFunnel = null,
   solAgeCounterfactual = null,
   crossAssetShadow = null,
+  localTevShadow = null,
   recentRowCount = 0,
   droppedRecordCount = 0,
 } = {}) {
@@ -452,6 +456,7 @@ export function buildSupervisorSummary({
     solFunnel,
     solAgeCounterfactual,
     ...(crossAssetShadow !== null ? { crossAssetShadow } : {}),
+    ...(localTevShadow !== null ? { localTevShadow } : {}),
     supportedProposals: counters.supportedProposals,
     unsupportedProposals: counters.unsupportedProposals,
     unsupportedProposalCount: counters.unsupportedProposals,

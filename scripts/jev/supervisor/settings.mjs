@@ -44,6 +44,7 @@ import {
   isValidSupervisorSessionId,
 } from "./definition.mjs";
 import { PS2D_CLI_PROFILES } from "./cross-asset-protocol.mjs";
+import { PS2E_CLI_PROFILES, PS2E_PROFILES } from "./local-tev-protocol.mjs";
 
 export const SUPERVISOR_SETTINGS_VERSION = 1;
 
@@ -112,6 +113,35 @@ export function buildSupervisorSettings(args = {}) {
     }
   }
 
+  // PS.2e: a frozen profile NAME only. It is a 60-minute temporal protocol, so
+  // the run duration must cover the whole window; a shorter run would silently
+  // truncate the frozen schedule.
+  let localTevProfile = null;
+  if (args["local-tev"] !== undefined) {
+    const requested = String(args["local-tev"]).trim().toLowerCase();
+    if (PS2E_CLI_PROFILES.includes(requested)) localTevProfile = requested;
+    else {
+      problems.push(
+        `invalid --local-tev '${requested}'; the frozen PS.2e profiles are: ${PS2E_CLI_PROFILES.join(", ")}`,
+      );
+    }
+    if (localTevProfile !== null && durationMinutes < PS2E_PROFILES[localTevProfile].minimumMinutes) {
+      problems.push(
+        `--local-tev ${localTevProfile} is a ${PS2E_PROFILES[localTevProfile].minimumMinutes}-minute temporal protocol; ` +
+          `--minutes must be at least ${PS2E_PROFILES[localTevProfile].minimumMinutes}`,
+      );
+    }
+  }
+
+  // One shadow protocol per run: a session is either PS.2d evidence or PS.2e
+  // evidence, never an ambiguous mixture.
+  if (localTevProfile !== null && crossAssetProfile !== null) {
+    problems.push(
+      "--cross-asset (PS.2d, direct TypeSafe) and --local-tev (PS.2e, shared Local JEV) cannot run in the same " +
+        "session: choose one evidence class per run",
+    );
+  }
+
   return {
     version: SUPERVISOR_SETTINGS_VERSION,
     marketId,
@@ -119,6 +149,7 @@ export function buildSupervisorSettings(args = {}) {
     durationMs: durationMinutes * 60_000,
     sessionId: requestedSessionId.length > 0 ? requestedSessionId : null,
     crossAssetProfile,
+    localTevProfile,
     problems,
   };
 }

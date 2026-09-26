@@ -2486,10 +2486,10 @@ await test("CLI wiring: fail-closed start, bounded run, non-blocking observer, C
 
 await test("package scripts and API route / dashboard panel integration", async () => {
   assertEqual(PACKAGE_JSON.scripts["jev:supervisor"], "node scripts/jev-supervisor.mjs");
-  // PS.2d chains its own suite AFTER this one; both must run.
+  // PS.2d and PS.2e chain their own suites AFTER this one; all must run.
   assertEqual(
     PACKAGE_JSON.scripts["validate:jev-supervisor"],
-    "node scripts/validate-phase5i-ps2.mjs && node scripts/validate-phase5i-ps2d.mjs",
+    "node scripts/validate-phase5i-ps2.mjs && node scripts/validate-phase5i-ps2d.mjs && node scripts/validate-phase5i-ps2e.mjs",
   );
   assertIncludes(PACKAGE_JSON.scripts["dev:jev-supervisor"], "npm:jev:supervisor");
   assertIncludes(PACKAGE_JSON.scripts["dev:jev-supervisor"], "npm:dev");
@@ -2620,12 +2620,36 @@ await test("no wallet, signing, swap, order-execution, RPC or process capability
     /child_process/,
     /execSync/,
     /\bspawn\b/,
-    /\bfork\b/,
+    // Process forking, NOT the noun: the shared Local JEV project is itself a fork
+    // of nobodywho, and that provenance is documented in the PS.2e protocol. The
+    // `/child_process/` pattern already covers any way to obtain `fork`.
+    /child_process\.fork/,
     /detached:/,
     /new\s+Connection/,
   ];
+  // ONE documented exemption, scoped to the PROCESS patterns only: the Phase
+  // 5I-PS.2e Local JEV boundary (`local-jev-client.mjs`) invokes the shared
+  // decision-router CLI as its single child process. It is not a capability:
+  // the argv is frozen (`decision ask --caller evolve --mode local-first`), the
+  // environment is an allow-list that drops every secret-shaped variable, there
+  // is no shell, and the dispatch is bounded by a hard timeout. The PS.2e suite
+  // (`validate-phase5i-ps2e.mjs`) verifies exactly that, and every OTHER PS.2e
+  // module remains fully covered here.
+  const PROCESS_BOUNDARY_EXEMPT = new Set([path.join(SUPERVISOR_DIR, "local-jev-client.mjs")]);
+  const PROCESS_CAPABILITY_PATTERNS = [
+    /child_process/,
+    /execSync/,
+    /\bspawn\b/,
+    /child_process\.fork/,
+    /detached:/,
+  ];
+  // Compare by source text: two identical RegExp literals are different objects.
+  const EXEMPT_PATTERN_SOURCES = new Set(PROCESS_CAPABILITY_PATTERNS.map((pattern) => pattern.source));
   for (const { file, text } of SUPERVISOR_SOURCES) {
-    const hits = FORBIDDEN_CAPABILITY_PATTERNS.filter((pattern) => pattern.test(text));
+    const patterns = PROCESS_BOUNDARY_EXEMPT.has(file)
+      ? FORBIDDEN_CAPABILITY_PATTERNS.filter((pattern) => !EXEMPT_PATTERN_SOURCES.has(pattern.source))
+      : FORBIDDEN_CAPABILITY_PATTERNS;
+    const hits = patterns.filter((pattern) => pattern.test(text));
     assertEqual(hits.length, 0, `${file} must not contain execution capability`);
     const imports = text
       .split("\n")
@@ -2633,6 +2657,16 @@ await test("no wallet, signing, swap, order-execution, RPC or process capability
       .join("\n");
     assertEqual(/solana|web3|jupiter|ethers|viem|@ai-sdk/.test(imports), false, `${file} must not import a chain or execution library`);
   }
+  // Nothing else in the tree may spawn, and the client itself may only spawn the
+  // frozen Local JEV CLI (no shell, no free-form argv).
+  for (const { file, text } of SUPERVISOR_SOURCES) {
+    if (PROCESS_BOUNDARY_EXEMPT.has(file)) continue;
+    assertEqual(/node:child_process/.test(text), false, `${file} must not import a process-spawning module`);
+  }
+  const clientSource = SOURCE_BY_FILE[path.join(SUPERVISOR_DIR, "local-jev-client.mjs")];
+  assertEqual(/node:child_process/.test(clientSource), true, "the PS.2e boundary is the one child process");
+  assertEqual(/shell:/.test(clientSource), false, "the PS.2e boundary must never use a shell");
+  assertEqual(/minimalChildEnv/.test(clientSource), true, "the PS.2e child environment must be an allow-list");
   const observerSource = SOURCE_BY_FILE[path.join(SUPERVISOR_DIR, "observer.mjs")];
   assertEqual(/engine\/simulation|engine\/paper|evolve-engine/.test(observerSource), false, "the observer must not import the engine");
 });

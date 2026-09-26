@@ -62,6 +62,20 @@ import {
   PS2D_TRANSPORT_SETTINGS,
   crossAssetExternalCallPolicy,
 } from "./jev/supervisor/cross-asset-protocol.mjs";
+import {
+  PS2E_AUTHORITY_TAG,
+  PS2E_CLI_PROFILES,
+  PS2E_LABEL,
+  PS2E_MISSING_LOCAL_JEV_INTERFACE,
+  PS2E_PRIMARY_CLASSIFIER,
+  PS2E_PROFILES,
+  localTevExternalCallPolicy,
+} from "./jev/supervisor/local-tev-protocol.mjs";
+import {
+  assessLocalTevReadiness,
+  createDecisionCliTransport,
+  readLocalJevEnvironment,
+} from "./jev/supervisor/local-jev-client.mjs";
 import { createSupervisorProposalObserver } from "./jev/supervisor/observer.mjs";
 import { validateExternalPolicy } from "./governance/external-policy.mjs";
 import { ensureSupervisorDir } from "./jev/supervisor/storage.mjs";
@@ -78,6 +92,9 @@ function usage() {
     "  --session <id>      explicit session id (default jsup-<UTC timestamp>-<digest>)",
     `  --cross-asset <p>   opt into the Phase 5I-PS.2d ${PS2D_LABEL} (${PS2D_AUTHORITY_TAG});`,
     `                      frozen profiles: ${PS2D_CLI_PROFILES.map((name) => `${name} (max ${PS2D_PROFILES[name].globalMaxJevCallsPerRun} Jev calls)`).join(", ")}`,
+    `  --local-tev <p>     opt into the Phase 5I-PS.2e ${PS2E_LABEL} (${PS2E_AUTHORITY_TAG});`,
+    `                      frozen profiles: ${PS2E_CLI_PROFILES.map((name) => `${name} (${PS2E_PROFILES[name].bucketCount} x ${PS2E_PROFILES[name].bucketMs / 60_000} min buckets, max ${PS2E_PROFILES[name].perBucketMaxAdmissions}/bucket, max ${PS2E_PROFILES[name].globalMaxAdmissions}/run, >= ${PS2E_PROFILES[name].minimumMinutes} minutes)`).join(", ")}`,
+    "                      one shadow protocol per run: --cross-asset and --local-tev are mutually exclusive.",
     "  --json              machine-readable result",
     "  --help              this help",
     "",
@@ -124,6 +141,62 @@ async function main() {
     process.exitCode = 2;
     return;
   }
+
+  // ---- PS.2e: the SHARED Local JEV classifier boundary -----------------------
+  // The precommitted primary Tev-style classifier is required. When the shared
+  // Local JEV installation does not expose it, PS.2e REFUSES to start: it never
+  // substitutes a generic local model as the primary decision model.
+  let localTev = null;
+  if (settings.localTevProfile !== null) {
+    const profile = PS2E_PROFILES[settings.localTevProfile];
+    const policyValidation = validateExternalPolicy(
+      localTevExternalCallPolicy({ policy: PS2E_PRIMARY_CLASSIFIER, profile }),
+      { evidenceBearing: true },
+    );
+    if (policyValidation.status !== "PASS") {
+      for (const problem of policyValidation.problems) console.error(`[jev:supervisor] PS.2e policy: ${problem}`);
+      console.error("[jev:supervisor] refusing to start: the PS.2e external-call policy failed validation.");
+      process.exitCode = 2;
+      return;
+    }
+    const projection = await readLocalJevEnvironment();
+    const readiness = assessLocalTevReadiness({ projection, policy: PS2E_PRIMARY_CLASSIFIER });
+    if (!readiness.ready) {
+      console.error(
+        `[jev:supervisor] PS.2e cannot start: primary classifier readiness is ${readiness.status} ` +
+          `(tier ${PS2E_PRIMARY_CLASSIFIER.primaryTier}, ${PS2E_PRIMARY_CLASSIFIER.classifierRuntime}).`,
+      );
+      for (const problem of readiness.problems) console.error(`[jev:supervisor] PS.2e ${problem}`);
+      // The missing-interface list is the HISTORICAL precommit-time record,
+      // retained for provenance. It is printed only when the CURRENT failure is
+      // about the missing specialist interface, and never as the current cause.
+      if (readiness.status === "PRIMARY_CLASSIFIER_UNAVAILABLE") {
+        console.error(
+          "[jev:supervisor] historical precommit-time missing-interface record (retained for provenance; the " +
+            "current cause is the readiness problem listed above):",
+        );
+        for (const item of PS2E_MISSING_LOCAL_JEV_INTERFACE) console.error(`[jev:supervisor]   - ${item}`);
+      }
+      console.error(
+        "[jev:supervisor] refusing to start: PS.2e never substitutes a generic local model and this session made no " +
+          "classifier call. No artifact was written.",
+      );
+      process.exitCode = 2;
+      return;
+    }
+    localTev = {
+      profile: settings.localTevProfile,
+      classifierPolicy: PS2E_PRIMARY_CLASSIFIER,
+      projection,
+      readiness,
+      transport: createDecisionCliTransport(),
+    };
+  }
+
+  // A PS.2e session makes no direct TypeSafe call of its own, but the unchanged
+  // PS.2 / PS.2a SOL observer in the same session still requires its existing
+  // direct-TypeSafe pins. That is pre-existing PS.2 behavior and is reported as
+  // such; it is never a PS.2e classifier call.
 
   // ---- PS.2d: Governance v1 validation of the evidence-bearing call policy
   // (no fallback, fail closed, bounded) BEFORE any artifact or provider exists.
@@ -191,6 +264,7 @@ async function main() {
       upstream: pins.identity?.upstreamProvider ?? null,
     },
     crossAsset,
+    localTev,
     onRow:
       args.json === true
         ? null
@@ -228,6 +302,7 @@ async function main() {
             summary: observer.summary(),
             queue: snapshot.queue,
             crossAssetShadow: snapshot.crossAssetShadow,
+            localTevShadow: snapshot.localTevShadow,
             observerFailures: snapshot.counters.observerFailures,
             paperOnly: true,
             developmentOnly: true,
@@ -254,6 +329,28 @@ async function main() {
     console.log(`[jev:supervisor]   SOL agreement    ${snapshot.counters.solAgreementCount} agree · ${snapshot.counters.solDisagreementCount} disagree · ${snapshot.counters.solExactHalfCount} exact 0.50`);
     console.log(`[jev:supervisor]   queue            depth ${snapshot.queue.depth} · high water ${snapshot.queue.highWatermark} · dropped ${snapshot.queue.dropped}`);
     console.log(`[jev:supervisor]   means            pHigher ${summary?.meanPHigher ?? "n/a"} · |p-0.50| ${summary?.meanDistanceFromHalf ?? "n/a"} · latency ${summary?.meanLatencyMs ?? "n/a"}ms`);
+    const tx = snapshot.localTevShadow;
+    if (tx) {
+      console.log(`[jev:supervisor]   ${tx.label} • ${tx.authorityTag} • profile ${tx.profile}`);
+      console.log(`[jev:supervisor]     scheduler      ${tx.bucketCount} buckets x ${tx.bucketMs / 60_000} min • max ${tx.perBucketMaxAdmissions}/bucket • max ${tx.globalMaxAdmissions}/run • run ${tx.runStartedAt ?? "—"}`);
+      console.log(`[jev:supervisor]     classifier     ${tx.classifier.classifierId} (${tx.classifier.classifierRuntime}, tier ${tx.classifier.primaryTier}) • thinking ${tx.thinking.enabled ? "ON" : "OFF"} • readiness ${tx.localJev.readinessStatus}`);
+      console.log(`[jev:supervisor]     opportunities  ${tx.counters.genuineProductionOpportunitiesObserved} genuine • ${tx.counters.schemaEligible} schema eligible • ${tx.counters.admitted} admitted • ${tx.counters.logicalCalls}/${tx.maxLogicalCallsPerRun} logical calls`);
+      console.log(`[jev:supervisor]     routes         primary ${tx.counters.primaryResults} • escalated ${tx.counters.escalatedResults} • TypeSafe fallback ${tx.counters.fallbackResults} • abstain ${tx.counters.abstainResults} • failed ${tx.counters.failures} • malformed ${tx.counters.malformed} • unavailable ${tx.counters.unavailable}`);
+      console.log(`[jev:supervisor]     physical       local attempts ${tx.counters.physicalLocalAttempts} • fallback attempts ${tx.counters.physicalFallbackAttempts} • total ${tx.counters.totalPhysicalAttempts} (ceiling ${tx.maxPhysicalAttemptsPerRun})`);
+      console.log(`[jev:supervisor]     queue          depth ${tx.queue.depth} • high water ${tx.queue.highWatermark} • dropped ${tx.queue.dropped} • unsent ${tx.counters.unsentAtFinalize} • in flight ${tx.counters.inFlightAtFinalize}`);
+      console.log(`[jev:supervisor]     temporal       span ${tx.temporal.admissionSpanSeconds ?? "—"}s • buckets with admissions ${tx.temporal.occupancy.bucketsWithAdmissions}/${tx.bucketCount} • empty ${tx.temporal.occupancy.emptyBuckets} • at cap ${tx.temporal.occupancy.bucketsAtCap}`);
+      console.log(`[jev:supervisor]     latency (E2E) primary p50 ${tx.latency.groups.primaryTevResults.metrics.totalE2EMs.p50 ?? "—"}ms p95 ${tx.latency.groups.primaryTevResults.metrics.totalE2EMs.p95 ?? "—"}ms • all p50 ${tx.latency.groups.allLogicalRequests.metrics.totalE2EMs.p50 ?? "—"}ms`);
+      // Score semantics are derived from the recorded evidence itself:
+      // `sample_stability` is a vote-share stability proxy and NOT a calibrated
+      // probability; a calibrated number exists only if the shared TypeSafe
+      // fallback reported one.
+      const scoreSemantics = tx.scoreSemantics ?? {};
+      console.log(
+        `[jev:supervisor]     TypeSafe as normal provider: ${tx.localJev.typeSafeIsNormalProvider ? "YES" : "no"} ` +
+          `• score semantics: sample_stability vote shares are stability proxies, never calibrated probabilities ` +
+          `• calibrated-probability records: ${scoreSemantics.calibratedProbabilityRecords ?? 0} (shared-stack reports only)`,
+      );
+    }
     const xa = snapshot.crossAssetShadow;
     if (xa) {
       console.log(`[jev:supervisor]   ${xa.label} • ${xa.authorityTag} • profile ${xa.profile}`);
