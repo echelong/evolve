@@ -325,7 +325,10 @@ Capture/storage failures finalize with status `incomplete` and return nonzero.
 Manifest includes file/record/provider/error counts, first/last recorded observation
 time, unique mint count, capture metrics, health and SHA-256 hashes of session,
 raw, normalized, disagreement, error and summary files. The combined fingerprint
-is SHA-256 of the canonical sorted file-hash map. Canonical JSON recursively sorts
+is SHA-256 of the canonical sorted file-hash map. Finalization hashes each file
+through its identity-verified descriptor in fixed 1 MiB positional reads, so
+hashing memory is bounded regardless of evidence size; digests are identical to
+hashing the whole file. Canonical JSON recursively sorts
 object keys, preserves array order and rejects nonfinite/undefined values. The
 manifest does not hash itself. Fixtures prove identical evidence yields identical
 hashes and fingerprints across separate directories.
@@ -348,7 +351,9 @@ session is preserved unchanged as operational evidence.
 Roughly 67 MiB in roughly 12 minutes, with GMGN and launch disabled, is one
 observation, not a rate assumption. The default bound was raised to 512 MiB on
 that basis. Capture remains hard-bounded: the cap is always a finite whole number
-of MiB from 64 to 2048, and storage refuses nonfinite or nonpositive caps. The
+of MiB from 64 to 2048. Before creating any directory or file, storage refuses
+nonfinite or nonpositive caps and any cap whose usable space (cap − 16 KiB)
+cannot hold the encoded `session.json`. The
 default does not guarantee any particular duration; higher evidence volume (more
 providers enabled, larger payloads, a larger universe) may still reach the bound
 early. When it does, the append that would cross `maxSessionBytes − 16 KiB` writes
@@ -451,7 +456,12 @@ fallback; the named finalization reserve; an exact `SESSION_STORAGE_BOUND`
 reproduction under an injected 64 KiB cap, at storage and recorder level;
 incomplete finalization with a valid manifest and exact telemetry; CLI code
 allowlisting and redaction; doctor capacity output; pre-5J.1 summary
-compatibility; and byte-identical finalized evidence across the run.
+compatibility; and byte-identical finalized evidence across the run. Review
+fixes add tests 85–92 (92 total): streaming hashes against whole-file and
+known-answer SHA-256 at every chunk boundary, re-hashed multi-chunk manifests, an
+isolated `--expose-gc` child bounding finalization array-buffer growth for a
+32 MiB evidence file, descriptor-only hashing with identity defenses intact,
+preserved manifests re-verified, and the exact session-metadata capacity boundary.
 
 No R1–R6 question is answered by implementation. Future experiments may test:
 

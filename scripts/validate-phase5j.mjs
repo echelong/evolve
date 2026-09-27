@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, renameSync, unlinkSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, renameSync, unlinkSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { EVIDENCE, canonical, digest, redact } from './market-intelligence/definition.mjs';
 import { createIntelligenceConfig, observation, normalizeGmgn, normalizeDex, normalizeJupiterMarkets, normalizeLaunchEvent, createGmgnProvider, createDexProvider, createLaunchObserver, aggregate, disagreement, createStorage, manifestFingerprint, createIntelligenceRecorder, FEATURE_NAMES,
   readSummary, sessionCapacityMiB, SESSION_CAPACITY_MIB, SESSION_FINALIZATION_RESERVE_BYTES, FINALIZATION_RECORD_MAX_BYTES } from './market-intelligence/index.mjs';
 import { SAFE_FAILURE_CODES, safeFailureCode, failureLine, doctorReport } from './market-intelligence.mjs';
+import { FILE_HASH_CHUNK_BYTES, hashFileDescriptor, fileHash } from './market-intelligence/storage.mjs';
 import { GMGN_ROUTES } from './market-intelligence/providers/gmgn.mjs';
 import { DEX_ROUTES } from './market-intelligence/providers/dexscreener.mjs';
 import { createObservationTransport } from './market-intelligence/providers/http.mjs';
@@ -797,10 +799,154 @@ test('83 pre-5J.1 summaries remain readable; new summaries keep every prior fiel
   assert.equal(publicState.state, 'FINALIZED_SESSION'); assert.equal(publicState.captureStatus, 'complete'); assert.equal(publicState.mintsJoined, 1);
   const [read] = readSummary(root); assert.equal(read.storage, undefined); assert.equal(read.bytesBeforeFinalization, current.bytesBeforeFinalization);
 });
-test('84 capacity fixtures use temporary storage only; finalized evidence byte-identical', () => {
+function assertTemporaryOnlyAndEvidenceUnchanged() {
   for (const root of temporary) { assert(path.resolve(root).startsWith(path.resolve(tmpdir()) + path.sep)); assert(!path.resolve(root).startsWith(path.resolve('.evolve'))); }
   assert.deepEqual(finalizedEvidence(), liveEvidenceBefore);
+}
+test('84 capacity fixtures use temporary storage only; finalized evidence byte-identical', assertTemporaryOnlyAndEvidenceUnchanged);
+
+// Phase 5J.1 review: finalization hashes evidence through one fixed buffer, and a
+// session's own metadata must fit its usable capacity before anything is created.
+const INCIDENT_SESSION = '1790507032018-6854248b-5e29-49fc-9dec-aef8ab398593';
+const INCIDENT_FINGERPRINT = '5fbb0a04fc572318f8c47f0f5e4f0eaace26d453778d179bf7b8ae56b814e82d';
+// xorshift32 stream: deterministic, and its state never repeats at these sizes, so unlike
+// a short repeating pattern a misplaced or repeated chunk read changes the digest.
+function deterministicBytes(size) {
+  const bytes = Buffer.alloc(size); let x = 0x5a17;
+  for (let i = 0; i < size; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; bytes[i] = x & 0xff; }
+  return bytes;
+}
+// SHA-256 of deterministicBytes(2 MiB + 4099) from coreutils sha256sum, independent of node:crypto.
+const KNOWN_MULTI_CHUNK_SHA256 = 'ee4b1b3abbfa2cb4d008dbb5205756869f24a699ef0612c0a6814d32ce79eddf';
+const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const directoryHashes = dir => Object.fromEntries(files(dir).filter(f => path.basename(f) !== 'manifest.json').map(f => [path.relative(dir, f).split(path.sep).join('/'), hashBytes(readFileSync(f))]));
+const sessionEncoding = (sessionId, maxSessionBytes) => expectedJson({ schemaVersion: 1, recordType: 'session', ...EVIDENCE, sessionId, startedAt: at, maxRawBytes: 262144, maxSessionBytes }) + '\n';
+
+test('85 streaming file hash uses a fixed 1 MiB buffer and equals whole-file SHA-256 at every chunk boundary', () => {
+  assert.equal(FILE_HASH_CHUNK_BYTES, MIB); const C = FILE_HASH_CHUNK_BYTES, dir = tempRoot();
+  for (const size of [0, 1, C - 1, C, C + 1, 2 * C + 4099, 3 * C + 7]) {
+    const file = path.join(dir, `evidence-${size}.bin`), bytes = deterministicBytes(size); writeFileSync(file, bytes);
+    const oracle = hashBytes(bytes);
+    assert.equal(fileHash(file), oracle, `fileHash ${size} bytes`);
+    const fd = openSync(file, 'r');
+    try {
+      assert.equal(hashFileDescriptor(fd), oracle, `descriptor ${size} bytes`);
+      // A tiny caller buffer forces many partial chunks through the same loop.
+      assert.equal(hashFileDescriptor(fd, Buffer.alloc(7)), oracle, `7-byte chunks ${size} bytes`);
+      if (size > 200) {
+        // Positional reads: an advanced descriptor offset neither changes the digest nor is moved by hashing.
+        const probe = Buffer.alloc(100); assert.equal(readSync(fd, probe, 0, 100, null), 100);
+        assert.equal(hashFileDescriptor(fd), oracle, `offset-independent ${size} bytes`);
+        assert.equal(readSync(fd, probe, 0, 100, null), 100); assert.deepEqual(probe, bytes.subarray(100, 200));
+      }
+    } finally { closeSync(fd); }
+    if (size === 0) assert.equal(oracle, EMPTY_SHA256);
+    if (size === 2 * C + 4099) assert.equal(oracle, KNOWN_MULTI_CHUNK_SHA256);
+  }
 });
+test('86 finalization re-hashes multi-chunk evidence; every manifest hash and the fingerprint independently match', () => {
+  const s = store({ maxRawBytes: 2 * MIB }), padding = deterministicBytes(700 * 1024).toString('hex');
+  for (let index = 0; index < 3; index++) s.writeRawResponse({ ...rawFixture, payload: { index, padding } }, 'dexscreener');
+  s.writeObservation(g(), gmgnPayload); s.writeObservation(d(), dexPayload); s.writeSnapshot(frozenSnapshot([g(), d()])[0]); s.error('gmgn', 'FIXTURE', at);
+  const manifest = s.finalize({ endedAt: at });
+  assert(statSync(path.join(s.dir, 'raw/dexscreener.ndjson')).size > 4 * FILE_HASH_CHUNK_BYTES, 'evidence spans several hash chunks');
+  const actual = directoryHashes(s.dir);
+  assert.deepEqual(manifest.files, actual); assert.equal(manifest.fingerprint, hashBytes(expectedJson(actual)));
+  assert.deepEqual(JSON.parse(readFileSync(path.join(s.dir, 'manifest.json'), 'utf8')).files, actual);
+  for (const [file, hash] of Object.entries(actual)) assert.equal(fileHash(path.join(s.dir, file)), hash);
+});
+// Isolated child: finalize a >= 32 MiB evidence file and sample array-buffer usage at
+// every hash update, the moment a whole-file read would be resident. Post-GC retention
+// alone cannot see the defect (the whole-file buffer is garbage once hashed).
+const LARGE_EVIDENCE_RECORDS = 32, FINALIZATION_MEMORY_GROWTH_LIMIT = 4 * MIB;
+const largeEvidenceChild = `
+import { createHash } from 'node:crypto';
+import { createStorage } from ${JSON.stringify(pathToFileURL(path.resolve('scripts/market-intelligence/storage.mjs')).href)};
+const [root, records, at, mint] = JSON.parse(process.argv[1]), MIB = 1024 * 1024;
+const padding = Array.from({ length: MIB / 64 - 8 }, (_, i) => createHash('sha256').update('evolve-5j1-' + i).digest('hex')).join('');
+const s = createStorage({ root, sessionId: 'large-evidence', startedAt: at, maxRawBytes: 2 * MIB });
+for (let index = 0; index < records; index++) s.writeRawResponse({ payload: { index, padding }, receivedAt: at, endpoint: '/fixture', requestIdentity: mint }, 'dexscreener');
+const Hash = Object.getPrototypeOf(createHash('sha256')), update = Hash.update, arrayBuffers = () => process.memoryUsage().arrayBuffers;
+gc(); gc(); const before = arrayBuffers(); let peak = before, updates = 0;
+Hash.update = function (...args) { updates++; peak = Math.max(peak, arrayBuffers()); return update.apply(this, args); };
+const manifest = s.finalize({ endedAt: at });
+const unreclaimed = arrayBuffers(); Hash.update = update; gc(); gc(); const retained = arrayBuffers();
+console.log(JSON.stringify({ dir: s.dir, updates, peakGrowth: peak - before, unreclaimedGrowth: unreclaimed - before, retainedGrowth: retained - before, manifest }));
+`;
+test('87 finalizing a 32 MiB evidence file keeps array-buffer growth under 4 MiB (isolated --expose-gc child)', () => {
+  const root = tempRoot();
+  const child = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', largeEvidenceChild, JSON.stringify([root, LARGE_EVIDENCE_RECORDS, at, mint])], { encoding: 'utf8', timeout: 120000 });
+  assert.equal(child.status, 0, child.stderr);
+  const { dir, updates, peakGrowth, unreclaimedGrowth, retainedGrowth, manifest } = JSON.parse(child.stdout);
+  assert(path.resolve(dir).startsWith(path.resolve(root) + path.sep));
+  const large = path.join(dir, 'raw/dexscreener.ndjson'), size = statSync(large).size;
+  assert(size >= 32 * MIB, `fixture ${size} bytes`); assert(FINALIZATION_MEMORY_GROWTH_LIMIT * 8 <= size, 'a whole-file read cannot pass the limit');
+  assert(updates > 0, 'array-buffer usage was sampled during hashing');
+  for (const [label, growth] of Object.entries({ peakGrowth, unreclaimedGrowth, retainedGrowth }))
+    assert(Number.isSafeInteger(growth) && growth < FINALIZATION_MEMORY_GROWTH_LIMIT, `${label} ${growth} bytes for a ${size}-byte evidence file`);
+  assert(updates >= size / FILE_HASH_CHUNK_BYTES, 'the large file was hashed chunk by chunk');
+  const actual = directoryHashes(dir);
+  assert.equal(manifest.files['raw/dexscreener.ndjson'], hashBytes(readFileSync(large)));
+  assert.deepEqual(manifest.files, actual); assert.equal(manifest.fingerprint, hashBytes(expectedJson(actual)));
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8')), manifest);
+});
+test('88 manifest hashing reads only the identity-verified descriptor; no whole-file reads remain', () => {
+  const ast = espree.parse(readFileSync('scripts/market-intelligence/storage.mjs', 'utf8'), { ecmaVersion: 'latest', sourceType: 'module' });
+  const named = name => ast.body.find(node => (node.declaration ?? node).id?.name === name || node.declaration?.declarations?.some(v => v.id.name === name));
+  const uses = (node, name) => { let found = false; walk(node, n => { if (n.type === 'Identifier' && n.name === name) found = true; }); return found; };
+  for (const node of ast.body) if (node.type !== 'ImportDeclaration' && node !== named('readSummary')) assert(!uses(node, 'readFileSync'), 'only readSummary may read a whole file');
+  assert(uses(named('hashFileDescriptor'), 'readSync') && uses(named('fileHash'), 'hashFileDescriptor'));
+  assert(uses(named('createStorage'), 'hashFileDescriptor') && !uses(named('createStorage'), 'fileHash'), 'finalization hashes its verified descriptor, never a reopened path');
+  // Identity defenses still guard the hashing open: replaced or symlinked evidence fails and no manifest is written.
+  const replaced = store(); replaced.writeObservation(g(), gmgnPayload);
+  const evidence = path.join(replaced.dir, 'normalized.ndjson'); renameSync(evidence, evidence + '.original'); writeFileSync(evidence, readFileSync(evidence + '.original'));
+  assert.throws(() => replaced.finalize({ endedAt: at }), /IDENTITY_MISMATCH/); assert(!existsSync(path.join(replaced.dir, 'manifest.json')));
+  const linked = store(), outside = tempRoot(), target = path.join(outside, 'evidence.ndjson'); writeFileSync(target, 'unchanged\n');
+  const raw = path.join(linked.dir, 'raw/gmgn.ndjson'); unlinkSync(raw); symlinkSync(target, raw);
+  assert.throws(() => linked.finalize({ endedAt: at }), /SYMLINK_FORBIDDEN/); assert(!existsSync(path.join(linked.dir, 'manifest.json')));
+  assert.equal(readFileSync(target, 'utf8'), 'unchanged\n');
+});
+test('89 preserved finalized manifests re-verify byte-for-byte under streaming hashing', () => {
+  if (!existsSync(LIVE_SESSIONS)) return;
+  for (const id of readdirSync(LIVE_SESSIONS).filter(id => existsSync(path.join(LIVE_SESSIONS, id, 'manifest.json')))) {
+    const dir = path.join(LIVE_SESSIONS, id), manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
+    for (const [file, hash] of Object.entries(manifest.files)) assert.equal(fileHash(path.join(dir, file)), hash, `${id}/${file}`);
+    assert.equal(manifestFingerprint(manifest.files), manifest.fingerprint); assert.equal(hashBytes(expectedJson(manifest.files)), manifest.fingerprint);
+    if (id === INCIDENT_SESSION) assert.equal(manifest.fingerprint, INCIDENT_FINGERPRINT);
+  }
+});
+test('90 a cap leaving less usable space than session.json is rejected before any directory or file exists', () => {
+  const parent = tempRoot(), root = path.join(parent, 'market-intelligence');
+  for (const maxSessionBytes of [SESSION_FINALIZATION_RESERVE_BYTES + 1, SESSION_FINALIZATION_RESERVE_BYTES + 100]) {
+    assert.throws(() => createStorage({ root, sessionId: 'fixture', startedAt: at, maxSessionBytes }), { message: 'SESSION_STORAGE_BOUND_INVALID' });
+    assert.deepEqual(readdirSync(parent), [], 'no root, sessions, session, raw or evidence file created');
+  }
+  const existing = tempRoot();
+  assert.throws(() => createStorage({ root: existing, sessionId: 'fixture', startedAt: at, maxSessionBytes: SESSION_FINALIZATION_RESERVE_BYTES + 1 }), { message: 'SESSION_STORAGE_BOUND_INVALID' });
+  assert.deepEqual(readdirSync(existing), []);
+});
+test('91 exact metadata-fit boundary: reserve + encoded session.json succeeds, one byte less is rejected', () => {
+  for (const sessionId of ['fixture', 'b'.repeat(100)]) {
+    // The cap is itself encoded in session.json, so derive the boundary as a fixed point.
+    let cap = SESSION_FINALIZATION_RESERVE_BYTES + 1;
+    for (let i = 0; i < 8; i++) cap = SESSION_FINALIZATION_RESERVE_BYTES + Buffer.byteLength(sessionEncoding(sessionId, cap));
+    const body = sessionEncoding(sessionId, cap), metadataBytes = Buffer.byteLength(body);
+    assert.equal(cap, SESSION_FINALIZATION_RESERVE_BYTES + metadataBytes);
+    assert.equal(Buffer.byteLength(sessionEncoding(sessionId, cap - 1)), metadataBytes, 'one byte less leaves one byte too little usable space');
+    const below = tempRoot();
+    assert.throws(() => createStorage({ root: below, sessionId, startedAt: at, maxSessionBytes: cap - 1 }), { message: 'SESSION_STORAGE_BOUND_INVALID' });
+    assert.deepEqual(readdirSync(below), []);
+    const s = createStorage({ root: tempRoot(), sessionId, startedAt: at, maxSessionBytes: cap });
+    assert.equal(readFileSync(path.join(s.dir, 'session.json'), 'utf8'), body); assert.equal(sessionBytes(s.dir), cap - SESSION_FINALIZATION_RESERVE_BYTES);
+    const hashes = treeHashes(s.dir);
+    assert.throws(() => s.error('dexscreener', 'FIXTURE', at), { message: 'SESSION_STORAGE_BOUND' }); assert.deepEqual(treeHashes(s.dir), hashes);
+    const manifest = s.finalize({ endedAt: at, reason: 'capture failed' });
+    assert.equal(manifest.status, 'incomplete'); assert.equal(manifest.storage.usableSessionBytes, metadataBytes); assert.equal(manifest.storage.utilizationRatio, 1);
+    assert.equal(manifest.storage.sessionBoundReached, true); assert(treeBytes(s.dir) <= cap, 'metadata, summary and manifest fit the hard cap');
+    assert.deepEqual(manifest.files, directoryHashes(s.dir));
+  }
+});
+test('92 finalization-memory and tiny-cap fixtures use temporary storage only; finalized evidence byte-identical', assertTemporaryOnlyAndEvidenceUnchanged);
 
 let failed = 0;
 try {

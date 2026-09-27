@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, readFileSync, readdirSync, lstatSync, fstatSync, renameSync, constants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, readFileSync, readSync, readdirSync, lstatSync, fstatSync, renameSync, constants } from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { canonical, digest, EVIDENCE, redact } from './definition.mjs';
@@ -11,7 +11,19 @@ export const SESSION_CAPACITY_MIB = Object.freeze({ default: 512, min: 64, max: 
 export const DEFAULT_MAX_SESSION_BYTES = SESSION_CAPACITY_MIB.default * MIB;
 export const FINALIZATION_RECORD_MAX_BYTES = 8 * 1024;
 export const SESSION_FINALIZATION_RESERVE_BYTES = 16 * 1024;
-export const fileHash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+// Evidence is hashed through one fixed buffer with positional reads, so hashing
+// memory stays bounded however large a session's files grow and the descriptor's
+// own offset cannot affect the digest (identical to hashing the whole file).
+export const FILE_HASH_CHUNK_BYTES = MIB;
+export function hashFileDescriptor(fd, buffer = Buffer.alloc(FILE_HASH_CHUNK_BYTES)) {
+  const hash = createHash('sha256');
+  for (let position = 0, read; (read = readSync(fd, buffer, 0, buffer.length, position)) > 0; position += read) hash.update(buffer.subarray(0, read));
+  return hash.digest('hex');
+}
+export function fileHash(file) {
+  const fd = openSync(file, constants.O_RDONLY);
+  try { return hashFileDescriptor(fd); } finally { closeSync(fd); }
+}
 export const manifestFingerprint = files => digest(files);
 const RAW_FILES = Object.freeze({ jupiter: 'raw/jupiter.ndjson', gmgn: 'raw/gmgn.ndjson', dexscreener: 'raw/dexscreener.ndjson', 'launch-observer': 'raw/launch-events.ndjson' });
 function rejectSymlinks(absolute) {
@@ -26,6 +38,10 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
   // A NaN/Infinity/nonpositive cap would silently disable the bound; reject it before any write.
   if (!Number.isSafeInteger(maxSessionBytes) || maxSessionBytes <= SESSION_FINALIZATION_RESERVE_BYTES) throw new Error('SESSION_STORAGE_BOUND_INVALID');
   const usableSessionBytes = maxSessionBytes - SESSION_FINALIZATION_RESERVE_BYTES;
+  // session.json is the first bytes counted against the usable bound, so it must fit beside the reserve before anything is created.
+  const session = { schemaVersion: 1, recordType: 'session', ...EVIDENCE, sessionId, startedAt, maxRawBytes, maxSessionBytes };
+  const sessionBody = canonical(session) + '\n';
+  if (Buffer.byteLength(sessionBody) > usableSessionBytes) throw new Error('SESSION_STORAGE_BOUND_INVALID');
   // Reject symlink ancestors so a session cannot redirect writes to existing evidence.
   const absolute = path.resolve(root);
   rejectSymlinks(path.join(absolute, 'sessions'));
@@ -61,8 +77,6 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
   }
   let closed = false, bytes = 0, records = 0, firstAt = null, lastAt = null, sessionBoundReached = false;
   const counts = {}, providerCounts = {}, errorCounts = {}, mints = new Set();
-  const session = { schemaVersion: 1, recordType: 'session', ...EVIDENCE, sessionId, startedAt, maxRawBytes, maxSessionBytes };
-  const sessionBody = canonical(session) + '\n';
   exclusive('session.json', sessionBody); bytes += Buffer.byteLength(sessionBody);
   for (const file of files) exclusive(file, '');
   const rawFile = provider => { if (!Object.hasOwn(RAW_FILES, provider)) throw new Error('STORAGE_PROVIDER_FORBIDDEN'); return RAW_FILES[provider]; };
@@ -133,9 +147,11 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
         fileIdentities.set(file, fileIdentities.get(`${file}.tmp`));
       }
       atomic('summary.json', summary);
+      // Hash the identity-verified descriptor itself, reusing one bounded buffer for every file.
+      const chunk = Buffer.alloc(FILE_HASH_CHUNK_BYTES);
       const hashes = Object.fromEntries([...files, 'session.json', 'summary.json'].sort().map(file => {
         const fd = openFile(file, constants.O_RDONLY);
-        try { return [file, createHash('sha256').update(readFileSync(fd)).digest('hex')]; } finally { closeSync(fd); }
+        try { return [file, hashFileDescriptor(fd, chunk)]; } finally { closeSync(fd); }
       }));
       const manifest = { ...summary, recordType: 'manifest', files: hashes, fingerprint: manifestFingerprint(hashes) };
       atomic('manifest.json', manifest); return manifest;
