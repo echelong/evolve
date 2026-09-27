@@ -289,9 +289,11 @@ normalized records have an explicit unavailable-normalization flag. Error record
 contain only bounded safe codes, provider and observation time with evidence flags.
 No failed HTTP response bodies or credential-bearing request URLs are persisted.
 
-Raw HTTP responses and individual raw records are bounded to 256 KiB; session
-appends are bounded to 64 MiB, reserving 16 KiB for finalization. Final summary and
-manifest each have an 8 KiB limit. Cache capacity is 256 entries/provider, retained
+Raw HTTP responses and individual raw records are bounded to 256 KiB. Session
+appends are bounded by `EVOLVE_INTELLIGENCE_MAX_SESSION_MIB` (default 512 MiB;
+whole MiB clamped to 64–2048; invalid values use the default), reserving
+`SESSION_FINALIZATION_RESERVE_BYTES` (16 KiB) for finalization. Final summary and
+manifest each have an 8 KiB limit, so both always fit the reserve. Cache capacity is 256 entries/provider, retained
 mint/endpoint identities 10,000, remembered duplicate launches 10,000. Old stale
 in-memory observations expire; persisted evidence never changes.
 Jupiter first-copy receipts are independently capped at 10,000 mint/endpoint
@@ -327,6 +329,39 @@ is SHA-256 of the canonical sorted file-hash map. Canonical JSON recursively sor
 object keys, preserves array order and rejects nonfinite/undefined values. The
 manifest does not hash itself. Fixtures prove identical evidence yields identical
 hashes and fingerprints across separate directories.
+
+### Capture capacity (Phase 5J.1)
+
+The first governed passive shakedown (session
+`1790507032018-6854248b-5e29-49fc-9dec-aef8ab398593`, fingerprint
+`5fbb0a04fc572318f8c47f0f5e4f0eaace26d453778d179bf7b8ae56b814e82d`) requested
+30 minutes and finalized `incomplete` (`capture failed`) after about 12 minutes.
+Providers were healthy: Jupiter 19/19 requests with no errors, rate limits or auth
+failures; DexScreener 114 requests with no errors; GMGN `DISABLED_NO_KEY`; launch
+`DISABLED_UNVERIFIED_TRANSPORT`. The session had appended 67,062,706 bytes against
+the fixed 64 MiB cap's effective append ceiling of 67,092,480 bytes
+(67,108,864 − 16,384). The remaining 29,774 bytes were smaller than a typical
+DexScreener raw response in that session (average ≈29 KiB, maximum ≈47 KiB) plus
+its normalized record, so the next append raised `SESSION_STORAGE_BOUND`. The
+session is preserved unchanged as operational evidence.
+
+Roughly 67 MiB in roughly 12 minutes, with GMGN and launch disabled, is one
+observation, not a rate assumption. The default bound was raised to 512 MiB on
+that basis. Capture remains hard-bounded: the cap is always a finite whole number
+of MiB from 64 to 2048, and storage refuses nonfinite or nonpositive caps. The
+default does not guarantee any particular duration; higher evidence volume (more
+providers enabled, larger payloads, a larger universe) may still reach the bound
+early. When it does, the append that would cross `maxSessionBytes − 16 KiB` writes
+nothing, capture stops, and the session finalizes `incomplete` with a valid
+manifest rather than silently truncating.
+
+Finalized summaries and manifests add a `storage` section: `bytesBeforeFinalization`,
+`maxSessionBytes`, `finalizationReserveBytes`, `usableSessionBytes`,
+`utilizationRatio` (bytes/usable, six decimals) and `sessionBoundReached`. The
+top-level `bytesBeforeFinalization` is kept for existing readers, and summaries
+written before Phase 5J.1 (no `storage` section) remain valid. Capture cadence,
+providers, normalization, aggregation, disagreement, GMGN scheduling and the other
+record schemas are unchanged.
 
 ## Network, secrets, health and rate limits
 
@@ -379,6 +414,14 @@ and errors; Ctrl+C finalizes. No terminal takeover or shell exit helper is used.
 Probe issues one small Solana DexScreener query; GMGN token info runs only when
 an API key already exists. Missing GMGN key is explicitly reported as skipped.
 Disabled launch transport produces no probe events.
+Doctor also reports the storage bound (`maxSessionMiB`, `maxSessionBytes`,
+`finalizationReserveBytes`) before a long run, with no paths or secrets. A failed
+command prints only an allowlisted code, for example
+`[EVOLVE 5J] capture failed: SESSION_STORAGE_BOUND`. The allowlist is
+`SESSION_STORAGE_BOUND`, `RAW_STORAGE_BOUND`, `FINALIZATION_STORAGE_BOUND`,
+`SESSION_STORAGE_IDENTITY_BOUND`, `SESSION_STORAGE_RECEIPT_BOUND` and
+`NO_LOOKAHEAD_TIMESTAMP`; anything else prints `OBSERVATION_FAILED`. Exception
+text, URLs, secrets and payloads are never printed, and the exit status stays nonzero.
 
 The separate `/api/market-intelligence` route supplies only finite numeric summary
 fields and allowlisted provider health enums. The development observer panel
@@ -403,6 +446,12 @@ payload permutations, independent metric eligibility and cross-provider age
 selection. Actual manifest files are re-hashed directly with node:crypto and
 their fingerprint and line counts independently checked. Tests write only to
 temporary directories, never existing observation/evidence sessions.
+Phase 5J.1 adds tests 71–84 (84 total): capacity default, clamps and invalid
+fallback; the named finalization reserve; an exact `SESSION_STORAGE_BOUND`
+reproduction under an injected 64 KiB cap, at storage and recorder level;
+incomplete finalization with a valid manifest and exact telemetry; CLI code
+allowlisting and redaction; doctor capacity output; pre-5J.1 summary
+compatibility; and byte-identical finalized evidence across the run.
 
 No R1–R6 question is answered by implementation. Future experiments may test:
 

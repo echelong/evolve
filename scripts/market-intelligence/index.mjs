@@ -1,9 +1,9 @@
 export { SCHEMA_VERSION, EVIDENCE, canonical, digest } from './definition.mjs';
-export { createIntelligenceConfig } from './config.mjs';
+export { createIntelligenceConfig, sessionCapacityMiB } from './config.mjs';
 export { observation, normalizeGmgn, normalizeDex, normalizeJupiterMarkets } from './normalize.mjs';
 export { FEATURE_NAMES, aggregate } from './aggregate.mjs';
 export { disagreement } from './disagreement.mjs';
-export { createStorage, manifestFingerprint, readSummary } from './storage.mjs';
+export { createStorage, manifestFingerprint, readSummary, SESSION_CAPACITY_MIB, SESSION_FINALIZATION_RESERVE_BYTES, FINALIZATION_RECORD_MAX_BYTES } from './storage.mjs';
 export { createIntelligenceRecorder } from './recorder.mjs';
 export { createGmgnProvider } from './providers/gmgn.mjs';
 export { createDexProvider } from './providers/dexscreener.mjs';

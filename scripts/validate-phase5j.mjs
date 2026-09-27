@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, renameSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, renameSync, unlinkSync, statSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { EVIDENCE, canonical, digest, redact } from './market-intelligence/definition.mjs';
-import { createIntelligenceConfig, observation, normalizeGmgn, normalizeDex, normalizeJupiterMarkets, normalizeLaunchEvent, createGmgnProvider, createDexProvider, createLaunchObserver, aggregate, disagreement, createStorage, manifestFingerprint, createIntelligenceRecorder, FEATURE_NAMES } from './market-intelligence/index.mjs';
+import { createIntelligenceConfig, observation, normalizeGmgn, normalizeDex, normalizeJupiterMarkets, normalizeLaunchEvent, createGmgnProvider, createDexProvider, createLaunchObserver, aggregate, disagreement, createStorage, manifestFingerprint, createIntelligenceRecorder, FEATURE_NAMES,
+  readSummary, sessionCapacityMiB, SESSION_CAPACITY_MIB, SESSION_FINALIZATION_RESERVE_BYTES, FINALIZATION_RECORD_MAX_BYTES } from './market-intelligence/index.mjs';
+import { SAFE_FAILURE_CODES, safeFailureCode, failureLine, doctorReport } from './market-intelligence.mjs';
 import { GMGN_ROUTES } from './market-intelligence/providers/gmgn.mjs';
 import { DEX_ROUTES } from './market-intelligence/providers/dexscreener.mjs';
 import { createObservationTransport } from './market-intelligence/providers/http.mjs';
@@ -622,6 +624,182 @@ test('70 universe shrink keeps GMGN cursors bounded and coverage intact', async 
   recorder.finalize();
   assert.deepEqual([...requested.keys()].sort(), [...small].sort(), 'no stale-mint selections after shrink');
   for (const m of small) assert.deepEqual([...requested.get(m)].sort(), [...ROUTE_KINDS].sort(), `shrunk mint keeps all five routes: ${m.slice(0, 8)}`);
+});
+
+// Phase 5J.1 capture capacity: the first governed shakedown reached the fixed
+// 64 MiB append ceiling (~67 MiB in ~12 minutes) and finalized incomplete.
+// Capacity is now bounded configuration. Fixtures inject a small cap into
+// temporary storage; nothing here reads or writes 512 MiB or existing evidence.
+const MIB = 1024 * 1024, SMALL_CAP = 64 * 1024, SMALL_USABLE = SMALL_CAP - 16384;
+const LIVE_SESSIONS = path.resolve('.evolve/market-intelligence/sessions');
+// Finalized live sessions are immutable, so their bytes are compared across the whole run
+// (an in-progress capture beside validation may still append to its own unfinalized session).
+function finalizedEvidence() {
+  if (!existsSync(LIVE_SESSIONS)) return {};
+  return Object.fromEntries(readdirSync(LIVE_SESSIONS).filter(id => existsSync(path.join(LIVE_SESSIONS, id, 'manifest.json'))).sort()
+    .map(id => [id, Object.fromEntries(files(path.join(LIVE_SESSIONS, id)).sort().map(f => [path.relative(LIVE_SESSIONS, f), hashBytes(readFileSync(f))]))]));
+}
+const liveEvidenceBefore = finalizedEvidence();
+const sessionBytes = dir => files(dir).filter(f => !['summary.json', 'manifest.json'].includes(path.basename(f))).reduce((n, f) => n + statSync(f).size, 0);
+const treeBytes = dir => files(dir).reduce((n, f) => n + statSync(f).size, 0);
+const treeHashes = dir => Object.fromEntries(files(dir).sort().map(f => [path.relative(dir, f), hashBytes(readFileSync(f))]));
+// A DexScreener-sized raw response: unknown fields are retained raw, never normalized.
+const paddedDex = [{ ...dexPayload[0], fixturePadding: 'p'.repeat(12000) }];
+const paddedObservation = () => normalizeDex(result(paddedDex, 'pairs'))[0];
+function appendSize(write) { const probe = store({ maxSessionBytes: SMALL_CAP }); const before = sessionBytes(probe.dir); write(probe); return sessionBytes(probe.dir) - before; }
+// Fill a small-cap session with deterministic observations until the next one cannot fit.
+function boundedSession() {
+  const s = store({ maxSessionBytes: SMALL_CAP }), size = appendSize(p => p.writeObservation(paddedObservation(), paddedDex));
+  const start = sessionBytes(s.dir), fits = Math.floor((SMALL_USABLE - start) / size);
+  for (let i = 1; i <= fits; i++) { s.writeObservation(paddedObservation(), paddedDex); assert.equal(sessionBytes(s.dir), start + i * size); }
+  const hashes = treeHashes(s.dir), bytes = sessionBytes(s.dir);
+  assert.throws(() => s.writeObservation(paddedObservation(), paddedDex), { message: 'SESSION_STORAGE_BOUND' });
+  assert.deepEqual(treeHashes(s.dir), hashes, 'a bounded append writes nothing'); assert.equal(sessionBytes(s.dir), bytes);
+  return { s, size, start, fits, bytes };
+}
+
+test('71 default session capacity is 512 MiB; raw bound and reserve unchanged', () => {
+  const c = createIntelligenceConfig({ env: {} });
+  assert.equal(c.maxSessionMiB, 512); assert.equal(c.maxSessionBytes, 512 * MIB); assert.equal(c.maxRawBytes, 256 * 1024);
+  assert.deepEqual({ ...SESSION_CAPACITY_MIB }, { default: 512, min: 64, max: 2048 });
+  const s = store(); assert.equal(JSON.parse(readFileSync(path.join(s.dir, 'session.json'), 'utf8')).maxSessionBytes, 512 * MIB);
+  assert.equal(s.finalize({ endedAt: at }).storage.maxSessionBytes, 512 * MIB);
+});
+const capacityCases = [[undefined, 512], ['64', 64], ['512', 512], ['2048', 2048], ['1', 64], ['99999', 2048]];
+const capacity = value => createIntelligenceConfig({ env: value === undefined ? {} : { EVOLVE_INTELLIGENCE_MAX_SESSION_MIB: value } });
+function assertCapacity(value, mib) {
+  const c = capacity(value);
+  assert.equal(c.maxSessionMiB, mib, `${JSON.stringify(value)} -> ${mib} MiB`); assert.equal(c.maxSessionBytes, mib * MIB);
+  assert(Number.isSafeInteger(c.maxSessionBytes) && c.maxSessionBytes >= 64 * MIB && c.maxSessionBytes <= 2048 * MIB, 'finite positive bounded capacity');
+}
+test('72 capacity lower clamp: 1/0 -> 64 MiB; 64 stays 64 MiB', () => {
+  for (const [value, mib] of capacityCases.filter(([, mib]) => mib === 64)) assertCapacity(value, mib);
+  assertCapacity('0', 64); assertCapacity(' 1 ', 64);
+});
+test('73 capacity upper clamp: 99999/huge -> 2048 MiB; 512/2048 preserved', () => {
+  for (const [value, mib] of capacityCases.filter(([, mib]) => mib !== 64)) assertCapacity(value, mib);
+  assertCapacity('9'.repeat(400), 2048); assertCapacity('1024', 1024);
+});
+test('74 invalid capacity falls back to 512 MiB; never NaN, Infinity or negative', () => {
+  for (const value of ['', '   ', 'abc', 'NaN', 'Infinity', '-Infinity', '-5', '-64', '12.5', '1e3', '0x200', '64MiB', '+512'])
+    assertCapacity(value, 512);
+  for (const value of [undefined, null, 'NaN', 'Infinity', '-1', '1e309']) assert.equal(sessionCapacityMiB(value), 512);
+  // Storage also refuses caps that would disable its bound, before creating anything.
+  for (const maxSessionBytes of [NaN, Infinity, -Infinity, -1, 0, 1.5, SESSION_FINALIZATION_RESERVE_BYTES]) {
+    const root = tempRoot();
+    assert.throws(() => createStorage({ root, sessionId: 'fixture', maxSessionBytes }), { message: 'SESSION_STORAGE_BOUND_INVALID' });
+    assert.deepEqual(readdirSync(root), []);
+  }
+});
+test('75 finalization reserve is an explicit 16 KiB constant covering both finalization records', () => {
+  assert.equal(SESSION_FINALIZATION_RESERVE_BYTES, 16 * 1024); assert.equal(FINALIZATION_RECORD_MAX_BYTES, 8 * 1024);
+  assert(SESSION_FINALIZATION_RESERVE_BYTES >= 2 * FINALIZATION_RECORD_MAX_BYTES, 'summary + manifest fit the reserve');
+  const ast = espree.parse(readFileSync('scripts/market-intelligence/storage.mjs', 'utf8'), { ecmaVersion: 'latest', sourceType: 'module' });
+  const magic = []; walk(ast, node => { if (node.type === 'Literal' && [16384, 8192, 67108864].includes(node.value)) magic.push(node.value); });
+  assert.deepEqual(magic, [], 'capacity arithmetic uses named constants');
+});
+test('76 exact SESSION_STORAGE_BOUND reproduction at maxSessionBytes - finalizationReserveBytes', () => {
+  const { s, size, start, fits, bytes } = boundedSession();
+  assert(fits >= 2, 'records append normally below the threshold');
+  assert.equal(bytes, start + fits * size); assert(bytes <= SMALL_USABLE && bytes + size > SMALL_USABLE, 'next append crosses the usable ceiling');
+  // The incident class: unused headroom remained, but less than one DexScreener-sized append.
+  const headroom = SMALL_USABLE - bytes; assert(headroom > 0 && headroom < size, `headroom ${headroom} < append ${size}`);
+  // The threshold is exact: smaller records still fit until bytes + next would exceed it.
+  const errorSize = appendSize(p => p.error('dexscreener', 'FIXTURE', at)), smallFits = Math.floor(headroom / errorSize);
+  for (let i = 0; i < smallFits; i++) s.error('dexscreener', 'FIXTURE', at);
+  assert.equal(sessionBytes(s.dir), bytes + smallFits * errorSize);
+  assert.throws(() => s.error('dexscreener', 'FIXTURE', at), { message: 'SESSION_STORAGE_BOUND' });
+  assert.throws(() => s.writeSnapshot(frozenSnapshot([d()])[0]), { message: 'SESSION_STORAGE_BOUND' });
+});
+test('77 bounded session still finalizes incomplete with exact storage telemetry', () => {
+  const { s, bytes } = boundedSession();
+  const manifest = s.finalize({ endedAt: at, reason: 'capture failed' });
+  assert.equal(manifest.status, 'incomplete'); assert.equal(manifest.reason, 'capture failed');
+  const summary = JSON.parse(readFileSync(path.join(s.dir, 'summary.json'), 'utf8'));
+  assert.deepEqual(summary.storage, { bytesBeforeFinalization: bytes, maxSessionBytes: SMALL_CAP, finalizationReserveBytes: 16384,
+    usableSessionBytes: SMALL_USABLE, utilizationRatio: Math.round(bytes / SMALL_USABLE * 1e6) / 1e6, sessionBoundReached: true });
+  assert.equal(summary.bytesBeforeFinalization, bytes); assert.equal(sessionBytes(s.dir), bytes);
+  assert(summary.storage.utilizationRatio > 0 && summary.storage.utilizationRatio <= 1);
+  assert(treeBytes(s.dir) <= SMALL_CAP, 'finalized session including summary and manifest stays within the hard cap');
+  assert.throws(() => s.writeObservation(paddedObservation(), paddedDex), /Session finalized/);
+  const unbounded = store({ maxSessionBytes: SMALL_CAP }); unbounded.writeObservation(g(), gmgnPayload);
+  const complete = unbounded.finalize({ endedAt: at }); assert.equal(complete.status, 'complete'); assert.equal(complete.storage.sessionBoundReached, false);
+});
+test('78 bounded incomplete manifest remains valid and is served as incomplete', () => {
+  const { s, fits } = boundedSession(); s.finalize({ endedAt: at, reason: 'capture failed' });
+  const manifest = JSON.parse(readFileSync(path.join(s.dir, 'manifest.json'), 'utf8'));
+  const actual = Object.fromEntries(files(s.dir).filter(f => path.basename(f) !== 'manifest.json').map(f => [path.relative(s.dir, f).split(path.sep).join('/'), hashBytes(readFileSync(f))]));
+  assert.deepEqual(manifest.files, actual); assert.equal(manifest.fingerprint, hashBytes(expectedJson(actual)));
+  for (const [name, count] of Object.entries(manifest.fileRecordCounts)) assert.equal(readFileSync(path.join(s.dir, name), 'utf8').trim().split('\n').length, count);
+  assert.equal(manifest.fileRecordCounts['raw/dexscreener.ndjson'], fits); assert.equal(manifest.recordCount, fits);
+  const { recordType, files: hashes, fingerprint, ...summary } = manifest;
+  assert.equal(recordType, 'manifest'); assert(hashes && fingerprint);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(s.dir, 'summary.json'), 'utf8')), { ...summary, recordType: 'summary' });
+  const publicState = loadMarketIntelligenceDashboard(path.dirname(path.dirname(s.dir)));
+  assert.equal(publicState.state, 'FINALIZED_SESSION'); assert.equal(publicState.captureStatus, 'incomplete');
+});
+test('79 recorder capture reaching the bound fails closed and finalizes incomplete', async () => {
+  let time = at;
+  const dex = { observe: async m => ({ payload: paddedDex, kind: 'pairs', receivedAt: time, endpoint: DEX_ROUTES.pairs.path(m), requestIdentity: m }), health: () => ({ state: 'HEALTHY', errors: 0 }) };
+  const s = store({ maxSessionBytes: SMALL_CAP });
+  const recorder = createIntelligenceRecorder({ config: { ...config, dex: { ...config.dex, maxRequests: 1 } }, storage: s, now: () => time, dex });
+  let captures = 0, failure = null;
+  for (let i = 0; i < 100 && !failure; i++) { try { await recorder.capture({ mints: [mint] }); captures++; time += 30001; } catch (e) { failure = e; } }
+  assert(captures >= 2, 'captures proceed normally below the bound'); assert.equal(failure?.message, 'SESSION_STORAGE_BOUND');
+  assert.equal(failureLine('capture', failure), '[EVOLVE 5J] capture failed: SESSION_STORAGE_BOUND');
+  const manifest = recorder.finalize('capture failed');
+  assert.equal(manifest.status, 'incomplete'); assert.equal(manifest.storage.sessionBoundReached, true); assert.equal(manifest.storage.maxSessionBytes, SMALL_CAP);
+  assert(manifest.storage.bytesBeforeFinalization <= SMALL_USABLE); assert.equal(manifest.bytesBeforeFinalization, sessionBytes(s.dir));
+  assert(treeBytes(s.dir) <= SMALL_CAP);
+});
+test('80 CLI prints allowlisted failure codes only', () => {
+  assert.deepEqual([...SAFE_FAILURE_CODES].sort(), ['FINALIZATION_STORAGE_BOUND', 'NO_LOOKAHEAD_TIMESTAMP', 'RAW_STORAGE_BOUND', 'SESSION_STORAGE_BOUND',
+    'SESSION_STORAGE_IDENTITY_BOUND', 'SESSION_STORAGE_RECEIPT_BOUND']);
+  for (const code of SAFE_FAILURE_CODES) { assert.equal(safeFailureCode(new Error(code)), code); assert.equal(failureLine('capture', new Error(code)), `[EVOLVE 5J] capture failed: ${code}`); }
+  assert.equal(failureLine('probe', new Error('RAW_STORAGE_BOUND')), '[EVOLVE 5J] probe failed: RAW_STORAGE_BOUND');
+  // Each code is produced by a real bound, not a fabricated label.
+  assert.throws(() => store({ maxRawBytes: 100 }).writeObservation(g(), gmgnPayload), { message: 'RAW_STORAGE_BOUND' });
+  assert.throws(() => store().finalize({ endedAt: at, metrics: { fixture: 'x'.repeat(9000) } }), { message: 'FINALIZATION_STORAGE_BOUND' });
+  assert.throws(() => aggregate([g()], { observedAt: at - 1 }), { message: 'NO_LOOKAHEAD_TIMESTAMP' });
+});
+test('81 unknown and non-code failures are redacted to OBSERVATION_FAILED', () => {
+  const leaks = [new Error(`https://openapi.gmgn.ai/v1/token/info?api_key=${key}`), new Error(`SESSION_STORAGE_BOUND ${key}`), new Error('session_storage_bound'),
+    new Error(JSON.stringify(gmgnPayload)), new TypeError('fetch failed'), 'SESSION_STORAGE_BOUND', null, undefined, { message: 42 }, { message: ['SESSION_STORAGE_BOUND'] }];
+  for (const error of leaks) { assert.equal(safeFailureCode(error), 'OBSERVATION_FAILED'); assert(!failureLine('capture', error).includes(key)); }
+  assert.equal(failureLine(`https://leak.example/?key=${key}`, new Error('x')), '[EVOLVE 5J] command failed: OBSERVATION_FAILED');
+  const cli = spawnSync(process.execPath, ['scripts/market-intelligence.mjs', `https://leak.example/?api_key=${key}`], { encoding: 'utf8', timeout: 30000 });
+  assert.equal(cli.status, 1, 'nonzero exit preserved');
+  assert.equal(cli.stderr, '[EVOLVE 5J] command failed: OBSERVATION_FAILED\nMarket intelligence command failed; no engine state changed.\n');
+  assert(!`${cli.stdout}${cli.stderr}`.includes(key) && !`${cli.stdout}${cli.stderr}`.includes('leak.example'));
+});
+test('82 doctor exposes bounded storage capacity without paths or secrets', () => {
+  const c = createIntelligenceConfig({ env: { EVOLVE_INTELLIGENCE_MAX_SESSION_MIB: '1024', EVOLVE_GMGN_API_KEY: key } });
+  const report = doctorReport({ config: c, gmgn: createGmgnProvider({ config: c.gmgn }), dex: createDexProvider({ config: c.dex }), launch: createLaunchObserver({ config: c.launch }) });
+  assert.deepEqual(report.storage, { maxSessionMiB: 1024, maxSessionBytes: 1024 * MIB, finalizationReserveBytes: 16384 });
+  const text = JSON.stringify(report); for (const unsafe of [key, '.evolve', process.cwd(), tmpdir()]) assert(!text.includes(unsafe), 'doctor exposes no path or secret');
+  const cli = spawnSync(process.execPath, ['scripts/market-intelligence.mjs', 'doctor'], { encoding: 'utf8', timeout: 30000, env: { ...process.env, EVOLVE_INTELLIGENCE_MAX_SESSION_MIB: '99999' } });
+  assert.equal(cli.status, 0); assert.deepEqual(JSON.parse(cli.stdout).storage, { maxSessionMiB: 2048, maxSessionBytes: 2048 * MIB, finalizationReserveBytes: 16384 });
+  assert(!cli.stdout.includes('.evolve') && !cli.stdout.includes(process.cwd()));
+});
+test('83 pre-5J.1 summaries remain readable; new summaries keep every prior field', () => {
+  const PRIOR = ['bytesBeforeFinalization', 'developmentOnly', 'endedAt', 'errorCounts', 'evidenceClassification', 'fileRecordCounts', 'firstObservedAt', 'futureOutcomeIncluded', 'health',
+    'lastObservedAt', 'metrics', 'observerOnly', 'paperOnly', 'providerCounts', 'reason', 'recordCount', 'recordType', 'schemaVersion', 'sessionId', 'startedAt', 'status', 'tradingAuthority', 'uniqueMintCount'];
+  const s = store(); s.writeObservation(g(), gmgnPayload); s.finalize({ endedAt: at, metrics: { mintsJoined: 1, providerErrors: 0 } });
+  const summaryFile = path.join(s.dir, 'summary.json'), manifestFile = path.join(s.dir, 'manifest.json');
+  const current = JSON.parse(readFileSync(summaryFile, 'utf8'));
+  assert.deepEqual(Object.keys(current).filter(k => k !== 'storage').sort(), PRIOR); assert.equal(current.bytesBeforeFinalization, current.storage.bytesBeforeFinalization);
+  // Re-express the same session in the sealed pre-5J.1 shape (no storage section) with a consistent manifest.
+  const { storage, ...prior } = current; assert(storage);
+  const body = expectedJson(prior) + '\n'; writeFileSync(summaryFile, body);
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')); delete manifest.storage;
+  manifest.files['summary.json'] = hashBytes(body); manifest.fingerprint = hashBytes(expectedJson(manifest.files)); writeFileSync(manifestFile, expectedJson(manifest) + '\n');
+  const root = path.dirname(path.dirname(s.dir)), publicState = loadMarketIntelligenceDashboard(root);
+  assert.equal(publicState.state, 'FINALIZED_SESSION'); assert.equal(publicState.captureStatus, 'complete'); assert.equal(publicState.mintsJoined, 1);
+  const [read] = readSummary(root); assert.equal(read.storage, undefined); assert.equal(read.bytesBeforeFinalization, current.bytesBeforeFinalization);
+});
+test('84 capacity fixtures use temporary storage only; finalized evidence byte-identical', () => {
+  for (const root of temporary) { assert(path.resolve(root).startsWith(path.resolve(tmpdir()) + path.sep)); assert(!path.resolve(root).startsWith(path.resolve('.evolve'))); }
+  assert.deepEqual(finalizedEvidence(), liveEvidenceBefore);
 });
 
 let failed = 0;

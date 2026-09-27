@@ -3,6 +3,14 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { canonical, digest, EVIDENCE, redact } from './definition.mjs';
 
+// Session capacity is a hard bound, never unlimited. Finalization writes exactly
+// two records (summary, manifest), each capped at 8 KiB, so the reserve always
+// fits both: a session that reaches its append bound can still finalize.
+export const MIB = 1024 * 1024;
+export const SESSION_CAPACITY_MIB = Object.freeze({ default: 512, min: 64, max: 2048 });
+export const DEFAULT_MAX_SESSION_BYTES = SESSION_CAPACITY_MIB.default * MIB;
+export const FINALIZATION_RECORD_MAX_BYTES = 8 * 1024;
+export const SESSION_FINALIZATION_RESERVE_BYTES = 16 * 1024;
 export const fileHash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
 export const manifestFingerprint = files => digest(files);
 const RAW_FILES = Object.freeze({ jupiter: 'raw/jupiter.ndjson', gmgn: 'raw/gmgn.ndjson', dexscreener: 'raw/dexscreener.ndjson', 'launch-observer': 'raw/launch-events.ndjson' });
@@ -13,8 +21,11 @@ function rejectSymlinks(absolute) {
     try { if (lstatSync(ancestor).isSymbolicLink()) throw new Error('STORAGE_SYMLINK_FORBIDDEN'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
 }
-export function createStorage({ root = '.evolve/market-intelligence', sessionId = `${Date.now()}-${randomUUID()}`, startedAt = Date.now(), maxRawBytes = 262144, maxSessionBytes = 67108864, secrets = [] } = {}) {
+export function createStorage({ root = '.evolve/market-intelligence', sessionId = `${Date.now()}-${randomUUID()}`, startedAt = Date.now(), maxRawBytes = 262144, maxSessionBytes = DEFAULT_MAX_SESSION_BYTES, secrets = [] } = {}) {
   if (!/^[a-zA-Z0-9_-]{1,100}$/.test(sessionId)) throw new Error('Invalid session identity');
+  // A NaN/Infinity/nonpositive cap would silently disable the bound; reject it before any write.
+  if (!Number.isSafeInteger(maxSessionBytes) || maxSessionBytes <= SESSION_FINALIZATION_RESERVE_BYTES) throw new Error('SESSION_STORAGE_BOUND_INVALID');
+  const usableSessionBytes = maxSessionBytes - SESSION_FINALIZATION_RESERVE_BYTES;
   // Reject symlink ancestors so a session cannot redirect writes to existing evidence.
   const absolute = path.resolve(root);
   rejectSymlinks(path.join(absolute, 'sessions'));
@@ -48,7 +59,7 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
     const fd = openFile(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, true);
     try { writeFileSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
   }
-  let closed = false, bytes = 0, records = 0, firstAt = null, lastAt = null;
+  let closed = false, bytes = 0, records = 0, firstAt = null, lastAt = null, sessionBoundReached = false;
   const counts = {}, providerCounts = {}, errorCounts = {}, mints = new Set();
   const session = { schemaVersion: 1, recordType: 'session', ...EVIDENCE, sessionId, startedAt, maxRawBytes, maxSessionBytes };
   const sessionBody = canonical(session) + '\n';
@@ -63,7 +74,7 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
   }
   function reserve(bodies) {
     if (closed) throw new Error('Session finalized');
-    if (bytes + bodies.reduce((sum, b) => sum + Buffer.byteLength(b), 0) > maxSessionBytes - 16384) throw new Error('SESSION_STORAGE_BOUND');
+    if (bytes + bodies.reduce((sum, b) => sum + Buffer.byteLength(b), 0) > usableSessionBytes) { sessionBoundReached = true; throw new Error('SESSION_STORAGE_BOUND'); }
   }
   function track(record) {
     records++; if (record.mint) mints.add(record.mint);
@@ -109,9 +120,12 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
       closed = true;
       const summary = { schemaVersion: 1, recordType: 'summary', ...EVIDENCE, sessionId, startedAt, endedAt, reason,
         status: reason === 'capture failed' ? 'incomplete' : 'complete', recordCount: records, fileRecordCounts: counts, providerCounts, errorCounts, firstObservedAt: firstAt, lastObservedAt: lastAt,
-        uniqueMintCount: mints.size, metrics: redact(metrics, secrets), health: redact(health, secrets), bytesBeforeFinalization: bytes };
+        uniqueMintCount: mints.size, metrics: redact(metrics, secrets), health: redact(health, secrets), bytesBeforeFinalization: bytes,
+        // Additive capacity telemetry; top-level bytesBeforeFinalization is kept for existing readers.
+        storage: { bytesBeforeFinalization: bytes, maxSessionBytes, finalizationReserveBytes: SESSION_FINALIZATION_RESERVE_BYTES, usableSessionBytes,
+          utilizationRatio: Math.round(bytes / usableSessionBytes * 1e6) / 1e6, sessionBoundReached } };
       function atomic(file, value) {
-        const body = canonical(redact(value, secrets)) + '\n'; if (Buffer.byteLength(body) > 8192) throw new Error('FINALIZATION_STORAGE_BOUND');
+        const body = canonical(redact(value, secrets)) + '\n'; if (Buffer.byteLength(body) > FINALIZATION_RECORD_MAX_BYTES) throw new Error('FINALIZATION_STORAGE_BOUND');
         exclusive(`${file}.tmp`, body);
         const target = destination(file);
         try { lstatSync(target); throw new Error('STORAGE_FINALIZATION_OVERWRITE'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
