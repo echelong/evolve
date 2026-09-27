@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, renameSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -13,6 +14,8 @@ import { createObservationTransport } from './market-intelligence/providers/http
 import { loadMarketIntelligenceDashboard } from './market-intelligence/dashboard.mjs';
 import { AGENT_REACH_PIN } from './intelligence/config.mjs';
 import { normalizeJupiterToken, deriveMarket } from './market/normalize.mjs';
+import { createMarketConfig, createMarketFeed } from './market/index.mjs';
+import { jupiterAdapterPayload } from './market-intelligence/normalize.mjs';
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -254,6 +257,200 @@ test('41 GMGN request budget and key fallback are deterministic', async () => {
 });
 
 test('42 existing external-intelligence CLI install path stays equivalent', () => assert.equal(AGENT_REACH_PIN.localInstallDir, path.join('.tools', 'agent-reach')));
+
+const hashBytes = value => createHash('sha256').update(value).digest('hex');
+// Independent serializer for expected fixture hashes; do not call the production
+// canonical/digest or manifest fingerprint helpers to verify their own output.
+function expectedJson(value) {
+  if (Array.isArray(value)) return `[${value.map(expectedJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${expectedJson(value[k])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function tempRoot() { const root = mkdtempSync(path.join(tmpdir(), 'evolve-5j-remediation-')); temporary.push(root); return root; }
+function inertStorage() { return { dir: '/temporary/in-memory-fixture', writeRawResponse() {}, writeObservation() {}, writeSnapshot() {}, error() {}, finalize() {} }; }
+const disabledDex = { observe: async () => ({ unavailable: 'DISABLED' }), health: () => ({ state: 'DISABLED', errors: 0 }) };
+async function realFeedFixture({ delayMs = 0 } = {}) {
+  let time = at;
+  const feed = createMarketFeed({ config: createMarketConfig({ JUPITER_API_KEY: key, EVOLVE_MARKET_MODE: 'live' }, { loadEnv: false }),
+    now: () => time, fetchImpl: async () => ({ status: 200, json: async () => { time += delayMs; return [{ id: mint, usdPrice: 2, liquidity: 100000 }]; } }) });
+  await feed.advance();
+  return { feed, now: () => time, advance: ms => { time += ms; } };
+}
+test('43 real feed/universe missing icon and optional fields capture successfully', async () => {
+  const fixture = await realFeedFixture(); const [market] = fixture.feed.markets();
+  assert.equal(market.icon, undefined); assert.equal(market.holderCount, null);
+  const before = Object.getOwnPropertyDescriptors(market), payload = jupiterAdapterPayload(market);
+  assert.equal(payload.icon, null); assert.equal(payload.holderCount, null);
+  assert.deepEqual(Object.getOwnPropertyDescriptors(market), before);
+  const s = store(); const recorder = createIntelligenceRecorder({ config, feed: fixture.feed, storage: s, now: fixture.now, dex: disabledDex });
+  const capture = await recorder.capture(); assert.equal(capture.providers.jupiter, 1); assert.equal(capture.errors, 0);
+  recorder.finalize(); fixture.feed.stop();
+  const raw = JSON.parse(readFileSync(path.join(s.dir, 'raw/jupiter.ndjson'), 'utf8').trim());
+  const normalized = readFileSync(path.join(s.dir, 'normalized.ndjson'), 'utf8').trim().split('\n').map(JSON.parse).find(r => r.provider === 'jupiter');
+  assert.equal(raw.payload.icon, null); assert.equal(normalized.normalized.holderCount, null);
+  assert.equal(raw.rawResponseDigest, hashBytes(expectedJson(raw.payload)));
+  assert.equal(normalized.rawResponseDigest, raw.rawResponseDigest);
+  assert.equal(normalized.normalizedPayloadDigest, hashBytes(expectedJson(normalized.normalized)));
+  assert.equal(normalizeJupiterMarkets([market], { observedAt: at })[0].rawResponseDigest, raw.rawResponseDigest);
+});
+test('44 Jupiter adapter preserves array order/null semantics and isolates nonfinite/nondata', async () => {
+  const optional = { icon: undefined, extra: undefined, items: [undefined, 0, null, 'x'], nested: { absent: undefined } };
+  assert.deepEqual(jupiterAdapterPayload(optional), { icon: null, extra: null, items: [null, 0, null, 'x'], nested: { absent: null } });
+  assert.equal(optional.icon, undefined);
+  for (const value of [NaN, Infinity, -Infinity, () => {}, 1n, new Date(at)]) assert.throws(() => jupiterAdapterPayload({ value }));
+  const fixture = await realFeedFixture(), market = fixture.feed.markets()[0]; let invoked = false;
+  const recorder = createIntelligenceRecorder({ config, storage: inertStorage(), now: fixture.now, dex: disabledDex });
+  const capture = await recorder.capture({ markets: [market, { ...market, mint: other, icon: () => { invoked = true; } }] });
+  fixture.feed.stop(); assert.equal(invoked, false); assert.equal(capture.errors, 1); assert.equal(capture.providers.jupiter, 1); assert.equal(capture.snapshots[0].mint, mint);
+});
+test('45 delayed real Jupiter response retains source time but receipt/capture follow parsing', async () => {
+  const fixture = await realFeedFixture({ delayMs: 5000 }); const s = store();
+  const recorder = createIntelligenceRecorder({ config, feed: fixture.feed, storage: s, now: fixture.now, dex: disabledDex });
+  await recorder.capture(); recorder.finalize(); fixture.feed.stop();
+  const r = readFileSync(path.join(s.dir, 'normalized.ndjson'), 'utf8').trim().split('\n').map(JSON.parse).find(r => r.provider === 'jupiter');
+  assert.equal(r.providerObservedAt, at); assert.equal(r.receivedAt, at + 5000); assert.equal(r.capturedAt, at + 5000); assert.equal(r.observedAt, at + 5000);
+  assert.equal(r.timestampBasis, 'feed_request_start_and_local_copy'); assert(r.limitations.some(l => l.includes('unavailable')));
+  assert.throws(() => aggregate([r], { observedAt: at + 4999 }), /NO_LOOKAHEAD/);
+});
+test('46 repeated Jupiter feed reads preserve first-copy receipt/raw digest and stale exclusion', async () => {
+  const fixture = await realFeedFixture({ delayMs: 5000 }); const s = store();
+  const recorder = createIntelligenceRecorder({ config, feed: fixture.feed, storage: s, now: fixture.now, dex: disabledDex });
+  await recorder.capture(); fixture.advance(70000); const second = await recorder.capture();
+  const raws = readFileSync(path.join(s.dir, 'raw/jupiter.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(raws.length, 1); assert.equal(raws[0].capturedAt, at + 5000);
+  const sources = second.snapshots[0].staleness.sourceObservations;
+  assert.equal(sources[0].receivedAt, at + 5000); assert.equal(sources[0].rawResponseDigest, raws[0].rawResponseDigest);
+  assert.equal(second.snapshots[0].features.crossSourceFreshCount, 0);
+  // A newly available source field is new copied evidence even if the legacy
+  // feed timestamp did not change. Never assign it the old local receipt.
+  await recorder.capture({ markets: [{ ...fixture.feed.markets()[0], icon: 'newly-available' }] });
+  recorder.finalize(); fixture.feed.stop();
+  const updated = readFileSync(path.join(s.dir, 'raw/jupiter.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(updated.length, 2); assert.equal(updated[1].timestamp, at + 75000); assert.equal(updated[1].capturedAt, at + 75000); assert.equal(updated[1].payload.icon, 'newly-available');
+});
+test('47 GMGN eventual mint and route coverage independent of universe/budget factors', async () => {
+  const routes = ['info', 'security', 'pool', 'holders', 'traders'];
+  for (const size of [5, 6, 10, 25, 30, 31, 32, 37]) for (const budget of [2, 3, 6, 11]) {
+    const identities = Array.from({ length: size }, (_, i) => `${'1'.repeat(32)}${(i + 1).toString().split('').map(digit => '123456789A'[Number(digit)]).join('')}`);
+    const seen = new Map(), calls = [], dexCalls = []; let time = at;
+    const c = { ...config, gmgn: { ...config.gmgn, maxRequests: budget }, dex: { ...config.dex, maxRequests: 6 } };
+    const recorder = createIntelligenceRecorder({ config: c, storage: inertStorage(), now: () => time,
+      gmgn: { observe: async (kind, identity) => { calls.push([kind, identity]); return { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: identity ?? null, receivedAt: time, payload: { code: 0, data: kind === 'trenches' ? { new_creation: [] } : { address: identity, list: [] } } }; }, health: () => ({ errors: 0 }) },
+      dex: { observe: async identity => { dexCalls.push(identity); return { unavailable: 'DISABLED' }; }, health: () => ({ errors: 0 }) } });
+    const cycles = Math.ceil(size * routes.length / Math.min(size, budget - 1)) + routes.length;
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      time += 30000; const previous = calls.length; const capture = await recorder.capture({ mints: identities }); assert.equal(capture.errors, 0);
+      const requests = calls.slice(previous); assert(requests.length <= budget); assert.equal(requests.filter(([kind]) => kind === 'trenches').length, 1);
+      assert(requests.filter(([, identity]) => identity).length <= budget - 1);
+      for (const [kind, identity] of requests) if (identity) { if (!seen.has(identity)) seen.set(identity, new Set()); seen.get(identity).add(kind); }
+    }
+    assert.equal(seen.size, size, `mint coverage size=${size} budget=${budget}`);
+    for (const identity of identities) assert.deepEqual([...seen.get(identity)].sort(), [...routes].sort(), `route coverage size=${size} budget=${budget}`);
+    assert.equal(new Set(dexCalls).size, size);
+  }
+});
+test('48 GMGN coverage schedule deterministic and route memory follows bounded eligible universe', async () => {
+  async function schedule() {
+    const calls = []; const recorder = createIntelligenceRecorder({ config, storage: inertStorage(), now: () => at, dex: disabledDex,
+      gmgn: { observe: async (kind, identity) => { calls.push([kind, identity]); return { unavailable: 'DISABLED' }; }, health: () => ({}) } });
+    for (let i = 0; i < 12; i++) await recorder.capture({ mints: i < 6 ? [mint, other] : [other] });
+    await assert.rejects(recorder.capture({ mints: Array.from({ length: 10001 }, (_, i) => String(i)) }), /IDENTITY_BOUND/);
+    return calls;
+  }
+  assert.deepEqual(await schedule(), await schedule());
+});
+const rawFixture = { payload: {}, receivedAt: at, endpoint: '/fixture', requestIdentity: mint };
+test('49 raw provider traversal/absolute inputs and prior-session target rejected', () => {
+  const root = tempRoot(); const prior = createStorage({ root, sessionId: 'old', startedAt: at }); prior.writeObservation(g(), gmgnPayload); prior.finalize({ endedAt: at });
+  const before = Object.fromEntries(files(prior.dir).map(f => [f, hashBytes(readFileSync(f))]));
+  const current = createStorage({ root, sessionId: 'new', startedAt: at });
+  for (const provider of ['../../old/raw/gmgn', '/tmp/x', '../gmgn', 'unknown', '__proto__']) assert.throws(() => current.writeRawResponse(rawFixture, provider), /PROVIDER_FORBIDDEN/);
+  current.finalize({ endedAt: at });
+  assert.deepEqual(Object.fromEntries(files(prior.dir).map(f => [f, hashBytes(readFileSync(f))])), before);
+});
+test('50 session traversal and absolute session identities rejected before writes', () => {
+  const root = tempRoot();
+  for (const sessionId of ['../old', '/tmp/x', 'a/b', '..', 'a\\b']) assert.throws(() => createStorage({ root, sessionId }), /Invalid session/);
+  assert.deepEqual(readdirSync(root), []);
+});
+test('51 existing sessions symlink cannot redirect session creation', () => {
+  const root = tempRoot(), outside = tempRoot(); symlinkSync(outside, path.join(root, 'sessions'), 'dir');
+  assert.throws(() => createStorage({ root, sessionId: 'fixture' }), /SYMLINK_FORBIDDEN/); assert.deepEqual(readdirSync(outside), []);
+});
+test('52 session child directory symlink blocks appends', () => {
+  const s = store(), outside = tempRoot(); const rawDir = path.join(s.dir, 'raw'); renameSync(rawDir, path.join(s.dir, 'original-raw')); symlinkSync(outside, rawDir, 'dir');
+  assert.throws(() => s.writeRawResponse(rawFixture, 'gmgn'), /SYMLINK_FORBIDDEN/); assert.deepEqual(readdirSync(outside), []);
+});
+test('53 raw destination symlink cannot append to external or prior evidence', () => {
+  const s = store(), outside = tempRoot(), target = path.join(outside, 'evidence.ndjson'); writeFileSync(target, 'unchanged\n');
+  const file = path.join(s.dir, 'raw/gmgn.ndjson'); unlinkSync(file); symlinkSync(target, file);
+  assert.throws(() => s.writeRawResponse(rawFixture, 'gmgn'), /SYMLINK_FORBIDDEN/); assert.equal(readFileSync(target, 'utf8'), 'unchanged\n');
+});
+test('54 finalized storage rejects all append methods and reopening', () => {
+  const s = store(); const snapshot = frozenSnapshot([g()])[0]; s.finalize({ endedAt: at });
+  const before = Object.fromEntries(files(s.dir).map(f => [f, hashBytes(readFileSync(f))]));
+  for (const operation of [() => s.writeRawResponse(rawFixture, 'gmgn'), () => s.writeObservation(g(), gmgnPayload), () => s.writeSnapshot(snapshot), () => s.error('gmgn', 'FIXTURE', at)]) assert.throws(operation, /finalized/);
+  assert.throws(() => createStorage({ root: path.dirname(path.dirname(s.dir)), sessionId: 'fixture' }));
+  assert.deepEqual(Object.fromEntries(files(s.dir).map(f => [f, hashBytes(readFileSync(f))])), before);
+});
+test('55 replaced regular append target fails its original file identity check', () => {
+  const s = store(), file = path.join(s.dir, 'raw/gmgn.ndjson'); renameSync(file, file + '.original'); writeFileSync(file, 'replacement\n');
+  assert.throws(() => s.writeRawResponse(rawFixture, 'gmgn'), /IDENTITY_MISMATCH/); assert.equal(readFileSync(file, 'utf8'), 'replacement\n');
+});
+test('56 finalization rejects destination and temporary symlinks', () => {
+  for (const name of ['summary.json', 'summary.json.tmp', 'manifest.json', 'manifest.json.tmp']) {
+    const s = store(), outside = tempRoot(), target = path.join(outside, 'protected'); writeFileSync(target, 'unchanged'); symlinkSync(target, path.join(s.dir, name));
+    assert.throws(() => s.finalize({ endedAt: at }), /SYMLINK_FORBIDDEN/); assert.equal(readFileSync(target, 'utf8'), 'unchanged');
+  }
+});
+function permutations(items) { return items.length ? items.flatMap((item, i) => permutations(items.filter((_, j) => j !== i)).map(rest => [item, ...rest])) : [[]]; }
+test('57 repeated payload observations retain provenance and serialization under every permutation', () => {
+  const payload = d().normalized;
+  const rs = [record('gmgn', payload, at - 2), record('gmgn', payload, at - 1), record('dexscreener', payload, at - 1)];
+  const serialized = permutations(rs).map(input => expectedJson(aggregate(input, { observedAt: at })));
+  assert.equal(new Set(serialized).size, 1);
+  const snapshot = JSON.parse(serialized[0])[0], sources = snapshot.staleness.sourceObservations;
+  assert.equal(sources.length, 3); assert.equal(new Set(sources.map(s => s.observationDigest)).size, 3);
+  assert.deepEqual(sources.map(s => s.providerObservedAt).sort(), [at - 2, at - 1, at - 1]);
+  for (const { observationDigest, ...source } of sources) assert.equal(observationDigest, hashBytes(expectedJson(source)));
+  assert.equal(snapshot.normalizedPayloadDigest, hashBytes(expectedJson({ features: snapshot.features, contributors: snapshot.contributors, sourceObservations: sources })));
+  assert.equal(new Set(permutations(rs).map(input => aggregate(input, { observedAt: at })[0].normalizedPayloadDigest)).size, 1);
+});
+test('58 repeated-payload permutations produce identical on-disk manifests', () => {
+  const rs = [record('gmgn', { priceUsd: 2 }, at - 1), record('gmgn', { priceUsd: 2 }, at)];
+  const hashes = permutations(rs).map(input => { const s = store(); s.writeSnapshot(aggregate(input, { observedAt: at })[0]); return s.finalize({ endedAt: at }).fingerprint; });
+  assert.equal(new Set(hashes).size, 1);
+});
+test('59 missing price cannot gate matching liquidity or volume evidence', () => {
+  const rs = [record('a', { priceUsd: null, liquidityUsd: 100, liquidityScope: 'pair:A', volume5mUsd: 10, volumeScope: 'pair:A', volumeWindowMs: 300000 }), record('b', { priceUsd: 2, liquidityUsd: 200, liquidityScope: 'pair:A', volume5mUsd: 40, volumeScope: 'pair:A', volumeWindowMs: 300000 })];
+  const m = disagreement(rs, { observedAt: at }).metrics;
+  assert.equal(m.priceMedianUsd, null); assert.equal(m.liquidityComparable, true); assert.equal(m.liquidityMedianUsd, (100 + 200) / 2); assert.equal(m.liquidityMaxRatio, 200 / 100);
+  assert.equal(m.volumeComparable, true); assert.equal(m.volumeDisagreementRatio, 40 / 10); assert.equal(m.contributors.liquidity.length, 2); assert.equal(m.contributors.volume.length, 2);
+});
+test('60 missing liquidity cannot gate price; missing volume cannot gate holders', () => {
+  const m = disagreement([record('a', { priceUsd: 2, liquidityUsd: null, volume5mUsd: null, holderCount: 100 }), record('b', { priceUsd: 4, liquidityUsd: 200, volume5mUsd: null, holderCount: 125 })], { observedAt: at }).metrics;
+  assert.equal(m.priceMedianUsd, (2 + 4) / 2); assert.equal(m.priceRangeBps, (4 - 2) / 3 * 10000); assert.equal(m.priceMaxDeviationBps, 1 / 3 * 10000);
+  assert.equal(m.holderCountRange, 125 - 100); assert.equal(m.contributors.holders.length, 2); assert.equal(m.volumeComparable, false);
+});
+test('61 stale records removed independently while valid metric contributors remain', () => {
+  const m = disagreement([record('a', { priceUsd: 1, liquidityUsd: 99999, liquidityScope: 'pair:A' }, at - 70000), record('b', { priceUsd: 2, liquidityUsd: 100, liquidityScope: 'pair:A' }), record('c', { priceUsd: null, liquidityUsd: 200, liquidityScope: 'pair:A' })], { observedAt: at }).metrics;
+  assert.equal(m.priceMedianUsd, null); assert.equal(m.liquidityMaxRatio, 2); assert.deepEqual(m.contributors.liquidity.map(s => s.provider), ['b', 'c']); assert.equal(m.freshSourceCount, 2);
+});
+test('62 cross-source age rejects one provider and selects one timestamp per distinct provider', () => {
+  const a = record('a', { priceUsd: 2 }, at - 1000), older = record('a', { priceUsd: 2 }, at - 2000), b = record('b', { priceUsd: 2 }, at - 500);
+  assert.equal(disagreement([a, older], { observedAt: at }).metrics.sourceAgeSpreadMs, null);
+  assert.equal(aggregate([a, older], { observedAt: at })[0].features.crossSourceAgeSpreadMs, null);
+  assert.equal(disagreement([a, b], { observedAt: at }).metrics.sourceAgeSpreadMs, 500);
+  for (const input of permutations([a, older, b])) { const m = disagreement(input, { observedAt: at }).metrics; assert.equal(m.sourceAgeSpreadMs, 500); assert.equal(m.contributors.age.length, 2); }
+});
+test('63 manifest hashes/fingerprint/counts independently recomputed from actual files', () => {
+  const s = store(); s.writeObservation(g(), gmgnPayload); s.writeObservation(d(), dexPayload); s.writeSnapshot(frozenSnapshot([g(), d()])[0]); s.error('gmgn', 'FIXTURE', at); s.finalize({ endedAt: at });
+  const manifest = JSON.parse(readFileSync(path.join(s.dir, 'manifest.json'), 'utf8'));
+  const actual = Object.fromEntries(files(s.dir).filter(f => path.basename(f) !== 'manifest.json').map(f => [path.relative(s.dir, f).split(path.sep).join('/'), hashBytes(readFileSync(f))]));
+  assert.deepEqual(manifest.files, actual); assert.equal(manifest.fingerprint, hashBytes(expectedJson(actual))); assert(!Object.hasOwn(actual, 'manifest.json'));
+  for (const [name, count] of Object.entries(manifest.fileRecordCounts)) assert.equal(readFileSync(path.join(s.dir, name), 'utf8').trim().split('\n').length, count);
+  assert.equal(manifest.recordCount, 3); assert.equal(manifest.fileRecordCounts['normalized.ndjson'], 3); assert.equal(manifest.errorCounts.gmgn, 1);
+});
 
 let failed = 0;
 try {

@@ -1,5 +1,5 @@
-import { redact } from './definition.mjs';
-import { normalizeGmgn, normalizeDex, normalizeJupiterMarkets } from './normalize.mjs';
+import { redact, digest } from './definition.mjs';
+import { normalizeGmgn, normalizeDex, normalizeJupiterMarkets, jupiterAdapterPayload } from './normalize.mjs';
 import { aggregate } from './aggregate.mjs';
 import { createStorage } from './storage.mjs';
 import { createGmgnProvider } from './providers/gmgn.mjs';
@@ -8,7 +8,8 @@ import { createLaunchObserver } from './providers/launch-observer.mjs';
 
 export function createIntelligenceRecorder({ config, feed = null, storage = createStorage({ ...config, secrets: config.secrets }), gmgn = createGmgnProvider({ config: config.gmgn }), dex = createDexProvider({ config: config.dex }), launch = createLaunchObserver({ config: config.launch }), now = Date.now } = {}) {
   const latest = new Map(), persisted = new Set(), normalizationErrors = {}, latestFailure = {};
-  let cursor = 0, cycle = 0, stopped = false, lastStats = {}, independentErrors = 0;
+  const jupiterReceipts = new Map(), gmgnRouteCursors = new Map();
+  let cursor = 0, gmgnCursor = 0, stopped = false, lastStats = {}, independentErrors = 0;
   const key = r => [r.provider, r.mint, r.sourceEndpoint, r.normalized.pairAddress ?? ''].join(':');
   function error(provider, code) { latestFailure[provider] = true; independentErrors++; normalizationErrors[provider] = (normalizationErrors[provider] ?? 0) + 1; storage.error(provider, code, now()); }
   function record(record, payload, identity) {
@@ -33,21 +34,43 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
     async capture({ markets = feed?.markets(now()) ?? [], mints = null } = {}) {
       if (stopped) throw new Error('Recorder stopped');
       const safeMarkets = redact(markets, config.secrets);
-      for (const r of normalizeJupiterMarkets(safeMarkets, { observedAt: now(), staleMs: config.jupiterStaleMs })) record(r, safeMarkets.find(m => m.mint === r.mint));
+      const copiedAt = now();
+      for (const market of safeMarkets.filter(m => m.synthetic === false && m.source === 'Jupiter Tokens V2')) {
+        try {
+          const copy = jupiterAdapterPayload(market), receiptKey = `${market.mint}:${market.endpoint ?? ''}`;
+          const previous = jupiterReceipts.get(receiptKey);
+          const sourceStateDigest = digest(Object.fromEntries(Object.entries(copy)
+            .filter(([field]) => !['ageMs', 'fresh', 'poolAgeMs', 'features'].includes(field))));
+          // Retain the first adapter copy for this feed observation, including its
+          // raw digest. Derived age fields changing on later reads are not new data.
+          const sameObservation = previous?.sourceStateDigest === sourceStateDigest;
+          const payload = sameObservation ? previous.payload : copy;
+          const receivedAt = sameObservation ? previous.receivedAt : copiedAt;
+          if (!previous && jupiterReceipts.size >= 10000) throw new Error('SESSION_STORAGE_RECEIPT_BOUND');
+          const [r] = normalizeJupiterMarkets([payload], { observedAt: copiedAt, receivedAt, capturedAt: copiedAt, staleMs: config.jupiterStaleMs });
+          if (r) { record(r, payload); jupiterReceipts.set(receiptKey, { sourceStateDigest, payload, receivedAt }); }
+        } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('jupiter', 'NORMALIZATION_FAILED'); }
+      }
       const identities = [...new Set(mints ?? safeMarkets.filter(m => !m.synthetic && m.source === 'Jupiter Tokens V2').map(m => m.mint))].sort();
+      if (identities.length > 10000) throw new Error('SESSION_STORAGE_IDENTITY_BOUND');
       const selected = [];
       for (let i = 0; i < Math.min(identities.length, config.dex.maxRequests); i++) selected.push(identities[(cursor + i) % identities.length]);
       cursor += selected.length;
       for (const mint of selected) {
         try { await collect('dexscreener', await dex.observe(mint), normalizeDex); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('dexscreener', 'NORMALIZATION_FAILED'); }
       }
-      // Rotate per-mint routes to avoid spending the entire GMGN budget on one route.
+      // Independent mint service and per-mint route rotation avoid common-factor
+      // starvation. Only the bounded current eligible universe retains cursors.
       const kinds = ['info', 'security', 'pool', 'holders', 'traders'];
-      let budget = Math.max(0, config.gmgn.maxRequests - 1);
-      for (const mint of selected) {
-        if (budget-- <= 0) break;
-        try { await collect('gmgn', await gmgn.observe(kinds[cycle % kinds.length], mint), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
+      const eligible = new Set(identities);
+      for (const mint of gmgnRouteCursors.keys()) if (!eligible.has(mint)) gmgnRouteCursors.delete(mint);
+      const budget = Math.min(identities.length, Math.max(0, config.gmgn.maxRequests - 1));
+      for (let i = 0; i < budget; i++) {
+        const mint = identities[(gmgnCursor + i) % identities.length], routeCursor = gmgnRouteCursors.get(mint) ?? 0;
+        try { await collect('gmgn', await gmgn.observe(kinds[routeCursor], mint), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
+        gmgnRouteCursors.set(mint, (routeCursor + 1) % kinds.length);
       }
+      gmgnCursor = identities.length ? (gmgnCursor + budget) % identities.length : 0;
       if (config.gmgn.maxRequests >= 1) {
         try { await collect('gmgn', await gmgn.observe('trenches'), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
       }
@@ -70,7 +93,7 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
         freshJoined: snapshots.filter(s => s.disagreement.metrics.alignedSourceCount >= 2).length, launchEvents: launch.health().events,
         errors: independentErrors + (health.jupiter.errorCount ?? 0), health,
         priceRangeBps: snapshots.map(s => s.features.crossSourcePriceRangeBps).filter(v => v !== null) };
-      cycle++; return { snapshots, ...lastStats };
+      return { snapshots, ...lastStats };
     },
     finalize(reason = 'complete') { stopped = true; launch.stop(); return storage.finalize({ endedAt: now(), reason, health: lastStats.health ?? {}, metrics: { mintsJoined: lastStats.mints ?? 0, freshJoined: lastStats.freshJoined ?? 0, launchEvents: lastStats.launchEvents ?? 0, providerErrors: lastStats.errors ?? 0, priceRangeBps: { count: lastStats.priceRangeBps?.length ?? 0, max: lastStats.priceRangeBps?.length ? Math.max(...lastStats.priceRangeBps) : null } } }); },
     health: () => ({ gmgn: gmgn.health(), dexscreener: dex.health(), launch: launch.health() }), dir: storage.dir,

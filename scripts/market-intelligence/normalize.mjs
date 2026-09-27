@@ -1,13 +1,13 @@
 import { SCHEMA_VERSION, EVIDENCE, digest, number as n, text, epoch, mintIdentity } from './definition.mjs';
 
-export function observation({ provider, endpoint, mint, payload, normalized, receivedAt, observedAt = receivedAt, providerObservedAt = receivedAt, staleMs, limitations = [], timestampBasis = 'received_at', providerVersion = null }) {
+export function observation({ provider, endpoint, mint, payload, normalized, receivedAt, capturedAt = receivedAt, observedAt = capturedAt, providerObservedAt = receivedAt, staleMs, limitations = [], timestampBasis = 'received_at', providerVersion = null }) {
   if (!mintIdentity(mint)) return null;
-  if (![observedAt, receivedAt, providerObservedAt].every(Number.isFinite) || providerObservedAt > receivedAt || receivedAt > observedAt) throw new Error('NO_LOOKAHEAD_TIMESTAMP');
+  if (![observedAt, capturedAt, receivedAt, providerObservedAt].every(Number.isFinite) || providerObservedAt > receivedAt || receivedAt > capturedAt || capturedAt > observedAt) throw new Error('NO_LOOKAHEAD_TIMESTAMP');
   const ageMs = observedAt - providerObservedAt;
   const dataAvailability = Object.fromEntries(Object.entries(normalized).map(([key, value]) => [key, value !== null]));
   return {
     schemaVersion: SCHEMA_VERSION, recordType: 'market_observation', ...EVIDENCE,
-    observedAt, capturedAt: receivedAt, provider, providerVersion, sourceEndpoint: endpoint,
+    observedAt, capturedAt, provider, providerVersion, sourceEndpoint: endpoint,
     chain: 'solana', mint, rawResponseDigest: digest(payload), normalizedPayloadDigest: digest(normalized),
     providerObservedAt, receivedAt, timestampBasis,
     staleness: { ageMs, fresh: ageMs <= staleMs, staleReason: ageMs > staleMs ? 'FRESHNESS_BUDGET_EXCEEDED' : null, budgetMs: staleMs },
@@ -93,11 +93,23 @@ export function normalizeDex(result, { observedAt = result.receivedAt, staleMs =
       receivedAt: result.receivedAt, observedAt, staleMs, limitations: ['Pair-specific flow/liquidity, not token aggregate', 'Source update time unavailable; receipt bounds earliest consumption', 'Rolling windows have approximate end times'] });
   });
 }
-export function normalizeJupiterMarkets(markets, { observedAt, staleMs = 60000 }) {
-  return markets.filter(m => m.synthetic === false && m.source === 'Jupiter Tokens V2').map(m => observation({
+// Feed records are plain data but may contain undefined optional fields after
+// universe merging. Represent unavailable values explicitly without mutating them.
+export function jupiterAdapterPayload(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') { if (!Number.isFinite(value)) throw new Error('Invalid Jupiter numeric value'); return value; }
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) return Array.from(value, jupiterAdapterPayload);
+  if (typeof value === 'object' && [Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jupiterAdapterPayload(item)]));
+  }
+  throw new Error('Invalid Jupiter adapter data');
+}
+export function normalizeJupiterMarkets(markets, { observedAt, receivedAt = observedAt, capturedAt = observedAt, staleMs = 60000 }) {
+  return markets.filter(m => m.synthetic === false && m.source === 'Jupiter Tokens V2').map(jupiterAdapterPayload).map(m => observation({
     provider: 'jupiter', endpoint: m.endpoint || 'feed.markets()', mint: m.mint, payload: m,
-    receivedAt: m.lastObservedAt, providerObservedAt: m.lastObservedAt, observedAt, staleMs, timestampBasis: 'feed_last_observed_at',
+    receivedAt, capturedAt, providerObservedAt: m.lastObservedAt, observedAt, staleMs, timestampBasis: 'feed_request_start_and_local_copy',
     normalized: { priceUsd: n(m.price), liquidityUsd: n(m.liquidity), liquidityScope: 'jupiter_token', volume5mUsd: n(m.volume5m), volumeWindowMs: 300000, volumeScope: 'jupiter_token', holderCount: n(m.holderCount), poolCreatedAt: n(m.poolCreatedAt) },
-    limitations: ['Copied normalized feed state; raw upstream response not duplicated', 'Jupiter token scope differs from individual DEX pair scope'],
+    limitations: ['Copied normalized feed state; raw upstream response not duplicated', 'Feed timestamp is request start, not upstream update or receipt time', 'Local receipt is the first Phase 5J copy; upstream receipt/update unavailable', 'Jupiter token scope differs from individual DEX pair scope'],
   })).filter(Boolean);
 }

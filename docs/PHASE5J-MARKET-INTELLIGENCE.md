@@ -13,6 +13,9 @@ its current `feed.markets()` array to `createIntelligenceRecorder`; it is copied
 and never mutated. The standalone capture CLI instantiates that same feed in
 live mode with synthetic fallback disabled. It does not create another Jupiter
 client implementation or modify an engine process.
+Running standalone intelligence capture beside the engine means two Jupiter
+polling streams. An injected existing feed is reused without starting another
+poll loop.
 
 GMGN, native DexScreener HTTP and the launch observation interface join by Solana
 **mint address**. Name, symbol and display labels never join records. DexScreener
@@ -117,6 +120,24 @@ payload, not credentials or HTTP headers. Jupiter's source payload is the copied
 normalized feed record, explicitly identified as such. Exact upstream server
 update times are unavailable for GMGN/DexScreener; they use receipt time with a
 recorded limitation, not a claim of historical timestamp precision.
+The Jupiter adapter explicitly converts undefined optional data to null in a
+separate plain-data copy, preserves array order, and rejects nonfinite numbers
+and executable/non-data values. The original feed record is never changed.
+Its `providerObservedAt` preserves the feed's request-start timestamp;
+`receivedAt` is the first local Phase 5J copy and `capturedAt` is local capture.
+For repeated reads of the same mint/endpoint/source state, the recorder retains
+its first payload and receipt time instead of refreshing availability from
+derived age fields/features. Newly available source fields create a new local
+copy with a new receipt, even if the legacy feed timestamp is unchanged.
+Exact upstream receipt/update timestamps are unavailable.
+
+Snapshot staleness provenance is a sorted `sourceObservations` list. Each entry
+retains chain, mint, provider, sourceEndpoint, providerObservedAt, receivedAt, capturedAt,
+observedAt, normalizedPayloadDigest, rawResponseDigest and budgetMs, with a
+canonical observationDigest covering all those fields. Repeated identical
+payloads at different times or from different providers remain represented.
+Snapshot normalizedPayloadDigest covers features, contributors and this list;
+input permutations yield identical serialized evidence and digests.
 
 GMGN normalized payload fields:
 
@@ -208,6 +229,10 @@ Stale sources remain evidence but do not contribute feature values.
 Alignment defaults to 15s relative to the freshest available source. One
 observation per provider is selected deterministically by timestamp, pair
 liquidity and digest; multiple DexScreener pairs never count as independent sources.
+Selection is independent for each metric: unavailable price does not remove
+valid liquidity, volume or holder evidence. Cross-source age spread selects one
+fresh aligned observation per provider and is unavailable with fewer than two
+distinct providers.
 Missing sources mean missing evidence, not zero-valued measurements.
 
 Disagreement metrics:
@@ -218,7 +243,7 @@ priceMedianUsd, priceRangeBps, priceMaxDeviationBps,
 liquidityComparable, liquidityMedianUsd, liquidityMaxRatio, liquidityReason,
 volumeComparable, volumeDisagreementRatio, volumeReason,
 holderCountRange, poolAgeComparable, poolAgeReason, sourceAgeSpreadMs,
-contributors: {price, liquidity, volume, holders}
+contributors: {price, liquidity, volume, holders, age}
 ```
 
 Price range is (max-min)/median × 10,000; max deviation is maximum absolute
@@ -233,8 +258,8 @@ comparison or historical holder backfill is permitted.
 
 ## No-lookahead
 
-`providerObservedAt <= receivedAt <= observedAt` is enforced at normalization.
-Aggregation/disagreement reject records whose provider, receipt or observation
+`providerObservedAt <= receivedAt <= capturedAt <= observedAt` is enforced at normalization.
+Aggregation/disagreement reject records whose provider, receipt, capture or observation
 time exceeds consumption time. Future launch/pair-creation timestamps are
 unavailable. Receipt is the earliest time a current response may later be used;
 current data is never assigned to an earlier market time. No candle endpoints
@@ -269,9 +294,20 @@ appends are bounded to 64 MiB, reserving 16 KiB for finalization. Final summary 
 manifest each have an 8 KiB limit. Cache capacity is 256 entries/provider, retained
 mint/endpoint identities 10,000, remembered duplicate launches 10,000. Old stale
 in-memory observations expire; persisted evidence never changes.
+Jupiter first-copy receipts are independently capped at 10,000 mint/endpoint
+identities and fail closed at capacity. GMGN route cursors are capped by the
+10,000-mint eligible universe, with inactive mints removed. GMGN has an independent
+mint cursor and per-mint five-route rotation; one request slot is reserved for
+Trenches. A budget of one therefore collects Trenches only. Stable eligible
+universes with a token-route budget eventually receive all five routes regardless
+of factors shared by universe size, route count or request budget.
 
 Session creation is exclusive. Existing sessions cannot be reopened, and finalized
-storage rejects appends/finalization. Symlink ancestors are rejected. NDJSON
+storage rejects appends/finalization. Provider filenames use a fixed mapping;
+unknown providers, traversal and absolute path inputs are rejected. Every write
+checks ancestors through its destination, including sessions and raw directories,
+and rejects symlinks. File opens use O_NOFOLLOW where supported and verify regular
+file identity; append opens do not create missing/replaced files. NDJSON
 appends use O_APPEND, complete writes and fsync. Summary/manifest finalization uses
 exclusive temporary files and atomic renames. A process crash may leave an
 unfinished session; it is never silently resumed or treated as finalized evidence.
@@ -354,6 +390,13 @@ checks. It covers the 35 required contracts plus provider-budget/timeout/origin,
 UI summary, receipt-cache, zero/missing, deterministic contributor and
 immutable-session edge cases. It is included in full validation only after its
 own suite passed. Existing market/replay/engine/Arena/JEV validations remain intact.
+The remediation extends the suite from 42 to 63 tests: genuine feed/universe
+missing-field and delayed-response fixtures, eventual coverage for eight universe
+sizes and four request budgets, path/symlink/prior-session adversaries, repeated
+payload permutations, independent metric eligibility and cross-provider age
+selection. Actual manifest files are re-hashed directly with node:crypto and
+their fingerprint and line counts independently checked. Tests write only to
+temporary directories, never existing observation/evidence sessions.
 
 No R1–R6 question is answered by implementation. Future experiments may test:
 

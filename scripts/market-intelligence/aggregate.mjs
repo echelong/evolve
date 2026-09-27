@@ -9,7 +9,7 @@ export const FEATURE_NAMES = Object.freeze([
   'crossSourceAgeSpreadMs', 'crossSourceCount', 'crossSourceFreshCount',
 ]);
 export function aggregate(records, { observedAt, alignmentMs = 15000 } = {}) {
-  if (records.some(r => r.observedAt > observedAt || r.providerObservedAt > observedAt || r.receivedAt > observedAt)) throw new Error('NO_LOOKAHEAD_TIMESTAMP');
+  if (records.some(r => r.observedAt > observedAt || r.providerObservedAt > observedAt || r.receivedAt > observedAt || r.capturedAt > observedAt)) throw new Error('NO_LOOKAHEAD_TIMESTAMP');
   const groups = new Map();
   for (const r of records) {
     if (r.chain !== 'solana' || !r.mint) continue;
@@ -17,11 +17,16 @@ export function aggregate(records, { observedAt, alignmentMs = 15000 } = {}) {
     groups.get(r.mint).push(r);
   }
   return [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([mint, rs]) => {
+    const sourceObservations = rs.map(r => ({ chain: r.chain, mint: r.mint, provider: r.provider, sourceEndpoint: r.sourceEndpoint,
+      providerObservedAt: r.providerObservedAt, receivedAt: r.receivedAt, capturedAt: r.capturedAt,
+      observedAt: r.observedAt, normalizedPayloadDigest: r.normalizedPayloadDigest, rawResponseDigest: r.rawResponseDigest,
+      budgetMs: r.staleness.budgetMs })).map(source => ({ observationDigest: digest(source), ...source }))
+      .sort((a, b) => a.observationDigest.localeCompare(b.observationDigest));
     const cross = disagreement(rs, { observedAt, alignmentMs });
     const features = Object.fromEntries(FEATURE_NAMES.map(k => [k, null]));
     const contributors = {};
     const fresh = rs.filter(r => observedAt - r.providerObservedAt <= r.staleness.budgetMs)
-      .sort((a, b) => b.providerObservedAt - a.providerObservedAt || (b.normalized.liquidityUsd ?? -1) - (a.normalized.liquidityUsd ?? -1) || a.normalizedPayloadDigest.localeCompare(b.normalizedPayloadDigest));
+      .sort((a, b) => b.providerObservedAt - a.providerObservedAt || (b.normalized.liquidityUsd ?? -1) - (a.normalized.liquidityUsd ?? -1) || a.normalizedPayloadDigest.localeCompare(b.normalizedPayloadDigest) || digest(a).localeCompare(digest(b)));
     const put = (name, value, record) => {
       if (features[name] !== null || value === undefined || value === null || typeof value === 'number' && !Number.isFinite(value)) return;
       features[name] = value;
@@ -59,9 +64,9 @@ export function aggregate(records, { observedAt, alignmentMs = 15000 } = {}) {
     }
     return { schemaVersion: 1, recordType: 'intelligence_snapshot', ...EVIDENCE, observedAt, capturedAt: observedAt, chain: 'solana', mint,
       provider: 'multi-source', providerVersion: null, sourceEndpoint: 'aggregate', rawResponseDigest: digest(rs.map(r => r.rawResponseDigest).sort()),
-      staleness: { budgetsByProvider: Object.fromEntries(rs.map(r => [r.provider, r.staleness.budgetMs])), sourceObservedAt: Object.fromEntries(rs.map(r => [r.normalizedPayloadDigest, r.providerObservedAt])) },
+      staleness: { sourceObservations },
       limitations: ['Research features only', 'Different provider scopes remain incomparable', 'No imputation'],
       features, contributors, dataAvailability: Object.fromEntries(Object.entries(features).map(([k, v]) => [k, v !== null])),
-      sourceDigests: rs.map(r => r.normalizedPayloadDigest).sort(), normalizedPayloadDigest: digest({ features, contributors }), disagreement: cross };
+      sourceDigests: rs.map(r => r.normalizedPayloadDigest).sort(), normalizedPayloadDigest: digest({ features, contributors, sourceObservations }), disagreement: cross };
   });
 }
