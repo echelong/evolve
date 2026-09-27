@@ -114,7 +114,8 @@ export const AGENT_REACH_PIN = Object.freeze({
   license: "MIT",
   python: ">=3.10",
   cli: "agent-reach",
-  localInstallDir: path.join(".tools", "agent-reach"),
+  // This is a runtime CLI location, not a directory asset for the dashboard bundle.
+  localInstallDir: [".tools", "agent-reach"].join(path.sep),
 });
 
 export const DEFAULT_REACH_TIMEOUT_MS = 20_000;

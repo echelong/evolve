@@ -23,7 +23,7 @@
     "validate:market": "node scripts/validate-market.mjs",
     "validate:syntax": "node scripts/check-syntax.mjs",
     "smoke:engine": "node scripts/smoke-engine.mjs",
-    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run validate:phase5a31 && npm run validate:phase5b && npm run validate:phase5c && npm run validate:phase5c2 && npm run validate:phase5c3 && npm run validate:phase5d && npm run validate:phase5e && npm run validate:phase5e2 && npm run validate:phase5f && npm run validate:phase5f1 && npm run validate:phase5g && npm run validate:phase5g1 && npm run validate:phase5g1a && npm run validate:phase5g1b && npm run validate:phase5g1c && npm run validate:phase5h && npm run validate:phase5i && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm && npm run validate:jev-paper && npm run validate:jev-paper-forensics && npm run validate:jev-supervisor",
+    "validate": "npm run validate:syntax && npm run validate:market && npm run validate:history && npm run validate:arena && npm run validate:phase41 && npm run validate:phase5a && npm run validate:phase5a2 && npm run validate:phase5a3 && npm run validate:phase5a31 && npm run validate:phase5b && npm run validate:phase5c && npm run validate:phase5c2 && npm run validate:phase5c3 && npm run validate:phase5d && npm run validate:phase5e && npm run validate:phase5e2 && npm run validate:phase5f && npm run validate:phase5f1 && npm run validate:phase5g && npm run validate:phase5g1 && npm run validate:phase5g1a && npm run validate:phase5g1b && npm run validate:phase5g1c && npm run validate:phase5h && npm run validate:phase5i && npm run smoke:engine && npm run smoke:replay && npm run smoke:arena && npm run smoke:swarm && npm run validate:jev-paper && npm run validate:jev-paper-forensics && npm run validate:jev-supervisor && npm run validate:phase5j",
     "research": "node scripts/research.mjs",
     "probe:research-provider": "node scripts/probe-research-provider.mjs",
     "compare:research": "node scripts/research-compare.mjs",
@@ -83,7 +83,9 @@
     "intelligence:classify": "node scripts/intelligence-classify.mjs",
     "intelligence:classify-eval": "node scripts/intelligence-classify-eval.mjs",
     "intelligence:classify-features": "node scripts/intelligence-classify-features.mjs",
-    "probe:reach": "node scripts/probe-reach.mjs"
+    "probe:reach": "node scripts/probe-reach.mjs",
+    "validate:phase5j": "node scripts/validate-phase5j.mjs",
+    "intelligence:market": "node scripts/market-intelligence.mjs"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",

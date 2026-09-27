@@ -33,6 +33,7 @@ import {
   YAxis,
 } from "recharts";
 import { useEffect, useMemo, useState } from "react";
+import { MarketIntelligencePanel } from "../components/market-intelligence-panel";
 
 type Agent = {
   id: string;
@@ -3993,6 +3994,8 @@ function Dashboard({
       {state.jevPaperShadow ? <JevPaperShadowPanel state={state} nowMs={nowMs} /> : null}
 
       {state.jevSupervisorObserver ? <JevSupervisorObserverPanel state={state} nowMs={nowMs} /> : null}
+
+      <MarketIntelligencePanel />
 
       {state.externalIntelligence ? (
         <section className="dashboard-grid research-grid">
