@@ -12,12 +12,16 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
   async function read(kind, identity, { query = {}, body = null } = {}) {
     const route = routes[kind];
     if (!route || !Object.hasOwn(routes, kind)) throw new Error('Observation route not allowed');
-    if (busy) return { unavailable: 'BUSY' };
+    // requestAttempted distinguishes a real provider call (success or bounded
+    // failure) from a blocked non-attempt; scheduling uses it to advance cursors
+    // only for actual service.
+    if (busy) return { unavailable: 'BUSY', requestAttempted: false };
     const cacheKey = JSON.stringify([kind, identity, query, body]);
     const old = cache.get(cacheKey);
-    if (old && now() - old.receivedAt <= config.cacheMs) { counters.cacheHits++; return structuredClone(old); }
-    if (now() < backoffUntil) return { unavailable: 'BACKOFF' };
+    if (old && now() - old.receivedAt <= config.cacheMs) { counters.cacheHits++; return { ...structuredClone(old), requestAttempted: false, servedFromCache: true }; }
+    if (now() < backoffUntil) return { unavailable: 'BACKOFF', requestAttempted: false };
     busy = true;
+    let requestAttempted = false;
     try {
       const wait = Math.max(0, nextAt - now());
       if (wait) await sleep(wait);
@@ -34,6 +38,7 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
       }
       if (body) headers['Content-Type'] = 'application/json';
       counters.requests++;
+      requestAttempted = true;
       nextAt = now() + config.spacingMs;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -65,7 +70,7 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
         payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } finally { clearTimeout(timer); }
       if (config.apiKey && (!payload || ![0, '0'].includes(payload.code) || !Object.hasOwn(payload, 'data'))) throw new Error('PROVIDER_ENVELOPE');
-      const result = { payload: redact(payload, secrets), receivedAt: now(), endpoint: typeof route.path === 'function' ? route.path(identity) : route.path, requestIdentity: identity, kind };
+      const result = { payload: redact(payload, secrets), receivedAt: now(), endpoint: typeof route.path === 'function' ? route.path(identity) : route.path, requestIdentity: identity, kind, requestAttempted: true };
       if (cache.size >= 256) cache.delete(cache.keys().next().value);
       cache.set(cacheKey, result); failures = 0; counters.state = 'HEALTHY'; counters.lastError = null;
       return structuredClone(result);
@@ -74,7 +79,8 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
       counters.lastError = /^HTTP_\d+$|^PAYLOAD_TOO_LARGE$|^PROVIDER_ENVELOPE$/.test((error?.message ?? '')) ? error.message : 'OBSERVATION_FAILED';
       counters.state = 'DEGRADED';
       backoffUntil = Math.max(backoffUntil, now() + Math.min(300000, 1000 * 2 ** Math.min(failures, 8)));
-      return { unavailable: counters.lastError };
+      // An attempted-but-failed call still progressed through this endpoint.
+      return { unavailable: counters.lastError, requestAttempted };
     } finally { busy = false; }
   }
   return Object.freeze({ read, health: () => ({ ...counters, backoffUntil, cacheEntries: cache.size, concurrencyLimit: 1 }) });

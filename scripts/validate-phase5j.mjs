@@ -251,9 +251,11 @@ test('40 source changes/missing pair fields never mix different DEX pairs', () =
 });
 test('41 GMGN request budget and key fallback are deterministic', async () => {
   const c = createIntelligenceConfig({ env: { GMGN_API_KEY: key, EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE: '1' } });
+  assert.equal(c.gmgn.maxRequests, 2, 'configured 1 resolves to the floor of 2');
   let calls = 0;
   const p = createGmgnProvider({ config: c.gmgn, now: () => at, fetchImpl: async () => { calls++; return response(gmgnPayload); } });
-  await p.observe('info', mint); assert.equal((await p.observe('security', mint)).unavailable, 'CYCLE_BUDGET'); assert.equal(calls, 1);
+  await p.observe('info', mint); await p.observe('security', mint);
+  assert.equal((await p.observe('pool', mint)).unavailable, 'CYCLE_BUDGET'); assert.equal(calls, 2);
 });
 
 test('42 existing external-intelligence CLI install path stays equivalent', () => assert.equal(AGENT_REACH_PIN.localInstallDir, path.join('.tools', 'agent-reach')));
@@ -450,6 +452,176 @@ test('63 manifest hashes/fingerprint/counts independently recomputed from actual
   assert.deepEqual(manifest.files, actual); assert.equal(manifest.fingerprint, hashBytes(expectedJson(actual))); assert(!Object.hasOwn(actual, 'manifest.json'));
   for (const [name, count] of Object.entries(manifest.fileRecordCounts)) assert.equal(readFileSync(path.join(s.dir, name), 'utf8').trim().split('\n').length, count);
   assert.equal(manifest.recordCount, 3); assert.equal(manifest.fileRecordCounts['normalized.ndjson'], 3); assert.equal(manifest.errorCounts.gmgn, 1);
+});
+
+// GMGN cadence fairness: cursors advance only for provider-serviced or attempted
+// calls, so eventual coverage must hold at every capture frequency.
+const ROUTE_KINDS = ['info', 'security', 'pool', 'holders', 'traders'];
+const kindForPath = pathname => pathname === '/v1/trenches' ? 'trenches' : pathname === '/v1/token/info' ? 'info' : pathname === '/v1/token/security' ? 'security'
+  : pathname === '/v1/token/pool_info' ? 'pool' : pathname === '/v1/market/token_top_holders' ? 'holders' : pathname === '/v1/market/token_top_traders' ? 'traders' : null;
+const stressIdentities = size => Array.from({ length: size }, (_, i) => `${'1'.repeat(32)}${(i + 1).toString().split('').map(digit => '123456789A'[Number(digit)]).join('')}`);
+async function cadenceCoverage({ size, budget, frequency, cacheMs = 0 }) {
+  let time = at;
+  const requested = new Map();
+  const provider = createGmgnProvider({
+    config: { ...config.gmgn, apiKey: key, maxRequests: budget, pollMs: 30000, cacheMs, spacingMs: 0, timeoutMs: 1000 },
+    now: () => time, sleep: async () => {},
+    fetchImpl: async url => {
+      const kind = kindForPath(url.pathname), id = url.searchParams.get('address') ?? null;
+      if (id && kind) { if (!requested.has(id)) requested.set(id, new Set()); requested.get(id).add(kind); }
+      return response({ code: 0, data: kind === 'trenches' ? { new_creation: [] } : { address: id, list: [] } });
+    },
+  });
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: budget }, dex: { ...config.dex, maxRequests: 1 } },
+    storage: inertStorage(), now: () => time, dex: disabledDex, gmgn: provider });
+  const idents = stressIdentities(size);
+  const maxWindows = 5 * size + 5;
+  let windows = 0;
+  for (; windows < maxWindows; windows++) {
+    for (let f = 0; f < frequency; f++) { await recorder.capture({ mints: idents }); time += Math.floor(30000 / frequency); }
+    time += 1;
+    if (idents.every(m => requested.get(m)?.size === ROUTE_KINDS.length)) break;
+  }
+  recorder.finalize();
+  return { windows: windows + 1, requested };
+}
+test('64 GMGN eventual coverage holds at every capture cadence (real provider budget)', async () => {
+  let worst = 0, worstCase = '';
+  for (const size of [1, 5, 10, 30, 31, 37]) for (const budget of [2, 3, 6, 11]) for (const frequency of [1, 2, 5, 6, 10, 30]) {
+    const { windows, requested } = await cadenceCoverage({ size, budget, frequency });
+    const label = `size=${size} budget=${budget} F=${frequency}`;
+    assert.equal(requested.size, size, `no mint starvation: ${label}`);
+    for (const [id, routes] of requested) assert.deepEqual([...routes].sort(), [...ROUTE_KINDS].sort(), `no endpoint-family starvation: ${label} mint=${id.slice(0, 8)}`);
+    if (windows > worst) { worst = windows; worstCase = label; }
+  }
+  console.log(`  worst-case full coverage: ${worst} windows (${worstCase})`);
+  for (const [size, budget, frequency] of [[1, 2, 5], [5, 6, 5]]) {
+    const { requested } = await cadenceCoverage({ size, budget, frequency });
+    for (const [id, routes] of requested) assert.deepEqual([...routes].sort(), [...ROUTE_KINDS].sort(), `prior failing case now passes: size=${size} budget=${budget} F=${frequency} mint=${id.slice(0, 8)}`);
+  }
+});
+test('65 blocked GMGN results never advance cursors; the pending route is retried, not skipped', async () => {
+  const script = ['attempt', 'BACKOFF', 'BACKOFF', 'attempt', 'BUSY', 'attempt', 'CYCLE_BUDGET', 'attempt', 'attempt', 'attempt'];
+  const calls = [];
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 6 }, dex: { ...config.dex, maxRequests: 1 } },
+    storage: inertStorage(), now: () => at, dex: disabledDex,
+    gmgn: { observe: async (kind, id) => {
+      if (kind === 'trenches') return { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: null, receivedAt: at, payload: { code: 0, data: { new_creation: [] } } };
+      const outcome = script.shift() ?? 'attempt';
+      calls.push([kind, id ?? null, outcome]);
+      return outcome === 'attempt' ? { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: id ?? null, receivedAt: at, payload: { code: 0, data: { address: id, list: [] } } }
+        : { unavailable: outcome, requestAttempted: false };
+    }, health: () => ({ errors: 0 }) } });
+  for (let i = 0; i < 10; i++) await recorder.capture({ mints: [mint] });
+  recorder.finalize();
+  assert.deepEqual(calls, [
+    ['info', mint, 'attempt'], ['security', mint, 'BACKOFF'], ['security', mint, 'BACKOFF'], ['security', mint, 'attempt'], ['pool', mint, 'BUSY'],
+    ['pool', mint, 'attempt'], ['holders', mint, 'CYCLE_BUDGET'], ['holders', mint, 'attempt'], ['traders', mint, 'attempt'], ['info', mint, 'attempt'],
+  ]);
+  assert.deepEqual(calls.filter(([, , outcome]) => outcome === 'attempt').map(([kind]) => kind), ['info', 'security', 'pool', 'holders', 'traders', 'info']);
+
+  // mint cursor fairness: a mint blocked mid-capture is serviced first next capture
+  const minted = [];
+  const mintScript = ['attempt', 'BUSY', 'attempt', 'attempt'];
+  const second = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 6 } }, storage: inertStorage(), now: () => at, dex: disabledDex,
+    gmgn: { observe: async (kind, id) => {
+      if (kind === 'trenches') return { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: null, receivedAt: at, payload: { code: 0, data: { new_creation: [] } } };
+      const outcome = mintScript.shift() ?? 'attempt';
+      minted.push([kind, id, outcome]);
+      return outcome === 'attempt' ? { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: id, receivedAt: at, payload: { code: 0, data: { address: id, list: [] } } } : { unavailable: outcome, requestAttempted: false };
+    }, health: () => ({ errors: 0 }) } });
+  const pair = stressIdentities(2), [firstMint, secondMint] = pair;
+  await second.capture({ mints: pair }); await second.capture({ mints: pair });
+  assert.deepEqual(minted, [['info', firstMint, 'attempt'], ['info', secondMint, 'BUSY'], ['info', secondMint, 'attempt'], ['security', firstMint, 'attempt']]);
+});
+test('66 an attempted HTTP failure progresses the route (fairness, no hammering)', async () => {
+  let directCalls = 0;
+  const direct = createGmgnProvider({ config: { ...config.gmgn, apiKey: key, maxRequests: 6, cacheMs: 0, spacingMs: 0 },
+    now: () => at, sleep: async () => {}, fetchImpl: async () => { directCalls++; return response({}, 500); } });
+  const failed = await direct.observe('info', mint);
+  assert.equal(failed.unavailable, 'HTTP_500'); assert.equal(failed.requestAttempted, true);
+  const blocked = await direct.observe('security', mint);
+  assert.equal(blocked.unavailable, 'BACKOFF'); assert.equal(blocked.requestAttempted, false);
+  assert.equal(directCalls, 1);
+
+  let time = at, calls = 0; const requested = [];
+  const provider = createGmgnProvider({ config: { ...config.gmgn, apiKey: key, maxRequests: 6, cacheMs: 0, spacingMs: 0 }, now: () => time, sleep: async () => {},
+    fetchImpl: async url => {
+      calls++;
+      const kind = kindForPath(url.pathname), id = url.searchParams.get('address') ?? null;
+      if (id) requested.push(kind);
+      return calls === 1 ? response({}, 500) : response({ code: 0, data: kind === 'trenches' ? { new_creation: [] } : { address: id, list: [] } });
+    } });
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 6 } }, storage: inertStorage(), now: () => time, dex: disabledDex, gmgn: provider });
+  for (let window = 0; window < 5; window++) { await recorder.capture({ mints: [mint] }); time += 30001; }
+  recorder.finalize();
+  assert.equal(requested[0], 'info', 'first attempt is the failed route');
+  assert.equal(requested[1], 'security', 'failed route is not retried; the next route is attempted');
+  assert.deepEqual([...new Set(requested)].sort(), [...ROUTE_KINDS].sort());
+});
+test('67 cache-served results keep GMGN progression without stalling', async () => {
+  let used = 0;
+  const direct = createGmgnProvider({ config: { ...config.gmgn, apiKey: key, cacheMs: 60000, spacingMs: 0 }, now: () => at, sleep: async () => {},
+    fetchImpl: async () => { used++; return response({ code: 0, data: { address: mint, list: [] } }); } });
+  const first = await direct.observe('info', mint), cachedValue = await direct.observe('info', mint);
+  assert.equal(first.requestAttempted, true); assert.equal(cachedValue.requestAttempted, false);
+  assert.equal(cachedValue.servedFromCache, true); assert.equal(used, 1); assert.equal(cachedValue.receivedAt, first.receivedAt);
+
+  let time = at; const log = [];
+  const provider = createGmgnProvider({ config: { ...config.gmgn, apiKey: key, maxRequests: 2, pollMs: 30000, cacheMs: 300000, spacingMs: 0 }, now: () => time, sleep: async () => {},
+    fetchImpl: async url => response({ code: 0, data: url.pathname === '/v1/trenches' ? { new_creation: [] } : { address: url.searchParams.get('address'), list: [] } }) });
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 2 } }, storage: inertStorage(), now: () => time, dex: disabledDex,
+    gmgn: { observe: async (kind, id) => { const r = await provider.observe(kind, id); if (id) log.push([kind, r.unavailable ?? (r.servedFromCache ? 'CACHE' : 'REQUEST')]); return r; }, health: provider.health } });
+  for (let window = 0; window < 10; window++) { await recorder.capture({ mints: [mint] }); time += 30001; }
+  recorder.finalize();
+  assert.deepEqual(log.map(([kind]) => kind), [...ROUTE_KINDS, ...ROUTE_KINDS]);
+  assert.deepEqual(log.slice(0, 5).map(([, state]) => state), ['REQUEST', 'REQUEST', 'REQUEST', 'REQUEST', 'REQUEST']);
+  assert.deepEqual(log.slice(5).map(([, state]) => state), ['CACHE', 'CACHE', 'CACHE', 'CACHE', 'CACHE']);
+});
+test('68 GMGN cycle budget has a floor of two, so token routes always keep a slot', async () => {
+  const floor = createIntelligenceConfig({ env: { EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE: '1' } });
+  assert.equal(floor.gmgn.maxRequests, 2);
+  assert.equal(createIntelligenceConfig({ env: { EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE: '0' } }).gmgn.maxRequests, 2);
+  assert.equal(createIntelligenceConfig({ env: { EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE: '30' } }).gmgn.maxRequests, 30);
+  let time = at; const requested = [];
+  const provider = createGmgnProvider({ config: { ...floor.gmgn, apiKey: key, cacheMs: 0, spacingMs: 0 }, now: () => time, sleep: async () => {},
+    fetchImpl: async url => { const kind = kindForPath(url.pathname); requested.push(kind); return response({ code: 0, data: kind === 'trenches' ? { new_creation: [] } : { address: url.searchParams.get('address'), list: [] } }); } });
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: floor.gmgn }, storage: inertStorage(), now: () => time, dex: disabledDex, gmgn: provider });
+  for (let window = 0; window < 5; window++) { await recorder.capture({ mints: [mint] }); time += 30001; }
+  recorder.finalize();
+  assert.equal(requested.filter(k => k === 'trenches').length, 5, 'one Trenches slot per window');
+  assert.deepEqual([...new Set(requested.filter(k => ROUTE_KINDS.includes(k)))].sort(), [...ROUTE_KINDS].sort(), 'token-route slot rotates all five routes');
+});
+test('69 DexScreener budget and state cannot influence GMGN progression', async () => {
+  const run = async dexMax => {
+    const calls = [];
+    const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 6 }, dex: { ...config.dex, maxRequests: dexMax } },
+      storage: inertStorage(), now: () => at,
+      dex: { observe: async id => ({ kind: 'pairs', endpoint: '/token-pairs/v1/solana/x', requestIdentity: id, receivedAt: at, payload: [] }), health: () => ({ errors: 0 }) },
+      gmgn: { observe: async (kind, id) => { calls.push([kind, id ?? null]); return { kind, endpoint: GMGN_ROUTES[kind].path, requestIdentity: id ?? null, receivedAt: at, payload: { code: 0, data: { address: id, list: [] } } }; }, health: () => ({ errors: 0 }) } });
+    const idents = stressIdentities(10);
+    for (let i = 0; i < 6; i++) await recorder.capture({ mints: idents });
+    recorder.finalize();
+    return calls;
+  };
+  assert.deepEqual(await run(1), await run(30));
+});
+test('70 universe shrink keeps GMGN cursors bounded and coverage intact', async () => {
+  let time = at; const requested = new Map();
+  const provider = createGmgnProvider({ config: { ...config.gmgn, apiKey: key, maxRequests: 6, pollMs: 30000, cacheMs: 0, spacingMs: 0 }, now: () => time, sleep: async () => {},
+    fetchImpl: async url => {
+      const kind = kindForPath(url.pathname), id = url.searchParams.get('address');
+      if (id) { if (!requested.has(id)) requested.set(id, new Set()); requested.get(id).add(kind); }
+      return response({ code: 0, data: kind === 'trenches' ? { new_creation: [] } : { address: id, list: [] } });
+    } });
+  const recorder = createIntelligenceRecorder({ config: { ...config, gmgn: { ...config.gmgn, maxRequests: 6 } }, storage: inertStorage(), now: () => time, dex: disabledDex, gmgn: provider });
+  const big = stressIdentities(37), small = big.slice(0, 3);
+  for (let i = 0; i < 4; i++) { await recorder.capture({ mints: big }); time += 30001; }
+  requested.clear();
+  for (let i = 0; i < 40 && !small.every(m => requested.get(m)?.size === ROUTE_KINDS.length); i++) { await recorder.capture({ mints: small }); time += 30001; }
+  recorder.finalize();
+  assert.deepEqual([...requested.keys()].sort(), [...small].sort(), 'no stale-mint selections after shrink');
+  for (const m of small) assert.deepEqual([...requested.get(m)].sort(), [...ROUTE_KINDS].sort(), `shrunk mint keeps all five routes: ${m.slice(0, 8)}`);
 });
 
 let failed = 0;

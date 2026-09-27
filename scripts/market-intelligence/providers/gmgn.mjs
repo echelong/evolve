@@ -16,9 +16,9 @@ export function createGmgnProvider({ config, ...options }) {
     async observe(kind, mint = null) {
       if (!Object.hasOwn(GMGN_ROUTES, kind)) throw new Error('Observation route not allowed');
       if (kind !== 'trenches' && !mintIdentity(mint)) throw new Error('Invalid Solana mint');
-      if (disabled) return { unavailable: disabled };
+      if (disabled) return { unavailable: disabled, requestAttempted: false };
       if (cycleAt === null || now() - cycleAt >= config.pollMs) { cycleAt = now(); cycleRequests = 0; }
-      if (cycleRequests >= config.maxRequests) return { unavailable: 'CYCLE_BUDGET' };
+      if (cycleRequests >= config.maxRequests) return { unavailable: 'CYCLE_BUDGET', requestAttempted: false };
       cycleRequests++;
       const query = kind === 'trenches' ? { chain: 'sol' } : { chain: 'sol', address: mint };
       if (kind === 'holders' || kind === 'traders') query.limit = 20;

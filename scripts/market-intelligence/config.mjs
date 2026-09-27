@@ -10,7 +10,9 @@ export function createIntelligenceConfig({ env = process.env, loadEnv = env === 
   const gmgn = {
     enabled: enabled('EVOLVE_GMGN_ENABLED', true), baseUrl: env.EVOLVE_GMGN_BASE_URL || 'https://openapi.gmgn.ai',
     timeoutMs: n('EVOLVE_GMGN_TIMEOUT_MS', 8000, 100, 60000), pollMs: n('EVOLVE_GMGN_POLL_MS', 30000, 1000),
-    maxRequests: Math.floor(n('EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE', 6, 1, 30)), cacheMs: n('EVOLVE_GMGN_CACHE_MS', 30000, 0),
+    // One request slot is reserved for Trenches and at least one for token-route
+    // service, so a GMGN budget below 2 can never cover the declared routes.
+    maxRequests: Math.floor(n('EVOLVE_GMGN_MAX_REQUESTS_PER_CYCLE', 6, 2, 30)), cacheMs: n('EVOLVE_GMGN_CACHE_MS', 30000, 0),
     staleMs: n('EVOLVE_GMGN_STALE_MS', 90000), spacingMs: 1200,
   };
   const key = env.EVOLVE_GMGN_API_KEY || env.GMGN_API_KEY || null;

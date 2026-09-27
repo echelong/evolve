@@ -298,9 +298,15 @@ Jupiter first-copy receipts are independently capped at 10,000 mint/endpoint
 identities and fail closed at capacity. GMGN route cursors are capped by the
 10,000-mint eligible universe, with inactive mints removed. GMGN has an independent
 mint cursor and per-mint five-route rotation; one request slot is reserved for
-Trenches. A budget of one therefore collects Trenches only. Stable eligible
-universes with a token-route budget eventually receive all five routes regardless
-of factors shared by universe size, route count or request budget.
+Trenches and the configured cycle budget has a minimum of two, so token-route
+service always keeps at least one slot. Cursors advance only for calls that
+actually reached the provider: a served observation (fresh or transport-cache)
+or a bounded failure after a real attempt. Blocked non-attempts — cycle budget,
+backoff, busy or disabled — leave the schedule untouched, so the pending mint and
+route are attempted again rather than skipped. Stable eligible universes therefore
+eventually receive all five routes at any capture cadence, regardless of factors
+shared by universe size, route count or request budget, provided the provider
+eventually permits requests.
 
 Session creation is exclusive. Existing sessions cannot be reopened, and finalized
 storage rejects appends/finalization. Provider filenames use a fixed mapping;
@@ -328,11 +334,11 @@ Exact HTTPS origins, methods and paths are validated both by provider declaratio
 and the transport. Redirects are rejected. GMGN paths cannot reach trade/cooking
 routes; DexScreener permits only GET token pairs. There is no arbitrary URL API.
 Single in-flight request per provider and 1.2s minimum spacing enforce bounded
-concurrency. Default cycle budgets are six requests/provider every 30s. One GMGN
-request is reserved for Trenches; remaining per-mint routes rotate across info,
-security, pool, holders and traders. Candidate cohorts rotate by mint. This is
-bounded sampling, not complete coverage. Actual collection cadence may exceed the
-poll period when requests are slow.
+concurrency. Default cycle budgets are six requests/provider every 30s (GMGN
+minimum two). One GMGN request is reserved for Trenches; remaining per-mint routes
+rotate across info, security, pool, holders and traders. Candidate cohorts rotate
+by mint. This is bounded sampling, not complete coverage. Actual collection cadence
+may exceed the poll period when requests are slow.
 
 GMGN documents weighted free-tier buckets (info/security/pool weight 1;
 holders/traders weight 5). Conservative spacing does not promise a provider plan's

@@ -65,12 +65,27 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
       const eligible = new Set(identities);
       for (const mint of gmgnRouteCursors.keys()) if (!eligible.has(mint)) gmgnRouteCursors.delete(mint);
       const budget = Math.min(identities.length, Math.max(0, config.gmgn.maxRequests - 1));
+      // Cursors advance only when a call actually reached the provider: a served
+      // observation (including one served from the transport cache of a prior
+      // attempt) or a bounded failure after a real attempt. Blocked non-attempts
+      // (CYCLE_BUDGET/BACKOFF/BUSY/DISABLED) leave the schedule untouched: the loop
+      // stops and the pending mint/route is attempted again next capture instead of
+      // being skipped. Progression therefore follows provider availability, never
+      // capture cadence, so eventual five-route coverage holds at any frequency.
+      let serviced = 0;
       for (let i = 0; i < budget; i++) {
         const mint = identities[(gmgnCursor + i) % identities.length], routeCursor = gmgnRouteCursors.get(mint) ?? 0;
-        try { await collect('gmgn', await gmgn.observe(kinds[routeCursor], mint), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
+        let requestServiced = false;
+        try {
+          const result = await gmgn.observe(kinds[routeCursor], mint);
+          requestServiced = result.unavailable === undefined || result.requestAttempted === true;
+          await collect('gmgn', result, normalizeGmgn);
+        } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
+        if (!requestServiced) break;
         gmgnRouteCursors.set(mint, (routeCursor + 1) % kinds.length);
+        serviced++;
       }
-      gmgnCursor = identities.length ? (gmgnCursor + budget) % identities.length : 0;
+      gmgnCursor = identities.length ? (gmgnCursor + serviced) % identities.length : 0;
       if (config.gmgn.maxRequests >= 1) {
         try { await collect('gmgn', await gmgn.observe('trenches'), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
       }
