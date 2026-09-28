@@ -70,3 +70,37 @@ export function loadEnvFiles({ dir = process.cwd(), files = DEFAULT_ENV_FILES } 
 
   return loaded;
 }
+
+/**
+ * Compute the FULL effective environment exactly the way `loadEnvFiles` would
+ * produce it, but WITHOUT mutating `process.env`.
+ *
+ * The sealed R4 runner must classify the environment capture would actually
+ * observe, not the process environment before `.env` / `.env.local` are loaded.
+ * This is the same loader (same files, same order, same precedence, same parser)
+ * applied to a copy, so the runner and the capture child can never disagree
+ * about which `.env` values are in effect.
+ *
+ * Returns `{ env, loaded }` where `loaded` lists the files that existed.
+ */
+export function loadEffectiveEnvironment({ dir = process.cwd(), files = DEFAULT_ENV_FILES, base = process.env } = {}) {
+  const env = { ...base };
+  const loaded = [];
+
+  for (const file of files) {
+    const fullPath = path.isAbsolute(file) ? file : path.join(dir, file);
+    if (!existsSync(fullPath)) continue;
+
+    try {
+      const parsed = parseEnvFile(readFileSync(fullPath, "utf8"));
+      for (const [key, value] of Object.entries(parsed)) {
+        if (env[key] === undefined) env[key] = value;
+      }
+      loaded.push(file);
+    } catch {
+      // An unreadable .env file must never crash the paper engine.
+    }
+  }
+
+  return { env, loaded };
+}

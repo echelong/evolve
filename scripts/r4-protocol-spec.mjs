@@ -35,7 +35,14 @@ const frozen = value => Object.freeze(value);
 // The historical `.evolve/governance/...` seal remains runtime/historical
 // evidence only and is not the committed authority.
 export const R4_TRACKED_SEAL_PATH = 'governance/r4/r4-preregistration-seal.json';
-export const R4_AUTHORITY_POINTER_PATH = 'governance/r4/AUTHORITY.json';
+// PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT (round 2): the canonical approval
+// artifact lives beside the seal. Authority is determined by the canonical Git
+// ancestry P -> S -> A plus these fixed paths, so no redundant mutable
+// `governance/r4/AUTHORITY.json` pointer exists (the previous wording that named
+// one was removed rather than materialised).
+export const R4_PRECAPTURE_APPROVAL_PATH = 'governance/r4/r4-precapture-approval.json';
+export const R4_AUTHORITY_CHAIN = 'P_S_A';
+export const R4_ATTEMPT1_START_WINDOW_MS = 300_000;
 
 /* ------------------------------------------------------------------ cohort */
 
@@ -50,11 +57,15 @@ const R4_SPEC_COHORT = frozen({
   maturationMode: R4_COHORT_SPEC.maturationMode,
   replacementRule: 'FIXED_REPLACEMENT_SESSION_RULE',
   t0Rule: R4_COHORT_SPEC.t0Rule,
-  // Enforcement clarification: T0 is computed from the committer timestamp of
-  // the seal authority commit S (the commit that adds the canonical tracked
-  // seal), not from the protocol commit P.
-  t0TimestampSource: 'SEAL_AUTHORITY_COMMIT_S_COMMITTER_TIMESTAMP',
+  // PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT (round 2): real execution
+  // derives T0 from the pre-capture APPROVAL commit A (the commit that adds the
+  // canonical approval artifact, whose direct parent is S), not from S. S remains
+  // required and must be on origin/main; A is the additional, independently
+  // reviewed start anchor. No scientific value changed.
+  authorizationChain: R4_COHORT_SPEC.authorizationChain,
+  t0TimestampSource: R4_COHORT_SPEC.t0TimestampSource,
   t0MinimumDelayMs: R4_COHORT_SPEC.t0MinimumDelayMs,
+  attempt1StartWindowMs: R4_COHORT_SPEC.attempt1StartWindowMs,
   discretionaryAttemptsPermitted: false,
   outcomeDependentExtensionPermitted: false,
   sessionParametersImmutable: true,
@@ -196,31 +207,64 @@ export const R4_CAPTURE_SPEC_DIGEST = captureSpecDigest();
 
 // The canonical validator/spec defines the required bound-file set. A seal may
 // not define or shrink its own list.
+//
+// Round-2 hardening (blocker B3): this is the COMPLETE runtime dependency
+// closure. It was generated deterministically from the canonical R4 runtime
+// entrypoints (`scripts/r4-import-closure.mjs`, `R4_RUNTIME_ROOTS`) and then
+// frozen as a literal here, so the validator (not the seal) is the authority.
+// `assertImportClosureBound` fails if any reachable module is missing from this
+// list; a new runtime import therefore cannot appear unbound. Validators that
+// gate the frozen protocol are bound too, even though the runtime never imports
+// them, because they are the executable definition of "frozen".
 export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'docs/R4-PREREGISTRATION.md',
+  'package.json',
+  'scripts/history/dataset.mjs',
+  'scripts/history/schema.mjs',
+  'scripts/lib/env.mjs',
+  'scripts/lib/hash.mjs',
+  'scripts/lib/sanitize.mjs',
   'scripts/market-intelligence.mjs',
   'scripts/market-intelligence/aggregate.mjs',
   'scripts/market-intelligence/config.mjs',
-  'scripts/market-intelligence/revisits.mjs',
+  'scripts/market-intelligence/definition.mjs',
+  'scripts/market-intelligence/disagreement.mjs',
+  'scripts/market-intelligence/index.mjs',
+  'scripts/market-intelligence/normalize.mjs',
+  'scripts/market-intelligence/providers/dexscreener.mjs',
+  'scripts/market-intelligence/providers/gmgn.mjs',
+  'scripts/market-intelligence/providers/http.mjs',
+  'scripts/market-intelligence/providers/launch-observer.mjs',
+  'scripts/market-intelligence/recorder.mjs',
   'scripts/market-intelligence/revisit-scheduler.mjs',
+  'scripts/market-intelligence/revisits.mjs',
   'scripts/market-intelligence/storage.mjs',
-  'scripts/market/config.mjs',
-  'scripts/market/feed.mjs',
-  'scripts/market/jupiter.mjs',
-  'scripts/market/universe.mjs',
   'scripts/market-outcomes/index.mjs',
   'scripts/market-outcomes/policy-a-cases.mjs',
   'scripts/market-outcomes/policy-b-cases.mjs',
   'scripts/market-outcomes/primary-analysis.mjs',
   'scripts/market-outcomes/reference-selection.mjs',
   'scripts/market-outcomes/sensitivity.mjs',
+  'scripts/market/config.mjs',
+  'scripts/market/feed.mjs',
+  'scripts/market/index.mjs',
+  'scripts/market/jupiter.mjs',
+  'scripts/market/normalize.mjs',
+  'scripts/market/replay.mjs',
+  'scripts/market/synthetic.mjs',
+  'scripts/market/universe.mjs',
+  'scripts/r4-approval.mjs',
   'scripts/r4-attestation.mjs',
   'scripts/r4-authority.mjs',
+  'scripts/r4-canonical-analysis.mjs',
+  'scripts/r4-capability.mjs',
   'scripts/r4-cohort-plan.mjs',
   'scripts/r4-cohort-run.mjs',
   'scripts/r4-e1-cases.mjs',
   'scripts/r4-enforcement.mjs',
   'scripts/r4-exclusions.mjs',
+  'scripts/r4-import-closure.mjs',
+  'scripts/r4-preregistration-seal.mjs',
   'scripts/r4-protocol-spec.mjs',
   'scripts/validate-market-outcomes-policy-b.mjs',
   'scripts/validate-market-outcomes.mjs',
@@ -228,9 +272,11 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/validate-r4-e1-mutation.mjs',
   'scripts/validate-r4-e1.mjs',
   'scripts/validate-r4-enforcement.mjs',
+  'scripts/validate-r4-import-closure.mjs',
   'scripts/validate-r4-preregistration-seal.mjs',
   'scripts/validate-r4-protocol.mjs',
   'scripts/validate-r4-revisits.mjs',
+  'scripts/validate-r4-round2.mjs',
 ]);
 
 /* --------------------------------------------------- capture env classification */
@@ -282,11 +328,38 @@ export const R4_CAPTURE_ENV_CLASSIFICATION = frozen([
   frozen({ name: 'GMGN_API_KEY', class: 'C', sealedValue: null }),
   frozen({ name: 'EVOLVE_SOLANA_RPC_URL', class: 'C', sealedValue: null }),
   frozen({ name: 'EVOLVE_SOLANA_WSS_URL', class: 'C', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_API_KEY', class: 'C', sealedValue: null }),
+  // `MARKET_MODE` is the legacy alias read by `scripts/market/config.mjs`
+  // (`readFirst(env, ['EVOLVE_MARKET_MODE', 'MARKET_MODE'])`). It is proven
+  // unreachable in the sealed capture (the sealed child forces
+  // EVOLVE_MARKET_MODE='live' first) AND explicitly classified so a present
+  // non-sealed value is rejected rather than silently ignored.
+  frozen({ name: 'MARKET_MODE', class: 'A', sealedValue: 'live' }),
   frozen({ name: 'EVOLVE_MARKET_PROBE_ONLY', class: 'B', sealedValue: null }),
   frozen({ name: 'EVOLVE_DISABLE_STDOUT_PROGRESS', class: 'B', sealedValue: null }),
-  frozen({ name: 'EVOLVE_JEV_SKIP', class: 'B', sealedValue: null }),
   frozen({ name: 'EVOLVE_DECISION_ROUTER', class: 'B', sealedValue: null }),
-  frozen({ name: 'R4_SEALED_RUNNER', class: 'B', sealedValue: null }),
+  // Known unrelated Jev (JEV) operational configuration that may exist in the
+  // operator's real environment. None of these can influence the market
+  // intelligence capture: `market-intelligence.mjs` imports no Jev module, and
+  // every scientific capture value is forced from the sealed spec. They are
+  // classified operational-only so a real environment does not produce a false
+  // fail-closed drift, while an UNKNOWN EVOLVE_* variable still fails.
+  frozen({ name: 'EVOLVE_JEV_SKIP', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_PROVIDER', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_MODE', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_TRANSPORT_CHAIN', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_TIMEOUT_MS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_MAX_CALLS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_MAX_ATTEMPTS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_MODEL', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_BASE_URL', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_CACHE', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_BACKOFF_BASE_MS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_BACKOFF_MAX_MS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_COOLDOWN_MS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_COOLDOWN_MAX_MS', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_HEALTH_DIR', class: 'B', sealedValue: null }),
+  frozen({ name: 'EVOLVE_JEV_MIN_CONFIDENCE', class: 'B', sealedValue: null }),
 ]);
 
 const CLASS_BY_NAME = new Map(R4_CAPTURE_ENV_CLASSIFICATION.map(entry => [entry.name, entry]));
@@ -334,6 +407,44 @@ export function sealedCaptureEnvironment(base = {}) {
   return env;
 }
 
+/**
+ * Build the SANITIZED child environment handed to the sealed capture process.
+ *
+ * Every unclassified `EVOLVE_*` / `JUPITER*` / `GMGN*` variable is DROPPED, every
+ * `R4_*` variable is dropped (the runner capability is an inherited descriptor,
+ * never an environment credential), class-C credentials are preserved, class-B
+ * operational values are preserved and every class-A sealed value is forced.
+ * No scientifically relevant configuration can therefore appear after the gate.
+ */
+export function sanitizeSealedChildEnvironment(base = {}) {
+  const env = { ...base };
+  for (const name of Object.keys(env)) {
+    if (/^R4_/.test(name)) { delete env[name]; continue; }
+    if (!/^(EVOLVE_|JUPITER|GMGN|MARKET_MODE)/.test(name)) continue;
+    if (CLASS_BY_NAME.has(name)) continue;
+    delete env[name];
+  }
+  for (const entry of R4_CAPTURE_ENV_CLASSIFICATION) {
+    if (entry.class === 'C') continue; // credentials preserved exactly
+    if (entry.class === 'A' && entry.sealedValue !== null) env[entry.name] = entry.sealedValue;
+  }
+  env.EVOLVE_MARKET_MODE = 'live';
+  env.EVOLVE_ALLOW_SYNTHETIC_FALLBACK = 'false';
+  env.MARKET_MODE = 'live';
+  return env;
+}
+
+/**
+ * Fail-closed revalidation of the ACTUAL child environment. Capture runs this on
+ * its own `process.env` immediately before it opens storage or the network, so a
+ * post-gate `.env` overlay or an injected variable is refused.
+ */
+export function assertSealedChildEnvironment(env = {}) {
+  const { drift, table } = classifyCaptureEnvironment(env);
+  if (drift.length) throw new Error('R4_CAPTURE_ENV_DRIFT');
+  return { table, drift };
+}
+
 /* ------------------------------------------------------------- consistency */
 
 /** Cross-check the live implementation constants against this spec. */
@@ -343,6 +454,10 @@ export function assertSpecConsistency() {
   if (R4_COHORT_SPEC.durationMinutes !== 45) fail('R4_SPEC_COHORT_DURATION_DRIFT');
   if (R4_COHORT_SPEC.captureMode !== '--r4-revisits') fail('R4_SPEC_CAPTURE_MODE_DRIFT');
   if (R4_COHORT_SPEC.maturationMode !== 'COHORT_DRAIN_ONLY') fail('R4_SPEC_MATURATION_DRIFT');
+  if (R4_COHORT_SPEC.authorizationChain !== 'P_S_A') fail('R4_SPEC_AUTHORIZATION_CHAIN_DRIFT');
+  if (R4_COHORT_SPEC.attempt1StartWindowMs !== 300_000) fail('R4_SPEC_START_WINDOW_DRIFT');
+  if (R4_COHORT_SPEC.t0Rule !== 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_PRECAPTURE_APPROVAL_COMMIT_A') fail('R4_SPEC_T0_RULE_DRIFT');
+  if (R4_COHORT_SPEC.t0TimestampSource !== 'PRECAPTURE_APPROVAL_COMMIT_A_COMMITTER_TIMESTAMP') fail('R4_SPEC_T0_SOURCE_DRIFT');
   if (PRIMARY_HORIZON_MS !== 300_000 || RESOLUTION_TOLERANCE_MS !== 60_000) fail('R4_SPEC_OUTCOME_DRIFT');
   if (BOOTSTRAP_REPLICATES !== 10_000) fail('R4_SPEC_BOOTSTRAP_DRIFT');
   if (MIN_RESOLVED_REFERENCES !== 100 || MIN_RESOLVED_MINTS !== 30 || MIN_DEFINED_REPLICATES !== 1000) fail('R4_SPEC_FLOOR_DRIFT');

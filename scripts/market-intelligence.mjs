@@ -2,11 +2,13 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { createIntelligenceConfig, createIntelligenceRecorder, createGmgnProvider, createDexProvider, createLaunchObserver, readSummary, normalizeDex, SESSION_FINALIZATION_RESERVE_BYTES } from './market-intelligence/index.mjs';
+import { createIntelligenceConfig, createIntelligenceRecorder, createGmgnProvider, createDexProvider, createLaunchObserver, readSummary, normalizeDex, createStorage, SESSION_FINALIZATION_RESERVE_BYTES } from './market-intelligence/index.mjs';
 import { createMarketConfig, createMarketFeed } from './market/index.mjs';
 import { createRevisitQueue } from './market-intelligence/revisits.mjs';
 import { planDexRevisits, dexRevisitSafetyMs } from './market-intelligence/revisit-scheduler.mjs';
 import { snapshotMissingReason } from './market-outcomes/index.mjs';
+import { assertSealedChildEnvironment } from './r4-protocol-spec.mjs';
+import { acquireRunnerCapability, createSessionReceipt, writeSessionReceipt } from './r4-capability.mjs';
 
 const COMMANDS = new Set(['doctor', 'probe', 'capture', 'summary']);
 // Only these fixed bounded codes reach the terminal. Exception text may carry
@@ -38,8 +40,23 @@ export function doctorReport({ config, gmgn, dex, launch }) {
 }
 
 export async function main(args = process.argv.slice(2)) {
-  const config = createIntelligenceConfig();
   const command = args[0] ?? 'doctor';
+  const targetedMode = command === 'capture' && args.includes('--r4-revisits');
+  // R4 enforcement (round 2, blocker B1): `R4_SEALED_RUNNER=yes` is NOT an
+  // authorization credential. A real R4 cohort session requires a live
+  // capability delivered by the verified canonical runner over the inherited
+  // descriptor, whose SHA-256 matches a persisted pre-attempt authorization.
+  // The capability is verified BEFORE the environment gate and before any
+  // storage or network access, and the fail-closed effective-environment check
+  // runs on the ACTUAL child environment.
+  let sealed = null;
+  if (targetedMode) {
+    sealed = acquireRunnerCapability();
+    if (!sealed) throw new Error('R4_SEALED_RUNNER_REQUIRED');
+    assertSealedChildEnvironment(process.env);
+  }
+  // A sealed child must NOT load a second `.env` overlay after classification.
+  const config = createIntelligenceConfig({ env: process.env, loadEnv: !targetedMode });
   if (command === 'summary') { console.log(JSON.stringify(readSummary(config.root), null, 2)); return; }
   const gmgn = createGmgnProvider({ config: config.gmgn }), dex = createDexProvider({ config: config.dex }), launch = createLaunchObserver({ config: config.launch });
   if (command === 'doctor') {
@@ -54,19 +71,15 @@ export async function main(args = process.argv.slice(2)) {
     console.log('Launch observer', launch.health().state); return;
   }
   if (command !== 'capture') throw new Error('Use probe, capture, summary or doctor');
-  const targetedMode = args.includes('--r4-revisits');
-  // R4 enforcement: a real cohort session may only be created through the sealed
-  // cohort runner (`scripts/r4-cohort-run.mjs`), which verifies the canonical
-  // tracked seal, the Git two-commit authority chain, the attempt index and the
-  // sealed capture environment. A bare `--r4-revisits` invocation is refused so
-  // an unsealed capture can never masquerade as R4 cohort evidence.
-  if (targetedMode && process.env.R4_SEALED_RUNNER !== 'yes') throw new Error('R4_SEALED_RUNNER_REQUIRED');
   const index = args.indexOf('--minutes');
   const minutes = index < 0 ? 30 : Number(args[index + 1]);
   if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) throw new Error('Minutes must be >0 and <=1440');
   // Always live: synthetic fallback is explicitly excluded from intelligence evidence.
   const feed = createMarketFeed({ config: createMarketConfig({ ...process.env, EVOLVE_MARKET_MODE: 'live', EVOLVE_ALLOW_SYNTHETIC_FALLBACK: 'false' }, { loadEnv: false }) });
-  const recorder = createIntelligenceRecorder({ config, feed, gmgn, dex, launch });
+  // A sealed attempt must use the capability-bound session id, so the produced
+  // manifest is authenticated to the pre-attempt authorization record.
+  const recorder = createIntelligenceRecorder({ config, feed, gmgn, dex, launch,
+    ...(sealed ? { storage: createStorage({ ...config, sessionId: sealed.sessionId, secrets: config.secrets }) } : {}) });
   const revisits = targetedMode ? createRevisitQueue({ onEvent: event => recorder.writeRevisitEvent(event) }) : null;
   let stop = false, reason = 'duration reached';
   const signal = () => { stop = true; reason = 'signal'; };
@@ -129,6 +142,14 @@ export async function main(args = process.argv.slice(2)) {
     if (!failed && revisitExitFailure(revisits)) { failed = revisitExitFailure(revisits); reason = 'capture failed'; }
     feed.stop(); process.off('SIGINT', signal); process.off('SIGTERM', signal);
     const manifest = recorder.finalize(reason, { revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending, failuresByCode: revisits.status().failuresByCode } : null });
+    // The capability receipt binds the authenticated manifest fingerprint back to
+    // the pre-attempt authorization. Only the runner consumes it; it never
+    // contains the raw capability.
+    if (sealed && !failed) {
+      writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint,
+        capabilityHash: sealed.capabilityHash, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
+        revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending } : null }));
+    }
     console.log(`\n${recorder.dir}\nfingerprint ${manifest.fingerprint}`);
   }
   if (failed) throw failed;

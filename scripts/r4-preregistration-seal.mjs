@@ -40,7 +40,7 @@ import { PRIMARY_ANALYSIS_SPEC_VERSION, PRIMARY_EXPOSURE_FIELD, PRIMARY_OUTCOME_
   SEED_DERIVATION } from './market-outcomes/primary-analysis.mjs';
 import { SENSITIVITY_POLICY, PRIMARY_POLICY } from './market-outcomes/sensitivity.mjs';
 import { R4_COHORT_SPEC, R4_B1_RULE, sessionParameters } from './r4-cohort-plan.mjs';
-import { R4_SPEC, R4_SPEC_DIGEST, R4_CAPTURE_ENV_CLASSIFICATION, R4_REQUIRED_BOUND_FILES, R4_TRACKED_SEAL_PATH, captureSpecDigest } from './r4-protocol-spec.mjs';
+import { R4_SPEC, R4_SPEC_DIGEST, R4_CAPTURE_ENV_CLASSIFICATION, R4_REQUIRED_BOUND_FILES, R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, captureSpecDigest } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS } from './r4-exclusions.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -57,7 +57,10 @@ export const R4_EXPECTED = Object.freeze({
   d1: Object.freeze({
     design: 'MULTI_SESSION_TARGETED', captureMode: '--r4-revisits', durationMinutes: 45,
     targetCompletedSessions: 6, maxAttempts: 8,
-    t0Rule: 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_SEAL_COMMIT',
+    t0Rule: 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_PRECAPTURE_APPROVAL_COMMIT_A',
+    authorizationChain: 'P_S_A',
+    t0TimestampSource: 'PRECAPTURE_APPROVAL_COMMIT_A_COMMITTER_TIMESTAMP',
+    attempt1StartWindowMs: 300_000,
     providers: Object.freeze({ jupiter: 'ENABLED', dexscreener: 'ENABLED', gmgn: 'DISABLED_NO_KEY', launchObserver: 'DISABLED_UNVERIFIED_TRANSPORT' }),
   }),
   d2: Object.freeze({ referenceRule: 'ALL_ELIGIBLE_REFERENCES', referenceRole: 'cohort' }),
@@ -76,8 +79,8 @@ export const R4_EXPECTED = Object.freeze({
   exclusions: R4_EXCLUSIONS,
   // Hand-written canonical specification digests. A mutated spec module changes
   // R4_SPEC_DIGEST and therefore fails these literals.
-  specDigest: '173383ba8c485998af91b4b990a9a090955e8e81167116836c7e0a754930a2a8',
-  captureSpecDigest: '39f2bf6a1da9ac45d6b6b31dbfcc9db1d61b0229f59e613c037f9fa5be30b97f',
+  specDigest: 'a01c42689ddbb6986d6a67182459338d925f019ae661aa0bc986101a1309c8c6',
+  captureSpecDigest: '897cbbb57a5d98e76d7d9190aaef6663777162a8741c05c76bc88b1e4866f08a',
 });
 
 export const R4_SEAL_AUTHORITY = Object.freeze({ developmentOnly: true, researchOnly: true, paperOnly: true, observerOnly: true,
@@ -85,10 +88,15 @@ export const R4_SEAL_AUTHORITY = Object.freeze({ developmentOnly: true, research
 
 export const R4_ARTIFACT_AUTHORITY = Object.freeze({
   canonicalSealPath: R4_TRACKED_SEAL_PATH,
-  authorityChain: 'TWO_COMMIT_P_S',
+  canonicalApprovalPath: R4_PRECAPTURE_APPROVAL_PATH,
+  authorityChain: 'P_S_A',
   protocolCommitRole: 'contains all code, preregistration, enforcement and validators; never contains the final seal',
   sealAuthorityCommitRole: 'adds only the canonical tracked seal; direct parent is the protocol commit',
-  t0TimestampSource: 'SEAL_AUTHORITY_COMMIT_S_COMMITTER_TIMESTAMP',
+  approvalCommitRole: 'pre-capture approval commit; direct parent is the seal commit; adds only the canonical approval artifact; only created after READY_TO_AUTHORIZE_COHORT',
+  t0TimestampSource: 'PRECAPTURE_APPROVAL_COMMIT_A_COMMITTER_TIMESTAMP',
+  attempt1StartWindowMs: 300_000,
+  // No redundant mutable pointer is tracked: authority is determined by the
+  // canonical Git ancestry P -> S -> A plus these fixed paths.
   historicalRuntimeSeal: '.evolve/governance/r4-preregistration-seal-*.json (historical/runtime evidence only; NOT authority; Git-ignored)',
 });
 
@@ -102,7 +110,9 @@ export function readProtocol() {
   return {
     d1: { design: 'MULTI_SESSION_TARGETED', captureMode: R4_COHORT_SPEC.captureMode, durationMinutes: R4_COHORT_SPEC.durationMinutes,
       targetCompletedSessions: R4_COHORT_SPEC.targetCompletedSessions, maxAttempts: R4_COHORT_SPEC.maxAttempts,
-      t0Rule: R4_COHORT_SPEC.t0Rule, providers: { ...R4_COHORT_SPEC.providers } },
+      t0Rule: R4_COHORT_SPEC.t0Rule, authorizationChain: R4_COHORT_SPEC.authorizationChain,
+      t0TimestampSource: R4_COHORT_SPEC.t0TimestampSource, attempt1StartWindowMs: R4_COHORT_SPEC.attempt1StartWindowMs,
+      providers: { ...R4_COHORT_SPEC.providers } },
     d2: { referenceRule: REFERENCE_RULE, referenceRole: R4_COHORT_SPEC.referenceRole },
     d3: { analysis: 'CONTINUOUS_RANK_ASSOCIATION', exposureField: PRIMARY_EXPOSURE_FIELD, outcomeField: PRIMARY_OUTCOME_FIELD,
       estimand: PRIMARY_ESTIMAND, clusterKey: CLUSTER_KEY, bootstrapReplicates: BOOTSTRAP_REPLICATES, ciLevel: CI_LEVEL,
@@ -150,8 +160,8 @@ export function sealContent({ baseSha, baseTree, sealedAt, boundFiles, protocol,
       phase5jScopeEvolution: 'The passive fixed-duration cohort recommended by Phase 5J was replaced by an opt-in targeted revisit cohort because the methods-only passive shakedown produced zero otherwise-valid post-target two-source future candidates.',
       staleSchedulerWording: 'The shakedown completion wording naming P3-C as the only remaining blocker is scoped to the live revisit scheduler and is stale; it is not global R4 authority.',
       directoryMtime: 'AUTHORITY_NOT_FOUND: no authoritative record of a .evolve directory-mtime observation exists; date, scope, cause and byte-change status are unknown; no scientific-evidence impact is asserted and the uncertainty is carried forward.',
-      storageHeadroom: 'A 45-minute targeted session uses roughly 77-88% of the default 512 MiB cap at observed methods-only volume.',
-      enforcement: 'Pre-capture enforcement controls only: canonical tracked seal, two-commit P/S authority chain, sealed capture mode, hard exclusion enforcement, authenticated session attestation, canonical reference-set enforcement, authenticated exposure provenance, locked primary-analysis interface and outcome/cohort/reference binding. No scientific rule was reopened.',
+      storageHeadroom: 'Storage provisioning (round-2 disclosure correction): the IMPLEMENTATION default remains 512 MiB (SESSION_CAPACITY_MIB.default); the R4 SEALED OPERATIONAL session cap is 1024 MiB; the estimated high-water volume for a 45-minute targeted window plus the bounded drain is ~561 MiB; the sealed-cap headroom is therefore ~463 MiB. The storage bound remains session-fatal (a session that reaches it finalizes incomplete and is governed by the fixed replacement rule). This provisioning choice was fixed before any cohort attempt and alters no science.',
+      enforcement: 'Pre-capture enforcement controls only: canonical tracked seal, P/S/A authority chain, sealed capture mode, runner capability over an inherited descriptor, effective-environment classification, mandatory origin/main proof, live worktree integrity, hard exclusion enforcement, authenticated session attestation, canonical cohort membership, canonical reference-set enforcement, evidence-reloaded exposure provenance, locked primary-analysis interface, outcome/cohort/reference binding, canonical analysis orchestrator, approval-commit schema/validator and the [T0, T0+5min) attempt-1 start window. No scientific rule was reopened.',
     },
   };
 }

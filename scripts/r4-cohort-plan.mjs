@@ -20,8 +20,15 @@ export const R4_COHORT_SPEC = Object.freeze({
   drainBoundMs: 360_000,
   horizonMs: 300_000,
   toleranceMs: 60_000,
-  t0Rule: 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_SEAL_COMMIT',
+  // PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT (round 2). Real cohort T0 is
+  // derived from the pre-capture APPROVAL commit A, not from the seal commit S.
+  // The scientific values above are unchanged; only the governance start anchor
+  // became executable so no already-expired or hand-picked market window exists.
+  t0Rule: 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_PRECAPTURE_APPROVAL_COMMIT_A',
+  authorizationChain: 'P_S_A',
+  t0TimestampSource: 'PRECAPTURE_APPROVAL_COMMIT_A_COMMITTER_TIMESTAMP',
   t0MinimumDelayMs: 1_800_000,
+  attempt1StartWindowMs: 300_000,
   sessionParametersImmutable: true,
   discretionaryAttemptsPermitted: false,
   outcomeDependentExtensionPermitted: false,
@@ -31,10 +38,15 @@ export const R4_COHORT_SPEC = Object.freeze({
 export const R4_B1_RULE = 'E1_REFERENCE_LEVEL_MISSINGNESS';
 export const R4_PLAN_VERSION = 'R4-COHORT-V1';
 
-/** First whole UTC hour at least 30 minutes after the seal commit. Mechanical only. */
-export function mechanicalT0(sealCommittedAtMs) {
-  if (!Number.isSafeInteger(sealCommittedAtMs) || sealCommittedAtMs < 0) throw new Error('T0_INPUT_INVALID');
-  return Math.ceil((sealCommittedAtMs + R4_COHORT_SPEC.t0MinimumDelayMs) / 3_600_000) * 3_600_000;
+/**
+ * First whole UTC hour at least 30 minutes after an authority commit timestamp.
+ * Mechanical only. Real cohort execution feeds it the committer timestamp of the
+ * pre-capture approval commit A; synthetic governance fixtures may feed any
+ * timestamp. It never consults market state, prices or outcomes.
+ */
+export function mechanicalT0(authorityCommittedAtMs) {
+  if (!Number.isSafeInteger(authorityCommittedAtMs) || authorityCommittedAtMs < 0) throw new Error('T0_INPUT_INVALID');
+  return Math.ceil((authorityCommittedAtMs + R4_COHORT_SPEC.t0MinimumDelayMs) / 3_600_000) * 3_600_000;
 }
 
 /** Every attempt uses exactly these frozen session parameters — no variation. */
@@ -43,16 +55,34 @@ export function sessionParameters() {
     command: R4_COHORT_SPEC.captureCommand, providers: R4_COHORT_SPEC.providers, referenceRule: R4_COHORT_SPEC.referenceRule });
 }
 
-export function buildCohortPlan({ sealFingerprint, preregistrationDigest, sealCommittedAt }) {
+/**
+ * SYNTHETIC helper: build a plan from an explicit anchor timestamp. Canonical
+ * real-R4 execution must use `buildAuthorizedCohortPlan`, which derives T0 only
+ * from the verified pre-capture approval commit A.
+ */
+export function buildCohortPlan({ sealFingerprint, preregistrationDigest, sealCommittedAt, approvalCommit = null, t0 = null }) {
   if (typeof sealFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(sealFingerprint)) throw new Error('PLAN_SEAL_INVALID');
   if (typeof preregistrationDigest !== 'string' || !/^[0-9a-f]{64}$/.test(preregistrationDigest)) throw new Error('PLAN_PREREGISTRATION_INVALID');
-  const t0 = mechanicalT0(sealCommittedAt);
+  const resolvedT0 = t0 ?? mechanicalT0(sealCommittedAt);
   return {
     schemaVersion: 1, recordType: 'r4_cohort_plan', planVersion: R4_PLAN_VERSION, b1Rule: R4_B1_RULE,
     sealFingerprint, preregistrationDigest, spec: R4_COHORT_SPEC,
-    t0, t0Iso: new Date(t0).toISOString(), sealCommittedAt,
+    t0: resolvedT0, t0Iso: new Date(resolvedT0).toISOString(), sealCommittedAt: sealCommittedAt ?? null,
+    authorizationChain: R4_COHORT_SPEC.authorizationChain, approvalCommit: approvalCommit ?? null,
     attempts: Array.from({ length: R4_COHORT_SPEC.maxAttempts }, (_, i) => ({ index: i + 1, status: 'PLANNED', sessionId: null, failureCode: null, replacementOf: null })),
   };
+}
+
+/**
+ * CANONICAL plan builder. T0 is taken ONLY from the verified approval authority
+ * (the committer timestamp of A). No caller-supplied time is accepted, and the
+ * seal's own commit time is NOT used for real execution.
+ */
+export function buildAuthorizedCohortPlan({ seal, approvalAuthority }) {
+  if (!seal || typeof seal.fingerprint !== 'string') throw new Error('PLAN_SEAL_INVALID');
+  if (!approvalAuthority || !Number.isSafeInteger(approvalAuthority.t0)) throw new Error('PLAN_APPROVAL_AUTHORITY_INVALID');
+  return buildCohortPlan({ sealFingerprint: seal.fingerprint, preregistrationDigest: seal.preregistration.sha256,
+    t0: approvalAuthority.t0, approvalCommit: approvalAuthority.approvalCommit });
 }
 
 /**

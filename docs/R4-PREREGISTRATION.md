@@ -12,11 +12,54 @@ unchanged as historical/runtime evidence and is **not** authority; the canonical
 schema deliberately rejects it. See “Enforcement controls” below.
 
 This document authorizes **no capture, no cohort start and no outcome
-generation**. Cohort start requires the canonical tracked seal to be committed
-and pushed, and then the mechanical T0 rule of §D1 (see the two-commit
-authority chain below). Outcome generation requires the cohort to be closed,
-maturation to be complete, source integrity to verify and a separate
-authorization.
+generation**. Cohort start requires the canonical tracked seal `S` to be
+committed and pushed, and then a separate, independently reviewed **pre-capture
+approval commit `A`** to be committed and pushed; the mechanical T0 rule of §D1
+then derives T0 from `A` (see the `P -> S -> A` authority chain below). Outcome
+generation requires the cohort to be closed, maturation to be complete, source
+integrity to verify and a separate authorization.
+
+## PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT
+
+**Narrowly scoped, prospective, and made before any cohort attempt.** This
+amendment was discovered during **independent pre-capture review round 2**. At
+the time it was written **no cohort had started, no cohort attempt existed, no
+real outcome existed and no returns had been inspected**, and **no scientific
+measurement or analysis rule was changed**: every value in §D1–§D4, §B1,
+maturation, Policy A/B, horizon, tolerance, freshness, alignment, Kendall tau-b,
+bootstrap count, sample floors and missingness semantics is untouched, and the
+frozen exclusion set is unchanged.
+
+The amendment makes an already-intended governance property executable: the
+original preregistration said capture may begin only after the seal is committed
+and pushed and T0 is the first whole UTC hour at least 30 minutes after that
+commit. In practice that left the start of the cohort **open-ended late by
+omission** — a missed or already-expired T0 had no enforcement, which in
+effect permitted an unlimited late market-timed start. That is exactly the
+hand-picking the original no-market-hand-picking intent excluded.
+
+The fix is a third authority commit (`P -> S -> A`), described in detail under
+“Enforcement controls” below:
+
+- `A` is the **pre-capture approval commit**; it is created **only after a later
+  independent review returns `READY_TO_AUTHORIZE_COHORT`**.
+- `A` has `S` as its **direct parent**, contains **no source-code change** and
+  **no scientific-protocol change**, and adds **only** the canonical tracked
+  approval artifact. `A` binds `S`'s SHA, the seal fingerprint, the independent
+  reviewer/model, the review verdict, the canonical review-report digest and the
+  approval status, and must be pushed to authoritative `origin/main`.
+- **Real cohort T0 is the first whole UTC hour at least 30 minutes after `A`'s
+  Git committer timestamp.** T0 is no longer derived from `S` for real
+  execution.
+- **Attempt 1 may start only inside `[T0, T0 + 5 minutes)`.** If that window is
+  missed, attempt 1 **must not start late**, the cohort authorization is
+  considered missed, **no automatic re-anchoring is permitted**, and a **new
+  independent approval/authorization commit is required** before another T0 can
+  exist. No new start time is silently chosen.
+
+This wording did **not** exist in the original seal and is carried transparently
+as a labelled amendment, not back-dated. The scientific core remains frozen. No
+approval commit `A` has been created by this document.
 
 The primary outcome primitive was frozen earlier by
 `docs/R4-MARKET-OUTCOME-FOUNDATION.md`. The Policy A rule was frozen earlier by
@@ -51,11 +94,13 @@ sensitivity.
 - Providers: **Jupiter + DexScreener enabled**; GMGN remains `DISABLED_NO_KEY`;
   the launch observer remains `DISABLED_UNVERIFIED_TRANSPORT`.
 - No outcome-dependent extension; no discretionary extra session.
-- Start trigger: capture may begin only after this complete preregistration and
-  its independent pre-capture seal are committed and pushed. **T0 = the first
-  whole UTC hour at least 30 minutes after that seal commit.** The rule is
-  mechanical (`mechanicalT0`) and T0 may not be moved because of market
-  conditions.
+- Start trigger (as amended, see “Pre-capture governance enforcement amendment”
+  below): capture may begin only after this complete preregistration, its
+  independent pre-capture seal and the pre-capture approval commit are committed
+  and pushed. **T0 = the first whole UTC hour at least 30 minutes after the
+  approval commit A.** The rule is mechanical (`mechanicalT0`/`approvalT0`) and
+  T0 may not be moved because of market conditions, recomputed, or rolled
+  forward. Attempt 1 may start only inside `[T0, T0 + 5 minutes)`.
 - Session eligibility requires `status = complete`, `reason = duration reached`,
   `storage.sessionBoundReached = false`, a completed 45-minute reference window,
   a completed bounded drain, a normally finalized manifest, all scheduled revisit
@@ -260,7 +305,7 @@ requires `createdAt ≥ referenceObservedAt + 360,000 ms`.
 | Contributor freshness budget | 60,000 ms (Jupiter, DexScreener) |
 | Alignment | 15,000 ms |
 | Dex revisit safe start | `target + 60,000 − (timeout + spacing + 5,000)` = `target + 45,800 ms` at defaults |
-| Session storage cap | default 512 MiB, whole-MiB clamp 64–2048, 16 KiB finalization reserve |
+| Session storage cap | implementation default 512 MiB; R4 sealed operational 1024 MiB; whole-MiB clamp 64–2048; 16 KiB finalization reserve |
 | Dex request budget | 6 per 30 s provider cycle; targeted work precedes passive work |
 
 ## Excluded methods evidence
@@ -319,11 +364,16 @@ the default to 512 MiB.
   evidence digest; however this is a general property of the integrity design and
   is **not** a verified finding about this specific observation. This note records
   the uncertainty only. No scientific-evidence impact is asserted.
-- **Storage headroom.** At observed methods-only volume (~9–11 MB/min in targeted
-  mode, GMGN disabled) a 45-minute session uses roughly 77–88 % of the default
-  512 MiB cap. Provisioning the cap higher (64–2048 MiB) is a configuration-only
-  change and alters no science; a session that does reach the bound finalizes
-  `incomplete` and is governed by §D4.
+- **Storage headroom (round-2 disclosure correction).** The **implementation
+  default** remains **512 MiB** (`SESSION_CAPACITY_MIB.default`). The **R4 sealed
+  operational session cap** is **1024 MiB**. At observed methods-only volume
+  (~11 MB/min high-water in targeted mode, GMGN disabled) a 45-minute session
+  plus the bounded drain is estimated at **~561 MiB**, leaving **~463 MiB of
+  sealed-cap headroom**. The storage bound remains **session-fatal**: a session
+  that reaches it finalizes `incomplete` and is governed by §D4. This
+  provisioning choice was fixed **before any cohort attempt** and alters no
+  science; the earlier wording that described 77–88 % of the *default* 512 MiB
+  cap as the active headroom was stale and has been corrected.
 
 ## Enforcement controls (implementation only)
 
@@ -333,31 +383,76 @@ already-frozen protocol**. It introduces no new scientific decision: no value in
 Kendall tau-b, bootstrap count, sample floors or missingness semantics is
 changed, and no threshold is moved.
 
-- **Two-commit authority chain.** `PROTOCOL COMMIT P` contains all code, this
+- **`P -> S -> A` authority chain.** `PROTOCOL COMMIT P` contains all code, this
   preregistration, the enforcement modules and the validators, and does **not**
   contain the final seal. `SEAL COMMIT S` adds only the canonical tracked seal
-  (plus a deterministic pointer) and has `P` as its direct parent. The seal
-  content binds `P`; it cannot contain `S`'s own SHA. Runtime authority is the
-  pair `(protocol commit P, seal authority commit S)`.
+  and has `P` as its direct parent; the seal content binds `P`, so it cannot
+  contain `S`'s own SHA. `APPROVAL COMMIT A` adds only the canonical tracked
+  approval artifact and has `S` as its direct parent. Runtime authority is the
+  chain `(P, S, A)`; real cohort T0 derives from `A`.
 - **Canonical tracked seal.** Authority may never depend on a Git-ignored file.
   The canonical seal lives at `governance/r4/r4-preregistration-seal.json`; the
   older `.evolve/governance/` artifact remains historical evidence only.
-- **T0 source.** T0 is the first whole UTC hour at least 30 minutes after the
-  **committer timestamp of the seal authority commit S**. The runner must also
-  prove `S` exists on `origin/main` before computing T0. This is the §D1 rule
-  applied to the committed seal; it does not move T0 for market conditions.
-- **Sealed cohort runner.** `scripts/r4-cohort-run.mjs` is the only path to a
-  real R4 cohort session. Its inputs are limited to the canonical tracked seal
-  path and an attempt index; every scientific capture parameter is derived from
-  the frozen specification and the seal. A bare `--r4-revisits` capture is
-  refused (`R4_SEALED_RUNNER_REQUIRED`), so an unsealed capture cannot
-  masquerade as R4 cohort evidence.
-- **Environment drift fails closed.** Every capture environment variable is
-  classified scientific (A), operational (B) or credential (C). A present
-  category-A variable that differs from the sealed value, or an unclassified
-  capture-shaped variable, fails **before capture**; it is never silently
-  overridden. Credentials may exist, but provider enablement and every
-  capture-relevant behaviour stay exactly sealed.
+- **T0 source (amended).** Real cohort T0 is the first whole UTC hour at least
+  30 minutes after the **committer timestamp of the pre-capture approval commit
+  A** (`approvalT0`). `A`'s direct parent is `S`, and both `S` and `A` must be
+  proven present on `origin/main` before T0 is computed. This is the §D1 rule
+  applied to the committed approval artifact; it does not move T0 for market
+  conditions.
+- **Approval commit A and the 5-minute attempt-1 window.** A real attempt is
+  impossible without a tracked approval artifact at
+  `governance/r4/r4-precapture-approval.json` (`recordType
+  r4_precapture_approval`, `status APPROVED`, verdict
+  `READY_TO_AUTHORIZE_COHORT`, bound to the seal fingerprint and `S`, with a
+  reviewer/model and a canonical review-report digest) committed by `A`, whose
+  direct parent is `S`, whose diff against `S` contains only the approved
+  governance path, which exists on `origin/main`, and which equals `HEAD` at
+  execution. Attempt 1 may start only inside `[T0, T0+5 min)`. Before T0 and at
+  or after `T0+5 min` the runner refuses; a missed window is **not**
+  re-anchored and requires a new independently approved authorization commit.
+- **No redundant authority pointer.** Authority is determined by the canonical
+  Git ancestry `P -> S -> A` plus the two fixed tracked paths (seal and
+  approval). No mutable `governance/r4/AUTHORITY.json` pointer exists or is
+  required; the earlier wording that named one was removed rather than
+  materialised.
+- **Sealed cohort runner capability.** `scripts/r4-cohort-run.mjs` is the only
+  path to a real R4 cohort session. `R4_SEALED_RUNNER=yes` is **not** an
+  authorization credential and cannot reach capture. Immediately before a real
+  attempt the verified runner draws a cryptographically random 256-bit
+  capability, persists a pre-attempt authorization record containing **only**
+  `SHA-256(capability)` (plus the seal fingerprint, `P`, `S`, `A`, attempt index,
+  session id, capture-spec digest and T0), and hands the **raw** capability to
+  the capture child over a dedicated inherited descriptor (fd 3) — never through
+  the environment, argv, the repository or a log. Capture verifies
+  `SHA-256(raw capability)` against the persisted hash before it opens an R4
+  session, uses the capability-bound session id, and writes a receipt binding the
+  authenticated manifest fingerprint back to the authorization. Finalization
+  requires the same capability proof. There is no exported interface that mints
+  a valid attestation from public fields alone. Threat model: this prevents
+  ordinary CLI/API/config bypass and accidental or manual masquerading inside the
+  repository's execution model; it is not a claim to defeat a malicious local
+  user who can rewrite code, attach a debugger or read another process's memory.
+- **Environment drift fails closed, on the effective environment.** The runner
+  loads `.env.local` / `.env` with the **same loader capture would use**, obtains
+  the full effective environment, classifies it and fails on any category-A
+  mismatch or any unclassified `EVOLVE_*` / `JUPITER*` / `GMGN*` variable, then
+  hands capture a sanitized child environment. Capture must not load a second
+  `.env` overlay after classification and re-runs the fail-closed check on its
+  actual environment before opening storage or the network. Credentials stay
+  category C and may exist, but provider enablement and every capture-relevant
+  behaviour stay exactly sealed.
+- **Complete runtime dependency closure.** The canonical bound-file set is the
+  deterministic static/dynamic ESM import closure of the R4 runtime entrypoints
+  plus the validators that gate the frozen protocol. A deterministic validator
+  (`scripts/validate-r4-import-closure.mjs`) asserts `closure ⊆ bound set`, so a
+  new runtime module cannot appear unbound.
+- **Live worktree integrity.** Because the process executes the working tree,
+  authority verification also requires `HEAD` to equal the required authority
+  commit and every bound runtime dependency to be byte-identical to its authority
+  version. A tracked working-tree change to a runtime dependency fails. `S` must
+  differ from `P` only by the canonical seal artifact, and `A` must differ from
+  `S` only by the approval artifact. This is repository integrity enforcement; it
+  does not claim to defeat arbitrary malicious code replacement.
 - **Real-R4 session attestation.** A real cohort session must carry a
   seal-bound attestation (`scripts/r4-attestation.mjs`) tying it to the seal
   fingerprint, protocol commit, seal authority commit, attempt index, role
@@ -376,23 +471,47 @@ changed, and no threshold is moved.
   attempt indexes are exactly `1..8` and attempt 9 is always illegal. The sealed
   governor additionally requires a seal-bound attestation for every completed
   attempt.
+- **Canonical cohort membership is an evaluator OUTPUT.** Membership is derived
+  mechanically from the attempt records (attempt order, completion eligibility,
+  target 6, budget 8) plus each attempt's verified seal-bound attestation. A
+  caller-authored `plan.membership` is never an authority input, and the
+  verified membership is returned as `canonicalMembership` for all downstream
+  consumers. A plan whose T0 does not match the authority-derived value is
+  rejected (`R4_PLAN_T0_MISMATCH`); `planSealedCohort` accepts no caller time at
+  all.
 - **Canonical reference-set enforcement.** The primary path builds
-  `ALL_ELIGIBLE_REFERENCES` itself over the authenticated cohort membership and
-  binds a deterministic reference-set digest. A caller-supplied thinned list
-  fails (`R4_REFERENCE_SET_MISMATCH`).
+  `ALL_ELIGIBLE_REFERENCES` itself over the verified canonical membership after
+  reloading each member from authenticated evidence on disk and verifying its
+  attestation. A caller-supplied thinned or reordered list fails
+  (`R4_REFERENCE_SET_MISMATCH`); an unattested, excluded or non-member source
+  fails; arbitrary in-memory session objects never reach the canonical path.
 - **Authenticated exposure provenance.** `crossSourcePriceRangeBps` is derived
   from the authenticated reference snapshot’s frozen feature and contributor
-  digest; a caller-supplied exposure value never reaches the real-R4 path.
+  digest. The real path reloads the members from disk and recomputes every row,
+  so caller tampering with exposure, mint or reference timestamp cannot pass;
+  the low-level helper additionally accepts only evidence-loaded sessions and
+  the authenticated snapshot evidence is frozen.
 - **Locked primary-analysis interface.** The real-R4 analysis entrypoint accepts
   no override for horizon, tolerance, bootstrap count, cluster key, exposure
-  field, outcome field, estimator, CI method, sample floors or seed scheme; all
-  are derived from the frozen specification, and no environment variable can
-  change them.
+  field, outcome field, estimator, CI method, sample floors or seed scheme, and
+  it **rejects unknown option keys** rather than silently ignoring them; all
+  parameters are derived from the frozen specification, and no environment
+  variable can change them.
+- **Single canonical analysis orchestrator.** `runCanonicalR4Analysis` is the
+  only supported real path: it verifies the authority chain, the canonical
+  membership, the reloaded authenticated sources, the canonical reference set,
+  the outcome-run binding, the exact `sourceSessionIds`, the certified exposures
+  and then the locked primary analysis, binding the result to the seal, cohort,
+  reference and outcome identities. `verifyOutcomeRunBinding` cannot be
+  bypassed before the primary analysis.
 - **Outcome/cohort/reference binding.** A canonical outcome run records the seal
-  fingerprint, protocol commit, seal authority commit, cohort-membership digest,
-  canonical reference-set digest, exact source session ids, Policy A and the
-  frozen outcome constants; a later analysis rejects a run whose bindings do not
-  match exactly.
+  fingerprint, protocol commit, seal authority commit, approval commit,
+  cohort-membership digest, canonical reference-set digest, exact source session
+  ids, Policy A and the frozen outcome constants; a later analysis rejects a run
+  whose bindings do not match exactly. The expected source session ids are
+  derived **independently** from the canonical references and membership, so an
+  added, omitted, reordered, excluded or non-member id fails
+  (`R4_BINDING_SESSION_IDS_MISMATCH`).
 - **Storage preflight.** Before a real attempt starts, the configured cap and a
   worst-case estimate for the sealed 45-minute window plus the bounded drain are
   reported with headroom. Duration is never altered. If the exact sealed

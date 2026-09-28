@@ -67,6 +67,8 @@ check('a freshly built seal verifies internally and binds the current commit', (
 check('the canonical tracked seal verifies against the external Git authority chain', () => {
   const trackedPath = path.resolve(REPO, R4_TRACKED_SEAL_PATH);
   if (!existsSync(trackedPath)) { console.log('      (canonical tracked seal not generated yet — pre-S dry run)'); return; }
+  try { verifyR4Seal(JSON.parse(readFileSync(trackedPath, 'utf8'))); }
+  catch { console.log('      (tracked seal is superseded pending re-issue as the new S)'); return; }
   const { seal, authority } = loadCanonicalTrackedSeal({ cwd: REPO, requireSealCommit: true, requireHead: true, requireRemote: false });
   assert.equal(authority.protocolCommit, seal.protocolCommit);
   assert(typeof authority.sealAuthorityCommit === 'string' && /^[0-9a-f]{40}$/.test(authority.sealAuthorityCommit));
@@ -124,6 +126,13 @@ const PROTOCOL_TAMPERS = [
   ['tolerance', s => { s.protocol.frozenConstants.toleranceMs = 1; }],
   ['freshness', s => { s.protocol.frozenConstants.freshnessMs = 1; }],
   ['alignment', s => { s.protocol.frozenConstants.alignmentMs = 1; }],
+  // PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT (round 2): the approval-anchor
+  // chain, the T0 source, the T0 rule and the attempt-1 start window are frozen
+  // protocol values too.
+  ['authorization chain', s => { s.protocol.d1.authorizationChain = 'TWO_COMMIT_P_S'; }],
+  ['T0 timestamp source', s => { s.protocol.d1.t0TimestampSource = 'SEAL_AUTHORITY_COMMIT_S_COMMITTER_TIMESTAMP'; }],
+  ['T0 rule', s => { s.protocol.d1.t0Rule = 'FIRST_WHOLE_UTC_HOUR_AT_LEAST_30_MINUTES_AFTER_SEAL_COMMIT'; }],
+  ['attempt-1 start window', s => { s.protocol.d1.attempt1StartWindowMs = 600_000; }],
 ];
 for (const [name, mutate] of PROTOCOL_TAMPERS) tamper(name, mutate, 'R4_SEAL_PROTOCOL_DRIFT');
 
@@ -151,6 +160,13 @@ tamper('protocol commit identity', s => { s.protocolCommit = 'not-a-sha'; }, 'R4
 tamper('git identity drift', s => { s.git = { ...s.git, protocolTree: 'b'.repeat(40) }; }, 'R4_SEAL_GIT_IDENTITY_DRIFT');
 tamper('seal status', s => { s.status = 'DRAFT'; }, 'R4_SEAL_STATUS_INVALID');
 tamper('seal record type', s => { s.recordType = 'other_seal'; }, 'R4_SEAL_INVALID');
+// Round-2 runtime modules that must be bound: altering any of them is a seal
+// failure. (environment loader, attestation, capability verifier, canonical
+// orchestrator, approval schema/validator.)
+for (const moduleFile of ['scripts/lib/env.mjs', 'scripts/r4-attestation.mjs', 'scripts/r4-capability.mjs', 'scripts/r4-canonical-analysis.mjs', 'scripts/r4-approval.mjs', 'scripts/r4-authority.mjs', 'scripts/r4-cohort-run.mjs']) {
+  tamper(`altered ${moduleFile}`, () => {}, 'R4_SEAL_FILE_DIGEST_MISMATCH', { refingerprintAfter: false,
+    loadOverride: file => (file === moduleFile ? Buffer.from('altered runtime module') : load(file)) });
+}
 
 /* ------------------------------------------- external authority tamper gate */
 

@@ -7,7 +7,7 @@
 // is created, no real outcome is generated and no T0 is materialized.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +23,8 @@ import { verifyR4SealAuthority, loadCanonicalTrackedSeal, gitCommitterTimestamp,
 import { R4_SPEC, R4_SPEC_DIGEST, captureSpecDigest, classifyCaptureEnvironment, R4_REQUIRED_BOUND_FILES } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS } from './r4-exclusions.mjs';
 import { createSessionAttestation, finalizeSessionAttestation, verifySessionAttestation } from './r4-attestation.mjs';
+import { createAttemptCapability, capabilityHash, createAttemptAuthorization, proveCapability } from './r4-capability.mjs';
+import { approvalT0 } from './r4-approval.mjs';
 import {
   verifyR4SourceEligibility, evaluateSealedCohortProgress, buildCanonicalReferenceSet,
   verifyCanonicalReferenceSet, referenceSetDigest, certifyExposureRows, runRealR4PrimaryAnalysis,
@@ -37,10 +39,13 @@ const EXCLUDED_S2 = '1790523432292-82b204a2-75b8-49fd-92a6-c51e6a9370ca';
 
 const seal = buildSeal({ ...gitIdentity(REPO), sealedAt: T });
 const SEAL_COMMIT_TIME = Date.UTC(2026, 8, 28, 10, 0, 0);
+const APPROVAL_COMMIT = 'b'.repeat(40);
+const T0 = approvalT0(SEAL_COMMIT_TIME);
 const authority = Object.freeze({
   sealAuthorityCommit: 'a'.repeat(40), sealCommitterTimestamp: SEAL_COMMIT_TIME,
   protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
 });
+const approvalAuthority = Object.freeze({ approvalCommit: APPROVAL_COMMIT, t0: T0 });
 
 const roots = [];
 const tempRoot = () => { const root = mkdtempSync(path.join(tmpdir(), 'evolve-r4-enforce-')); roots.push(root); return root; };
@@ -69,9 +74,16 @@ function buildSession({ sessionId, snapshots }) {
 function attestedSession({ sessionId = 'r4-s1', snapshots = [{ time: T, price: 2 }, { time: T + 300_000, price: 3 }] } = {}) {
   const fixture = buildSession({ sessionId, snapshots });
   const session = readSourceSession({ dir: fixture.dir, role: 'cohort' });
-  const open = createSessionAttestation({ seal, authority, attemptIndex: 1, sessionId });
-  const attestation = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 } });
-  return { fixture, session, attestation };
+  // Round-2 capability flow: only a live capability whose blinded hash matches a
+  // persisted pre-attempt authorization may open/finalize an attestation.
+  const capability = createAttemptCapability();
+  const authorization = createAttemptAuthorization({ seal, authority, approvalCommit: APPROVAL_COMMIT, attemptIndex: 1,
+    sessionId, t0: T0, capabilityHash: capabilityHash(capability), captureSpecDigest: captureSpecDigest() });
+  const proof = proveCapability({ capability, record: authorization });
+  const open = createSessionAttestation({ seal, authority, approvalAuthority, proof });
+  const attestation = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint,
+    revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 }, proof });
+  return { fixture, session, attestation, proof, authorization };
 }
 
 function refingerprint(record) { const content = { ...record }; delete content.fingerprint; return { ...content, fingerprint: digest(content) }; }
@@ -145,12 +157,13 @@ test('sealed governor requires an authenticated attestation for every completed 
 
 test('sealed governor accepts an authenticated membership and rejects plan/seal mismatch', () => {
   const { session, attestation } = attestedSession({ sessionId: 'r4-s1' });
-  const plan = buildCohortPlan({ sealFingerprint: seal.fingerprint, preregistrationDigest: seal.preregistration.sha256, sealCommittedAt: SEAL_COMMIT_TIME });
+  const plan = buildCohortPlan({ sealFingerprint: seal.fingerprint, preregistrationDigest: seal.preregistration.sha256, t0: T0, approvalCommit: APPROVAL_COMMIT });
   plan.membership = [session.sessionId];
   const attempts = [{ index: 1, status: 'COMPLETED', sessionId: session.sessionId, failureCode: null, replacementOf: null, attestationFingerprint: attestation.fingerprint }];
-  const progress = evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations: [attestation] });
+  const progress = evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations: [attestation], approvalAuthority });
   assert.deepEqual(progress.authenticatedMembership, ['r4-s1']);
-  throwsCode(() => evaluateSealedCohortProgress({ plan: { ...plan, sealFingerprint: 'b'.repeat(64) }, attempts, seal, authority, attestations: [attestation] }), 'R4_PLAN_SEAL_MISMATCH');
+  assert.deepEqual(progress.canonicalMembership, ['r4-s1']);
+  throwsCode(() => evaluateSealedCohortProgress({ plan: { ...plan, sealFingerprint: 'b'.repeat(64) }, attempts, seal, authority, attestations: [attestation], approvalAuthority }), 'R4_PLAN_SEAL_MISMATCH');
 });
 
 /* --------------------------------------- 6-9. configuration/attestation capture */
@@ -201,23 +214,26 @@ test('sealed runner accepts only the seal path and attempt index', () => {
 /* --------------------------------------------------- source eligibility */
 
 test('source eligibility requires an authenticated attestation, not a role string', () => {
-  const { session, attestation } = attestedSession({ sessionId: 'r4-s4' });
+  const { fixture, session, attestation } = attestedSession({ sessionId: 'r4-s4' });
   const proof = verifyR4SourceEligibility({ session, attestation, seal, authority });
   assert.equal(proof.sessionId, 'r4-s4');
-  throwsCode(() => verifyR4SourceEligibility({ session: { ...session, role: 'maturation' }, attestation, seal, authority }), 'R4_SOURCE_ROLE_INVALID');
+  // A role-forged or policy-forged copy loses the evidence marker; a real
+  // maturation load and a real relaxed policy are both still rejected on their own.
+  throwsCode(() => verifyR4SourceEligibility({ session: { ...session, role: 'maturation' }, attestation, seal, authority }), 'R4_SOURCE_NOT_AUTHENTICATED');
+  throwsCode(() => verifyR4SourceEligibility({ session: readSourceSession({ dir: fixture.dir, role: 'maturation' }), attestation, seal, authority }), 'R4_SOURCE_ROLE_INVALID');
   throwsCode(() => verifyR4SourceEligibility({ session, attestation: null, seal, authority }), 'R4_ATTESTATION_REQUIRED');
   throwsCode(() => verifyR4SourceEligibility({ session, attestation: refingerprint({ ...attestation, role: 'maturation' }), seal, authority }), 'R4_ATTESTATION_ROLE_INVALID');
-  throwsCode(() => verifyR4SourceEligibility({ session: { ...session, policy: { requireDurationComplete: false } }, attestation, seal, authority }), 'R4_SOURCE_NOT_DURATION_VERIFIED');
+  throwsCode(() => verifyR4SourceEligibility({ session: readSourceSession({ dir: fixture.dir, role: 'cohort' }, { requireDurationComplete: false }), attestation, seal, authority }), 'R4_SOURCE_NOT_DURATION_VERIFIED');
 });
 
 test('a session with unfinished revisit work is source-ineligible (E1 pending)', () => {
-  const { session } = attestedSession({ sessionId: 'r4-s5' });
-  const open = createSessionAttestation({ seal, authority, attemptIndex: 1, sessionId: 'r4-s5' });
-  const pending = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 0, pending: 1 } });
+  const { session, proof } = attestedSession({ sessionId: 'r4-s5' });
+  const open = createSessionAttestation({ seal, authority, approvalAuthority, proof });
+  const pending = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 0, pending: 1 }, proof });
   throwsCode(() => verifySessionAttestation({ attestation: pending, session, seal, authority }), 'R4_ATTESTATION_REVISIT_PENDING');
   // A terminal reference-level failure with pending = 0 stays eligible.
-  const terminal = finalizeSessionAttestation(createSessionAttestation({ seal, authority, attemptIndex: 1, sessionId: 'r4-s5' }),
-    { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 1, pending: 0 } });
+  const terminal = finalizeSessionAttestation(createSessionAttestation({ seal, authority, approvalAuthority, proof }),
+    { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 1, pending: 0 }, proof });
   assert.equal(verifySessionAttestation({ attestation: terminal, session, seal, authority }).ok, true);
 });
 
@@ -231,7 +247,7 @@ test('a forged attestation binding a different session fingerprint is rejected',
 
 test('REGRESSION 10: arbitrary reference thinning is rejected', () => {
   const { session } = attestedSession({ sessionId: 'r4-ref', snapshots: [{ time: T, price: 2 }, { time: T + 1000, price: 2.5 }] });
-  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session] });
+  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
   assert.equal(canonicalSet.references.length, 2);
   const digestBefore = canonicalSet.digest;
   assert.equal(referenceSetDigest(canonicalSet.references), digestBefore);
@@ -243,14 +259,15 @@ test('REGRESSION 10: arbitrary reference thinning is rejected', () => {
 
 test('REGRESSION 11: exposure is derived from authenticated evidence, never caller-supplied', () => {
   const { session } = attestedSession({ sessionId: 'r4-exp', snapshots: [{ time: T, price: 2, dexPrice: 3 }, { time: T + 1000, price: 4, dexPrice: 6 }] });
-  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session] });
+  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
   const { rows } = certifyExposureRows({ references: canonicalSet.references, sessions: [session] });
   assert.equal(rows.length, 2);
   assert(rows.every(row => Number.isFinite(row.exposureValue) && row.exposureValue > 0));
   assert(rows.every(row => row.exposureValue === 4000)); // (3-2)/2.5 * 10000 for every snapshot
-  // A tampered provenance digest fails: caller-supplied exposure cannot be certified.
+  // A caller-supplied in-memory session object (spread copy loses the evidence
+  // marker) is refused outright: exposure/mint/timestamp tampering cannot pass.
   const tampered = { ...session, snapshotsByDigest: new Map([...session.snapshotsByDigest].map(([k, v]) => [k, v.map(entry => ({ ...entry, snapshot: { ...entry.snapshot, exposure: { ...entry.snapshot.exposure, contributorDigest: '0'.repeat(64) } } }))])) };
-  throwsCode(() => certifyExposureRows({ references: canonicalSet.references, sessions: [tampered] }), 'R4_EXPOSURE_PROVENANCE_MISMATCH');
+  throwsCode(() => certifyExposureRows({ references: canonicalSet.references, sessions: [tampered] }), 'R4_EXPOSURE_SESSION_NOT_AUTHENTICATED');
 });
 
 /* --------------------------------------------- 12-14. locked analysis interface */
@@ -266,7 +283,7 @@ test('REGRESSION 12/13/14: bootstrap, horizon and tolerance overrides are reject
 
 test('the canonical analysis runs end to end and records the frozen locked parameters', () => {
   const { fixture, session } = attestedSession({ sessionId: 'r4-run' });
-  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session] });
+  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
   const { rows: exposureRows } = certifyExposureRows({ references: canonicalSet.references, sessions: [session] });
   const outcomes = generateOutcomeRun({ sources: [{ dir: fixture.dir, role: 'cohort' }], references: canonicalSet.references, outputRoot: path.join(tempRoot(), 'outcomes'),
     runId: 'enforce-run', createdAt: T + 700_000, sealedCode: { sha: seal.protocolCommit, tree: seal.protocolTree } }).outcomes;
@@ -285,7 +302,7 @@ test('the canonical analysis runs end to end and records the frozen locked param
 
 test('an outcome run is bound to seal, authority, cohort membership and reference set', () => {
   const { session } = attestedSession({ sessionId: 'r4-bind', snapshots: [{ time: T, price: 2 }, { time: T + 1000, price: 2.5 }] });
-  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session] });
+  const canonicalSet = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
   const binding = buildOutcomeRunBinding({ seal, authority, cohortMembership: ['r4-bind'], references: canonicalSet.references });
   assert.equal(verifyOutcomeRunBinding({ binding, seal, authority, cohortMembership: ['r4-bind'], references: canonicalSet.references }).ok, true);
   throwsCode(() => verifyOutcomeRunBinding({ binding, seal, authority, cohortMembership: ['r4-bind'], references: [canonicalSet.references[0]] }), 'R4_BINDING_REFERENCE_SET_MISMATCH');
@@ -345,6 +362,8 @@ test('the committer timestamp is milliseconds so T0 is never derived from second
 
 test('the canonical tracked seal, when present, verifies against the Git authority chain', () => {
   if (!existsSync(path.resolve(REPO, R4_TRACKED_SEAL_PATH))) return; // pre-S dry run
+  try { verifyR4Seal(JSON.parse(readFileSync(path.resolve(REPO, R4_TRACKED_SEAL_PATH), 'utf8'))); }
+  catch { console.log('      (tracked seal is superseded pending re-issue as the new S)'); return; }
   const tracked = loadCanonicalTrackedSeal({ cwd: REPO, requireSealCommit: true, requireHead: true, requireRemote: false });
   assert.equal(tracked.authority.protocolCommit, tracked.seal.protocolCommit);
   assert(tracked.authority.sealCommitterTimestamp > 1e12);

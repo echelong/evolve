@@ -14,7 +14,19 @@ export const RESOLUTION_TOLERANCE_MS = 60_000;
 export const CLASSIFICATION = Object.freeze({ developmentOnly: true, researchOnly: true, paperOnly: true, observerOnly: true,
   tradingAuthority: false, engineAuthority: false, arenaEligible: false, promotionEligible: false, profitabilityInferencePermitted: false });
 export const R4_SOURCE_POLICY = Object.freeze({ requireDurationComplete: true });
+// Non-enumerable authenticity marker attached ONLY by `readSourceSession`. It
+// cannot survive a spread/copy or a JSON round-trip, so a fabricated in-memory
+// session object can never be certified as authenticated evidence (P3-5).
+export const R4_AUTHENTICATED_SESSION = Symbol('r4.authenticatedSession');
 const stamp = n => Number.isSafeInteger(n) && n >= 0;
+// Deep-freeze authenticated snapshot evidence so an in-memory field overwrite
+// (exposure, mint, reference timestamp) throws instead of silently passing.
+function deepFreeze(value, seen = new Set()) {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Object.keys(value)) deepFreeze(value[key], seen);
+  return Object.freeze(value);
+}
 const positive = n => Number.isFinite(n) && n > 0;
 const order = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const fail = code => { throw new Error(code); };
@@ -168,13 +180,16 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
         disagreementDigest: disagreement.normalizedPayloadDigest ?? null },
       disagreement: { metrics: { priceMedianUsd: disagreement.metrics?.priceMedianUsd,
         contributors: { price: disagreement.metrics?.contributors?.price } } } };
-    return { snapshot: compact, validationReason: snapshotMissingReason(full), sessionId: manifest.sessionId, role, snapshotDigest: digest(full) };
+    return Object.freeze({ snapshot: deepFreeze(compact), validationReason: snapshotMissingReason(full), sessionId: manifest.sessionId, role, snapshotDigest: digest(full) });
   });
   const snapshotsByDigest = new Map();
-  for (const candidate of snapshots) { const group = snapshotsByDigest.get(candidate.snapshotDigest) ?? []; group.push(candidate); snapshotsByDigest.set(candidate.snapshotDigest,group); }
+  for (const candidate of snapshots) { const group = snapshotsByDigest.get(candidate.snapshotDigest) ?? []; group.push(candidate); snapshotsByDigest.set(candidate.snapshotDigest, group); }
+  for (const [key, group] of snapshotsByDigest) snapshotsByDigest.set(key, Object.freeze(group));
   if (canonical(tree(dir)) !== canonical(before) || canonical(directories(dir).sort()) !== canonical(beforeDirs)) fail('SOURCE_CHANGED_DURING_READ');
-  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs,
+  const loadedSession = { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs,
     coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, policy: { ...policy }, snapshots, snapshotsByDigest };
+  Object.defineProperty(loadedSession, R4_AUTHENTICATED_SESSION, { value: true, enumerable: false });
+  return loadedSession;
 }
 
 // Validate the recorded provenance; never reconstruct a median or select a different pair.
