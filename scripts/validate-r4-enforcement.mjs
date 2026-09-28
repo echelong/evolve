@@ -19,7 +19,7 @@ import { readSourceSession, generateOutcomeRun } from './market-outcomes/index.m
 import { selectAllEligibleReferences } from './market-outcomes/reference-selection.mjs';
 import { buildCohortPlan, evaluateCohortProgress, mechanicalT0 } from './r4-cohort-plan.mjs';
 import { buildSeal, verifyR4Seal, gitIdentity, R4_EXPECTED, R4_BOUND_FILES, R4_PREREGISTRATION_PATH } from './r4-preregistration-seal.mjs';
-import { verifyR4SealAuthority, loadCanonicalTrackedSeal, R4_TRACKED_SEAL_PATH } from './r4-authority.mjs';
+import { verifyR4SealAuthority, loadCanonicalTrackedSeal, gitCommitterTimestamp, R4_TRACKED_SEAL_PATH } from './r4-authority.mjs';
 import { R4_SPEC, R4_SPEC_DIGEST, captureSpecDigest, classifyCaptureEnvironment, R4_REQUIRED_BOUND_FILES } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS } from './r4-exclusions.mjs';
 import { createSessionAttestation, finalizeSessionAttestation, verifySessionAttestation } from './r4-attestation.mjs';
@@ -334,12 +334,22 @@ test('REGRESSION 18: a changed cohort parameter record is rejected', () => {
   throwsCode(() => verifyR4Seal(refingerprint({ ...seal, protocolCommit: 'not-a-sha' })), 'R4_SEAL_PROTOCOL_COMMIT_INVALID');
 });
 
+test('the committer timestamp is milliseconds so T0 is never derived from seconds', () => {
+  const ts = gitCommitterTimestamp(gitIdentity(REPO).baseSha);
+  assert(Number.isSafeInteger(ts));
+  assert(ts > 1e12, 'a seconds value would be ~1e9 and would produce a 1970 T0');
+  const t0 = mechanicalT0(ts);
+  assert(new Date(t0).getUTCFullYear() >= 2026);
+  assert.equal(t0 % 3_600_000, 0);
+});
+
 test('the canonical tracked seal, when present, verifies against the Git authority chain', () => {
   if (!existsSync(path.resolve(REPO, R4_TRACKED_SEAL_PATH))) return; // pre-S dry run
   const tracked = loadCanonicalTrackedSeal({ cwd: REPO, requireSealCommit: true, requireHead: true, requireRemote: false });
   assert.equal(tracked.authority.protocolCommit, tracked.seal.protocolCommit);
-  assert.equal(tracked.authority.sealCommitterTimestamp, mechanicalT0(tracked.authority.sealCommitterTimestamp) < 0 ? -1 : tracked.authority.sealCommitterTimestamp);
+  assert(tracked.authority.sealCommitterTimestamp > 1e12);
   assert(Number.isSafeInteger(tracked.authority.sealCommitterTimestamp));
+  assert(new Date(mechanicalT0(tracked.authority.sealCommitterTimestamp)).getUTCFullYear() >= 2026);
 });
 
 /* ------------------------------------------------------ frozen spec binding */

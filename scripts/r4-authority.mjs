@@ -52,10 +52,13 @@ export function gitTree(sha, cwd = R4_REPO_ROOT) {
   return gitText(['rev-parse', `${sha}^{tree}`], cwd);
 }
 
+// `git show --format=%ct` reports UNIX seconds; every consumer of this value
+// (mechanical T0, attestation T0) works in milliseconds, so convert exactly
+// once here. A seconds value must never leak into T0 arithmetic.
 export function gitCommitterTimestamp(sha, cwd = R4_REPO_ROOT) {
   const value = gitText(['show', '-s', '--format=%ct', sha], cwd);
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds * 1000 : null;
 }
 
 export function gitCommitterIso(sha, cwd = R4_REPO_ROOT) {
