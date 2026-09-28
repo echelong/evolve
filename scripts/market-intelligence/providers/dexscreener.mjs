@@ -7,6 +7,14 @@ export function createDexProvider({ config, ...options }) {
   let cycleAt = null, cycleRequests = 0, malformed = 0, lastMalformed = false;
   const now = options.now || Date.now;
   return Object.freeze({
+    budget(at = now()) {
+      if (!config.enabled) return { remaining: 0, resetAt: Infinity, usableAt: Infinity, busy: false, spacingMs: config.spacingMs };
+      const freshWindow = cycleAt === null || at - cycleAt >= config.pollMs;
+      const resetAt = freshWindow ? at + config.pollMs : cycleAt + config.pollMs;
+      const remaining = freshWindow ? config.maxRequests : Math.max(0, config.maxRequests - cycleRequests);
+      const transportState = transport.readiness();
+      return { remaining, resetAt, usableAt: Math.max(remaining ? at : resetAt, transportState.usableAt), busy: transportState.busy, spacingMs: config.spacingMs };
+    },
     async observe(mint, { fresh = false } = {}) {
       if (!mintIdentity(mint)) throw new Error('Invalid Solana mint');
       if (!config.enabled) return { unavailable: 'DISABLED' };
@@ -14,6 +22,7 @@ export function createDexProvider({ config, ...options }) {
       if (cycleRequests >= config.maxRequests) return { unavailable: 'CYCLE_BUDGET' };
       cycleRequests++;
       const result = await transport.read('pairs', mint, { fresh });
+      if (result.requestAttempted !== true) cycleRequests--;
       if (result.payload !== undefined && (!Array.isArray(result.payload) || result.payload.some(p => !p || typeof p !== 'object' || typeof p.chainId !== 'string' || typeof p.pairAddress !== 'string' || !mintIdentity(p.baseToken?.address)))) { malformed++; lastMalformed = true; return { unavailable: 'MALFORMED_PAYLOAD' }; }
       if (result.payload !== undefined) lastMalformed = false;
       return result;

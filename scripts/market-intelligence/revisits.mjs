@@ -2,18 +2,19 @@ import { PRIMARY_HORIZON_MS, RESOLUTION_TOLERANCE_MS, snapshotMissingReason } fr
 
 // The queue contains only structural reference identity and time. No price,
 // prediction, or subsequent market value is retained or used for ordering.
-export function createRevisitQueue({ maxPending = 10000 } = {}) {
+export function createRevisitQueue({ maxPending = 10000, onEvent = () => {} } = {}) {
   const pending = new Map();
   const failures = [];
   const failuresByCode = {};
   let scheduled = 0, completed = 0, failed = 0;
-  function fail(entry, code) {
+  function fail(entry, code, detail = {}) {
     failed++;
     failuresByCode[code] = (failuresByCode[code] ?? 0) + 1;
     if (failures.length < 32) failures.push({ ...entry, code });
+    onEvent({ ...entry, result: 'failed', failureCode: code, ...detail });
   }
   const key = (mint, targetAt) => `${mint}:${targetAt}`;
-  const ordered = () => [...pending.values()].sort((a, b) => a.targetAt - b.targetAt || a.mint.localeCompare(b.mint));
+  const ordered = () => [...pending.values()].sort((a, b) => a.deadlineAt - b.deadlineAt || a.targetAt - b.targetAt || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0));
   return Object.freeze({
     add(snapshot) {
       if (snapshotMissingReason(snapshot) !== null) return false;
@@ -28,26 +29,29 @@ export function createRevisitQueue({ maxPending = 10000 } = {}) {
       if (pending.size >= maxPending) throw new Error('REVISIT_QUEUE_BOUND');
       pending.set(id, { mint, targetAt, deadlineAt: targetAt + RESOLUTION_TOLERANCE_MS });
       scheduled++;
+      onEvent({ mint, targetAt, deadlineAt: targetAt + RESOLUTION_TOLERANCE_MS, result: 'scheduled', queueDepth: pending.size });
       return true;
     },
     due(at, limit = Infinity) {
       return [...new Set(ordered().filter(x => x.targetAt <= at && at <= x.deadlineAt).map(x => x.mint))].slice(0, limit);
     },
     targets(mint, at) { return ordered().filter(x => x.mint === mint && x.targetAt <= at && at <= x.deadlineAt); },
+    entries() { return ordered(); },
     nextAt() { return ordered()[0]?.targetAt ?? null; },
     // A request attempt closes its due work. Its observation can still be
     // invalid; the coverage ledger records that separately and fails closed.
-    complete(mint, at, condition) {
-      for (const entry of ordered().filter(x => x.mint === mint && x.targetAt <= at)) {
+    complete(mint, at, condition, detail = {}) {
+      for (const entry of ordered().filter(x => x.mint === mint && x.targetAt <= Math.min(detail.requestStartedAt ?? at, detail.eligibleUntilAt ?? at))) {
         pending.delete(key(entry.mint, entry.targetAt));
-        if (at > entry.deadlineAt || !(typeof condition === 'function' ? condition(entry) : condition)) fail(entry, at > entry.deadlineAt ? 'REVISIT_DEADLINE_MISSED' : 'REVISIT_TWO_SOURCE_UNAVAILABLE');
-        else completed++;
+        const event = { ...detail, queueDepth: pending.size, queueLagMs: Math.max(0, (detail.requestStartedAt ?? at) - entry.targetAt), coalescedEntryCount: detail.coalescedEntryCount ?? 1 };
+        if (at > entry.deadlineAt || !(typeof condition === 'function' ? condition(entry) : condition)) fail(entry, at > entry.deadlineAt ? 'REVISIT_DEADLINE_MISSED' : 'REVISIT_TWO_SOURCE_UNAVAILABLE', event);
+        else { completed++; onEvent({ ...entry, result: 'completed', failureCode: null, ...event }); }
       }
     },
-    expire(at) {
-      for (const entry of ordered().filter(x => at > x.deadlineAt)) {
+    expire(at, safetyMs = 0) {
+      for (const entry of ordered().filter(x => at > x.deadlineAt - safetyMs)) {
         pending.delete(key(entry.mint, entry.targetAt));
-        fail(entry, 'REVISIT_DEADLINE_MISSED');
+        fail(entry, 'REVISIT_DEADLINE_MISSED', { queueDepth: pending.size, queueLagMs: at - entry.targetAt, coalescedEntryCount: 0 });
       }
     },
     status() { return { scheduled, completed, failed, pending: pending.size, failuresByCode: { ...failuresByCode }, failures: [...failures], nextAt: this.nextAt() }; },

@@ -99,6 +99,24 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   const expectedDirs = new Set(listed.flatMap(f => { const parts = f.split('/'); return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/') + '/'); }));
   if (canonical([...expectedDirs].sort()) !== canonical(directories(dir).sort())) fail('SOURCE_MANIFEST_FILE_SET_INVALID');
   if (digest(manifest.files) !== manifest.fingerprint) fail('SOURCE_FINGERPRINT_MISMATCH');
+  if (listed.includes('revisit-scheduler.ndjson')) {
+    for (const event of verifiedRows(dir, 'revisit-scheduler.ndjson', before)) {
+      if (event.schemaVersion !== 1 || event.recordType !== 'revisit_scheduler_event' ||
+          !['scheduled', 'completed', 'failed'].includes(event.result) ||
+          !mintIdentity(event.mint) || !stamp(event.targetAt) ||
+          !stamp(event.deadlineAt) || event.deadlineAt - event.targetAt !== RESOLUTION_TOLERANCE_MS ||
+          !Number.isSafeInteger(event.queueDepth) || event.queueDepth < 0 ||
+          (event.result !== 'scheduled' && (!Number.isSafeInteger(event.queueLagMs) || event.queueLagMs < 0 ||
+            !Number.isSafeInteger(event.coalescedEntryCount) || event.coalescedEntryCount < 0)) ||
+          (event.result === 'completed' && event.failureCode !== null) ||
+          (event.result === 'failed' && !['REVISIT_DEADLINE_MISSED', 'REVISIT_TWO_SOURCE_UNAVAILABLE'].includes(event.failureCode)) ||
+          (event.requestStartedAt !== undefined && event.requestStartedAt !== null && !stamp(event.requestStartedAt)) ||
+          (event.requestReceivedAt !== undefined && event.requestReceivedAt !== null && (!stamp(event.requestReceivedAt) ||
+            event.requestStartedAt > event.requestReceivedAt)) ||
+          (event.snapshotAt !== undefined && event.snapshotAt !== null && (!stamp(event.snapshotAt) ||
+            event.requestReceivedAt > event.snapshotAt))) fail('SOURCE_REVISIT_TELEMETRY_INVALID');
+    }
+  }
   const summary = sourceJson(verifiedJson(dir, 'summary.json', before));
   const session = sourceJson(verifiedJson(dir, 'session.json', before));
   if (summary.sessionId !== manifest.sessionId || session.sessionId !== manifest.sessionId || summary.recordType !== 'summary' || session.recordType !== 'session') fail('SOURCE_SESSION_IDENTITY_INVALID');

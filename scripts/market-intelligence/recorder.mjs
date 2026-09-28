@@ -31,7 +31,8 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
     for (const r of records) record(r, safe.payload, result.requestIdentity);
   }
   return Object.freeze({
-    async capture({ markets = feed?.markets(now()) ?? [], mints = null, targetedMints = [], passiveDexLimit = config.dex.maxRequests } = {}) {
+    writeRevisitEvent: event => storage.writeRevisitEvent?.(event),
+    async capture({ markets = feed?.markets(now()) ?? [], mints = null, targetedMints = [], targetedLatestStart = {}, passiveDexLimit = config.dex.maxRequests, skipGmgn = false } = {}) {
       if (stopped) throw new Error('Recorder stopped');
       const safeMarkets = redact(markets, config.secrets);
       const copiedAt = now();
@@ -53,7 +54,7 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
       }
       const identities = [...new Set(mints ?? safeMarkets.filter(m => !m.synthetic && m.source === 'Jupiter Tokens V2').map(m => m.mint))].sort();
       if (identities.length > 10000) throw new Error('SESSION_STORAGE_IDENTITY_BOUND');
-      const targeted = [...new Set(targetedMints)].sort();
+      const targeted = [...new Set(targetedMints)];
       if (targeted.length > config.dex.maxRequests) throw new Error('REVISIT_CYCLE_BOUND');
       const selected = [...targeted];
       let passive = 0;
@@ -66,8 +67,12 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
       const revisitResults = {};
       for (const mint of selected) {
         try {
+          if (targeted.includes(mint) && now() > (targetedLatestStart[mint] ?? Infinity)) {
+            revisitResults[mint] = { requestAttempted: false, requestStartedAt: null, receivedAt: null, unavailable: 'DEADLINE_UNSAFE' };
+            continue;
+          }
           const result = await dex.observe(mint, { fresh: targeted.includes(mint) });
-          if (targeted.includes(mint)) revisitResults[mint] = { requestAttempted: result.requestAttempted === true, receivedAt: result.receivedAt ?? null, unavailable: result.unavailable ?? null };
+          if (targeted.includes(mint)) revisitResults[mint] = { requestAttempted: result.requestAttempted === true, requestStartedAt: result.requestStartedAt ?? null, receivedAt: result.receivedAt ?? null, unavailable: result.unavailable ?? null };
           await collect('dexscreener', result, normalizeDex);
         } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('dexscreener', 'NORMALIZATION_FAILED'); }
       }
@@ -85,7 +90,7 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
       // being skipped. Progression therefore follows provider availability, never
       // capture cadence, so eventual five-route coverage holds at any frequency.
       let serviced = 0;
-      for (let i = 0; i < budget; i++) {
+      for (let i = 0; !skipGmgn && i < budget; i++) {
         const mint = identities[(gmgnCursor + i) % identities.length], routeCursor = gmgnRouteCursors.get(mint) ?? 0;
         let requestServiced = false;
         try {
@@ -98,7 +103,7 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
         serviced++;
       }
       gmgnCursor = identities.length ? (gmgnCursor + serviced) % identities.length : 0;
-      if (config.gmgn.maxRequests >= 1) {
+      if (!skipGmgn && config.gmgn.maxRequests >= 1) {
         try { await collect('gmgn', await gmgn.observe('trenches'), normalizeGmgn); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('gmgn', 'NORMALIZATION_FAILED'); }
       }
       try {

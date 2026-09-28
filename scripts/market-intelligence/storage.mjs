@@ -50,7 +50,7 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
   rejectSymlinks(dir);
   mkdirSync(dir); // Exclusive session creation; prior sessions are never reopened for writing.
   mkdirSync(path.join(dir, 'raw'));
-  const files = [...Object.values(RAW_FILES), 'normalized.ndjson', 'disagreement.ndjson', 'errors.ndjson'];
+  const files = [...Object.values(RAW_FILES), 'normalized.ndjson', 'disagreement.ndjson', 'errors.ndjson', 'revisit-scheduler.ndjson'];
   const allowedFiles = new Set([...files, 'session.json', 'summary.json', 'manifest.json', 'summary.json.tmp', 'manifest.json.tmp']);
   const fileIdentities = new Map();
   function destination(file) {
@@ -96,6 +96,10 @@ export function createStorage({ root = '.evolve/market-intelligence', sessionId 
     if (Number.isFinite(timestamp)) { firstAt = firstAt === null ? timestamp : Math.min(firstAt, timestamp); lastAt = lastAt === null ? timestamp : Math.max(lastAt, timestamp); }
   }
   return Object.freeze({ dir,
+    writeRevisitEvent(event) {
+      const body = encode({ schemaVersion: 1, recordType: 'revisit_scheduler_event', ...event });
+      reserve([body]); append('revisit-scheduler.ndjson', body);
+    },
     writeRawResponse(result, provider) {
       const file = rawFile(provider);
       const payload = redact(result.payload, secrets);

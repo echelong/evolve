@@ -38,6 +38,7 @@ function fixture(id = 'fixture', times = [at, at + 300000], options = {}) {
     const rs = records(t, 2, options.identity ?? mint); for (const r of rs) s.writeObservation(r, { provider: r.provider, time: t, price: 2 });
     s.writeSnapshot(aggregate(rs, { observedAt: t })[0]);
   }
+  if (options.revisitEvent) s.writeRevisitEvent(options.revisitEvent);
   s.finalize({ endedAt: times.at(-1), reason: options.reason ?? 'duration reached' });
   return { dir: s.dir, role: options.role ?? 'cohort' };
 }
@@ -85,6 +86,16 @@ test('reference contains no future timestamps', () => { const s = snapshot(); s.
 test('duplicate provider masquerading with shared raw evidence rejected', () => { const s = snapshot(); const p = s.disagreement.metrics.contributors.price; p[1].rawResponseDigest = p[0].rawResponseDigest; s.staleness.sourceObservations.find(v => v.provider === p[1].provider).rawResponseDigest = p[0].rawResponseDigest; refresh(s); assert.equal(snapshotMissingReason(s), 'DUPLICATE_PRICE_EVIDENCE'); });
 test('stored median retained without recomputing', () => { const s = snapshot(at + 300000); s.disagreement.metrics.priceMedianUsd = 7; refresh(s); assert.equal(resolve([s]).futurePriceUsd, 7); });
 test('valid source manifest and fingerprint', () => { const s = readSourceSession(fixture()); assert.equal(s.snapshots.length, 2); assert.equal(s.fingerprint, digest(JSON.parse(readFileSync(path.join(s.dir, 'manifest.json'))).files)); });
+test('revisit timing telemetry is authenticated but does not change source snapshots', () => {
+  const event = { mint, targetAt: at + 300000, deadlineAt: at + 360000, result: 'completed', failureCode: null,
+    requestStartedAt: at + 300100, requestReceivedAt: at + 300200, snapshotAt: at + 300300, queueLagMs: 100, queueDepth: 0, coalescedEntryCount: 1 };
+  const source = fixture('with-telemetry', [at, at + 300000], { revisitEvent: event });
+  const manifest = JSON.parse(readFileSync(path.join(source.dir, 'manifest.json')));
+  assert.equal(manifest.files['revisit-scheduler.ndjson'], createHash('sha256').update(readFileSync(path.join(source.dir, 'revisit-scheduler.ndjson'))).digest('hex'));
+  assert.equal(readSourceSession(source).snapshots.length, 2);
+  rewriteSource(source, 'revisit-scheduler.ndjson', rows => { rows[0].deadlineAt++; });
+  assert.throws(() => readSourceSession(source), /SOURCE_REVISIT_TELEMETRY_INVALID/);
+});
 test('tampered source file hash rejected', () => { const s = fixture(); writeFileSync(path.join(s.dir, 'normalized.ndjson'), '\n', { flag: 'a' }); assert.throws(() => readSourceSession(s), /SOURCE_FILE_HASH_MISMATCH/); });
 test('tampered manifest fingerprint rejected', () => { const s = fixture(), f = path.join(s.dir, 'manifest.json'), m = JSON.parse(readFileSync(f)); m.fingerprint = '0'.repeat(64); writeFileSync(f, canonical(m)); assert.throws(() => readSourceSession(s), /SOURCE_FINGERPRINT_MISMATCH/); });
 test('manifest-listed path traversal rejected', () => { const s = fixture(), f = path.join(s.dir, 'manifest.json'), m = JSON.parse(readFileSync(f)); m.files['../escape'] = 'x'; writeFileSync(f, canonical(m)); assert.throws(() => readSourceSession(s), /SOURCE_MANIFEST_PATH_INVALID/); });

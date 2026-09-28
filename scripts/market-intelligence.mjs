@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createIntelligenceConfig, createIntelligenceRecorder, createGmgnProvider, createDexProvider, createLaunchObserver, readSummary, normalizeDex, SESSION_FINALIZATION_RESERVE_BYTES } from './market-intelligence/index.mjs';
 import { createMarketConfig, createMarketFeed } from './market/index.mjs';
 import { createRevisitQueue } from './market-intelligence/revisits.mjs';
+import { planDexRevisits, dexRevisitSafetyMs } from './market-intelligence/revisit-scheduler.mjs';
 import { snapshotMissingReason } from './market-outcomes/index.mjs';
 
 const COMMANDS = new Set(['doctor', 'probe', 'capture', 'summary']);
@@ -47,43 +48,54 @@ export async function main(args = process.argv.slice(2)) {
   // Always live: synthetic fallback is explicitly excluded from intelligence evidence.
   const feed = createMarketFeed({ config: createMarketConfig({ ...process.env, EVOLVE_MARKET_MODE: 'live', EVOLVE_ALLOW_SYNTHETIC_FALLBACK: 'false' }, { loadEnv: false }) });
   const recorder = createIntelligenceRecorder({ config, feed, gmgn, dex, launch });
-  const revisits = targetedMode ? createRevisitQueue() : null;
+  const revisits = targetedMode ? createRevisitQueue({ onEvent: event => recorder.writeRevisitEvent(event) }) : null;
   let stop = false, reason = 'duration reached';
   const signal = () => { stop = true; reason = 'signal'; };
   process.on('SIGINT', signal); process.on('SIGTERM', signal);
-  const started = Date.now(), referenceCutoffAt = started + minutes * 60000; let failed = null, nextOrdinaryAt = started, revisitBlockedUntil = 0;
+  const started = Date.now(), referenceCutoffAt = started + minutes * 60000; let failed = null, nextOrdinaryAt = started;
+  const safetyMs = dexRevisitSafetyMs(config.dex);
   try {
     while (!stop && (Date.now() < referenceCutoffAt || revisits?.status().pending)) {
       const cycleAt = Date.now();
       try { await feed.advance(); } catch { /* Provider failure is reflected by existing feed health. */ }
-      revisits?.expire(Date.now());
+      revisits?.expire(Date.now(), safetyMs);
       const markets = feed.markets(Date.now()).map(m => targetedMode && m.synthetic === false && m.source === 'Jupiter Tokens V2'
         ? { ...m, lastFetchedAt: feed.universe.get(m.mint)?.lastSeenAt ?? m.lastObservedAt } : m);
-      const ready = (Date.now() < revisitBlockedUntil ? [] : revisits?.due(Date.now()).filter(mint => {
+      const ready = revisits?.due(Date.now()).filter(mint => {
         const targets = revisits.targets(mint, Date.now());
         const observation = markets.find(m => m.mint === mint && m.synthetic === false && m.source === 'Jupiter Tokens V2');
-        return targets.length && observation && observation.lastFetchedAt >= Math.max(...targets.map(t => t.targetAt)) && Date.now() - observation.lastFetchedAt <= config.alignmentMs;
-      }).slice(0, config.dex.maxRequests)) ?? [];
+        return targets.length && observation && observation.lastFetchedAt >= Math.min(...targets.map(t => t.targetAt)) && Date.now() - observation.lastFetchedAt <= config.alignmentMs;
+      }) ?? [];
       const ordinaryDue = cycleAt >= nextOrdinaryAt;
-      if (!ordinaryDue && !ready.length) {
+      const schedulingAt = Date.now();
+      const plan = revisits ? planDexRevisits({ queue: revisits, at: schedulingAt, budget: dex.budget(schedulingAt), readyMints: ready,
+        ordinaryDue, safetyMs }) : null;
+      const targetedMints = plan?.targetedMints ?? [];
+      const passiveDexLimit = targetedMode ? plan.passiveDexLimit : config.dex.maxRequests;
+      if ((!ordinaryDue && !targetedMints.length) || targetedMode && !targetedMints.length && !passiveDexLimit) {
         await sleep(250);
         continue;
       }
-      const stats = await recorder.capture({ markets, targetedMints: ready, passiveDexLimit: targetedMode ? (ordinaryDue ? 2 : 0) : config.dex.maxRequests });
-      if (ordinaryDue) nextOrdinaryAt = Date.now() + Math.max(config.gmgn.pollMs, config.dex.pollMs);
-      for (const mint of ready) {
+      const targetedLatestStart = Object.fromEntries(targetedMints.map(mint => [mint, Math.min(...revisits.targets(mint, schedulingAt).map(entry => entry.deadlineAt - safetyMs))]));
+      const stats = await recorder.capture({ markets, targetedMints, targetedLatestStart, passiveDexLimit, skipGmgn: targetedMints.length > 0 });
+      if (ordinaryDue && (!targetedMode || passiveDexLimit > 0 || !targetedMints.length)) nextOrdinaryAt = Date.now() + Math.max(config.gmgn.pollMs, config.dex.pollMs);
+      for (const mint of targetedMints) {
         const snapshot = stats.snapshots.find(s => s.mint === mint);
         const attempt = stats.revisitResults[mint];
+        if (attempt?.unavailable === 'DEADLINE_UNSAFE') { revisits.expire(Date.now(), safetyMs); continue; }
         if (attempt?.requestAttempted !== true && ['CYCLE_BUDGET', 'BACKOFF', 'BUSY'].includes(attempt?.unavailable)) {
-          revisitBlockedUntil = Date.now() + (attempt.unavailable === 'BUSY' ? 1000 : config.dex.pollMs);
           continue;
         }
-        revisits.complete(mint, snapshot?.observedAt ?? Date.now(), entry => attempt?.requestAttempted === true && attempt.unavailable === null && snapshotMissingReason(snapshot) === null && snapshot.disagreement.metrics.contributors.price.every(p => p.providerObservedAt >= entry.targetAt));
+        const closedAt = snapshot?.observedAt ?? Date.now();
+        revisits.complete(mint, closedAt, entry => attempt?.requestAttempted === true && attempt.unavailable === null && snapshotMissingReason(snapshot) === null && snapshot.disagreement.metrics.contributors.price.every(p => p.providerObservedAt >= entry.targetAt),
+          { requestStartedAt: attempt?.requestStartedAt ?? null, requestReceivedAt: attempt?.receivedAt ?? null, snapshotAt: snapshot?.observedAt ?? null,
+            coalescedEntryCount: revisits.targets(mint, attempt?.requestStartedAt ?? closedAt).filter(entry => entry.targetAt <= (markets.find(m => m.mint === mint)?.lastFetchedAt ?? -Infinity)).length,
+            eligibleUntilAt: markets.find(m => m.mint === mint)?.lastFetchedAt ?? null, providerUnavailable: attempt?.unavailable ?? null });
       }
       for (const snapshot of stats.snapshots) if (snapshot.observedAt < referenceCutoffAt) revisits?.add(snapshot);
       const elapsed = Math.floor((Date.now() - started) / 1000);
       process.stdout.write(`\r[EVOLVE 5J] elapsed ${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')} mints ${stats.mints} Jupiter ${stats.providers.jupiter} GMGN ${stats.providers.gmgn} DexScreener ${stats.providers.dexscreener} launch events ${stats.launchEvents} fresh joined ${stats.freshJoined} errors ${stats.errors}    `);
-      const deadline = Math.min(Date.now() < referenceCutoffAt ? referenceCutoffAt : Infinity, nextOrdinaryAt, revisits?.status().nextAt ?? Infinity);
+      const deadline = Math.min(Date.now() < referenceCutoffAt ? referenceCutoffAt : Infinity, nextOrdinaryAt, revisits?.status().nextAt ?? Infinity, plan?.nextAt ?? Infinity);
       while (!stop && Date.now() < deadline) await sleep(Math.min(250, deadline - Date.now()));
     }
     if (revisits) {
