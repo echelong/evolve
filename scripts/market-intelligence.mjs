@@ -16,7 +16,20 @@ export const SAFE_FAILURE_CODES = Object.freeze(['SESSION_STORAGE_BOUND', 'RAW_S
   'REVISIT_COVERAGE_FAILED', 'REVISIT_QUEUE_BOUND', 'REVISIT_CYCLE_BOUND', 'REVISIT_TIMESTAMP_BOUND']);
 export const safeFailureCode = error => typeof error?.message === 'string' && SAFE_FAILURE_CODES.includes(error.message) ? error.message : 'OBSERVATION_FAILED';
 export const failureLine = (command, error) => `[EVOLVE 5J] ${COMMANDS.has(command) ? command : 'command'} failed: ${safeFailureCode(error)}`;
-export const revisitExitFailure = queue => queue && (queue.status().pending || queue.status().failed) ? new Error('REVISIT_COVERAGE_FAILED') : null;
+// E1_REFERENCE_LEVEL_MISSINGNESS. A terminal per-reference revisit failure is a
+// reference-level measurement failure; it is never by itself a session-level
+// capture failure. Failure counts and failure codes stay in the authenticated
+// revisit telemetry and in the finalize record, and every failed entry remains
+// visible and attributable. Only unfinished scheduler work (pending after the
+// complete bounded drain) or a broken scheduler invariant invalidates the
+// session. Capture telemetry never assigns a scientific outcome missingness
+// category; the offline resolver derives that independently from evidence.
+export const revisitExitFailure = queue => {
+  if (!queue) return null;
+  if (queue.status().pending) return new Error('REVISIT_COVERAGE_FAILED');
+  const violations = typeof queue.invariants === 'function' ? queue.invariants() : [];
+  return violations.length ? new Error('REVISIT_COVERAGE_FAILED') : null;
+};
 
 // Storage bounds are shown before a long capture starts; no path or secret is included.
 export function doctorReport({ config, gmgn, dex, launch }) {

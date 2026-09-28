@@ -39,7 +39,12 @@ q.expire(reference.observedAt + 360000);
 assert.equal(q.status().pending, 1);
 q.expire(reference.observedAt + 360001);
 assert.deepEqual(q.status().failures.map(x => x.code), ['REVISIT_DEADLINE_MISSED']);
-assert.equal(revisitExitFailure(q)?.message, 'REVISIT_COVERAGE_FAILED');
+// E1_REFERENCE_LEVEL_MISSINGNESS: terminal reference-level failures alone no
+// longer invalidate the session. The failure stays visible in the telemetry.
+assert.equal(revisitExitFailure(q), null, 'terminal reference failures alone do not fail the session');
+assert.equal(q.status().failed, 1, 'the failed entry is still counted and attributable');
+assert.deepEqual(q.invariants(), [], 'a consistent ledger reports no scheduler invariant violation');
+assert.equal(revisitExitFailure({ status: () => ({ pending: 0 }), invariants: () => ['REVISIT_LEDGER_INCONSISTENT'] })?.message, 'REVISIT_COVERAGE_FAILED', 'a scheduler invariant violation stays session-fatal');
 const boundedFailures = createRevisitQueue();
 for (let i = 0; i < 100; i++) boundedFailures.schedule(mint, t + i);
 boundedFailures.expire(t + 500000);

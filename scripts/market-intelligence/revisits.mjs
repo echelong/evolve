@@ -1,5 +1,10 @@
 import { PRIMARY_HORIZON_MS, RESOLUTION_TOLERANCE_MS, snapshotMissingReason } from '../market-outcomes/index.mjs';
 
+// The only terminal revisit failure states the queue may produce. A failure with
+// any other code is a scheduler invariant violation, not a reference-level
+// measurement failure, and is treated as session-fatal by the capture exit gate.
+const TERMINAL_FAILURE_CODES = Object.freeze(['REVISIT_DEADLINE_MISSED', 'REVISIT_TWO_SOURCE_UNAVAILABLE']);
+
 // The queue contains only structural reference identity and time. No price,
 // prediction, or subsequent market value is retained or used for ordering.
 export function createRevisitQueue({ maxPending = 10000, onEvent = () => {} } = {}) {
@@ -53,6 +58,17 @@ export function createRevisitQueue({ maxPending = 10000, onEvent = () => {} } = 
         pending.delete(key(entry.mint, entry.targetAt));
         fail(entry, 'REVISIT_DEADLINE_MISSED', { queueDepth: pending.size, queueLagMs: at - entry.targetAt, coalescedEntryCount: 0 });
       }
+    },
+    // Deterministic scheduler self-check. An empty list means every scheduled
+    // entry is accounted for (terminal or pending) and every failure code is a
+    // recognised reference-level outcome. This distinguishes a terminal
+    // reference failure from a broken scheduler/capture process (E1).
+    invariants() {
+      const violations = [];
+      if (scheduled !== completed + failed + pending.size) violations.push('REVISIT_LEDGER_INCONSISTENT');
+      if (pending.size === 0 && this.nextAt() !== null) violations.push('REVISIT_QUEUE_INCONSISTENT');
+      for (const code of Object.keys(failuresByCode)) if (!TERMINAL_FAILURE_CODES.includes(code)) violations.push('REVISIT_FAILURE_CODE_INVALID');
+      return violations;
     },
     status() { return { scheduled, completed, failed, pending: pending.size, failuresByCode: { ...failuresByCode }, failures: [...failures], nextAt: this.nextAt() }; },
   });
