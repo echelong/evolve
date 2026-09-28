@@ -127,6 +127,7 @@ const evidenceCase = (name, change, code = /SOURCE_PRICE_EVIDENCE_INVALID/) => t
   const source = fixture(); rewriteSource(source, 'normalized.ndjson', rows => { change(rows); });
   assert.throws(() => readSourceSession(source), code);
 });
+evidenceCase('duplicate matching market observation', rows => { rows.push(structuredClone(rows.find(r => r.recordType === 'market_observation'))); });
 evidenceCase('missing matching market observation', rows => { rows.splice(rows.findIndex(r => r.recordType === 'market_observation'), 1); });
 for (const [field, value] of [['provider','gmgn'],['sourceEndpoint','/wrong'],['providerObservedAt',at-1],['rawResponseDigest','0'.repeat(64)],['normalizedPayloadDigest','0'.repeat(64)]])
   evidenceCase(`market observation ${field} mismatch`, rows => { rows.find(r => r.recordType === 'market_observation')[field] = value; });
@@ -164,7 +165,7 @@ test('source coverage gap differs from covered mint absence',()=>{const a=fixtur
 test('missing and ambiguous disagreement joins structural',()=>{for(const kind of ['missing','ambiguous']){const s=fixture();rewriteSource(s,'disagreement.ndjson',rows=>{if(kind==='missing')rows.shift();else rows.push({...rows[0], extra:'duplicate'});});assert.throws(()=>readSourceSession(s),kind==='missing'?/MISSING_DISAGREEMENT_JOIN/:/AMBIGUOUS_DISAGREEMENT_JOIN/);}});
 test('invalid source policy has stable code',()=>assert.throws(()=>readSourceSession(fixture(),null),/SOURCE_POLICY_INVALID/));
 test('unlisted source directory rejected',()=>{const s=fixture();mkdirSync(path.join(s.dir,'empty'));assert.throws(()=>readSourceSession(s),/SOURCE_MANIFEST_FILE_SET_INVALID/);});
-test('malformed source JSON has stable code',()=>{const s=fixture();rewriteSource(s,'summary.json',()=>({broken:true}));writeFileSync(path.join(s.dir,'summary.json'),'{');assert.throws(()=>readSourceSession(s),/SOURCE_FILE_HASH_MISMATCH|SOURCE_FORMAT_INVALID/);});
+test('malformed authenticated source JSON has stable code',()=>{const s=fixture(),file=path.join(s.dir,'summary.json'),mfile=path.join(s.dir,'manifest.json');writeFileSync(file,'{');const m=JSON.parse(readFileSync(mfile));m.files['summary.json']=createHash('sha256').update('{').digest('hex');m.fingerprint=digest(m.files);writeFileSync(mfile,canonical(m)+'\n');assert.throws(()=>readSourceSession(s),/SOURCE_FORMAT_INVALID/);});
 test('equal and extreme prices',()=>{assert.equal(resolve([snapshot(at+300000)]).absLogReturn300sBps,0);assert.equal(resolve([snapshot(at+300000,Number.MAX_VALUE/4)],entry(snapshot(at,Number.MIN_VALUE))).missingReason,'NONFINITE_LOG_RETURN');});
 
 test('failure paths leave source trees byte identical',()=>{

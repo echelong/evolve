@@ -73,9 +73,15 @@ function verifiedRows(dir, file, hashes) {
   } finally { closeSync(fd); }
 }
 function verifiedJson(dir, file, hashes) {
-  const bytes = readFileSync(path.join(dir, file));
-  if (createHash('sha256').update(bytes).digest('hex') !== hashes[file]) fail('SOURCE_CHANGED_DURING_READ');
-  return bytes.toString('utf8');
+  const full = path.join(dir,file); safePath(full);
+  if (!lstatSync(full).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
+  const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
+    const bytes = readFileSync(fd);
+    if (createHash('sha256').update(bytes).digest('hex') !== hashes[file]) fail('SOURCE_CHANGED_DURING_READ');
+    return bytes.toString('utf8');
+  } finally { closeSync(fd); }
 }
 export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   if (!['cohort', 'maturation'].includes(role)) fail('SOURCE_ROLE_INVALID');
@@ -99,22 +105,39 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   if (policy.requireDurationComplete && !(summary.status === 'complete' && summary.reason === 'duration reached' && summary.storage?.sessionBoundReached === false)) fail('SOURCE_STATUS_INELIGIBLE');
   if (![session.startedAt, summary.startedAt, summary.endedAt].every(stamp) || session.startedAt !== summary.startedAt || summary.startedAt > summary.endedAt) fail('SOURCE_SESSION_COVERAGE_INVALID');
   const normalized = verifiedRows(dir, 'normalized.ndjson', before), disagreements = verifiedRows(dir, 'disagreement.ndjson', before);
+  const tupleKey = values => values.some(value => value !== null && typeof value === 'object')
+    ? Symbol('nonprimitive-join-field') : canonical(values.map(value => [typeof value, value === undefined ? null : value]));
+  const disagreementKey = d => tupleKey([d.mint, d.observedAt, d.normalizedPayloadDigest]);
+  const observationKey = o => tupleKey([o.chain,o.mint,o.provider,o.sourceEndpoint,o.providerObservedAt,o.rawResponseDigest,o.normalizedPayloadDigest]);
+  const disagreementIndex = new Map(), observationIndex = new Map();
+  for (const d of disagreements) if (d.recordType === 'disagreement') {
+    const key = disagreementKey(d), matches = disagreementIndex.get(key) ?? [];
+    matches.push(d); disagreementIndex.set(key,matches);
+  }
+  for (const o of normalized) if (o.recordType === 'market_observation') {
+    const key = observationKey(o), matches = observationIndex.get(key) ?? [];
+    matches.push(o); observationIndex.set(key,matches);
+  }
   const snapshots = normalized.filter(r => r.recordType === 'intelligence_snapshot').map(r => {
-    const matches = disagreements.filter(d => d.recordType === 'disagreement' && d.mint === r.mint && d.observedAt === r.observedAt && d.normalizedPayloadDigest === r.contributors?.crossSourcePriceRangeBps?.disagreementDigest);
-    const unique = new Map(matches.map(d => [digest(d), d]));
+    const matches = disagreementIndex.get(tupleKey([r.mint,r.observedAt,r.contributors?.crossSourcePriceRangeBps?.disagreementDigest])) ?? [];
     if (!matches.length) fail('MISSING_DISAGREEMENT_JOIN');
     if (matches.length !== 1) fail('AMBIGUOUS_DISAGREEMENT_JOIN');
-    const disagreement = [...unique.values()][0];
+    const disagreement = matches[0];
     for (const contributor of disagreement?.metrics?.contributors?.price ?? []) {
-      const evidence = normalized.filter(o => o.recordType === 'market_observation' && o.chain === r.chain && o.mint === r.mint &&
-        ['provider', 'sourceEndpoint', 'providerObservedAt', 'rawResponseDigest', 'normalizedPayloadDigest'].every(k => o[k] === contributor[k]));
+      const evidence = observationIndex.get(tupleKey([r.chain,r.mint,contributor.provider,contributor.sourceEndpoint,contributor.providerObservedAt,contributor.rawResponseDigest,contributor.normalizedPayloadDigest])) ?? [];
       const source = r.staleness?.sourceObservations?.find(o => o.provider === contributor.provider && o.normalizedPayloadDigest === contributor.normalizedPayloadDigest && o.rawResponseDigest === contributor.rawResponseDigest && o.providerObservedAt === contributor.providerObservedAt && o.sourceEndpoint === contributor.sourceEndpoint);
       if (evidence.length !== 1 || !source || evidence.some(o => o.staleness?.budgetMs !== source.budgetMs || digest(o.normalized) !== o.normalizedPayloadDigest || !positive(o.normalized.priceUsd) || ![o.providerObservedAt,o.receivedAt,o.capturedAt,o.observedAt].every(stamp) || o.providerObservedAt > o.receivedAt || o.receivedAt > o.capturedAt || o.capturedAt > o.observedAt || o.observedAt > r.observedAt)) fail('SOURCE_PRICE_EVIDENCE_INVALID');
     }
-    return { snapshot: { ...r, disagreement }, sessionId: manifest.sessionId, role, snapshotDigest: digest({ ...r, disagreement }) };
+    const full = { ...r, disagreement };
+    const compact = { recordType: r.recordType, chain: r.chain, mint: r.mint, observedAt: r.observedAt,
+      normalizedPayloadDigest: r.normalizedPayloadDigest, disagreement: { metrics: { priceMedianUsd: disagreement.metrics?.priceMedianUsd,
+        contributors: { price: disagreement.metrics?.contributors?.price } } } };
+    return { snapshot: compact, validationReason: snapshotMissingReason(full), sessionId: manifest.sessionId, role, snapshotDigest: digest(full) };
   });
+  const snapshotsByDigest = new Map();
+  for (const candidate of snapshots) { const group = snapshotsByDigest.get(candidate.snapshotDigest) ?? []; group.push(candidate); snapshotsByDigest.set(candidate.snapshotDigest,group); }
   if (canonical(tree(dir)) !== canonical(before) || canonical(directories(dir).sort()) !== canonical(beforeDirs)) fail('SOURCE_CHANGED_DURING_READ');
-  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs, coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, snapshots };
+  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs, coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, snapshots, snapshotsByDigest };
 }
 
 // Validate the recorded provenance; never reconstruct a median or select a different pair.
@@ -151,7 +174,7 @@ export function snapshotMissingReason(s) {
   return null;
 }
 export function resolveReference(reference, candidates, coverage = null) {
-  const s = reference.snapshot, invalid = snapshotMissingReason(s);
+  const s = reference.snapshot, invalid = Object.hasOwn(reference,'validationReason') ? reference.validationReason : snapshotMissingReason(s);
   const targetAt = stamp(s?.observedAt) && stamp(s.observedAt + PRIMARY_HORIZON_MS) ? s.observedAt + PRIMARY_HORIZON_MS : null;
   const base = { schemaVersion: 1, recordType: 'market_outcome', ...CLASSIFICATION, outcomeDefinitionId: OUTCOME_DEFINITION_ID,
     primaryField: 'absLogReturn300sBps', outcomeType: 'continuous', mint: s?.mint ?? null,
@@ -161,11 +184,18 @@ export function resolveReference(reference, candidates, coverage = null) {
     horizonSeconds: PRIMARY_HORIZON_SECONDS, resolutionToleranceMs: RESOLUTION_TOLERANCE_MS };
   const unavailable = (reason, rejectedCandidatesByReason = {}) => ({ ...base, status: 'unavailable', missingReason: reason, rejectedCandidatesByReason, absLogReturn300sBps: null });
   if (invalid || targetAt === null) return unavailable(`REFERENCE_${invalid ?? 'INVALID_TIMESTAMP'}`);
-  const window = candidates.filter(c => c.snapshot.mint === s.mint && stamp(c.snapshot.observedAt) && c.snapshot.observedAt >= targetAt && c.snapshot.observedAt <= targetAt + RESOLUTION_TOLERANCE_MS)
+  let window;
+  if (candidates instanceof Map) {
+    const list = candidates.get(s.mint) ?? [];
+    let lo = 0, hi = list.length;
+    while (lo < hi) { const mid = (lo + hi) >>> 1; if (list[mid].snapshot.observedAt < targetAt) lo = mid + 1; else hi = mid; }
+    let end = lo; while (end < list.length && list[end].snapshot.observedAt <= targetAt + RESOLUTION_TOLERANCE_MS) end++;
+    window = list.slice(lo,end);
+  } else window = candidates.filter(c => c.snapshot.mint === s.mint && stamp(c.snapshot.observedAt) && c.snapshot.observedAt >= targetAt && c.snapshot.observedAt <= targetAt + RESOLUTION_TOLERANCE_MS)
     .sort((a, b) => a.snapshot.observedAt - b.snapshot.observedAt || order(a.snapshotDigest, b.snapshotDigest) || order(a.sessionId, b.sessionId));
   const rejected = {}; let future;
   for (const candidate of window) {
-    let reason = snapshotMissingReason(candidate.snapshot);
+    let reason = Object.hasOwn(candidate,'validationReason') ? candidate.validationReason : snapshotMissingReason(candidate.snapshot);
     if (!reason) {
       const futurePrice = candidate.snapshot.disagreement.metrics.contributors.price;
       const referencePrice = s.disagreement.metrics.contributors.price;
@@ -175,7 +205,14 @@ export function resolveReference(reference, candidates, coverage = null) {
     if (!reason) { future = candidate; break; }
     rejected[reason] = (rejected[reason] ?? 0) + 1;
   }
-  const covered = !coverage || (() => { let end = targetAt; for (const span of coverage.sort((a,b) => a.startedAt-b.startedAt)) { if (span.startedAt > end) break; end = Math.max(end, span.endedAt); if (end >= targetAt + RESOLUTION_TOLERANCE_MS) return true; } return false; })();
+  const covered = !coverage || (() => {
+    if (coverage.spans) {
+      const spans = coverage.spans; let lo = 0, hi = spans.length;
+      while (lo < hi) { const mid = (lo + hi) >>> 1; if (spans[mid].startedAt <= targetAt) lo = mid + 1; else hi = mid; }
+      return lo > 0 && spans[lo - 1].endedAt >= targetAt + RESOLUTION_TOLERANCE_MS;
+    }
+    let end = targetAt; for (const span of coverage.slice().sort((a,b) => a.startedAt-b.startedAt)) { if (span.startedAt > end) break; end = Math.max(end, span.endedAt); if (end >= targetAt + RESOLUTION_TOLERANCE_MS) return true; } return false;
+  })();
   if (!future) return unavailable(window.length ? 'NO_VALID_FUTURE_TWO_SOURCE_OBSERVATION' : covered ? 'NO_SAME_MINT_OBSERVATION_IN_WINDOW' : 'SOURCE_COVERAGE_GAP', rejected);
   const f = future.snapshot, ratio = f.disagreement.metrics.priceMedianUsd / base.referencePriceUsd;
   const signed = Math.log(ratio) * 10_000;
@@ -192,24 +229,36 @@ export function resolveReference(reference, candidates, coverage = null) {
 export function generateOutcomeRun({ sources, references, outputRoot, runId, createdAt, sourcePolicy = R4_SOURCE_POLICY, sealedCode = null }) {
   if (!Array.isArray(sources) || !sources.length || !Array.isArray(references) || !references.length || !stamp(createdAt) || typeof runId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(runId) || typeof outputRoot !== 'string') fail('RUN_INPUT_INVALID');
   const sessions = sources.map(s => readSourceSession(s, sourcePolicy));
-  let primaryError;
+  let primaryError, published = false;
   try {
     if (new Set(sessions.map(s => s.sessionId)).size !== sessions.length) fail('DUPLICATE_SOURCE_SESSION');
     const root = safePath(outputRoot), dir = path.join(root, runId);
     if (PROTECTED.some(p => overlaps(root,p))) fail('OUTPUT_PROTECTED_ROOT');
     for (const s of sessions) if (overlaps(root,s.dir)) fail('OUTPUT_SOURCE_OVERLAP');
-    const candidates = sessions.flatMap(s => s.snapshots);
-    if (candidates.some(c => !stamp(c.snapshot.observedAt) || c.snapshot.observedAt > createdAt)) fail('EVIDENCE_NOT_YET_OBSERVED');
+    const candidatesByMint = new Map();
+    for (const session of sessions) for (const c of session.snapshots) {
+      if (!stamp(c.snapshot.observedAt) || c.snapshot.observedAt > createdAt) fail('EVIDENCE_NOT_YET_OBSERVED');
+      const group = candidatesByMint.get(c.snapshot.mint) ?? []; group.push(c); candidatesByMint.set(c.snapshot.mint,group);
+    }
+    for (const group of candidatesByMint.values()) group.sort((a,b) => a.snapshot.observedAt-b.snapshot.observedAt || order(a.snapshotDigest,b.snapshotDigest) || order(a.sessionId,b.sessionId));
+    const sessionsById = new Map(sessions.map(s => [s.sessionId,s]));
     const selected = references.map(r => {
-      const session = sessions.find(s => s.sessionId === r.sessionId);
+      const session = sessionsById.get(r.sessionId);
       if (!session || session.role !== 'cohort') fail('REFERENCE_NOT_IN_COHORT');
-      const matches = session.snapshots.filter(c => c.snapshotDigest === r.snapshotDigest);
+      const matches = session.snapshotsByDigest.get(r.snapshotDigest) ?? [];
       if (matches.length !== 1) fail('REFERENCE_IDENTITY_NOT_UNIQUE');
       if (createdAt < matches[0].snapshot.observedAt + PRIMARY_HORIZON_MS + RESOLUTION_TOLERANCE_MS) fail('RESOLUTION_WINDOW_NOT_MATURE');
       return matches[0];
     }).sort((a, b) => order(a.sessionId, b.sessionId) || order(a.snapshotDigest, b.snapshotDigest));
     if (new Set(selected.map(r => `${r.sessionId}/${r.snapshotDigest}`)).size !== selected.length) fail('DUPLICATE_REFERENCE');
-    const outcomes = selected.map(r => resolveReference(r, candidates, sessions.map(s => s.coverage)));
+    const spans = [];
+    for (const span of sessions.map(s => s.coverage).sort((a,b) => a.startedAt-b.startedAt)) {
+      const last = spans.at(-1);
+      if (last && span.startedAt <= last.endedAt) last.endedAt = Math.max(last.endedAt, span.endedAt);
+      else spans.push({ ...span });
+    }
+    const coverage = { spans };
+    const outcomes = selected.map(r => resolveReference(r, candidatesByMint, coverage));
     const unresolvedByReason = {};
     for (const o of outcomes) if (o.status === 'unavailable') unresolvedByReason[o.missingReason] = (unresolvedByReason[o.missingReason] ?? 0) + 1;
     const metadata = { schemaVersion: 1, ...CLASSIFICATION, outcomeDefinitionId: OUTCOME_DEFINITION_ID, primaryField: 'absLogReturn300sBps', outcomeType: 'continuous',
@@ -232,13 +281,16 @@ export function generateOutcomeRun({ sources, references, outputRoot, runId, cre
     const fd = openSync(tmp, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
     try { lstatSync(final); fail('EEXIST'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     renameSync(tmp, final);
+    published = true; // The pre-publication source check is the last successful-run integrity boundary.
     const dfd = openSync(dir, 'r'); try { fsyncSync(dfd); } finally { closeSync(dfd); }
     chmodSync(dir, 0o555);
     return { dir, manifest, outcomes };
   } catch (e) { primaryError = e; throw e;
   } finally {
-    try { for (const s of sessions) if ((canonical(tree(s.dir)) !== canonical(s.before) || canonical(directories(s.dir).sort()) !== canonical(s.beforeDirs))) fail('SOURCE_CHANGED_AFTER_RESOLUTION'); }
-    catch (e) { if (primaryError) throw new AggregateError([primaryError,e], primaryError.message, { cause: primaryError }); throw e; }
+    if (!published) {
+      try { for (const s of sessions) if ((canonical(tree(s.dir)) !== canonical(s.before) || canonical(directories(s.dir).sort()) !== canonical(s.beforeDirs))) fail('SOURCE_CHANGED_AFTER_RESOLUTION'); }
+      catch (e) { if (primaryError) throw new AggregateError([primaryError,e], primaryError.message, { cause: primaryError }); throw e; }
+    }
   }
 }
 

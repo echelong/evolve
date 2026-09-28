@@ -95,8 +95,9 @@ the inclusive window, select the first valid candidate ordered by:
 2. full reconstructed snapshot SHA-256 digest ascending (ASCII hex order);
 3. session ID ascending, for identical timestamp and digest across sessions.
 
-Phase 5J stores snapshots and disagreement separately. Reconstruction joins by
-mint, timestamp, and the recorded disagreement digest. Missing or ambiguous disagreement bodies reject the source with `MISSING_DISAGREEMENT_JOIN` or `AMBIGUOUS_DISAGREEMENT_JOIN`. The
+Candidates are indexed by mint, sorted once in this order, and located by binary search over the frozen target window. Reference digests also have per-session indexes, and merged source-coverage spans are searched by target. Resolution therefore examines only same-mint candidates in that window.
+
+Phase 5J stores snapshots and disagreement separately. Reconstruction indexes disagreement records by mint, timestamp, and recorded digest, and market observations by the full chain/mint/provider/endpoint/provider timestamp/raw digest/normalized digest tuple. A join must have exactly one body or observation; duplicates fail closed. The per-session parsed NDJSON arrays and indexes are released after a compact validated candidate is built. Each candidate retains its full reconstruction digest, cached validation result, timestamps, price median, contributor provenance, and output digests. Missing or ambiguous disagreement bodies reject the source with `MISSING_DISAGREEMENT_JOIN` or `AMBIGUOUS_DISAGREEMENT_JOIN`. The
 stored full snapshot digest covers the joined representation, while the original
 snapshot and disagreement normalized digests remain source provenance.
 
@@ -133,11 +134,11 @@ untrusted evidence.
 Before interpreting source evidence, verify the manifest schema/identity, exact
 listed file set, every listed SHA-256, and the canonical file-map fingerprint.
 Reject path traversal, symlinks, missing/unlisted files, identity discrepancies,
-and tampering. Evidence reads are checked against verified bytes; NDJSON is parsed one line at a time from bounded read chunks. The tree is rehashed after reading, before publication, and on exit. These passes authenticate pre-read files, interpreted bytes, and pre-publication immutability independently. Source files and the manifest must remain byte-identical. There is no repair path.
+and tampering. Evidence reads are checked against verified bytes; NDJSON is parsed one line at a time from bounded read chunks. The tree is rehashed after reading and immediately before publication. Failed runs also rehash during cleanup, preserving a primary error if both fail. Successful runs do not perform a post-publication check that could report a new failure after finalization. These passes authenticate pre-read files, interpreted bytes, and pre-publication immutability independently. Source files and the manifest must remain byte-identical. There is no repair path.
 
 Output goes only to a caller-injected separate tree, suitable later for
 `.evolve/market-outcomes/<runId>/`. Implementation validation uses temporary roots
-only. Source and output trees cannot overlap. Protected EVOLVE source, history, arena, research, and production-state roots are barred even if not supplied as sources. Exclusive directory creation reserves the run ID, even if a failed write leaves a partial run. Body files use exclusive creation, mode 0444, and fsync. Source integrity is rechecked before manifest publication. The manifest is written to an exclusive temporary file, fsynced, then atomically renamed as the finalization marker; the directory is fsynced and set to mode 0555. A partial run has no final manifest and is not valid evidence. `verifyOutcomeRun` reads only and checks the exact file set, finalized status, hashes, fingerprint, classification, definition, horizon, and tolerance. It never repairs a run. Source failures on cleanup preserve an earlier primary error in an `AggregateError`. Existing runs are never reopened for writing. This is
+only. Source and output trees cannot overlap. Protected EVOLVE source, history, arena, research, and production-state roots are barred even if not supplied as sources. Exclusive directory creation reserves the run ID, even if a failed write leaves a partial run. Body files use exclusive creation, mode 0444, and fsync. Source integrity is rechecked before manifest publication. The manifest is written to an exclusive temporary file, fsynced, then atomically renamed as the finalization marker; the directory is fsynced and set to mode 0555. A partial run has no final manifest and is not valid evidence. `verifyOutcomeRun` reads only and checks the exact file set, finalized status, hashes, fingerprint, classification, definition, horizon, and tolerance. It never repairs a run. Verification authenticates bytes and structure; file modes are asserted at generation time and are not part of the manifest fingerprint. Source failures on cleanup preserve an earlier primary error in an `AggregateError`. Existing runs are never reopened for writing. This is
 application-level immutability, not a claim that a filesystem owner cannot alter
 files externally.
 
