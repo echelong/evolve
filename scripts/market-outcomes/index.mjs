@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { canonical, digest, mintIdentity } from '../market-intelligence/definition.mjs';
 
 export const OUTCOME_DEFINITION_ID = 'ABS_LOG_RETURN_300S_BPS_V1';
@@ -14,6 +15,9 @@ const stamp = n => Number.isSafeInteger(n) && n >= 0;
 const positive = n => Number.isFinite(n) && n > 0;
 const order = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const fail = code => { throw new Error(code); };
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const PROTECTED = ['market-intelligence','jev','jev-direction','jev-paper-forensics','arenas','arena','arena-cache','history','research','replication','experiments','champions','classifier','datasets','regimes','stress','hall-of-fame','governance','intelligence','jev-paper-shadow','jev-supervisor-observer','shadow'].map(name => path.join(REPO,'.evolve',name));
+const overlaps = (a,b) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep);
 function safePath(file) {
   const absolute = path.resolve(file); let current = path.parse(absolute).root;
   for (const part of absolute.slice(current.length).split(path.sep)) {
@@ -23,7 +27,8 @@ function safePath(file) {
   return absolute;
 }
 function hashFile(file) {
-  safePath(file); const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  safePath(file); if (!lstatSync(file).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     if (!fstatSync(fd).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
     const hash = createHash('sha256'), buffer = Buffer.alloc(1024 * 1024);
@@ -38,6 +43,35 @@ function tree(dir, prefix = '') {
     return e.isDirectory() ? Object.entries(tree(file, name + '/')) : [[name, hashFile(file)]];
   }));
 }
+function directories(dir, prefix = '') {
+  return readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? [prefix + e.name + '/', ...directories(path.join(dir, e.name), prefix + e.name + '/')] : []);
+}
+function sourceJson(body) { try { return JSON.parse(body); } catch { fail('SOURCE_FORMAT_INVALID'); } }
+function verifiedRows(dir, file, hashes) {
+  const full = path.join(dir, file); safePath(full);
+  if (!lstatSync(full).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
+  const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) fail('SOURCE_NOT_REGULAR_FILE');
+    const hash = createHash('sha256'), chunk = Buffer.alloc(1024 * 1024), rows = [];
+    let carry = Buffer.alloc(0);
+    for (let pos = 0, n; (n = readSync(fd, chunk, 0, chunk.length, pos)) > 0; pos += n) {
+      const bytes = chunk.subarray(0, n); hash.update(bytes);
+      const data = carry.length ? Buffer.concat([carry, bytes]) : bytes;
+      let start = 0, end;
+      while ((end = data.indexOf(10, start)) !== -1) {
+        if (end - start > 8 * 1024 * 1024) fail('SOURCE_RECORD_TOO_LARGE');
+        if (end > start) rows.push(sourceJson(data.subarray(start, end).toString('utf8')));
+        start = end + 1;
+      }
+      carry = Buffer.from(data.subarray(start));
+      if (carry.length > 8 * 1024 * 1024) fail('SOURCE_RECORD_TOO_LARGE');
+    }
+    if (carry.length) rows.push(sourceJson(carry.toString('utf8')));
+    if (hash.digest('hex') !== hashes[file]) fail('SOURCE_CHANGED_DURING_READ');
+    return rows;
+  } finally { closeSync(fd); }
+}
 function verifiedJson(dir, file, hashes) {
   const bytes = readFileSync(path.join(dir, file));
   if (createHash('sha256').update(bytes).digest('hex') !== hashes[file]) fail('SOURCE_CHANGED_DURING_READ');
@@ -45,10 +79,10 @@ function verifiedJson(dir, file, hashes) {
 }
 export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   if (!['cohort', 'maturation'].includes(role)) fail('SOURCE_ROLE_INVALID');
-  if (typeof policy.requireDurationComplete !== 'boolean') fail('SOURCE_POLICY_INVALID');
-  dir = safePath(dir); const before = tree(dir);
+  if (!policy || typeof policy !== 'object' || typeof policy.requireDurationComplete !== 'boolean') fail('SOURCE_POLICY_INVALID');
+  dir = safePath(dir); const before = tree(dir), beforeDirs = directories(dir).sort();
   if (!before['manifest.json']) fail('SOURCE_MANIFEST_MISSING');
-  const manifest = JSON.parse(verifiedJson(dir, 'manifest.json', before));
+  const manifest = sourceJson(verifiedJson(dir, 'manifest.json', before));
   if (manifest.schemaVersion !== 1 || manifest.recordType !== 'manifest' || !manifest.files || !/^[a-zA-Z0-9_-]{1,100}$/.test(manifest.sessionId)) fail('SOURCE_MANIFEST_INVALID');
   for (const [file, hash] of Object.entries(manifest.files)) {
     if (file === 'manifest.json' || !/^[a-zA-Z0-9_./-]+$/.test(file) || file.startsWith('/') || file.split('/').some(p => p === '..' || p === '.' || !p)) fail('SOURCE_MANIFEST_PATH_INVALID');
@@ -56,27 +90,31 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   }
   const listed = Object.keys(manifest.files).sort(), actual = Object.keys(before).filter(f => f !== 'manifest.json').sort();
   if (canonical(listed) !== canonical(actual) || !['summary.json', 'session.json', 'normalized.ndjson', 'disagreement.ndjson'].every(f => listed.includes(f))) fail('SOURCE_MANIFEST_FILE_SET_INVALID');
+  const expectedDirs = new Set(listed.flatMap(f => { const parts = f.split('/'); return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/') + '/'); }));
+  if (canonical([...expectedDirs].sort()) !== canonical(directories(dir).sort())) fail('SOURCE_MANIFEST_FILE_SET_INVALID');
   if (digest(manifest.files) !== manifest.fingerprint) fail('SOURCE_FINGERPRINT_MISMATCH');
-  const summary = JSON.parse(verifiedJson(dir, 'summary.json', before));
-  const session = JSON.parse(verifiedJson(dir, 'session.json', before));
+  const summary = sourceJson(verifiedJson(dir, 'summary.json', before));
+  const session = sourceJson(verifiedJson(dir, 'session.json', before));
   if (summary.sessionId !== manifest.sessionId || session.sessionId !== manifest.sessionId || summary.recordType !== 'summary' || session.recordType !== 'session') fail('SOURCE_SESSION_IDENTITY_INVALID');
   if (policy.requireDurationComplete && !(summary.status === 'complete' && summary.reason === 'duration reached' && summary.storage?.sessionBoundReached === false)) fail('SOURCE_STATUS_INELIGIBLE');
-  const rows = file => verifiedJson(dir, file, before).split('\n').filter(Boolean).map(line => JSON.parse(line));
-  const normalized = rows('normalized.ndjson'), disagreements = rows('disagreement.ndjson');
+  if (![session.startedAt, summary.startedAt, summary.endedAt].every(stamp) || session.startedAt !== summary.startedAt || summary.startedAt > summary.endedAt) fail('SOURCE_SESSION_COVERAGE_INVALID');
+  const normalized = verifiedRows(dir, 'normalized.ndjson', before), disagreements = verifiedRows(dir, 'disagreement.ndjson', before);
   const snapshots = normalized.filter(r => r.recordType === 'intelligence_snapshot').map(r => {
     const matches = disagreements.filter(d => d.recordType === 'disagreement' && d.mint === r.mint && d.observedAt === r.observedAt && d.normalizedPayloadDigest === r.contributors?.crossSourcePriceRangeBps?.disagreementDigest);
     const unique = new Map(matches.map(d => [digest(d), d]));
-    const disagreement = unique.size === 1 ? [...unique.values()][0] : null;
+    if (!matches.length) fail('MISSING_DISAGREEMENT_JOIN');
+    if (matches.length !== 1) fail('AMBIGUOUS_DISAGREEMENT_JOIN');
+    const disagreement = [...unique.values()][0];
     for (const contributor of disagreement?.metrics?.contributors?.price ?? []) {
       const evidence = normalized.filter(o => o.recordType === 'market_observation' && o.chain === r.chain && o.mint === r.mint &&
         ['provider', 'sourceEndpoint', 'providerObservedAt', 'rawResponseDigest', 'normalizedPayloadDigest'].every(k => o[k] === contributor[k]));
       const source = r.staleness?.sourceObservations?.find(o => o.provider === contributor.provider && o.normalizedPayloadDigest === contributor.normalizedPayloadDigest && o.rawResponseDigest === contributor.rawResponseDigest && o.providerObservedAt === contributor.providerObservedAt && o.sourceEndpoint === contributor.sourceEndpoint);
-      if (!evidence.length || !source || evidence.some(o => o.staleness?.budgetMs !== source.budgetMs || digest(o.normalized) !== o.normalizedPayloadDigest || !positive(o.normalized.priceUsd) || o.observedAt > r.observedAt)) fail('SOURCE_PRICE_EVIDENCE_INVALID');
+      if (evidence.length !== 1 || !source || evidence.some(o => o.staleness?.budgetMs !== source.budgetMs || digest(o.normalized) !== o.normalizedPayloadDigest || !positive(o.normalized.priceUsd) || ![o.providerObservedAt,o.receivedAt,o.capturedAt,o.observedAt].every(stamp) || o.providerObservedAt > o.receivedAt || o.receivedAt > o.capturedAt || o.capturedAt > o.observedAt || o.observedAt > r.observedAt)) fail('SOURCE_PRICE_EVIDENCE_INVALID');
     }
     return { snapshot: { ...r, disagreement }, sessionId: manifest.sessionId, role, snapshotDigest: digest({ ...r, disagreement }) };
   });
-  if (canonical(tree(dir)) !== canonical(before)) fail('SOURCE_CHANGED_DURING_READ');
-  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, snapshots };
+  if (canonical(tree(dir)) !== canonical(before) || canonical(directories(dir).sort()) !== canonical(beforeDirs)) fail('SOURCE_CHANGED_DURING_READ');
+  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs, coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, snapshots };
 }
 
 // Validate the recorded provenance; never reconstruct a median or select a different pair.
@@ -112,7 +150,7 @@ export function snapshotMissingReason(s) {
   if (price[0].normalizedPayloadDigest === price[1].normalizedPayloadDigest || price[0].rawResponseDigest === price[1].rawResponseDigest) return 'DUPLICATE_PRICE_EVIDENCE';
   return null;
 }
-export function resolveReference(reference, candidates) {
+export function resolveReference(reference, candidates, coverage = null) {
   const s = reference.snapshot, invalid = snapshotMissingReason(s);
   const targetAt = stamp(s?.observedAt) && stamp(s.observedAt + PRIMARY_HORIZON_MS) ? s.observedAt + PRIMARY_HORIZON_MS : null;
   const base = { schemaVersion: 1, recordType: 'market_outcome', ...CLASSIFICATION, outcomeDefinitionId: OUTCOME_DEFINITION_ID,
@@ -127,11 +165,18 @@ export function resolveReference(reference, candidates) {
     .sort((a, b) => a.snapshot.observedAt - b.snapshot.observedAt || order(a.snapshotDigest, b.snapshotDigest) || order(a.sessionId, b.sessionId));
   const rejected = {}; let future;
   for (const candidate of window) {
-    const reason = snapshotMissingReason(candidate.snapshot);
+    let reason = snapshotMissingReason(candidate.snapshot);
+    if (!reason) {
+      const futurePrice = candidate.snapshot.disagreement.metrics.contributors.price;
+      const referencePrice = s.disagreement.metrics.contributors.price;
+      if (futurePrice.some(p => p.providerObservedAt < targetAt)) reason = 'PRE_TARGET_PRICE_EVIDENCE';
+      else if (futurePrice.some(p => referencePrice.some(q => p.provider === q.provider && (p.normalizedPayloadDigest === q.normalizedPayloadDigest || p.rawResponseDigest === q.rawResponseDigest)))) reason = 'REUSED_REFERENCE_PRICE_EVIDENCE';
+    }
     if (!reason) { future = candidate; break; }
     rejected[reason] = (rejected[reason] ?? 0) + 1;
   }
-  if (!future) return unavailable(window.length ? 'NO_VALID_FUTURE_TWO_SOURCE_OBSERVATION' : 'NO_SAME_MINT_OBSERVATION_IN_WINDOW', rejected);
+  const covered = !coverage || (() => { let end = targetAt; for (const span of coverage.sort((a,b) => a.startedAt-b.startedAt)) { if (span.startedAt > end) break; end = Math.max(end, span.endedAt); if (end >= targetAt + RESOLUTION_TOLERANCE_MS) return true; } return false; })();
+  if (!future) return unavailable(window.length ? 'NO_VALID_FUTURE_TWO_SOURCE_OBSERVATION' : covered ? 'NO_SAME_MINT_OBSERVATION_IN_WINDOW' : 'SOURCE_COVERAGE_GAP', rejected);
   const f = future.snapshot, ratio = f.disagreement.metrics.priceMedianUsd / base.referencePriceUsd;
   const signed = Math.log(ratio) * 10_000;
   if (!Number.isFinite(signed)) return unavailable('NONFINITE_LOG_RETURN', rejected);
@@ -139,7 +184,7 @@ export function resolveReference(reference, candidates) {
   return { ...base, status: 'resolved', missingReason: null, resolvedAt: f.observedAt, futureObservedAt: f.observedAt,
     resolutionLagMs: f.observedAt - targetAt, futurePriceUsd: f.disagreement.metrics.priceMedianUsd,
     futureSessionId: future.sessionId, futureSnapshotDigest: future.snapshotDigest, futureNormalizedPayloadDigest: f.normalizedPayloadDigest,
-    futurePriceContributors: f.disagreement.metrics.contributors.price, absLogReturn300sBps: Math.abs(signed),
+    futurePriceContributors: f.disagreement.metrics.contributors.price, rejectedCandidatesByReason: rejected, absLogReturn300sBps: Math.abs(signed),
     logReturn300sBps: signed, logReturn300sBpsRole: 'descriptive / provenance only' };
 }
 
@@ -147,10 +192,12 @@ export function resolveReference(reference, candidates) {
 export function generateOutcomeRun({ sources, references, outputRoot, runId, createdAt, sourcePolicy = R4_SOURCE_POLICY, sealedCode = null }) {
   if (!Array.isArray(sources) || !sources.length || !Array.isArray(references) || !references.length || !stamp(createdAt) || typeof runId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(runId) || typeof outputRoot !== 'string') fail('RUN_INPUT_INVALID');
   const sessions = sources.map(s => readSourceSession(s, sourcePolicy));
+  let primaryError;
   try {
     if (new Set(sessions.map(s => s.sessionId)).size !== sessions.length) fail('DUPLICATE_SOURCE_SESSION');
     const root = safePath(outputRoot), dir = path.join(root, runId);
-    for (const s of sessions) if (root === s.dir || root.startsWith(s.dir + path.sep) || s.dir.startsWith(root + path.sep)) fail('OUTPUT_SOURCE_OVERLAP');
+    if (PROTECTED.some(p => overlaps(root,p))) fail('OUTPUT_PROTECTED_ROOT');
+    for (const s of sessions) if (overlaps(root,s.dir)) fail('OUTPUT_SOURCE_OVERLAP');
     const candidates = sessions.flatMap(s => s.snapshots);
     if (candidates.some(c => !stamp(c.snapshot.observedAt) || c.snapshot.observedAt > createdAt)) fail('EVIDENCE_NOT_YET_OBSERVED');
     const selected = references.map(r => {
@@ -162,7 +209,7 @@ export function generateOutcomeRun({ sources, references, outputRoot, runId, cre
       return matches[0];
     }).sort((a, b) => order(a.sessionId, b.sessionId) || order(a.snapshotDigest, b.snapshotDigest));
     if (new Set(selected.map(r => `${r.sessionId}/${r.snapshotDigest}`)).size !== selected.length) fail('DUPLICATE_REFERENCE');
-    const outcomes = selected.map(r => resolveReference(r, candidates));
+    const outcomes = selected.map(r => resolveReference(r, candidates, sessions.map(s => s.coverage)));
     const unresolvedByReason = {};
     for (const o of outcomes) if (o.status === 'unavailable') unresolvedByReason[o.missingReason] = (unresolvedByReason[o.missingReason] ?? 0) + 1;
     const metadata = { schemaVersion: 1, ...CLASSIFICATION, outcomeDefinitionId: OUTCOME_DEFINITION_ID, primaryField: 'absLogReturn300sBps', outcomeType: 'continuous',
@@ -173,14 +220,49 @@ export function generateOutcomeRun({ sources, references, outputRoot, runId, cre
     const hashes = Object.fromEntries(Object.entries(bodies).map(([name, body]) => [name, createHash('sha256').update(body).digest('hex')]));
     const content = { ...metadata, recordType: 'outcome_manifest', status: 'finalized', files: hashes };
     const manifest = { ...content, fingerprint: digest(content) };
-    for (const s of sessions) if (canonical(tree(s.dir)) !== canonical(s.before)) fail('SOURCE_CHANGED_AFTER_RESOLUTION');
+    for (const s of sessions) if ((canonical(tree(s.dir)) !== canonical(s.before) || canonical(directories(s.dir).sort()) !== canonical(s.beforeDirs))) fail('SOURCE_CHANGED_AFTER_RESOLUTION');
     mkdirSync(root, { recursive: true }); safePath(root); mkdirSync(dir); // Exclusive reservation, including abandoned partial runs.
-    for (const [name, body] of Object.entries({ ...bodies, 'manifest.json': canonical(manifest) + '\n' })) {
+    for (const [name, body] of Object.entries(bodies)) {
       const file = path.join(dir, name); writeFileSync(file, body, { flag: 'wx', mode: 0o444 });
       const fd = openSync(file, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
     }
+    for (const s of sessions) if ((canonical(tree(s.dir)) !== canonical(s.before) || canonical(directories(s.dir).sort()) !== canonical(s.beforeDirs))) fail('SOURCE_CHANGED_AFTER_RESOLUTION');
+    const tmp = path.join(dir, 'manifest.json.tmp'), final = path.join(dir, 'manifest.json');
+    writeFileSync(tmp, canonical(manifest) + '\n', { flag: 'wx', mode: 0o444 });
+    const fd = openSync(tmp, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
+    try { lstatSync(final); fail('EEXIST'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    renameSync(tmp, final);
+    const dfd = openSync(dir, 'r'); try { fsyncSync(dfd); } finally { closeSync(dfd); }
+    chmodSync(dir, 0o555);
     return { dir, manifest, outcomes };
+  } catch (e) { primaryError = e; throw e;
   } finally {
-    for (const s of sessions) if (canonical(tree(s.dir)) !== canonical(s.before)) fail('SOURCE_CHANGED_AFTER_RESOLUTION');
+    try { for (const s of sessions) if ((canonical(tree(s.dir)) !== canonical(s.before) || canonical(directories(s.dir).sort()) !== canonical(s.beforeDirs))) fail('SOURCE_CHANGED_AFTER_RESOLUTION'); }
+    catch (e) { if (primaryError) throw new AggregateError([primaryError,e], primaryError.message, { cause: primaryError }); throw e; }
   }
+}
+
+export function verifyOutcomeRun(dir) {
+  dir = safePath(dir);
+  const names = readdirSync(dir).sort();
+  if (!names.includes('manifest.json')) fail('OUTCOME_MANIFEST_MISSING');
+  if (canonical(names) !== canonical(['manifest.json','outcomes.ndjson','summary.json'])) fail('OUTCOME_FILE_SET_INVALID');
+  for (const name of names) if (!lstatSync(path.join(dir,name)).isFile()) fail('OUTCOME_FILE_SET_INVALID');
+  const manifest = sourceJson(readFileSync(path.join(dir,'manifest.json')));
+  if (manifest.recordType !== 'outcome_manifest' || manifest.schemaVersion !== 1 || manifest.status !== 'finalized') fail('OUTCOME_MANIFEST_INVALID');
+  if (manifest.outcomeDefinitionId !== OUTCOME_DEFINITION_ID || manifest.horizonSeconds !== PRIMARY_HORIZON_SECONDS || manifest.horizonMs !== PRIMARY_HORIZON_MS || manifest.resolutionToleranceMs !== RESOLUTION_TOLERANCE_MS) fail('OUTCOME_DEFINITION_INVALID');
+  for (const [key,value] of Object.entries(CLASSIFICATION)) if (manifest[key] !== value) fail('OUTCOME_CLASSIFICATION_INVALID');
+  if (canonical(Object.keys(manifest.files ?? {}).sort()) !== canonical(['outcomes.ndjson','summary.json'])) fail('OUTCOME_FILE_SET_INVALID');
+  for (const [name,hash] of Object.entries(manifest.files)) if (hashFile(path.join(dir,name)) !== hash) fail('OUTCOME_FILE_HASH_MISMATCH');
+  const { fingerprint, ...content } = manifest;
+  if (digest(content) !== fingerprint) fail('OUTCOME_FINGERPRINT_MISMATCH');
+  const summary = sourceJson(readFileSync(path.join(dir,'summary.json')));
+  if (summary.recordType !== 'outcome_summary' || summary.outcomeDefinitionId !== OUTCOME_DEFINITION_ID || summary.horizonSeconds !== PRIMARY_HORIZON_SECONDS || summary.resolutionToleranceMs !== RESOLUTION_TOLERANCE_MS) fail('OUTCOME_SUMMARY_INVALID');
+  for (const [key,value] of Object.entries(CLASSIFICATION)) if (summary[key] !== value) fail('OUTCOME_CLASSIFICATION_INVALID');
+  for (const line of readFileSync(path.join(dir,'outcomes.ndjson'),'utf8').trimEnd().split('\n')) {
+    const row = sourceJson(line);
+    if (row.recordType !== 'market_outcome' || row.outcomeDefinitionId !== OUTCOME_DEFINITION_ID || row.horizonSeconds !== PRIMARY_HORIZON_SECONDS || row.resolutionToleranceMs !== RESOLUTION_TOLERANCE_MS) fail('OUTCOME_ROW_INVALID');
+    for (const [key,value] of Object.entries(CLASSIFICATION)) if (row[key] !== value) fail('OUTCOME_CLASSIFICATION_INVALID');
+  }
+  return manifest;
 }

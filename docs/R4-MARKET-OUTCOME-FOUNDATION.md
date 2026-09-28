@@ -25,7 +25,7 @@ substitution.
 ## Offline API and evidence policy
 
 `scripts/market-outcomes/index.mjs` exposes `readSourceSession`,
-`generateOutcomeRun`, and pure validation/resolution helpers. It has no CLI,
+`generateOutcomeRun`, `verifyOutcomeRun`, and pure validation/resolution helpers. It has no CLI,
 network dependency, capture operation, prediction model, or trading capability.
 The generation API requires explicit inputs:
 
@@ -79,7 +79,7 @@ market observations must corroborate these contributor identities and contain a
 positive price; shared raw or normalized evidence cannot masquerade as two
 independent providers. Snapshot and disagreement normalized digests are checked.
 
-Each snapshot independently passes recorded freshness budgets and the recorded
+For each future Jupiter and DexScreener price contributor, `providerObservedAt` must be at or after the frozen target. A future contributor cannot reuse the matching reference provider’s raw response or normalized payload digest. Recorded budgets cannot relax either rule. Each snapshot independently passes recorded freshness budgets and the recorded
 alignment rule. Alignment uses the newest fresh recorded source timestamp,
 matching Phase 5J's rule. All recorded source timestamps and snapshot capture
 timestamps are checked for lookahead. The price basis is the **already computed
@@ -96,8 +96,7 @@ the inclusive window, select the first valid candidate ordered by:
 3. session ID ascending, for identical timestamp and digest across sessions.
 
 Phase 5J stores snapshots and disagreement separately. Reconstruction joins by
-mint, timestamp, and the recorded disagreement digest. Ambiguous disagreement
-bodies produce an invalid snapshot rather than choosing one arbitrarily. The
+mint, timestamp, and the recorded disagreement digest. Missing or ambiguous disagreement bodies reject the source with `MISSING_DISAGREEMENT_JOIN` or `AMBIGUOUS_DISAGREEMENT_JOIN`. The
 stored full snapshot digest covers the joined representation, while the original
 snapshot and disagreement normalized digests remain source provenance.
 
@@ -114,7 +113,8 @@ A row has a null primary value and an exact `missingReason`:
 
 - `REFERENCE_` plus the snapshot validation reason below (or
   `REFERENCE_INVALID_TIMESTAMP`).
-- `NO_SAME_MINT_OBSERVATION_IN_WINDOW`.
+- `SOURCE_COVERAGE_GAP` if the union of eligible source session start/end spans does not cover the entire inclusive target-to-target-plus-tolerance interval; this is collection absence, not mint absence.
+- `NO_SAME_MINT_OBSERVATION_IN_WINDOW` when that interval is covered but the mint has no candidate.
 - `NO_VALID_FUTURE_TWO_SOURCE_OBSERVATION` with exact counts of rejected
   candidates by validation reason.
 - `NONFINITE_LOG_RETURN`.
@@ -124,7 +124,7 @@ Snapshot validation reasons are `INVALID_SNAPSHOT`, `INVALID_PRICE`,
 `NO_LOOKAHEAD_VIOLATION`, `INVALID_SOURCE_BUDGET`, `INVALID_PAYLOAD_DIGEST`,
 `INVALID_ALIGNMENT_RULE`, `STALE_PRICE_CONTRIBUTOR`,
 `MISALIGNED_PRICE_CONTRIBUTOR`, and `DUPLICATE_PRICE_EVIDENCE`.
-Source integrity, session policy, immature windows, invalid reference selection,
+Both resolved and unavailable rows persist deterministic `rejectedCandidatesByReason`, including invalid earlier candidates skipped before a valid future. Source integrity, session policy, immature windows, invalid reference selection,
 or output conflicts reject the run rather than emitting scientific values from
 untrusted evidence.
 
@@ -133,16 +133,11 @@ untrusted evidence.
 Before interpreting source evidence, verify the manifest schema/identity, exact
 listed file set, every listed SHA-256, and the canonical file-map fingerprint.
 Reject path traversal, symlinks, missing/unlisted files, identity discrepancies,
-and tampering. Evidence reads are checked against the verified bytes. Hash the
-entire source tree again after reading, before publication, and on exit; source
-files and the manifest must remain byte-identical. There is no repair path.
+and tampering. Evidence reads are checked against verified bytes; NDJSON is parsed one line at a time from bounded read chunks. The tree is rehashed after reading, before publication, and on exit. These passes authenticate pre-read files, interpreted bytes, and pre-publication immutability independently. Source files and the manifest must remain byte-identical. There is no repair path.
 
 Output goes only to a caller-injected separate tree, suitable later for
 `.evolve/market-outcomes/<runId>/`. Implementation validation uses temporary roots
-only. Source and output trees cannot overlap. Exclusive directory creation
-reserves the run ID, even if a failed write leaves a partial run. Files use
-exclusive creation and read-only permissions; the manifest is written last as
-the finalization marker. Existing runs are never reopened for writing. This is
+only. Source and output trees cannot overlap. Protected EVOLVE source, history, arena, research, and production-state roots are barred even if not supplied as sources. Exclusive directory creation reserves the run ID, even if a failed write leaves a partial run. Body files use exclusive creation, mode 0444, and fsync. Source integrity is rechecked before manifest publication. The manifest is written to an exclusive temporary file, fsynced, then atomically renamed as the finalization marker; the directory is fsynced and set to mode 0555. A partial run has no final manifest and is not valid evidence. `verifyOutcomeRun` reads only and checks the exact file set, finalized status, hashes, fingerprint, classification, definition, horizon, and tolerance. It never repairs a run. Source failures on cleanup preserve an earlier primary error in an `AggregateError`. Existing runs are never reopened for writing. This is
 application-level immutability, not a claim that a filesystem owner cannot alter
 files externally.
 

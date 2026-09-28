@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, mkdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { aggregate } from './market-intelligence/aggregate.mjs';
 import { observation } from './market-intelligence/normalize.mjs';
 import { createStorage } from './market-intelligence/storage.mjs';
 import { canonical, digest } from './market-intelligence/definition.mjs';
-import { CLASSIFICATION, PRIMARY_HORIZON_MS, resolveReference, snapshotMissingReason, readSourceSession, generateOutcomeRun } from './market-outcomes/index.mjs';
+import { CLASSIFICATION, PRIMARY_HORIZON_MS, resolveReference, snapshotMissingReason, readSourceSession, generateOutcomeRun, verifyOutcomeRun } from './market-outcomes/index.mjs';
 const tests = [], test = (name, fn) => tests.push([name, fn]);
 const roots = [], temp = () => { const r = mkdtempSync(path.join(tmpdir(), 'evolve-outcomes-')); roots.push(r); return r; };
 const at = 1800000000000, mint = 'So11111111111111111111111111111111111111112', other = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 function records(time, price = 2, identity = mint) {
   return ['jupiter', 'dexscreener'].map(provider => {
-    const normalized = { priceUsd: price, providerFixture: provider, liquidityUsd: null, volumes: { m5: null, h1: null }, transactions: { m5: { buys: null, sells: null } }, priceChanges: { m5: null, h1: null }, pairCreatedAt: null };
+    const normalized = { priceUsd: price, providerFixture: provider, liquidityUsd: null, volumes: { m5: null, h1: null }, transactions: { m5: { buys: null, sells: null } }, priceChanges: { m5: null, h1: null }, pairCreatedAt: time };
     return observation({ provider, endpoint: '/' + provider, mint: identity, payload: { provider, time, price }, normalized, receivedAt: time, staleMs: 60000 });
   });
 }
@@ -32,7 +33,7 @@ function refresh(s) {
 function fixture(id = 'fixture', times = [at, at + 300000], options = {}) {
   const s = createStorage({ root: temp(), sessionId: id, startedAt: times[0] });
   for (const t of times) {
-    const rs = records(t); for (const r of rs) s.writeObservation(r, { provider: r.provider, time: t, price: 2 });
+    const rs = records(t, 2, options.identity ?? mint); for (const r of rs) s.writeObservation(r, { provider: r.provider, time: t, price: 2 });
     s.writeSnapshot(aggregate(rs, { observedAt: t })[0]);
   }
   s.finalize({ endedAt: times.at(-1), reason: options.reason ?? 'duration reached' });
@@ -81,9 +82,10 @@ test('exclusive finalized run no overwrite', () => { const a = args([fixture()])
 test('cross-session end-of-cohort reference with maturation future', () => { const a = fixture('cohort', [at]), b = fixture('maturation', [at + 300000], { role: 'maturation' }); const input = args([a, b]), o = generateOutcomeRun(input).outcomes[0]; assert.equal(o.referenceSessionId, 'cohort'); assert.equal(o.futureSessionId, 'maturation'); assert.equal(o.resolutionLagMs, 0); input.references = [{ sessionId: 'maturation', snapshotDigest: readSourceSession(b).snapshots[0].snapshotDigest }]; assert.throws(() => generateOutcomeRun(input), /REFERENCE_NOT_IN_COHORT/); });
 test('cross-session cohort future and source ordering determinism', () => { const a = fixture('first', [at]), b = fixture('second', [at + 300000]), input = args([a, b]); const first = generateOutcomeRun(input), second = generateOutcomeRun({ ...input, sources: [b, a], outputRoot: temp() }); assert.equal(first.outcomes[0].futureSessionId, 'second'); assert.deepEqual(bytes(first.dir), bytes(second.dir)); });
 test('unmatured resolution window rejected', () => { const input = args([fixture()]); input.createdAt = at + 300000; assert.throws(() => generateOutcomeRun(input), /RESOLUTION_WINDOW_NOT_MATURE/); });
+test('exact maturation boundary is permitted', () => { const input=args([fixture()]); input.createdAt=at+360000; assert.equal(generateOutcomeRun(input).manifest.recordCount,1); });
 test('output-source overlap rejected', () => { const s = fixture(), input = args([s]); input.outputRoot = path.join(s.dir, 'outcomes'); assert.throws(() => generateOutcomeRun(input), /OUTPUT_SOURCE_OVERLAP/); });
 test('classification in every output artifact', () => { const result = generateOutcomeRun(args([fixture()])); for (const o of [result.manifest, JSON.parse(readFileSync(path.join(result.dir, 'summary.json'))), ...result.outcomes]) for (const [k, v] of Object.entries(CLASSIFICATION)) assert.equal(o[k], v); });
-test('no network dependency or engine/trading authority import', () => { const code = readFileSync('scripts/market-outcomes/index.mjs', 'utf8'); const imports = [...code.matchAll(/from\s+['"]([^'"]+)['"]/g)].map(m => m[1]); assert.deepEqual(imports, ['node:crypto', 'node:fs', 'node:path', '../market-intelligence/definition.mjs']); assert(!/\b(fetch|WebSocket|https?|engine|arena)\s*\(/.test(code)); const original = globalThis.fetch; globalThis.fetch = () => { throw new Error('NETWORK_FORBIDDEN'); }; try { assert.equal(generateOutcomeRun(args([fixture()])).manifest.resolvedCount, 1); } finally { globalThis.fetch = original; } });
+test('no network dependency or engine/trading authority import', () => { const code = readFileSync('scripts/market-outcomes/index.mjs', 'utf8'); const imports = [...code.matchAll(/from\s+['"]([^'"]+)['"]/g)].map(m => m[1]); assert.deepEqual(imports, ['node:crypto', 'node:fs', 'node:path', 'node:url', '../market-intelligence/definition.mjs']); assert(!/\b(fetch|WebSocket|https?|engine|arena)\s*\(/.test(code)); const original = globalThis.fetch; globalThis.fetch = () => { throw new Error('NETWORK_FORBIDDEN'); }; try { assert.equal(generateOutcomeRun(args([fixture()])).manifest.resolvedCount, 1); } finally { globalThis.fetch = original; } });
 test('explicit future-outcome flag rejected', () => { const s = snapshot(); s.futureOutcomeIncluded = true; assert.equal(snapshotMissingReason(s), 'NO_LOOKAHEAD_VIOLATION'); });
 test('malformed contributor rejected', () => { const s = snapshot(); s.disagreement.metrics.contributors.price[0] = null; assert.equal(snapshotMissingReason(s), 'INVALID_PRICE_CONTRIBUTORS'); });
 test('future and reference freshness validated independently', () => { const s = snapshot(at + 300000); s.staleness.sourceObservations[0].budgetMs = 0; s.observedAt++; s.disagreement.observedAt++; refresh(s); assert.equal(resolve([s]).status, 'unavailable'); const ref = structuredClone(s); assert.equal(resolve([], entry(ref)).missingReason, 'REFERENCE_STALE_PRICE_CONTRIBUTOR'); });
@@ -112,8 +114,90 @@ test('48-session cohort plus separate maturation session', () => {
   assert(result.outcomes.every(o => o.referenceSessionId !== 'post-cohort'));
 });
 test('disagreement timestamps contain no future information', () => { const s = snapshot(); s.disagreement.staleness.sourceObservedAt.push(at + 1); assert.equal(snapshotMissingReason(s), 'NO_LOOKAHEAD_VIOLATION'); });
+
+function rewriteSource(source, file, transform) {
+  const target = path.join(source.dir, file), value = file.endsWith('.ndjson') ? readFileSync(target, 'utf8').trimEnd().split('\n').map(JSON.parse) : JSON.parse(readFileSync(target));
+  transform(value); const changed = value;
+  const body = file.endsWith('.ndjson') ? changed.map(v => canonical(v)).join('\n') + '\n' : canonical(changed) + '\n';
+  writeFileSync(target, body);
+  const mfile = path.join(source.dir, 'manifest.json'), m = JSON.parse(readFileSync(mfile));
+  m.files[file] = createHash('sha256').update(body).digest('hex'); m.fingerprint = digest(m.files); writeFileSync(mfile, canonical(m) + '\n');
+}
+const evidenceCase = (name, change, code = /SOURCE_PRICE_EVIDENCE_INVALID/) => test(name, () => {
+  const source = fixture(); rewriteSource(source, 'normalized.ndjson', rows => { change(rows); });
+  assert.throws(() => readSourceSession(source), code);
+});
+evidenceCase('missing matching market observation', rows => { rows.splice(rows.findIndex(r => r.recordType === 'market_observation'), 1); });
+for (const [field, value] of [['provider','gmgn'],['sourceEndpoint','/wrong'],['providerObservedAt',at-1],['rawResponseDigest','0'.repeat(64)],['normalizedPayloadDigest','0'.repeat(64)]])
+  evidenceCase(`market observation ${field} mismatch`, rows => { rows.find(r => r.recordType === 'market_observation')[field] = value; });
+evidenceCase('market observation normalized body digest mismatch', rows => { rows.find(r => r.recordType === 'market_observation').normalized.priceUsd = 9; });
+for (const field of ['observedAt','receivedAt','capturedAt']) evidenceCase(`market observation ${field} after snapshot`, rows => { rows.find(r => r.recordType === 'market_observation')[field] = at+1; });
+test('future contributor timestamps must reach target independently', () => {
+  for (const lag of [0,60000]) assert.equal(resolve([snapshot(at+300000+lag)]).status, 'resolved');
+  for (const provider of ['jupiter','dexscreener']) {
+    const f = snapshot(at+300000), p = f.disagreement.metrics.contributors.price.find(x => x.provider === provider), src = f.staleness.sourceObservations.find(x => x.provider === provider);
+    p.providerObservedAt = src.providerObservedAt = at+299999; src.budgetMs = 1000000; refresh(f);
+    assert.deepEqual(resolve([f]).rejectedCandidatesByReason, { PRE_TARGET_PRICE_EVIDENCE: 1 });
+  }
+});
+test('reference evidence cannot be reused as future price', () => {
+  for (const key of ['rawResponseDigest','normalizedPayloadDigest']) { const r = snapshot(), f = snapshot(at+300000); f.disagreement.metrics.contributors.price[0][key] = r.disagreement.metrics.contributors.price[0][key]; f.staleness.sourceObservations.find(x=>x.provider===f.disagreement.metrics.contributors.price[0].provider)[key] = r.disagreement.metrics.contributors.price[0][key]; refresh(f); assert.deepEqual(resolve([f],entry(r)).rejectedCandidatesByReason,{REUSED_REFERENCE_PRICE_EVIDENCE:1}); }
+});
+test('exact freshness and alignment boundaries', () => {
+  for (const delta of [0,1]) { const s = snapshot(); const p=s.disagreement.metrics.contributors.price[0], src=s.staleness.sourceObservations.find(x=>x.provider===p.provider); src.providerObservedAt-=60000+delta; p.providerObservedAt-=60000+delta; src.budgetMs=60000; s.disagreement.alignmentMs=s.disagreement.staleness.alignmentMs=70000; refresh(s); assert.equal(snapshotMissingReason(s),delta?'STALE_PRICE_CONTRIBUTOR':null); }
+  for (const delta of [0,1]) { const s=snapshot(), p=s.disagreement.metrics.contributors.price[0], src=s.staleness.sourceObservations.find(x=>x.provider===p.provider); src.providerObservedAt-=15000+delta; p.providerObservedAt-=15000+delta; refresh(s); assert.equal(snapshotMissingReason(s),delta?'MISALIGNED_PRICE_CONTRIBUTOR':null); }
+});
+test('session ID ascending tie after identical timestamp and digest', () => { const s=snapshot(at+300000), a=entry(s,'a'), z=entry(s,'z'); assert.equal(resolveReference(reference(),[z,a]).futureSessionId,'a'); });
+for (const value of [-1, Infinity]) test(`reject budget ${value}`, () => { const s=snapshot(); s.staleness.sourceObservations[0].budgetMs=value; if(Number.isFinite(value))refresh(s); assert.equal(snapshotMissingReason(s),'INVALID_SOURCE_BUDGET'); });
+test('observation digest required', () => { const s=snapshot(); s.staleness.sourceObservations[0].observationDigest='0'.repeat(64); assert.equal(snapshotMissingReason(s),'INVALID_SOURCE_PROVENANCE'); });
+test('disagreement metrics digest required', () => { const s=snapshot(); s.disagreement.normalizedPayloadDigest='0'.repeat(64); assert.equal(snapshotMissingReason(s),'INVALID_PAYLOAD_DIGEST'); });
+test('coherent future source timestamps cannot look ahead',()=>{const s=snapshot();for(const k of ['providerObservedAt','receivedAt','capturedAt','observedAt'])s.staleness.sourceObservations[0][k]=at+1;refresh(s);assert.equal(snapshotMissingReason(s),'NO_LOOKAHEAD_VIOLATION');});
+test('provider timestamp cannot look ahead', () => { const s=snapshot(); s.staleness.sourceObservations[0].providerObservedAt=at+1; refresh(s); assert.equal(snapshotMissingReason(s),'NO_LOOKAHEAD_VIOLATION'); });
+for (const providers of [['dexscreener','gmgn'],['dexscreener','dexscreener'],['Jupiter','dexscreener']]) test(`reject set ${providers.join('+')}`,()=>{ const s=snapshot(); s.disagreement.metrics.contributors.price=providers.map((provider,i)=>({...s.disagreement.metrics.contributors.price[i],provider})); assert.equal(snapshotMissingReason(s),'INVALID_PRICE_CONTRIBUTORS'); });
+for (const [label,edit] of [['status',s=>s.status='incomplete'],['reason signal',s=>s.reason='signal'],['reason capture failed',s=>s.reason='capture failed'],['missing storage',s=>delete s.storage],['bound reached',s=>s.storage.sessionBoundReached=true]]) test(`session policy ${label}`,()=>{const source=fixture();rewriteSource(source,'summary.json',edit);assert.throws(()=>readSourceSession(source),/SOURCE_STATUS_INELIGIBLE/);});
+test('exclusive create flag is an explicit publication guard',()=>{const code=readFileSync('scripts/market-outcomes/index.mjs','utf8');assert.match(code,/writeFileSync\(file, body, \{ flag: 'wx', mode: 0o444 \}\)/);});
+test('final permissions, verifier, and exclusive individual paths',()=>{ const a=args([fixture()]), result=generateOutcomeRun(a); for(const name of ['outcomes.ndjson','summary.json','manifest.json']) assert.equal(statSync(path.join(result.dir,name)).mode&0o777,0o444); assert.equal(statSync(result.dir).mode&0o777,0o555); assert.equal(verifyOutcomeRun(result.dir).fingerprint,result.manifest.fingerprint); assert.throws(()=>generateOutcomeRun(a),/EEXIST/); });
+test('partial and malformed runs do not verify',()=>{ const root=temp(), dir=path.join(root,'partial'); mkdirSync(dir); writeFileSync(path.join(dir,'outcomes.ndjson'),'x'); assert.throws(()=>verifyOutcomeRun(dir),/OUTCOME_MANIFEST_MISSING/); writeFileSync(path.join(dir,'summary.json'),'{}');writeFileSync(path.join(dir,'manifest.json'),'{'); assert.throws(()=>verifyOutcomeRun(dir),/SOURCE_FORMAT_INVALID/); });
+test('body, manifest and extra-file tampering fail verification',()=>{for(const kind of ['body','manifest','extra']){const r=generateOutcomeRun(args([fixture()]));chmodSync(r.dir,0o755);if(kind==='body'){chmodSync(path.join(r.dir,'summary.json'),0o644);writeFileSync(path.join(r.dir,'summary.json'),'bad');}if(kind==='manifest'){chmodSync(path.join(r.dir,'manifest.json'),0o644);writeFileSync(path.join(r.dir,'manifest.json'),'{}');}if(kind==='extra')writeFileSync(path.join(r.dir,'extra'),'x');assert.throws(()=>verifyOutcomeRun(r.dir));}});
+test('resolved row retains rejected candidate audit',()=>{const bad=snapshot(at+300000);bad.disagreement.metrics.priceMedianUsd=0;const o=resolve([bad,snapshot(at+300001)]);assert.deepEqual(o.rejectedCandidatesByReason,{INVALID_PRICE:1});});
+test('source coverage gap differs from covered mint absence',()=>{const a=fixture('a',[at]), b=fixture('b',[at+300000,at+360000],{identity:other});let input=args([a]);assert.equal(generateOutcomeRun(input).outcomes[0].missingReason,'SOURCE_COVERAGE_GAP');input=args([a,b]);assert.equal(generateOutcomeRun(input).outcomes[0].missingReason,'NO_SAME_MINT_OBSERVATION_IN_WINDOW');});
+test('missing and ambiguous disagreement joins structural',()=>{for(const kind of ['missing','ambiguous']){const s=fixture();rewriteSource(s,'disagreement.ndjson',rows=>{if(kind==='missing')rows.shift();else rows.push({...rows[0], extra:'duplicate'});});assert.throws(()=>readSourceSession(s),kind==='missing'?/MISSING_DISAGREEMENT_JOIN/:/AMBIGUOUS_DISAGREEMENT_JOIN/);}});
+test('invalid source policy has stable code',()=>assert.throws(()=>readSourceSession(fixture(),null),/SOURCE_POLICY_INVALID/));
+test('unlisted source directory rejected',()=>{const s=fixture();mkdirSync(path.join(s.dir,'empty'));assert.throws(()=>readSourceSession(s),/SOURCE_MANIFEST_FILE_SET_INVALID/);});
+test('malformed source JSON has stable code',()=>{const s=fixture();rewriteSource(s,'summary.json',()=>({broken:true}));writeFileSync(path.join(s.dir,'summary.json'),'{');assert.throws(()=>readSourceSession(s),/SOURCE_FILE_HASH_MISMATCH|SOURCE_FORMAT_INVALID/);});
+test('equal and extreme prices',()=>{assert.equal(resolve([snapshot(at+300000)]).absLogReturn300sBps,0);assert.equal(resolve([snapshot(at+300000,Number.MAX_VALUE/4)],entry(snapshot(at,Number.MIN_VALUE))).missingReason,'NONFINITE_LOG_RETURN');});
+
+test('failure paths leave source trees byte identical',()=>{
+  for(const kind of ['bad reference','bad provenance','EEXIST','overlap']){
+    const source=fixture(), input=args([source]);
+    if(kind==='bad reference')input.references=[{sessionId:'absent',snapshotDigest:'0'.repeat(64)}];
+    if(kind==='bad provenance')rewriteSource(source,'normalized.ndjson',rows=>{rows.find(r=>r.recordType==='market_observation').provider='gmgn';});
+    if(kind==='EEXIST')mkdirSync(path.join(input.outputRoot,input.runId),{recursive:true});
+    if(kind==='overlap')input.outputRoot=path.join(source.dir,'outcomes');
+    const before=bytes(source.dir);assert.throws(()=>generateOutcomeRun(input));assert.deepEqual(bytes(source.dir),before);
+  }
+});
+test('primary error survives cleanup source change',()=>{
+  const source=fixture(),input=args([source]), file=path.join(source.dir,'summary.json');let changed=false;
+  input.references=[{get sessionId(){if(!changed){writeFileSync(file,'mutated');changed=true;}return 'absent';},snapshotDigest:'0'.repeat(64)}];
+  let caught;try{generateOutcomeRun(input);}catch(e){caught=e;}
+  assert(caught instanceof AggregateError);assert.match(caught.errors[0].message,/REFERENCE_NOT_IN_COHORT/);assert.match(caught.errors[1].message,/SOURCE_CHANGED_AFTER_RESOLUTION/);
+});
+test('protected output root is rejected without writing',()=>{
+  const source=fixture(),input=args([source]);input.outputRoot=path.join(process.cwd(),'.evolve','market-intelligence','sessions','sibling-outcomes');const before=bytes(source.dir);
+  assert.throws(()=>generateOutcomeRun(input),/OUTPUT_PROTECTED_ROOT/);assert.deepEqual(bytes(source.dir),before);
+});
+test('FIFO source entry rejected without blocking',()=>{
+  const source=fixture(), fifo=path.join(source.dir,'fifo');assert.equal(spawnSync('mkfifo',[fifo]).status,0);assert.throws(()=>readSourceSession(source),/SOURCE_NOT_REGULAR_FILE/);
+});
+test('pre-existing partial run and output path reject exclusive publication',()=>{
+  for(const name of ['outcomes.ndjson','summary.json','manifest.json.tmp']){
+    const input=args([fixture()]),dir=path.join(input.outputRoot,input.runId);mkdirSync(dir,{recursive:true});writeFileSync(path.join(dir,name),'reserved');
+    assert.throws(()=>generateOutcomeRun(input),/EEXIST/);assert.equal(readFileSync(path.join(dir,name),'utf8'),'reserved');
+  }
+});
 let failed = 0;
 try { for (const [name, fn] of tests) { try { await fn(); console.log(`PASS ${name}`); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.stack}`); } } }
-finally { for (const root of roots) { assert(root.startsWith(tmpdir() + path.sep)); rmSync(root, { recursive: true, force: true }); } }
+finally { for (const root of roots) { assert(root.startsWith(tmpdir() + path.sep)); const walk = p => { chmodSync(p, 0o755); for (const e of readdirSync(p, { withFileTypes: true })) if (e.isDirectory()) walk(path.join(p,e.name)); }; walk(root); rmSync(root, { recursive: true, force: true }); } }
 console.log(`Market outcomes: ${tests.length - failed}/${tests.length} passed; synthetic temporary fixtures only`);
 if (failed) process.exitCode = 1;
