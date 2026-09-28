@@ -31,7 +31,7 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
     for (const r of records) record(r, safe.payload, result.requestIdentity);
   }
   return Object.freeze({
-    async capture({ markets = feed?.markets(now()) ?? [], mints = null } = {}) {
+    async capture({ markets = feed?.markets(now()) ?? [], mints = null, targetedMints = [], passiveDexLimit = config.dex.maxRequests } = {}) {
       if (stopped) throw new Error('Recorder stopped');
       const safeMarkets = redact(markets, config.secrets);
       const copiedAt = now();
@@ -53,11 +53,23 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
       }
       const identities = [...new Set(mints ?? safeMarkets.filter(m => !m.synthetic && m.source === 'Jupiter Tokens V2').map(m => m.mint))].sort();
       if (identities.length > 10000) throw new Error('SESSION_STORAGE_IDENTITY_BOUND');
-      const selected = [];
-      for (let i = 0; i < Math.min(identities.length, config.dex.maxRequests); i++) selected.push(identities[(cursor + i) % identities.length]);
-      cursor += selected.length;
+      const targeted = [...new Set(targetedMints)].sort();
+      if (targeted.length > config.dex.maxRequests) throw new Error('REVISIT_CYCLE_BOUND');
+      const selected = [...targeted];
+      let passive = 0;
+      for (let i = 0; i < identities.length && selected.length < config.dex.maxRequests && selected.length - targeted.length < passiveDexLimit; i++) {
+        const mint = identities[(cursor + i) % identities.length];
+        passive++;
+        if (!selected.includes(mint)) selected.push(mint);
+      }
+      cursor += passive;
+      const revisitResults = {};
       for (const mint of selected) {
-        try { await collect('dexscreener', await dex.observe(mint), normalizeDex); } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('dexscreener', 'NORMALIZATION_FAILED'); }
+        try {
+          const result = await dex.observe(mint, { fresh: targeted.includes(mint) });
+          if (targeted.includes(mint)) revisitResults[mint] = { requestAttempted: result.requestAttempted === true, receivedAt: result.receivedAt ?? null, unavailable: result.unavailable ?? null };
+          await collect('dexscreener', result, normalizeDex);
+        } catch (e) { if (/STORAGE|DIGEST|finalized/.test(e.message)) throw e; error('dexscreener', 'NORMALIZATION_FAILED'); }
       }
       // Independent mint service and per-mint route rotation avoid common-factor
       // starvation. Only the bounded current eligible universe retains cursors.
@@ -108,9 +120,9 @@ export function createIntelligenceRecorder({ config, feed = null, storage = crea
         freshJoined: snapshots.filter(s => s.disagreement.metrics.alignedSourceCount >= 2).length, launchEvents: launch.health().events,
         errors: independentErrors + (health.jupiter.errorCount ?? 0), health,
         priceRangeBps: snapshots.map(s => s.features.crossSourcePriceRangeBps).filter(v => v !== null) };
-      return { snapshots, ...lastStats };
+      return { snapshots, revisitResults, ...lastStats };
     },
-    finalize(reason = 'complete') { stopped = true; launch.stop(); return storage.finalize({ endedAt: now(), reason, health: lastStats.health ?? {}, metrics: { mintsJoined: lastStats.mints ?? 0, freshJoined: lastStats.freshJoined ?? 0, launchEvents: lastStats.launchEvents ?? 0, providerErrors: lastStats.errors ?? 0, priceRangeBps: { count: lastStats.priceRangeBps?.length ?? 0, max: lastStats.priceRangeBps?.length ? Math.max(...lastStats.priceRangeBps) : null } } }); },
+    finalize(reason = 'complete', { revisitCoverage = null } = {}) { stopped = true; launch.stop(); return storage.finalize({ endedAt: now(), reason, health: lastStats.health ?? {}, metrics: { mintsJoined: lastStats.mints ?? 0, freshJoined: lastStats.freshJoined ?? 0, launchEvents: lastStats.launchEvents ?? 0, providerErrors: lastStats.errors ?? 0, priceRangeBps: { count: lastStats.priceRangeBps?.length ?? 0, max: lastStats.priceRangeBps?.length ? Math.max(...lastStats.priceRangeBps) : null }, ...(revisitCoverage ? { revisitCoverage } : {}) } }); },
     health: () => ({ gmgn: gmgn.health(), dexscreener: dex.health(), launch: launch.health() }), dir: storage.dir,
   });
 }

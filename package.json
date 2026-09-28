@@ -86,7 +86,8 @@
     "probe:reach": "node scripts/probe-reach.mjs",
     "validate:phase5j": "node scripts/validate-phase5j.mjs",
     "intelligence:market": "node scripts/market-intelligence.mjs",
-    "validate:market-outcomes": "node scripts/validate-market-outcomes.mjs"
+    "validate:market-outcomes": "node scripts/validate-market-outcomes.mjs",
+    "validate:r4-revisits": "node scripts/validate-r4-revisits.mjs"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",

@@ -9,7 +9,7 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
   const cache = new Map();
   let busy = false, nextAt = 0, backoffUntil = 0, failures = 0;
   const counters = { requests: 0, errors: 0, cacheHits: 0, throttled: 0, lastError: null, state: 'READY' };
-  async function read(kind, identity, { query = {}, body = null } = {}) {
+  async function read(kind, identity, { query = {}, body = null, fresh = false } = {}) {
     const route = routes[kind];
     if (!route || !Object.hasOwn(routes, kind)) throw new Error('Observation route not allowed');
     // requestAttempted distinguishes a real provider call (success or bounded
@@ -18,7 +18,7 @@ export function createObservationTransport({ config, origin, routes, fetchImpl =
     if (busy) return { unavailable: 'BUSY', requestAttempted: false };
     const cacheKey = JSON.stringify([kind, identity, query, body]);
     const old = cache.get(cacheKey);
-    if (old && now() - old.receivedAt <= config.cacheMs) { counters.cacheHits++; return { ...structuredClone(old), requestAttempted: false, servedFromCache: true }; }
+    if (!fresh && old && now() - old.receivedAt <= config.cacheMs) { counters.cacheHits++; return { ...structuredClone(old), requestAttempted: false, servedFromCache: true }; }
     if (now() < backoffUntil) return { unavailable: 'BACKOFF', requestAttempted: false };
     busy = true;
     let requestAttempted = false;

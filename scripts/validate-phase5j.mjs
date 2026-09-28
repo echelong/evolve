@@ -756,10 +756,10 @@ test('79 recorder capture reaching the bound fails closed and finalizes incomple
 });
 test('80 CLI prints allowlisted failure codes only', () => {
   assert.deepEqual([...SAFE_FAILURE_CODES].sort(), ['FINALIZATION_STORAGE_BOUND', 'NO_LOOKAHEAD_TIMESTAMP', 'RAW_STORAGE_BOUND', 'SESSION_STORAGE_BOUND',
-    'SESSION_STORAGE_IDENTITY_BOUND', 'SESSION_STORAGE_RECEIPT_BOUND']);
+    'SESSION_STORAGE_IDENTITY_BOUND', 'SESSION_STORAGE_RECEIPT_BOUND', 'REVISIT_COVERAGE_FAILED', 'REVISIT_CYCLE_BOUND', 'REVISIT_QUEUE_BOUND', 'REVISIT_TIMESTAMP_BOUND'].sort());
   for (const code of SAFE_FAILURE_CODES) { assert.equal(safeFailureCode(new Error(code)), code); assert.equal(failureLine('capture', new Error(code)), `[EVOLVE 5J] capture failed: ${code}`); }
   assert.equal(failureLine('probe', new Error('RAW_STORAGE_BOUND')), '[EVOLVE 5J] probe failed: RAW_STORAGE_BOUND');
-  // Each code is produced by a real bound, not a fabricated label.
+  // Storage codes are produced by real bounds; revisit codes have separate scheduler fixtures.
   assert.throws(() => store({ maxRawBytes: 100 }).writeObservation(g(), gmgnPayload), { message: 'RAW_STORAGE_BOUND' });
   assert.throws(() => store().finalize({ endedAt: at, metrics: { fixture: 'x'.repeat(9000) } }), { message: 'FINALIZATION_STORAGE_BOUND' });
   assert.throws(() => aggregate([g()], { observedAt: at - 1 }), { message: 'NO_LOOKAHEAD_TIMESTAMP' });

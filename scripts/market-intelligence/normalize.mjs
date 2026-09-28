@@ -108,8 +108,8 @@ export function jupiterAdapterPayload(value) {
 export function normalizeJupiterMarkets(markets, { observedAt, receivedAt = observedAt, capturedAt = observedAt, staleMs = 60000 }) {
   return markets.filter(m => m.synthetic === false && m.source === 'Jupiter Tokens V2').map(jupiterAdapterPayload).map(m => observation({
     provider: 'jupiter', endpoint: m.endpoint || 'feed.markets()', mint: m.mint, payload: m,
-    receivedAt, capturedAt, providerObservedAt: m.lastObservedAt, observedAt, staleMs, timestampBasis: 'feed_request_start_and_local_copy',
+    receivedAt, capturedAt, providerObservedAt: m.lastFetchedAt ?? m.lastObservedAt, observedAt, staleMs, timestampBasis: m.lastFetchedAt === undefined ? 'feed_request_start_and_local_copy' : 'feed_last_seen_request_start_and_local_copy',
     normalized: { priceUsd: n(m.price), liquidityUsd: n(m.liquidity), liquidityScope: 'jupiter_token', volume5mUsd: n(m.volume5m), volumeWindowMs: 300000, volumeScope: 'jupiter_token', holderCount: n(m.holderCount), poolCreatedAt: n(m.poolCreatedAt) },
-    limitations: ['Copied normalized feed state; raw upstream response not duplicated', 'Feed timestamp is request start, not upstream update or receipt time', 'Local receipt is the first Phase 5J copy; upstream receipt/update unavailable', 'Jupiter token scope differs from individual DEX pair scope'],
+    limitations: ['Copied normalized feed state; raw upstream response not duplicated', 'Feed timestamp is request start, not upstream update or receipt time', 'Local receipt is the first Phase 5J copy; upstream receipt/update unavailable', 'Jupiter token scope differs from individual DEX pair scope', ...(m.lastFetchedAt === undefined ? [] : ['lastFetchedAt is locally recorded per-mint HTTP-list inclusion, not provider-authenticated price update'])],
   })).filter(Boolean);
 }
