@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, mkdirSync, chmodSync, statSync } from 'node:fs';
+import fs, { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, mkdirSync, chmodSync, statSync, copyFileSync, existsSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { aggregate } from './market-intelligence/aggregate.mjs';
@@ -40,6 +42,18 @@ function fixture(id = 'fixture', times = [at, at + 300000], options = {}) {
   return { dir: s.dir, role: options.role ?? 'cohort' };
 }
 const bytes = dir => Object.fromEntries(readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? Object.entries(bytes(path.join(dir, e.name))).map(([f, b]) => [e.name + '/' + f, b]) : [[e.name, readFileSync(path.join(dir, e.name)).toString('hex')]]));
+function withFsHooks(hooks, fn) {
+  const original = Object.fromEntries(Object.keys(hooks).map(name => [name, fs[name]]));
+  for (const [name, hook] of Object.entries(hooks)) fs[name] = (...values) => hook(original[name], ...values);
+  syncBuiltinESMExports();
+  try { return fn(); }
+  finally { Object.assign(fs, original); syncBuiltinESMExports(); }
+}
+function assertUnpublished(input) {
+  const dir = path.join(input.outputRoot, input.runId);
+  assert(!existsSync(path.join(dir, 'manifest.json')));
+  if (existsSync(dir)) assert.throws(() => verifyOutcomeRun(dir), /OUTCOME_MANIFEST_MISSING/);
+}
 function args(sources) {
   const r = readSourceSession(sources[0]).snapshots[0];
   return { sources, references: [{ sessionId: r.sessionId, snapshotDigest: r.snapshotDigest }], outputRoot: path.join(temp(), 'outcomes'), runId: 'run', createdAt: at + 600000, sealedCode: { sha: 'fixture-sha', tree: 'fixture-tree' } };
@@ -81,6 +95,39 @@ test('output bytes and fingerprint deterministic', () => { const s = fixture(), 
 test('exclusive finalized run no overwrite', () => { const a = args([fixture()]), first = generateOutcomeRun(a), before = bytes(first.dir); assert.throws(() => generateOutcomeRun(a), /EEXIST/); assert.deepEqual(bytes(first.dir), before); });
 test('cross-session end-of-cohort reference with maturation future', () => { const a = fixture('cohort', [at]), b = fixture('maturation', [at + 300000], { role: 'maturation' }); const input = args([a, b]), o = generateOutcomeRun(input).outcomes[0]; assert.equal(o.referenceSessionId, 'cohort'); assert.equal(o.futureSessionId, 'maturation'); assert.equal(o.resolutionLagMs, 0); input.references = [{ sessionId: 'maturation', snapshotDigest: readSourceSession(b).snapshots[0].snapshotDigest }]; assert.throws(() => generateOutcomeRun(input), /REFERENCE_NOT_IN_COHORT/); });
 test('cross-session cohort future and source ordering determinism', () => { const a = fixture('first', [at]), b = fixture('second', [at + 300000]), input = args([a, b]); const first = generateOutcomeRun(input), second = generateOutcomeRun({ ...input, sources: [b, a], outputRoot: temp() }); assert.equal(first.outcomes[0].futureSessionId, 'second'); assert.deepEqual(bytes(first.dir), bytes(second.dir)); });
+test('indexed identical future snapshots use ascending session ID independent of source order', () => {
+  const cohort = fixture('cohort', [at]);
+  const z = fixture('z-future', [at + 300000], { role: 'maturation' });
+  const a = fixture('a-future', [at + 300000], { role: 'maturation' });
+  assert.equal(readSourceSession(a).snapshots[0].snapshotDigest, readSourceSession(z).snapshots[0].snapshotDigest);
+  const input = args([cohort, z, a]);
+  const first = generateOutcomeRun(input), reversed = generateOutcomeRun({ ...input, sources: [a, z, cohort], outputRoot: temp() });
+  assert.equal(first.outcomes[0].futureSessionId, 'a-future');
+  assert.deepEqual(bytes(first.dir), bytes(reversed.dir));
+});
+test('indexed different-digest future ties use digest before session ID independent of source order', () => {
+  const cohort = fixture('cohort', [at]);
+  const a = fixture('a-future', [at + 300000], { role: 'maturation' });
+  const z = fixture('z-future', [at + 300000], { role: 'maturation' });
+  rewriteSource(z, 'normalized.ndjson', rows => { for (const row of rows) if (row.recordType === 'intelligence_snapshot') row.extra = 'different digest'; });
+  const candidates = [a, z].map(source => readSourceSession(source).snapshots[0]);
+  const expected = candidates.sort((x, y) => x.snapshotDigest < y.snapshotDigest ? -1 : 1)[0];
+  const input = args([cohort, z, a]);
+  const first = generateOutcomeRun(input), reversed = generateOutcomeRun({ ...input, sources: [a, z, cohort], outputRoot: temp() });
+  assert.equal(first.outcomes[0].futureSessionId, expected.sessionId);
+  assert.equal(first.outcomes[0].futureSnapshotDigest, expected.snapshotDigest);
+  assert.deepEqual(bytes(first.dir), bytes(reversed.dir));
+});
+test('indexed resolution accepts exactly +60000 ms and rejects +60001 ms', () => {
+  const cohort = fixture('cohort', [at]);
+  const edge = fixture('edge', [at + 360000], { role: 'maturation' });
+  const late = fixture('late', [at + 360001], { role: 'maturation' });
+  const input = args([cohort, late, edge]);
+  const first = generateOutcomeRun(input).outcomes[0];
+  assert.equal(first.status, 'resolved'); assert.equal(first.futureSessionId, 'edge'); assert.equal(first.resolutionLagMs, 60000);
+  const onlyLate = generateOutcomeRun({ ...input, sources: [cohort, late], outputRoot: temp() }).outcomes[0];
+  assert.equal(onlyLate.status, 'unavailable'); assert.equal(onlyLate.futureSessionId, undefined);
+});
 test('unmatured resolution window rejected', () => { const input = args([fixture()]); input.createdAt = at + 300000; assert.throws(() => generateOutcomeRun(input), /RESOLUTION_WINDOW_NOT_MATURE/); });
 test('exact maturation boundary is permitted', () => { const input=args([fixture()]); input.createdAt=at+360000; assert.equal(generateOutcomeRun(input).manifest.recordCount,1); });
 test('output-source overlap rejected', () => { const s = fixture(), input = args([s]); input.outputRoot = path.join(s.dir, 'outcomes'); assert.throws(() => generateOutcomeRun(input), /OUTPUT_SOURCE_OVERLAP/); });
@@ -184,9 +231,83 @@ test('primary error survives cleanup source change',()=>{
   let caught;try{generateOutcomeRun(input);}catch(e){caught=e;}
   assert(caught instanceof AggregateError);assert.match(caught.errors[0].message,/REFERENCE_NOT_IN_COHORT/);assert.match(caught.errors[1].message,/SOURCE_CHANGED_AFTER_RESOLUTION/);
 });
-test('protected output root is rejected without writing',()=>{
-  const source=fixture(),input=args([source]);input.outputRoot=path.join(process.cwd(),'.evolve','market-intelligence','sessions','sibling-outcomes');const before=bytes(source.dir);
-  assert.throws(()=>generateOutcomeRun(input),/OUTPUT_PROTECTED_ROOT/);assert.deepEqual(bytes(source.dir),before);
+test('end-of-read source change is rejected before generation', () => {
+  const source = fixture(), input = args([source]), normalized = path.join(source.dir, 'normalized.ndjson');
+  const disagreement = path.join(source.dir, 'disagreement.ndjson');
+  const original = readFileSync(normalized); let armed = false, changed = false;
+  const sealedCode = { get sha() { return 'fixture-sha'; }, get tree() { if (changed) writeFileSync(normalized, original); return 'fixture-tree'; } };
+  input.sealedCode = sealedCode;
+  let fd, opens = 0;
+  withFsHooks({
+    openSync(real, file, ...rest) { const authenticatedRead = file === disagreement && ++opens === 2; const result = real(file, ...rest); if (authenticatedRead) fd = result; return result; },
+    readSync(real, descriptor, ...rest) {
+      const n = real(descriptor, ...rest);
+      if (descriptor === fd && n === 0 && !armed) { writeFileSync(normalized, Buffer.concat([original, Buffer.from('\n')])); armed = changed = true; }
+      return n;
+    }
+  }, () => assert.throws(() => generateOutcomeRun(input), /SOURCE_CHANGED_DURING_READ/));
+  assert(armed); assertUnpublished(input);
+});
+test('source changed after interpretation fails before body publication', () => {
+  const source = fixture(), input = args([source]), file = path.join(source.dir, 'summary.json');
+  const original = readFileSync(file); let changed = false;
+  input.sealedCode = { get sha() { if (!changed) { writeFileSync(file, Buffer.concat([original, Buffer.from(' ')])); changed = true; } return 'fixture-sha'; }, tree: 'fixture-tree' };
+  try { assert.throws(() => generateOutcomeRun(input), /SOURCE_CHANGED_AFTER_RESOLUTION/); }
+  finally { writeFileSync(file, original); }
+  assert(changed); assertUnpublished(input);
+});
+test('source changed during output body writes fails before manifest publication', () => {
+  const source = fixture(), input = args([source]), file = path.join(source.dir, 'summary.json');
+  const original = readFileSync(file); let changed = false;
+  try {
+    withFsHooks({
+      writeFileSync(real, target, ...rest) {
+        const result = real(target, ...rest);
+        if (target === path.join(input.outputRoot, input.runId, 'outcomes.ndjson')) { real(file, Buffer.concat([original, Buffer.from(' ')])); changed = true; }
+        return result;
+      },
+      renameSync(real, from, to) { if (changed) writeFileSync(file, original); return real(from, to); }
+    }, () => assert.throws(() => generateOutcomeRun(input), /SOURCE_CHANGED_AFTER_RESOLUTION/));
+  } finally { writeFileSync(file, original); }
+  assert(changed); assertUnpublished(input);
+});
+for (const [kind, file] of [['NDJSON', 'normalized.ndjson'], ['JSON', 'summary.json']]) test(`${kind} source swap during authenticated read fails after restoration`, () => {
+  const source = fixture(), input = args([source]), target = path.join(source.dir, file);
+  const original = readFileSync(target); let opens = 0, swapped = false, restored = false, fd;
+  try {
+    withFsHooks({
+      openSync(real, opened, ...rest) {
+        const authenticatedRead = opened === target && ++opens === 2;
+        if (authenticatedRead) { writeFileSync(target, Buffer.concat([original, Buffer.from('\n')])); swapped = true; }
+        const result = real(opened, ...rest);
+        if (authenticatedRead) fd = result;
+        return result;
+      },
+      readSync(real, descriptor, ...rest) {
+        const n = real(descriptor, ...rest);
+        if (kind === 'NDJSON' && descriptor === fd && n === 0 && !restored) { writeFileSync(target, original); restored = true; }
+        return n;
+      },
+      readFileSync(real, descriptor, ...rest) {
+        const value = real(descriptor, ...rest);
+        if (kind === 'JSON' && descriptor === fd && !restored) { writeFileSync(target, original); restored = true; }
+        return value;
+      }
+    }, () => assert.throws(() => generateOutcomeRun(input), /SOURCE_CHANGED_DURING_READ/));
+  } finally { writeFileSync(target, original); }
+  assert(swapped && restored); assertUnpublished(input);
+});
+test('protected output root is rejected without writing in mirrored temporary repository', async () => {
+  const mirror = temp(), moduleFile = path.join(mirror, 'scripts', 'market-outcomes', 'index.mjs');
+  mkdirSync(path.dirname(moduleFile), { recursive: true }); mkdirSync(path.join(mirror, 'scripts', 'market-intelligence'), { recursive: true });
+  copyFileSync('scripts/market-outcomes/index.mjs', moduleFile);
+  copyFileSync('scripts/market-intelligence/definition.mjs', path.join(mirror, 'scripts', 'market-intelligence', 'definition.mjs'));
+  const isolated = await import(pathToFileURL(moduleFile).href);
+  const source = fixture(), input = args([source]);
+  input.outputRoot = path.join(mirror, '.evolve', 'market-intelligence', 'sessions', 'sibling-outcomes');
+  const before = bytes(source.dir);
+  assert.throws(() => isolated.generateOutcomeRun(input), /OUTPUT_PROTECTED_ROOT/);
+  assert(!existsSync(input.outputRoot)); assert.deepEqual(bytes(source.dir), before);
 });
 test('FIFO source entry rejected without blocking',()=>{
   const source=fixture(), fifo=path.join(source.dir,'fifo');assert.equal(spawnSync('mkfifo',[fifo]).status,0);assert.throws(()=>readSourceSession(source),/SOURCE_NOT_REGULAR_FILE/);
