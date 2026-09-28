@@ -47,7 +47,9 @@ The fix is a third authority commit (`P -> S -> A`), described in detail under
   **no scientific-protocol change**, and adds **only** the canonical tracked
   approval artifact. `A` binds `S`'s SHA, the seal fingerprint, the independent
   reviewer/model, the review verdict, the canonical review-report digest and the
-  approval status, and must be pushed to authoritative `origin/main`.
+  approval status, and must be pushed so that it is exactly the **live**
+  `refs/heads/main` of the authoritative remote `origin` (round-3
+  clarification below).
 - **Real cohort T0 is the first whole UTC hour at least 30 minutes after `A`'s
   Git committer timestamp.** T0 is no longer derived from `S` for real
   execution.
@@ -60,6 +62,98 @@ The fix is a third authority commit (`P -> S -> A`), described in detail under
 This wording did **not** exist in the original seal and is carried transparently
 as a labelled amendment, not back-dated. The scientific core remains frozen. No
 approval commit `A` has been created by this document.
+
+## PRE-CAPTURE ENFORCEMENT CLARIFICATIONS (ROUND 3)
+
+**Enforcement clarifications only, made before any cohort attempt.** Independent
+pre-capture re-review round 3 returned `CHANGES_REQUIRED` with four enforcement
+blockers: a valid capability could be replayed (P1-1), attempts 2..8 could be
+authorized without prior history (P1-2), the canonical analysis accepted a
+caller-forged `stage: 'A'` authority (P1-3), and the remote proof read the cached
+`refs/remotes/origin/main` (P2-1). At the time of writing **no approval commit
+`A` existed, no cohort had started, no T0 had been materialized and no real
+outcome existed.** No scientific rule changed: 6 completed sessions, 8 maximum
+attempts, 45-minute sessions, `--r4-revisits`, `COHORT_DRAIN_ONLY`, providers,
+universe, freshness, alignment, the 300 s horizon, +60 s tolerance, Policy A/B,
+`ALL_ELIGIBLE_REFERENCES`, E1, the exposure and outcome fields, Kendall tau-b,
+cluster = mint, 10,000 bootstrap replicates, the type-7 percentile CI, the
+100-reference / 30-mint floors, the `P -> S -> A` model, the 5-minute attempt-1
+window and the 1024 MiB sealed storage cap are all unchanged.
+
+- **Attempt capabilities are single-use.** Each attempt moves through
+  `AUTHORIZED -> CLAIMED -> COMPLETED` or `AUTHORIZED -> CLAIMED -> FAILED`.
+  There is no `CLAIMED -> AUTHORIZED` transition and a claimed capability is
+  never reusable.
+- **The atomic claim is the consumption boundary.** Before it creates a session
+  directory, a recorder, storage, provider objects or any network access, the
+  capture child creates `.evolve/governance/r4-attempts/attempt-N.claim.json`
+  with `open(O_CREAT | O_EXCL)` and fsyncs the file and its directory. The claim
+  binds the authorization fingerprint, the capability hash, the attempt index,
+  the session id, the seal, `P`, `S`, `A`, the capture-spec digest, T0, the claim
+  time and a deterministic claim fingerprint; it never contains the raw
+  capability. Exactly one process can create it: a sequential or concurrent
+  second use of the same capability fails with `R4_CAPABILITY_ALREADY_CLAIMED`
+  and never reaches storage, providers, attestation or the network. As defence
+  in depth a claim is also refused when any downstream consumption evidence for
+  the attempt already exists. Authorization, claim, terminal, receipt and
+  attestation records are created write-once and read-only.
+- **A crash after the claim consumes the attempt.** A claimed attempt without a
+  valid `COMPLETED` terminal record is a **FAILED** attempt for canonical cohort
+  progress, and an authorization that no child ever claimed is likewise FAILED.
+  Deleting a claim and retrying the same attempt is not a supported transition,
+  and no manual judgement decides reuse. Because a claimed attempt may still be
+  running, the next attempt additionally requires an explicit terminal record
+  for the previous one. The runner always writes that record when its child
+  exits (runner-consumed if no child claimed it); after a runner crash the
+  explicit, mechanical `recover --execute` rule writes it, always as FAILED.
+  §D4 then determines whether the next attempt may begin. Terminal records are
+  write-once, so `COMPLETED` can never be rewritten to `FAILED` or vice versa,
+  and each later authorization binds the previous terminal fingerprint (a hash
+  chain).
+- **Canonical attempt ordering is mechanically derived.** The only legal next
+  attempt (`nextAttemptIndex`) is derived from the authenticated attempt history
+  (authorizations, claims, terminal records, receipts and attestations), which
+  is verified for duplicates, gaps, orphaned claims/terminals/attestations,
+  identity mismatches, wrong or superseded `P`/`S`/`A`/seal, attempts above 8,
+  attempts after the cohort stopped and rewritten state. Attempt `N` may be
+  authorized only when every attempt `1..N-1` exists exactly once, attempt `N-1`
+  is terminal, fewer than six completed sessions exist and fewer than eight
+  attempts were used. `--attempt` is at most an assertion that must equal the
+  derived index. Attempt 1 additionally requires `now` in `[T0, T0 + 5 min)` at
+  authorization, and the capture child's claim of attempt 1 must also fall
+  inside that window.
+- **Replacement timing: ordering, not market state.** Attempts 2..8 are the §D4
+  replacement/continuation attempts. They are authorized only after the previous
+  attempt is terminal, with the canonical sealed parameters, and nobody may skip
+  an index or choose among alternative attempt ids. The frozen protocol contains
+  no additional clock rule for replacement starts, so none was invented.
+- **Live remote proof.** Remote authority is a live `git ls-remote --exit-code
+  origin refs/heads/main`, parsed for the exact SHA of exactly that ref. It must
+  **equal** the expected authority commit exactly (`S` at the pre-approval seal
+  stage, `A` at real execution and canonical analysis); ancestry is not
+  sufficient, the cached `refs/remotes/origin/main` is never consulted, nothing is
+  fetched from another branch, and any lookup failure fails closed
+  (`R4_AUTHORITY_REMOTE_UNAVAILABLE`, `R4_AUTHORITY_REMOTE_MAIN_MISMATCH:<what>`).
+- **Canonical analysis resolves `A` from Git itself.** `runCanonicalR4Analysis`
+  rejects caller-supplied authority (`authorityResolution`, `stage`, an approval
+  SHA, T0, seal/authority objects) and caller-authored history (plan, attempts,
+  attestations, session reader). It calls `resolveR4ExecutionAuthority({
+  requireApproval: true })` itself (seal, `S` shape, approval binding, `A`'s
+  direct parent `S`, approval-only diff, live remote main `== A`, `HEAD == A`,
+  worktree integrity, T0 from `A`), derives the plan, attempts and attestations
+  from the authenticated attempt history under the supplied evidence root, and
+  verifies the outcome-run binding against that internally resolved authority.
+  The caller supplies only locations and the outcome binding/outcomes.
+- **`package-lock.json` is bound as defence in depth.** The R4 runtime closure is
+  local modules plus Node builtins only; no third-party runtime package reaches
+  R4 execution. Binding the tracked lockfile makes future dependency drift a
+  seal failure. It changes no scientific behaviour.
+- **Operational environment alignment (procedure, not a protocol change).** The
+  operator's current `.env.local` sets `EVOLVE_MARKET_MODE=auto`, which the
+  sealed preflight correctly reports as class-A drift. It is intentionally left
+  unchanged before approval. **After** an independent `READY` verdict and the
+  creation of `A`, and **before** the attempt-1 start window, the operator aligns
+  the effective `EVOLVE_MARKET_MODE` to the already-sealed value `live`.
 
 The primary outcome primitive was frozen earlier by
 `docs/R4-MARKET-OUTCOME-FOUNDATION.md`. The Policy A rule was frozen earlier by
@@ -395,8 +489,8 @@ changed, and no threshold is moved.
   older `.evolve/governance/` artifact remains historical evidence only.
 - **T0 source (amended).** Real cohort T0 is the first whole UTC hour at least
   30 minutes after the **committer timestamp of the pre-capture approval commit
-  A** (`approvalT0`). `A`'s direct parent is `S`, and both `S` and `A` must be
-  proven present on `origin/main` before T0 is computed. This is the §D1 rule
+  A** (`approvalT0`). `A`'s direct parent is `S`, and the live remote main of
+  `origin` must equal `A` exactly before T0 is computed. This is the §D1 rule
   applied to the committed approval artifact; it does not move T0 for market
   conditions.
 - **Approval commit A and the 5-minute attempt-1 window.** A real attempt is
@@ -406,8 +500,8 @@ changed, and no threshold is moved.
   `READY_TO_AUTHORIZE_COHORT`, bound to the seal fingerprint and `S`, with a
   reviewer/model and a canonical review-report digest) committed by `A`, whose
   direct parent is `S`, whose diff against `S` contains only the approved
-  governance path, which exists on `origin/main`, and which equals `HEAD` at
-  execution. Attempt 1 may start only inside `[T0, T0+5 min)`. Before T0 and at
+  governance path, which is exactly the live `refs/heads/main` of `origin`, and
+  which equals `HEAD` at execution. Attempt 1 may start only inside `[T0, T0+5 min)`. Before T0 and at
   or after `T0+5 min` the runner refuses; a missed window is **not**
   re-anchored and requires a new independently approved authorization commit.
 - **No redundant authority pointer.** Authority is determined by the canonical
@@ -424,10 +518,18 @@ changed, and no threshold is moved.
   session id, capture-spec digest and T0), and hands the **raw** capability to
   the capture child over a dedicated inherited descriptor (fd 3) — never through
   the environment, argv, the repository or a log. Capture verifies
-  `SHA-256(raw capability)` against the persisted hash before it opens an R4
-  session, uses the capability-bound session id, and writes a receipt binding the
-  authenticated manifest fingerprint back to the authorization. Finalization
-  requires the same capability proof. There is no exported interface that mints
+  `SHA-256(raw capability)` against the persisted hash and then **atomically
+  claims** the authorization (single use; see the round-3 clarifications) before
+  it opens an R4 session, uses the capability-bound session id, and writes a
+  receipt binding the authenticated manifest fingerprint and the claim back to
+  the authorization. Finalization requires the same capability proof plus the
+  durable capture-child claim, and every attempt ends in exactly one write-once
+  terminal record. The authorization is persisted only after every gate passed,
+  in the fail-closed order: Git authority, live remote, `HEAD`, worktree,
+  approval `A`, T0, effective environment, storage, authenticated attempt
+  history, `nextAttemptIndex`, cohort-not-stopped, the attempt-1 window, and the
+  derived-index assertion; any earlier failure leaves zero attempt artifacts.
+  There is no exported interface that mints
   a valid attestation from public fields alone. Threat model: this prevents
   ordinary CLI/API/config bypass and accidental or manual masquerading inside the
   repository's execution model; it is not a claim to defeat a malicious local
@@ -498,8 +600,10 @@ changed, and no threshold is moved.
   parameters are derived from the frozen specification, and no environment
   variable can change them.
 - **Single canonical analysis orchestrator.** `runCanonicalR4Analysis` is the
-  only supported real path: it verifies the authority chain, the canonical
-  membership, the reloaded authenticated sources, the canonical reference set,
+  only supported real path: it independently resolves and verifies the
+  authority chain from Git (accepting no caller authority or caller history),
+  derives the canonical membership from the authenticated attempt history, and
+  verifies the reloaded authenticated sources, the canonical reference set,
   the outcome-run binding, the exact `sourceSessionIds`, the certified exposures
   and then the locked primary analysis, binding the result to the seal, cohort,
   reference and outcome identities. `verifyOutcomeRunBinding` cannot be

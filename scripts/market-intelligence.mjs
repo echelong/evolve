@@ -46,12 +46,16 @@ export async function main(args = process.argv.slice(2)) {
   // authorization credential. A real R4 cohort session requires a live
   // capability delivered by the verified canonical runner over the inherited
   // descriptor, whose SHA-256 matches a persisted pre-attempt authorization.
-  // The capability is verified BEFORE the environment gate and before any
-  // storage or network access, and the fail-closed effective-environment check
-  // runs on the ACTUAL child environment.
+  // Round 3 (P1-1): the capability is single-use. `acquireRunnerCapability`
+  // ATOMICALLY CLAIMS the authorization (O_CREAT|O_EXCL claim record, fsync'd
+  // with its directory) as the very first act, BEFORE the environment gate and
+  // before any session directory, recorder, storage, provider object or network
+  // access. A replayed or concurrently reused capability throws here and never
+  // reaches any of them. Governance records resolve against the working
+  // directory the runner started this child in (where storage also lives).
   let sealed = null;
   if (targetedMode) {
-    sealed = acquireRunnerCapability();
+    sealed = acquireRunnerCapability({ cwd: process.cwd() });
     if (!sealed) throw new Error('R4_SEALED_RUNNER_REQUIRED');
     assertSealedChildEnvironment(process.env);
   }
@@ -147,8 +151,8 @@ export async function main(args = process.argv.slice(2)) {
     // contains the raw capability.
     if (sealed && !failed) {
       writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint,
-        capabilityHash: sealed.capabilityHash, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
-        revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending } : null }));
+        capabilityHash: sealed.capabilityHash, claimFingerprint: sealed.claimFingerprint, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
+        revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending } : null }), { cwd: process.cwd() });
     }
     console.log(`\n${recorder.dir}\nfingerprint ${manifest.fingerprint}`);
   }

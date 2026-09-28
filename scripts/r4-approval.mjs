@@ -15,7 +15,8 @@
 // A must: have S as its direct parent; contain no source-code change; contain no
 // scientific-protocol change; add only the canonical tracked approval artifact;
 // bind S SHA, seal fingerprint, reviewer/model, verdict, review report digest and
-// approval status; and be pushed to authoritative origin/main.
+// approval status; and be the LIVE `refs/heads/main` of the authoritative remote
+// `origin` (queried with `git ls-remote`, never the cached tracking ref).
 //
 // Real cohort T0 is then the first whole UTC hour at least 30 minutes after A's
 // Git committer timestamp. Attempt 1 may start only inside [T0, T0 + 5 minutes).
@@ -28,9 +29,9 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
-  R4_REPO_ROOT, R4_REMOTE_MAIN, R4_TRACKED_SEAL_PATH, gitParents, gitShowFile, gitCommitterTimestamp, gitHead,
-  remoteContains, gitCommitExists, loadCanonicalTrackedSeal, assertWorktreeIntegrity, assertSealCommitShape,
-  assertRemoteContains, isCanonicalSealSuperseded,
+  R4_REPO_ROOT, R4_TRACKED_SEAL_PATH, gitParents, gitShowFile, gitCommitterTimestamp, gitHead,
+  gitCommitExists, loadCanonicalTrackedSeal, assertWorktreeIntegrity, assertSealCommitShape,
+  assertLiveRemoteMainEquals, isCanonicalSealSuperseded,
 } from './r4-authority.mjs';
 import { digest, canonical } from './market-intelligence/definition.mjs';
 import { mechanicalT0, R4_COHORT_SPEC } from './r4-cohort-plan.mjs';
@@ -123,7 +124,11 @@ export function findApprovalCommit({ sealAuthorityCommit, approval = null, appro
 
 /**
  * Enforce the A Git contract: direct parent S, diff(S, A) limited to approved
- * governance paths, optionally on origin/main and equal to HEAD.
+ * governance paths, LIVE remote main exactly equal to A, and HEAD equal to A.
+ *
+ * Round 3 (P2-1): the remote proof is a live `git ls-remote` of
+ * `origin refs/heads/main` that must equal A exactly — never the cached
+ * `refs/remotes/origin/main` and never mere ancestry.
  */
 export function verifyApprovalGitContract({
   sealAuthorityCommit, approval, approvalPath = R4_APPROVAL_PATH, cwd = R4_REPO_ROOT,
@@ -136,13 +141,11 @@ export function verifyApprovalGitContract({
   if (changed.length === 0) fail('R4_APPROVAL_EMPTY_DIFF');
   const allowed = new Set(R4_APPROVED_GOVERNANCE_PATHS);
   for (const file of changed) if (!allowed.has(file)) fail(`R4_APPROVAL_GOVERNANCE_SCOPE_VIOLATION:${file}`);
+  let remote = null;
+  if (requireRemote) remote = assertLiveRemoteMainEquals(approvalCommit, { cwd, what: 'APPROVAL_COMMIT_A' });
   if (requireHead && gitHead(cwd) !== approvalCommit) fail('R4_APPROVAL_HEAD_NOT_APPROVAL_COMMIT');
-  if (requireRemote) {
-    const remote = remoteContains(approvalCommit, R4_REMOTE_MAIN, cwd);
-    if (!remote.available) fail('R4_APPROVAL_REMOTE_UNAVAILABLE');
-    if (!remote.contains) fail('R4_APPROVAL_REMOTE_MISSING');
-  }
-  return { ok: true, approvalCommit, changed, approvalCommitterTimestamp: gitCommitterTimestamp(approvalCommit, cwd),
+  return { ok: true, approvalCommit, changed, remoteSha: remote?.remoteSha ?? null,
+    approvalCommitterTimestamp: gitCommitterTimestamp(approvalCommit, cwd),
     committerIso: gitText(['show', '-s', '--format=%cI', approvalCommit], cwd) };
 }
 
@@ -186,25 +189,34 @@ export function readApprovalArtifact({ cwd = R4_REPO_ROOT, ref = null, approvalP
 }
 
 /**
- * Resolve the full real-execution authority chain for the current working tree.
+ * Resolve the full real-execution authority chain for a repository working tree.
+ * This function reads Git and the tracked artifacts itself; it accepts no
+ * caller-supplied authority fact (stage, approval SHA, T0, seal object).
  *
- * `requireApproval: false` is the S-stage dry run (authority = S); it still
- * enforces remote presence of S and live worktree integrity. `requireApproval:
- * true` is the only path capable of `--execute`: it additionally requires the
- * tracked approval artifact A, its content binding, S as A's direct parent, an
- * approval-only diff, A on origin/main, HEAD == A, integrity against A, and it
- * derives T0 from A.
+ * `requireApproval: false` is the S-stage dry run (authority = S): the LIVE
+ * remote main must equal S exactly, and live worktree integrity against S is
+ * enforced. `requireApproval: true` is the only path capable of `--execute` or
+ * of a canonical analysis: it additionally requires the tracked approval
+ * artifact, its content binding, S as A's direct parent, an approval-only diff,
+ * LIVE remote main == A exactly, HEAD == A, integrity against A, and it derives
+ * T0 from A.
+ *
+ * Fail-closed order (round-3 section 11, steps 1-6): canonical seal/Git
+ * authority -> live remote -> HEAD -> worktree -> approval A -> T0. Approval
+ * discovery precedes the remote check at the A stage only because the expected
+ * live SHA *is* A.
  */
 export function resolveR4ExecutionAuthority({
   cwd = R4_REPO_ROOT, sealPath = R4_TRACKED_SEAL_PATH, approvalPath = R4_APPROVAL_PATH, requireApproval = true,
 } = {}) {
   if (isCanonicalSealSuperseded({ cwd, sealPath })) fail('R4_AUTHORITY_SEAL_SUPERSEDED');
-  const { seal, authority } = loadCanonicalTrackedSeal({ cwd, sealPath, requireSealCommit: true, requireHead: false, requireRemote: true });
+  const { seal, authority } = loadCanonicalTrackedSeal({ cwd, sealPath, requireSealCommit: true, requireHead: false, requireRemote: false });
   assertSealCommitShape({ cwd, protocolCommit: authority.protocolCommit, sealAuthorityCommit: authority.sealAuthorityCommit, sealPath });
-  assertRemoteContains(authority.sealAuthorityCommit, { cwd, what: 'SEAL_COMMIT_S' });
   if (!requireApproval) {
+    const remote = assertLiveRemoteMainEquals(authority.sealAuthorityCommit, { cwd, what: 'SEAL_COMMIT_S' });
     assertWorktreeIntegrity({ cwd, requiredCommit: authority.sealAuthorityCommit, sealPath });
-    return { stage: 'S', seal, authority, approval: null, approvalCommit: null, approvalCommitterTimestamp: null, t0: null, t0Iso: null };
+    return { stage: 'S', seal, authority, approval: null, approvalCommit: null, approvalCommitterTimestamp: null, t0: null, t0Iso: null,
+      remoteSha: remote.remoteSha };
   }
   const approval = readApprovalArtifact({ cwd, approvalPath });
   if (!approval) fail('R4_APPROVAL_MISSING');
@@ -212,9 +224,9 @@ export function resolveR4ExecutionAuthority({
   const contract = verifyApprovalGitContract({ sealAuthorityCommit: authority.sealAuthorityCommit, approval, approvalPath, cwd, requireRemote: true, requireHead: true });
   assertWorktreeIntegrity({ cwd, requiredCommit: contract.approvalCommit, sealPath });
   const t0 = approvalT0(contract.approvalCommitterTimestamp);
-  return { stage: 'A', seal, authority, approval, approvalCommit: contract.approvalCommit,
+  return Object.freeze({ stage: 'A', seal, authority, approval, approvalCommit: contract.approvalCommit,
     approvalCommitterTimestamp: contract.approvalCommitterTimestamp, approvalCommitterIso: contract.committerIso,
-    t0, t0Iso: new Date(t0).toISOString() };
+    t0, t0Iso: new Date(t0).toISOString(), remoteSha: contract.remoteSha });
 }
 
 export { gitCommitExists };

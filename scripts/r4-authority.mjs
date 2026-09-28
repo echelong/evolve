@@ -27,7 +27,13 @@ import { verifyR4Seal } from './r4-preregistration-seal.mjs';
 
 export const R4_REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export { R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, R4_REQUIRED_BOUND_FILES };
-export const R4_REMOTE_MAIN = 'origin/main';
+// Round-3 (P2-1): remote authority is the LIVE `refs/heads/main` of the remote
+// named `origin`, queried with `git ls-remote`. The local remote-tracking ref
+// `refs/remotes/origin/main` is a cache and is never consulted as proof.
+export const R4_REMOTE_NAME = 'origin';
+export const R4_REMOTE_BRANCH_REF = 'refs/heads/main';
+export const R4_REMOTE_MAIN = `${R4_REMOTE_NAME} ${R4_REMOTE_BRANCH_REF} (live)`;
+export const R4_REMOTE_QUERY_TIMEOUT_MS = 30_000;
 
 export const sha256Hex = value => createHash('sha256').update(value).digest('hex');
 const isSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
@@ -132,22 +138,45 @@ export function findSealAuthorityCommit({ protocolCommit, seal = null, sealPath 
   return { found: true, sealAuthorityCommit: matches[0] };
 }
 
-export function remoteContains(commit, remote = R4_REMOTE_MAIN, cwd = R4_REPO_ROOT) {
-  if (!isSha(commit)) return { available: false, contains: false };
-  if (!git(['rev-parse', '--verify', `refs/remotes/${remote}`], cwd).ok) return { available: false, contains: false };
-  const contains = git(['merge-base', '--is-ancestor', commit, remote], cwd).ok;
-  return { available: true, contains };
+/**
+ * LIVE remote main. Runs `git ls-remote --exit-code origin refs/heads/main`
+ * against the actual remote and parses the exact SHA of exactly that ref. No
+ * fetch is performed, no other branch is consulted and the cached
+ * `refs/remotes/origin/main` tracking ref is never read. Any failure (network,
+ * missing remote, missing ref, ambiguous or malformed output, timeout) reports
+ * `available: false` so every caller fails closed.
+ */
+export function liveRemoteMainSha({ cwd = R4_REPO_ROOT, remote = R4_REMOTE_NAME, ref = R4_REMOTE_BRANCH_REF, timeoutMs = R4_REMOTE_QUERY_TIMEOUT_MS } = {}) {
+  const result = spawnSync('git', ['ls-remote', '--exit-code', remote, ref], {
+    cwd, encoding: 'utf8', timeout: timeoutMs,
+    // Never block on an interactive credential prompt: an unanswerable prompt is
+    // an unavailable remote, not a reason to wait.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'true', SSH_ASKPASS: 'true' },
+  });
+  if (result.error || result.status !== 0) return { available: false, sha: null, reason: 'R4_REMOTE_QUERY_FAILED' };
+  const lines = String(result.stdout ?? '').split('\n').map(line => line.trim()).filter(Boolean);
+  const exact = lines.map(line => line.split(/\s+/)).filter(parts => parts.length === 2 && parts[1] === ref);
+  if (exact.length !== 1) return { available: false, sha: null, reason: 'R4_REMOTE_REF_AMBIGUOUS' };
+  const sha = exact[0][0];
+  if (!isSha(sha)) return { available: false, sha: null, reason: 'R4_REMOTE_REF_MALFORMED' };
+  return { available: true, sha, remote, ref };
 }
 
 /**
- * MANDATORY remote authority. There is no flag that disables this: a commit that
- * is not present on `origin/main` may never anchor a real R4 attempt.
+ * MANDATORY live remote authority. The live remote main SHA must EQUAL the
+ * expected authority commit exactly: S at the pre-approval seal stage, A at real
+ * execution. Ancestry is not sufficient (a remote that moved past, behind or
+ * away from the authority fails), and there is no flag that disables this.
+ *
+ * Stable codes: R4_AUTHORITY_REMOTE_UNAVAILABLE,
+ * R4_AUTHORITY_REMOTE_MAIN_MISMATCH:<what>.
  */
-export function assertRemoteContains(commit, { remote = R4_REMOTE_MAIN, cwd = R4_REPO_ROOT, what = 'AUTHORITY_COMMIT' } = {}) {
-  const result = remoteContains(commit, remote, cwd);
-  if (!result.available) throw new Error('R4_AUTHORITY_REMOTE_UNAVAILABLE');
-  if (!result.contains) throw new Error(`R4_AUTHORITY_REMOTE_MISSING:${what}`);
-  return true;
+export function assertLiveRemoteMainEquals(expected, { cwd = R4_REPO_ROOT, what = 'AUTHORITY_COMMIT', query = liveRemoteMainSha } = {}) {
+  if (!isSha(expected)) throw new Error('R4_AUTHORITY_REMOTE_EXPECTED_INVALID');
+  const live = query({ cwd });
+  if (!live || live.available !== true) throw new Error('R4_AUTHORITY_REMOTE_UNAVAILABLE');
+  if (live.sha !== expected) throw new Error(`R4_AUTHORITY_REMOTE_MAIN_MISMATCH:${what}`);
+  return { ok: true, remoteSha: live.sha, expected, what };
 }
 
 /**
@@ -200,8 +229,9 @@ export function assertApprovalCommitShape({ cwd = R4_REPO_ROOT, sealAuthorityCom
  * tree, bound-file digests and seal authority commit all agree.
  *
  * `requireRemote` remains a parameter for the canonical seal validator, which
- * legitimately runs before the seal is pushed. Every path capable of real
- * execution calls `assertRemoteContains` unconditionally instead.
+ * legitimately runs before the seal is pushed; when set it requires the LIVE
+ * remote main to equal S exactly. Every path capable of real execution calls
+ * `assertLiveRemoteMainEquals` unconditionally for its stage instead.
  */
 export function verifyR4SealAuthority(seal, {
   cwd = R4_REPO_ROOT,
@@ -235,11 +265,7 @@ export function verifyR4SealAuthority(seal, {
       const head = gitHead(cwd);
       if (head !== sealAuthorityCommit) throw new Error('R4_AUTHORITY_HEAD_NOT_SEAL_COMMIT');
     }
-    if (requireRemote) {
-      const remote = remoteContains(sealAuthorityCommit, R4_REMOTE_MAIN, cwd);
-      if (!remote.available) throw new Error('R4_AUTHORITY_REMOTE_UNAVAILABLE');
-      if (!remote.contains) throw new Error('R4_AUTHORITY_REMOTE_MISSING_SEAL_COMMIT');
-    }
+    if (requireRemote) assertLiveRemoteMainEquals(sealAuthorityCommit, { cwd, what: 'SEAL_COMMIT_S' });
   }
   return {
     ok: true, protocolCommit, protocolTree: seal.protocolTree, sealAuthorityCommit,

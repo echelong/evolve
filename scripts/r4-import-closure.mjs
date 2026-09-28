@@ -27,6 +27,7 @@ export const R4_RUNTIME_ROOTS = Object.freeze([
   'scripts/r4-cohort-run.mjs',
   'scripts/r4-canonical-analysis.mjs',
   'scripts/r4-capability.mjs',
+  'scripts/r4-attempt-history.mjs',
   'scripts/r4-approval.mjs',
   'scripts/r4-attestation.mjs',
   'scripts/r4-authority.mjs',
@@ -43,10 +44,17 @@ export const R4_RUNTIME_ROOTS = Object.freeze([
  */
 export const R4_BOUND_NON_RUNTIME_ARTIFACTS = Object.freeze([
   'docs/R4-PREREGISTRATION.md',
+  // Defense-in-depth (round 3): the runtime closure above is local modules plus
+  // Node builtins only, so no third-party package reaches R4 execution today.
+  // Binding the tracked lockfile makes any future dependency drift a seal
+  // failure. It changes no scientific behaviour.
+  'package-lock.json',
   'package.json',
   'scripts/market-outcomes/policy-a-cases.mjs',
   'scripts/market-outcomes/policy-b-cases.mjs',
   'scripts/r4-e1-cases.mjs',
+  // Synthetic P -> S -> A Git authority fixture used by the round-3 validator.
+  'scripts/r4-synthetic-authority.mjs',
 ]);
 
 export const R4_BOUND_VALIDATORS = Object.freeze([
@@ -61,6 +69,7 @@ export const R4_BOUND_VALIDATORS = Object.freeze([
   'scripts/validate-r4-protocol.mjs',
   'scripts/validate-r4-revisits.mjs',
   'scripts/validate-r4-round2.mjs',
+  'scripts/validate-r4-round3.mjs',
 ]);
 
 const STATIC_PATTERNS = [

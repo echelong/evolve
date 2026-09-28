@@ -216,8 +216,16 @@ export const R4_CAPTURE_SPEC_DIGEST = captureSpecDigest();
 // list; a new runtime import therefore cannot appear unbound. Validators that
 // gate the frozen protocol are bound too, even though the runtime never imports
 // them, because they are the executable definition of "frozen".
+//
+// Round-3 additions (enforcement only): the canonical attempt-history module,
+// the round-3 validator and its synthetic P/S/A authority fixture, and
+// `package-lock.json`. The current R4 runtime closure is local modules plus Node
+// builtins only (no third-party runtime package); binding the lockfile is
+// prospective defense-in-depth integrity hardening and changes no scientific
+// behaviour.
 export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'docs/R4-PREREGISTRATION.md',
+  'package-lock.json',
   'package.json',
   'scripts/history/dataset.mjs',
   'scripts/history/schema.mjs',
@@ -254,6 +262,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/market/synthetic.mjs',
   'scripts/market/universe.mjs',
   'scripts/r4-approval.mjs',
+  'scripts/r4-attempt-history.mjs',
   'scripts/r4-attestation.mjs',
   'scripts/r4-authority.mjs',
   'scripts/r4-canonical-analysis.mjs',
@@ -266,6 +275,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/r4-import-closure.mjs',
   'scripts/r4-preregistration-seal.mjs',
   'scripts/r4-protocol-spec.mjs',
+  'scripts/r4-synthetic-authority.mjs',
   'scripts/validate-market-outcomes-policy-b.mjs',
   'scripts/validate-market-outcomes.mjs',
   'scripts/validate-p3c-mutation.mjs',
@@ -277,6 +287,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/validate-r4-protocol.mjs',
   'scripts/validate-r4-revisits.mjs',
   'scripts/validate-r4-round2.mjs',
+  'scripts/validate-r4-round3.mjs',
 ]);
 
 /* --------------------------------------------------- capture env classification */

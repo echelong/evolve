@@ -23,7 +23,7 @@ import { verifyR4SealAuthority, loadCanonicalTrackedSeal, gitCommitterTimestamp,
 import { R4_SPEC, R4_SPEC_DIGEST, captureSpecDigest, classifyCaptureEnvironment, R4_REQUIRED_BOUND_FILES } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS } from './r4-exclusions.mjs';
 import { createSessionAttestation, finalizeSessionAttestation, verifySessionAttestation } from './r4-attestation.mjs';
-import { createAttemptCapability, capabilityHash, createAttemptAuthorization, proveCapability } from './r4-capability.mjs';
+import { createAttemptCapability, capabilityHash, createAttemptAuthorization, proveCapability, writeAttemptAuthorization, claimAttemptAuthorization } from './r4-capability.mjs';
 import { approvalT0 } from './r4-approval.mjs';
 import {
   verifyR4SourceEligibility, evaluateSealedCohortProgress, buildCanonicalReferenceSet,
@@ -76,14 +76,18 @@ function attestedSession({ sessionId = 'r4-s1', snapshots = [{ time: T, price: 2
   const session = readSourceSession({ dir: fixture.dir, role: 'cohort' });
   // Round-2 capability flow: only a live capability whose blinded hash matches a
   // persisted pre-attempt authorization may open/finalize an attestation.
+  // Round 3: finalization additionally requires the durable capture-child claim.
   const capability = createAttemptCapability();
   const authorization = createAttemptAuthorization({ seal, authority, approvalCommit: APPROVAL_COMMIT, attemptIndex: 1,
-    sessionId, t0: T0, capabilityHash: capabilityHash(capability), captureSpecDigest: captureSpecDigest() });
+    sessionId, t0: T0, capabilityHash: capabilityHash(capability), captureSpecDigest: captureSpecDigest(), authorizedAt: T0 + 1000 });
+  const governance = tempRoot();
+  writeAttemptAuthorization(authorization, { cwd: governance });
+  const claim = claimAttemptAuthorization({ record: authorization, capability, cwd: governance, now: T0 + 2000 });
   const proof = proveCapability({ capability, record: authorization });
   const open = createSessionAttestation({ seal, authority, approvalAuthority, proof });
   const attestation = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint,
-    revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 }, proof });
-  return { fixture, session, attestation, proof, authorization };
+    revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 }, proof, claim });
+  return { fixture, session, attestation, proof, authorization, claim };
 }
 
 function refingerprint(record) { const content = { ...record }; delete content.fingerprint; return { ...content, fingerprint: digest(content) }; }
@@ -200,9 +204,12 @@ test('REGRESSION 9: environment drift is rejected before capture', () => {
   assert.equal(credentialed.drift.length, 0);
 });
 
-test('sealed runner accepts only the seal path and attempt index', () => {
+test('sealed runner accepts only the seal path and an attempt-index assertion', () => {
+  // `--attempt` is parsed as an ASSERTION only; the legal attempt is derived
+  // from authenticated history (round 3, validate-r4-round3.mjs).
   const options = parseRunnerArgs(['preflight', '--attempt', '3']);
   assert.equal(options.attemptIndex, 3);
+  throwsCode(() => parseRunnerArgs(['capture', '--attempt', '9']), 'R4_RUNNER_ATTEMPT_INDEX_INVALID');
   assert.equal(options.sealPath, R4_TRACKED_SEAL_PATH);
   throwsCode(() => parseRunnerArgs(['capture', '--minutes', '30']), 'R4_RUNNER_ARGUMENT_UNSUPPORTED');
   assert(R4_RUNNER_LOCKED_ARGUMENTS.includes('minutes'));
@@ -227,13 +234,13 @@ test('source eligibility requires an authenticated attestation, not a role strin
 });
 
 test('a session with unfinished revisit work is source-ineligible (E1 pending)', () => {
-  const { session, proof } = attestedSession({ sessionId: 'r4-s5' });
+  const { session, proof, claim } = attestedSession({ sessionId: 'r4-s5' });
   const open = createSessionAttestation({ seal, authority, approvalAuthority, proof });
-  const pending = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 0, pending: 1 }, proof });
+  const pending = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 0, pending: 1 }, proof, claim });
   throwsCode(() => verifySessionAttestation({ attestation: pending, session, seal, authority }), 'R4_ATTESTATION_REVISIT_PENDING');
   // A terminal reference-level failure with pending = 0 stays eligible.
   const terminal = finalizeSessionAttestation(createSessionAttestation({ seal, authority, approvalAuthority, proof }),
-    { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 1, pending: 0 }, proof });
+    { sessionFingerprint: session.fingerprint, revisitCoverage: { scheduled: 3, completed: 2, failed: 1, pending: 0 }, proof, claim });
   assert.equal(verifySessionAttestation({ attestation: terminal, session, seal, authority }).ok, true);
 });
 

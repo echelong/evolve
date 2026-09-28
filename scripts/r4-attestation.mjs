@@ -33,16 +33,17 @@
 // accidental/manual masquerading inside the repository's execution model; it does
 // NOT claim to defend against a malicious local user who can rewrite code,
 // attach a debugger or steal another process's memory.
-import { mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { digest, canonical } from './market-intelligence/definition.mjs';
 import { R4_SPEC, captureSpecDigest } from './r4-protocol-spec.mjs';
 import { isR4Excluded } from './r4-exclusions.mjs';
-import { assertAttemptProof, R4_SESSION_ROLE, R4_CAPABILITY_FD } from './r4-capability.mjs';
+import {
+  assertAttemptProof, assertAttemptClaim, writeDurableExclusive, R4_SESSION_ROLE, R4_CAPABILITY_FD, R4_ATTESTATION_DIR, R4_CLAIMANTS,
+} from './r4-capability.mjs';
 
 export const R4_ATTESTATION_RECORD_TYPE = 'r4_cohort_session_attestation';
-export { R4_SESSION_ROLE, R4_CAPABILITY_FD };
-export const R4_ATTESTATION_DIR = '.evolve/governance/r4-attestations';
+export { R4_SESSION_ROLE, R4_CAPABILITY_FD, R4_ATTESTATION_DIR };
 export const R4_AUTHORIZATION_CHAIN = 'P_S_A';
 
 const fail = code => { throw new Error(code); };
@@ -108,18 +109,28 @@ function normalizeCoverage(coverage) {
  * Bind the authenticated session manifest fingerprint (and the bounded-drain
  * revisit coverage) to an open attestation. Requires the same capability proof
  * as creation: a caller without the raw runner capability cannot finalize.
+ *
+ * Round 3: finalization additionally requires the durable CAPTURE_CHILD claim
+ * that consumed this authorization, and binds its fingerprint. An attestation
+ * can therefore never exist for an attempt that was not atomically claimed by
+ * the capture child that held the raw capability.
  */
-export function finalizeSessionAttestation(attestation, { sessionFingerprint, revisitCoverage = null, proof } = {}) {
+export function finalizeSessionAttestation(attestation, { sessionFingerprint, revisitCoverage = null, proof, claim = null } = {}) {
   if (!attestation || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE) fail('R4_ATTESTATION_INVALID');
   if (attestation.status !== 'OPEN') fail('R4_ATTESTATION_STATE_INVALID');
   if (!proof || typeof proof !== 'object') fail('R4_ATTESTATION_CAPABILITY_REQUIRED');
   assertAttemptProof(proof, { attemptIndex: attestation.attemptIndex, sessionId: attestation.sessionId });
   if (proof.authorizationFingerprint !== attestation.authorizationFingerprint || proof.capabilityHash !== attestation.capabilityHash) fail('R4_ATTESTATION_CAPABILITY_MISMATCH');
+  if (!claim) fail('R4_ATTESTATION_CLAIM_REQUIRED');
+  assertAttemptClaim(claim);
+  if (claim.claimant !== R4_CLAIMANTS.child) fail('R4_ATTESTATION_CLAIM_NOT_CAPTURE_CHILD');
+  if (claim.authorizationFingerprint !== attestation.authorizationFingerprint || claim.capabilityHash !== attestation.capabilityHash
+    || claim.sessionId !== attestation.sessionId || claim.attemptIndex !== attestation.attemptIndex) fail('R4_ATTESTATION_CLAIM_MISMATCH');
   if (typeof sessionFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(sessionFingerprint)) fail('R4_ATTESTATION_SESSION_FINGERPRINT_INVALID');
   const coverage = normalizeCoverage(revisitCoverage);
   const content = { ...attestation };
   delete content.fingerprint;
-  const next = { ...content, status: 'FINALIZED', sessionFingerprint, revisitCoverage: coverage };
+  const next = { ...content, status: 'FINALIZED', claimFingerprint: claim.fingerprint, sessionFingerprint, revisitCoverage: coverage };
   return { ...next, fingerprint: attestationFingerprint(next) };
 }
 
@@ -127,11 +138,19 @@ export function finalizeSessionAttestation(attestation, { sessionFingerprint, re
  * Verify an attestation against the canonical seal, the Git authority chain, the
  * approval anchor and an authenticated session. Throws a fixed code on mismatch.
  */
-export function verifySessionAttestation({ attestation, session, seal, authority, approvalAuthority = null, authorizationRecord = null, attemptIndex = null }) {
+export function verifySessionAttestation({ attestation, session, seal, authority, approvalAuthority = null, authorizationRecord = null, claimRecord = null, attemptIndex = null }) {
   if (!attestation || typeof attestation !== 'object' || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE || attestation.schemaVersion !== 1) fail('R4_ATTESTATION_INVALID');
   const { fingerprint, ...content } = attestation;
   if (attestationFingerprint(content) !== fingerprint) fail('R4_ATTESTATION_FINGERPRINT_MISMATCH');
   if (attestation.status !== 'FINALIZED') fail('R4_ATTESTATION_NOT_FINALIZED');
+  if (typeof attestation.claimFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(attestation.claimFingerprint)) fail('R4_ATTESTATION_CLAIM_REQUIRED');
+  if (claimRecord) {
+    assertAttemptClaim(claimRecord);
+    if (claimRecord.fingerprint !== attestation.claimFingerprint) fail('R4_ATTESTATION_CLAIM_MISMATCH');
+    if (claimRecord.claimant !== R4_CLAIMANTS.child) fail('R4_ATTESTATION_CLAIM_NOT_CAPTURE_CHILD');
+    if (claimRecord.authorizationFingerprint !== attestation.authorizationFingerprint || claimRecord.sessionId !== attestation.sessionId
+      || claimRecord.attemptIndex !== attestation.attemptIndex || claimRecord.capabilityHash !== attestation.capabilityHash) fail('R4_ATTESTATION_CLAIM_MISMATCH');
+  }
   if (attestation.role !== R4_SESSION_ROLE) fail('R4_ATTESTATION_ROLE_INVALID');
   if (attestation.authorizationChain !== R4_AUTHORIZATION_CHAIN) fail('R4_ATTESTATION_AUTHORIZATION_CHAIN_INVALID');
   if (!isSha(attestation.approvalCommit)) fail('R4_ATTESTATION_APPROVAL_COMMIT_INVALID');
@@ -173,12 +192,18 @@ export function verifySessionAttestation({ attestation, session, seal, authority
     authorizationFingerprint: attestation.authorizationFingerprint, capabilityHash: attestation.capabilityHash };
 }
 
-/** The only write performed by this module: the governance attestation store. */
+/**
+ * The only write performed by this module: the governance attestation store.
+ * Write-once (O_CREAT|O_EXCL, fsync'd): an existing attestation is never
+ * overwritten.
+ */
 export function writeSessionAttestation(attestation, { root = R4_ATTESTATION_DIR } = {}) {
   if (!attestation || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE) fail('R4_ATTESTATION_INVALID');
+  if (attestation.status !== 'FINALIZED') fail('R4_ATTESTATION_NOT_FINALIZED');
   mkdirSync(root, { recursive: true });
   const file = path.join(root, `${attestation.sessionId}.json`);
-  writeFileSync(file, canonical(attestation) + '\n');
+  try { writeDurableExclusive(file, canonical(attestation) + '\n'); }
+  catch (error) { if (error?.code === 'EEXIST') fail('R4_ATTESTATION_EXISTS'); throw error; }
   return { file, fingerprint: attestation.fingerprint };
 }
 

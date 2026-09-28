@@ -21,11 +21,13 @@ import { readSourceSession } from './market-outcomes/index.mjs';
 import { buildSeal, verifyR4Seal, gitIdentity } from './r4-preregistration-seal.mjs';
 import { R4_REQUIRED_BOUND_FILES, captureSpecDigest, classifyCaptureEnvironment, sanitizeSealedChildEnvironment, assertSealedChildEnvironment } from './r4-protocol-spec.mjs';
 import { loadEffectiveEnvironment } from './lib/env.mjs';
-import { assertRemoteContains, assertWorktreeIntegrity } from './r4-authority.mjs';
+import { assertLiveRemoteMainEquals, assertWorktreeIntegrity } from './r4-authority.mjs';
 import {
   createAttemptCapability, capabilityHash, createAttemptAuthorization, proveCapability, assertAttemptProof,
-  resolveCapabilityRecord, acquireRunnerCapability,
+  resolveCapabilityRecord, acquireRunnerCapability, writeAttemptAuthorization, claimAttemptAuthorization,
 } from './r4-capability.mjs';
+import { completedAttemptFixture, removeTree } from './r4-synthetic-authority.mjs';
+import { resolveR4ExecutionAuthority } from './r4-approval.mjs';
 import { createSessionAttestation, finalizeSessionAttestation } from './r4-attestation.mjs';
 import {
   evaluateSealedCohortProgress, deriveCanonicalCohortMembership, planSealedCohort,
@@ -52,8 +54,6 @@ const T0 = approvalT0(SEAL_COMMIT_TIME);
 const seal = buildSeal({ ...gitIdentity(REPO), sealedAt: T });
 const authority = Object.freeze({ sealAuthorityCommit: 'a'.repeat(40), protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree, sealCommitterTimestamp: SEAL_COMMIT_TIME });
 const approvalAuthority = Object.freeze({ approvalCommit: APPROVAL_SHA, t0: T0 });
-// The full verified execution authority (A stage) used by the canonical orchestrator.
-const executionAuthority = Object.freeze({ stage: 'A', seal, authority, approvalCommit: APPROVAL_SHA, t0: T0 });
 
 const roots = [];
 const tempRoot = () => { const root = mkdtempSync(path.join(tmpdir(), 'evolve-r4-round2-')); roots.push(root); return root; };
@@ -91,11 +91,15 @@ function attestedFixture({ cwd = tempRoot(), sessionId = 'r4-round2', attemptInd
   const capability = createAttemptCapability();
   const hash = capabilityHash(capability);
   const authorization = createAttemptAuthorization({ seal, authority, approvalCommit: APPROVAL_SHA, attemptIndex,
-    sessionId, t0: T0, capabilityHash: hash, captureSpecDigest: captureSpecDigest() });
+    sessionId, t0: T0, capabilityHash: hash, captureSpecDigest: captureSpecDigest(), authorizedAt: T0 + 1000 });
+  // Round 3: an attestation requires the durable capture-child claim.
+  const governance = tempRoot();
+  writeAttemptAuthorization(authorization, { cwd: governance });
+  const claim = claimAttemptAuthorization({ record: authorization, capability, cwd: governance, now: T0 + 2000 });
   const proof = proveCapability({ capability, record: authorization });
   const open = createSessionAttestation({ seal, authority, approvalAuthority, proof });
   const attestation = finalizeSessionAttestation(open, { sessionFingerprint: session.fingerprint,
-    revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 }, proof });
+    revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 }, proof, claim });
   const plan = buildCohortPlan({ sealFingerprint: seal.fingerprint, preregistrationDigest: seal.preregistration.sha256,
     t0: T0, approvalCommit: APPROVAL_SHA });
   const attempts = [{ index: attemptIndex, status: 'COMPLETED', sessionId, failureCode: null, replacementOf: null, attestationFingerprint: attestation.fingerprint }];
@@ -144,7 +148,13 @@ function syntheticApprovalChain({ parentIsProtocol = false, modifySource = false
   const files = { [R4_APPROVAL_PATH]: canonical(approval) + '\n' };
   if (modifySource) files['src/code.js'] = 'export const v = 2;\n';
   const approvalCommit = commit(repo, { message: 'A: approval', iso: '2026-09-28T10:10:00Z', files });
-  repo.run(['update-ref', 'refs/remotes/origin/main', pushApproval ? approvalCommit : sealCommit]);
+  // Round 3: remote authority is the LIVE remote main, so the fixture pushes to
+  // a real local bare `origin` rather than writing a cached tracking ref.
+  const remoteDir = mkdtempSync(path.join(tmpdir(), 'evolve-r4-origin-'));
+  roots.push(remoteDir);
+  spawnSync('git', ['init', '-q', '--bare', '-b', 'main', remoteDir]);
+  repo.run(['remote', 'add', 'origin', remoteDir]);
+  repo.run(['push', '-q', 'origin', `${pushApproval ? approvalCommit : sealCommit}:refs/heads/main`]);
   return { repo, protocolCommit, sealCommit, approvalCommit, approval };
 }
 
@@ -209,17 +219,24 @@ test('P1-5: a wrong capability is rejected', () => {
 
 /* P2 — mandatory remote proof (B2) */
 
-test('P2-6: S not pushed to origin/main fails remote authority', () => {
+test('P2-6: S not pushed to the live remote main fails remote authority', () => {
   const repo = gitRepo();
   const head = commit(repo, { message: 'local only', iso: '2026-09-28T09:00:00Z', files: { 'a.txt': 'a\n' } });
-  throwsCode(() => assertRemoteContains(head, { cwd: repo.dir, what: 'SEAL_COMMIT_S' }), 'R4_AUTHORITY_REMOTE_UNAVAILABLE');
+  throwsCode(() => assertLiveRemoteMainEquals(head, { cwd: repo.dir, what: 'SEAL_COMMIT_S' }), 'R4_AUTHORITY_REMOTE_UNAVAILABLE');
+  // Round 3: a cached tracking ref is NOT remote proof.
   repo.run(['update-ref', 'refs/remotes/origin/main', head]);
-  assert.equal(assertRemoteContains(head, { cwd: repo.dir }), true);
+  throwsCode(() => assertLiveRemoteMainEquals(head, { cwd: repo.dir, what: 'SEAL_COMMIT_S' }), 'R4_AUTHORITY_REMOTE_UNAVAILABLE');
+  const remoteDir = mkdtempSync(path.join(tmpdir(), 'evolve-r4-origin-'));
+  roots.push(remoteDir);
+  spawnSync('git', ['init', '-q', '--bare', '-b', 'main', remoteDir]);
+  repo.run(['remote', 'add', 'origin', remoteDir]);
+  repo.run(['push', '-q', 'origin', `${head}:refs/heads/main`]);
+  assert.equal(assertLiveRemoteMainEquals(head, { cwd: repo.dir }).ok, true);
 });
 
 test('P2-7: an approval commit A that is not pushed fails', () => {
   const chain = syntheticApprovalChain({ pushApproval: false });
-  throwsCode(() => verifyApprovalGitContract({ sealAuthorityCommit: chain.sealCommit, approval: chain.approval, cwd: chain.repo.dir, requireRemote: true, requireHead: false }), 'R4_APPROVAL_REMOTE_MISSING');
+  throwsCode(() => verifyApprovalGitContract({ sealAuthorityCommit: chain.sealCommit, approval: chain.approval, cwd: chain.repo.dir, requireRemote: true, requireHead: false }), 'R4_AUTHORITY_REMOTE_MAIN_MISMATCH:APPROVAL_COMMIT_A');
 });
 
 test('P2-8b (section 8): a tracked working-tree runtime modification is rejected', () => {
@@ -356,10 +373,18 @@ test('P3-22 (P3-5): caller-mutated reference timestamp is rejected', () => {
   assert.equal(rows[0].referenceObservedAt, evidence.snapshot.observedAt);
 });
 
+// Round 3 (P1-3): the canonical orchestrator resolves A from Git itself, so these
+// cases run over a real synthetic P -> S -> A repository with a live bare
+// remote and an attempt completed through the real runner lifecycle.
+let synthetic = null;
+const completedSynthetic = () => {
+  if (!synthetic) synthetic = completedAttemptFixture();
+  return synthetic;
+};
+
 test('P3-23 (P3-6): canonical analysis without a verified outcome binding is rejected', () => {
-  const fixture = attestedFixture({ cwd: tempRoot(), sessionId: 'r4-no-binding' });
-  throwsCode(() => runCanonicalR4Analysis({ authorityResolution: executionAuthority, plan: fixture.plan, attempts: fixture.attempts,
-    attestations: [fixture.attestation], sessionRoot: fixture.sessionsRoot, cwd: fixture.cwd }), 'R4_CANONICAL_ANALYSIS_OUTCOME_BINDING_REQUIRED');
+  const { fixture } = completedSynthetic();
+  throwsCode(() => runCanonicalR4Analysis({ repoRoot: fixture.dir }), 'R4_CANONICAL_ANALYSIS_OUTCOME_BINDING_REQUIRED');
 });
 
 test('P3-24 (P3-6): forged sourceSessionIds are rejected', () => {
@@ -409,18 +434,22 @@ test('P3-28: an unknown analysis option is rejected', () => {
   throwsCode(() => assertNoAnalysisOverrides({ replicates: 1 }), 'R4_ANALYSIS_OVERRIDE_FORBIDDEN:replicates');
 });
 
-test('canonical analysis orchestrator runs end to end over authenticated evidence', () => {
-  const fixture = attestedFixture({ cwd: tempRoot(), sessionId: 'r4-orchestrated' });
-  const { references } = buildCanonicalReferenceSet({ sessions: [fixture.session], canonicalMembership: [fixture.session.sessionId] });
-  const binding = buildOutcomeRunBinding({ seal, authority, approvalAuthority, cohortMembership: [fixture.session.sessionId], references });
+test('canonical analysis orchestrator runs end to end over authenticated evidence and Git-resolved A', () => {
+  const { fixture, result: run } = completedSynthetic();
+  // The test derives the binding inputs itself; the orchestrator receives only
+  // locations plus the binding/outcomes and resolves authority on its own.
+  const resolved = resolveR4ExecutionAuthority({ cwd: fixture.dir, requireApproval: true });
+  const session = readSourceSession({ dir: path.join(fixture.dir, '.evolve/market-intelligence/sessions', run.sessionId), role: 'cohort' });
+  const { references } = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
+  const binding = buildOutcomeRunBinding({ seal: resolved.seal, authority: resolved.authority, approvalAuthority: resolved, cohortMembership: [session.sessionId], references });
   const outcomes = references.map((reference, i) => ({ referenceSessionId: reference.sessionId, referenceSnapshotDigest: reference.snapshotDigest,
     status: 'resolved', absLogReturn300sBps: i + 1, mint: MINT, referenceObservedAt: T }));
-  const result = runCanonicalR4Analysis({ authorityResolution: executionAuthority, plan: fixture.plan, attempts: fixture.attempts,
-    attestations: [fixture.attestation], outcomeRunBinding: binding, outcomes, sessionRoot: fixture.sessionsRoot, cwd: fixture.cwd });
+  const result = runCanonicalR4Analysis({ repoRoot: fixture.dir, outcomeRunBinding: binding, outcomes });
   assert.equal(result.recordType, 'r4_canonical_analysis_result');
-  assert.equal(result.analysis.sealFingerprint, seal.fingerprint);
-  assert.deepEqual(result.identity.canonicalMembership, [fixture.session.sessionId]);
-  assert.equal(result.identity.approvalCommit, APPROVAL_SHA);
+  assert.equal(result.analysis.sealFingerprint, fixture.seal.fingerprint);
+  assert.deepEqual(result.identity.canonicalMembership, [session.sessionId]);
+  assert.equal(result.identity.approvalCommit, fixture.approvalCommit);
+  assert.equal(result.identity.liveRemoteMain, fixture.approvalCommit);
 });
 
 /* Approval commit A and the start window */
@@ -441,9 +470,9 @@ test('A-31: an approval with a non-READY verdict is rejected', () => {
   throwsCode(() => assertApprovalRecord({ ...buildApprovalRecord({ seal, authority, reviewer: 'r', reviewerModel: 'm', reviewVerdict: R4_APPROVAL_VERDICT, reviewReportDigest: 'd'.repeat(64) }), reviewVerdict: 'CHANGES_REQUIRED' }), 'R4_APPROVAL_VERDICT_INVALID');
 });
 
-test('A-32: an approval commit not on origin/main is rejected', () => {
+test('A-32: an approval commit that is not the live remote main is rejected', () => {
   const chain = syntheticApprovalChain({ pushApproval: false });
-  throwsCode(() => verifyApprovalGitContract({ sealAuthorityCommit: chain.sealCommit, approval: chain.approval, cwd: chain.repo.dir, requireRemote: true, requireHead: true }), 'R4_APPROVAL_REMOTE_MISSING');
+  throwsCode(() => verifyApprovalGitContract({ sealAuthorityCommit: chain.sealCommit, approval: chain.approval, cwd: chain.repo.dir, requireRemote: true, requireHead: true }), 'R4_AUTHORITY_REMOTE_MAIN_MISMATCH:APPROVAL_COMMIT_A');
 });
 
 test('A-33: starting before T0 is refused', () => {
@@ -486,6 +515,7 @@ try {
   }
 } finally {
   while (roots.length) { const root = roots.pop(); makeWritable(root); rmSync(root, { recursive: true, force: true }); }
+  if (synthetic) removeTree(synthetic.fixture.root);
 }
 console.log('');
 console.log(`R4 round-2 regression: ${count - failed}/${count} passed; synthetic temporary fixtures only`);
