@@ -3,6 +3,9 @@ import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openS
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, mintIdentity } from '../market-intelligence/definition.mjs';
+// R4 hard exclusion enforcement. A methods-only session can never be loaded as
+// R4 source evidence, regardless of the role a caller supplies.
+import { assertR4NotExcluded } from '../r4-exclusions.mjs';
 
 export const OUTCOME_DEFINITION_ID = 'ABS_LOG_RETURN_300S_BPS_V1';
 export const PRIMARY_HORIZON_SECONDS = 300;
@@ -90,6 +93,9 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
   if (!before['manifest.json']) fail('SOURCE_MANIFEST_MISSING');
   const manifest = sourceJson(verifiedJson(dir, 'manifest.json', before));
   if (manifest.schemaVersion !== 1 || manifest.recordType !== 'manifest' || !manifest.files || !/^[a-zA-Z0-9_-]{1,100}$/.test(manifest.sessionId)) fail('SOURCE_MANIFEST_INVALID');
+  // Hard exclusion: the five frozen methods-only sessions are rejected at the
+  // source-loading boundary, before any role can be trusted.
+  assertR4NotExcluded(manifest.sessionId);
   for (const [file, hash] of Object.entries(manifest.files)) {
     if (file === 'manifest.json' || !/^[a-zA-Z0-9_./-]+$/.test(file) || file.startsWith('/') || file.split('/').some(p => p === '..' || p === '.' || !p)) fail('SOURCE_MANIFEST_PATH_INVALID');
     if (before[file] !== hash) fail('SOURCE_FILE_HASH_MISMATCH');
@@ -147,15 +153,28 @@ export function readSourceSession({ dir, role }, policy = R4_SOURCE_POLICY) {
       if (evidence.length !== 1 || !source || evidence.some(o => o.staleness?.budgetMs !== source.budgetMs || digest(o.normalized) !== o.normalizedPayloadDigest || !positive(o.normalized.priceUsd) || ![o.providerObservedAt,o.receivedAt,o.capturedAt,o.observedAt].every(stamp) || o.providerObservedAt > o.receivedAt || o.receivedAt > o.capturedAt || o.capturedAt > o.observedAt || o.observedAt > r.observedAt)) fail('SOURCE_PRICE_EVIDENCE_INVALID');
     }
     const full = { ...r, disagreement };
+    // The compact snapshot carries the authenticated exposure provenance: the
+    // frozen `crossSourcePriceRangeBps` feature, the contributor digest that
+    // binds it, and the disagreement payload digest it was derived from. Each
+    // was already authenticated by `snapshotMissingReason(full)` above, which
+    // proves `digest({features, contributors, sourceObservations})` equals the
+    // record's `normalizedPayloadDigest` and that the disagreement metrics hash
+    // to its own digest. The exposure value therefore derives from authenticated
+    // evidence, not from a caller.
     const compact = { recordType: r.recordType, chain: r.chain, mint: r.mint, observedAt: r.observedAt,
-      normalizedPayloadDigest: r.normalizedPayloadDigest, disagreement: { metrics: { priceMedianUsd: disagreement.metrics?.priceMedianUsd,
+      normalizedPayloadDigest: r.normalizedPayloadDigest,
+      exposure: { field: 'crossSourcePriceRangeBps', value: r.features?.crossSourcePriceRangeBps ?? null,
+        contributorDigest: r.contributors?.crossSourcePriceRangeBps?.disagreementDigest ?? null,
+        disagreementDigest: disagreement.normalizedPayloadDigest ?? null },
+      disagreement: { metrics: { priceMedianUsd: disagreement.metrics?.priceMedianUsd,
         contributors: { price: disagreement.metrics?.contributors?.price } } } };
     return { snapshot: compact, validationReason: snapshotMissingReason(full), sessionId: manifest.sessionId, role, snapshotDigest: digest(full) };
   });
   const snapshotsByDigest = new Map();
   for (const candidate of snapshots) { const group = snapshotsByDigest.get(candidate.snapshotDigest) ?? []; group.push(candidate); snapshotsByDigest.set(candidate.snapshotDigest,group); }
   if (canonical(tree(dir)) !== canonical(before) || canonical(directories(dir).sort()) !== canonical(beforeDirs)) fail('SOURCE_CHANGED_DURING_READ');
-  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs, coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, snapshots, snapshotsByDigest };
+  return { dir, role, sessionId: manifest.sessionId, fingerprint: manifest.fingerprint, before, beforeDirs,
+    coverage: { startedAt: summary.startedAt, endedAt: summary.endedAt }, policy: { ...policy }, snapshots, snapshotsByDigest };
 }
 
 // Validate the recorded provenance; never reconstruct a median or select a different pair.

@@ -55,6 +55,12 @@ export async function main(args = process.argv.slice(2)) {
   }
   if (command !== 'capture') throw new Error('Use probe, capture, summary or doctor');
   const targetedMode = args.includes('--r4-revisits');
+  // R4 enforcement: a real cohort session may only be created through the sealed
+  // cohort runner (`scripts/r4-cohort-run.mjs`), which verifies the canonical
+  // tracked seal, the Git two-commit authority chain, the attempt index and the
+  // sealed capture environment. A bare `--r4-revisits` invocation is refused so
+  // an unsealed capture can never masquerade as R4 cohort evidence.
+  if (targetedMode && process.env.R4_SEALED_RUNNER !== 'yes') throw new Error('R4_SEALED_RUNNER_REQUIRED');
   const index = args.indexOf('--minutes');
   const minutes = index < 0 ? 30 : Number(args[index + 1]);
   if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) throw new Error('Minutes must be >0 and <=1440');

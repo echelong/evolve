@@ -2,14 +2,20 @@
 
 Status: **FROZEN full R4 preregistration.** This document fixes the complete R4
 protocol prospectively, before any real R4 cohort, source session, maturation or
-outcome exists. It is bound by the deterministic R4 preregistration seal under
-`.evolve/governance/` (record type `r4_preregistration_seal`), whose authority
-section lists every bound artifact digest and every frozen constant.
+outcome exists. It is bound by the deterministic R4 preregistration seal
+(record type `r4_preregistration_seal`). The **canonical authority** is the
+TRACKED seal at `governance/r4/r4-preregistration-seal.json`, whose authority
+section lists every required bound-artifact digest, the canonical specification
+and every frozen constant. The historical, Git-ignored
+`.evolve/governance/r4-preregistration-seal-*.json` runtime artifact is retained
+unchanged as historical/runtime evidence and is **not** authority; the canonical
+schema deliberately rejects it. See “Enforcement controls” below.
 
 This document authorizes **no capture, no cohort start and no outcome
-generation**. Cohort start requires the seal to be committed and pushed, and then
-the mechanical T0 rule of §D1. Outcome generation requires the cohort to be
-closed, maturation to be complete, source integrity to verify and a separate
+generation**. Cohort start requires the canonical tracked seal to be committed
+and pushed, and then the mechanical T0 rule of §D1 (see the two-commit
+authority chain below). Outcome generation requires the cohort to be closed,
+maturation to be complete, source integrity to verify and a separate
 authorization.
 
 The primary outcome primitive was frozen earlier by
@@ -318,6 +324,83 @@ the default to 512 MiB.
   512 MiB cap. Provisioning the cap higher (64–2048 MiB) is a configuration-only
   change and alters no science; a session that does reach the bound finalizes
   `incomplete` and is governed by §D4.
+
+## Enforcement controls (implementation only)
+
+Everything in this section is an **implementation control that enforces the
+already-frozen protocol**. It introduces no new scientific decision: no value in
+§D1–§D4, §B1, maturation, Policy A/B, horizon, tolerance, freshness, alignment,
+Kendall tau-b, bootstrap count, sample floors or missingness semantics is
+changed, and no threshold is moved.
+
+- **Two-commit authority chain.** `PROTOCOL COMMIT P` contains all code, this
+  preregistration, the enforcement modules and the validators, and does **not**
+  contain the final seal. `SEAL COMMIT S` adds only the canonical tracked seal
+  (plus a deterministic pointer) and has `P` as its direct parent. The seal
+  content binds `P`; it cannot contain `S`'s own SHA. Runtime authority is the
+  pair `(protocol commit P, seal authority commit S)`.
+- **Canonical tracked seal.** Authority may never depend on a Git-ignored file.
+  The canonical seal lives at `governance/r4/r4-preregistration-seal.json`; the
+  older `.evolve/governance/` artifact remains historical evidence only.
+- **T0 source.** T0 is the first whole UTC hour at least 30 minutes after the
+  **committer timestamp of the seal authority commit S**. The runner must also
+  prove `S` exists on `origin/main` before computing T0. This is the §D1 rule
+  applied to the committed seal; it does not move T0 for market conditions.
+- **Sealed cohort runner.** `scripts/r4-cohort-run.mjs` is the only path to a
+  real R4 cohort session. Its inputs are limited to the canonical tracked seal
+  path and an attempt index; every scientific capture parameter is derived from
+  the frozen specification and the seal. A bare `--r4-revisits` capture is
+  refused (`R4_SEALED_RUNNER_REQUIRED`), so an unsealed capture cannot
+  masquerade as R4 cohort evidence.
+- **Environment drift fails closed.** Every capture environment variable is
+  classified scientific (A), operational (B) or credential (C). A present
+  category-A variable that differs from the sealed value, or an unclassified
+  capture-shaped variable, fails **before capture**; it is never silently
+  overridden. Credentials may exist, but provider enablement and every
+  capture-relevant behaviour stay exactly sealed.
+- **Real-R4 session attestation.** A real cohort session must carry a
+  seal-bound attestation (`scripts/r4-attestation.mjs`) tying it to the seal
+  fingerprint, protocol commit, seal authority commit, attempt index, role
+  `cohort`, T0/cohort id, the sealed 45-minute reference window, the sealed
+  provider configuration, the capture mode and the authenticated session
+  manifest fingerprint. A caller-supplied `role='cohort'` string is never
+  sufficient. Trust model: like every governance record here, the attestation
+  authenticates content digests and a declared operator identity — there is no
+  private-key signing infrastructure in this repository.
+- **Hard exclusion enforcement.** The five frozen methods-only sessions are
+  rejected deterministically at source loading, the reference builder, the
+  cohort governor and analysis provenance, whatever role is supplied, yielding
+  zero R4 references.
+- **Cohort governance hardening.** `evaluateCohortProgress` rejects duplicated
+  session ids, excluded session ids and any completed attempt after the sixth;
+  attempt indexes are exactly `1..8` and attempt 9 is always illegal. The sealed
+  governor additionally requires a seal-bound attestation for every completed
+  attempt.
+- **Canonical reference-set enforcement.** The primary path builds
+  `ALL_ELIGIBLE_REFERENCES` itself over the authenticated cohort membership and
+  binds a deterministic reference-set digest. A caller-supplied thinned list
+  fails (`R4_REFERENCE_SET_MISMATCH`).
+- **Authenticated exposure provenance.** `crossSourcePriceRangeBps` is derived
+  from the authenticated reference snapshot’s frozen feature and contributor
+  digest; a caller-supplied exposure value never reaches the real-R4 path.
+- **Locked primary-analysis interface.** The real-R4 analysis entrypoint accepts
+  no override for horizon, tolerance, bootstrap count, cluster key, exposure
+  field, outcome field, estimator, CI method, sample floors or seed scheme; all
+  are derived from the frozen specification, and no environment variable can
+  change them.
+- **Outcome/cohort/reference binding.** A canonical outcome run records the seal
+  fingerprint, protocol commit, seal authority commit, cohort-membership digest,
+  canonical reference-set digest, exact source session ids, Policy A and the
+  frozen outcome constants; a later analysis rejects a run whose bindings do not
+  match exactly.
+- **Storage preflight.** Before a real attempt starts, the configured cap and a
+  worst-case estimate for the sealed 45-minute window plus the bounded drain are
+  reported with headroom. Duration is never altered. If the exact sealed
+  operational configuration cannot safely complete under the required storage
+  conditions, the attempt is **refused before capture** rather than silently
+  changing the cap. Consistent with the disclosed note above, the sealed
+  operational cap is 1024 MiB inside the frozen 64–2048 MiB clamp; this is a
+  configuration-only value that alters no science.
 
 ## Authority
 

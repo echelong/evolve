@@ -14,6 +14,7 @@
 //   * the module is read-only with respect to evidence and never inspects a
 //     price direction, an outcome, a model score or a later token state.
 import { R4_SOURCE_POLICY, readSourceSession } from './index.mjs';
+import { assertR4NotExcluded } from '../r4-exclusions.mjs';
 
 const order = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 export const REFERENCE_RULE = 'ALL_ELIGIBLE_REFERENCES';
@@ -24,6 +25,10 @@ export function selectAllEligibleReferences(sessions) {
   const selected = [];
   for (const session of sessions) {
     if (!session || typeof session.sessionId !== 'string' || !Array.isArray(session.snapshots)) throw new Error('REFERENCE_SESSION_INVALID');
+    // Hard exclusion at the reference-builder boundary: an excluded methods-only
+    // session must never contribute a single R4 reference, whatever role it was
+    // labelled with.
+    assertR4NotExcluded(session.sessionId);
     if (session.role !== 'cohort') continue;
     for (const candidate of session.snapshots) {
       if (candidate.validationReason !== null) continue;
