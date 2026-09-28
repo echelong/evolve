@@ -12,6 +12,7 @@ import { observation } from './market-intelligence/normalize.mjs';
 import { createStorage } from './market-intelligence/storage.mjs';
 import { canonical, digest } from './market-intelligence/definition.mjs';
 import { CLASSIFICATION, PRIMARY_HORIZON_MS, resolveReference, snapshotMissingReason, readSourceSession, generateOutcomeRun, verifyOutcomeRun } from './market-outcomes/index.mjs';
+import { policyACases } from './market-outcomes/policy-a-cases.mjs';
 const tests = [], test = (name, fn) => tests.push([name, fn]);
 const roots = [], temp = () => { const r = mkdtempSync(path.join(tmpdir(), 'evolve-outcomes-')); roots.push(r); return r; };
 const at = 1800000000000, mint = 'So11111111111111111111111111111111111111112', other = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -329,6 +330,11 @@ test('pre-existing partial run and output path reject exclusive publication',()=
     assert.throws(()=>generateOutcomeRun(input),/EEXIST/);assert.equal(readFileSync(path.join(dir,name),'utf8'),'reserved');
   }
 });
+// Frozen P3-C Policy A boundary coverage. The same case module drives the
+// mutation harness in scripts/validate-p3c-mutation.mjs, so both executables
+// assert byte-identical Policy A behavior.
+for (const [name, fn] of policyACases({ resolveReference, snapshotMissingReason })) test(name, fn);
+
 let failed = 0;
 try { for (const [name, fn] of tests) { try { await fn(); console.log(`PASS ${name}`); } catch (e) { failed++; console.error(`FAIL ${name}: ${e.stack}`); } } }
 finally { for (const root of roots) { assert(root.startsWith(tmpdir() + path.sep)); const walk = p => { chmodSync(p, 0o755); for (const e of readdirSync(p, { withFileTypes: true })) if (e.isDirectory()) walk(path.join(p,e.name)); }; walk(root); rmSync(root, { recursive: true, force: true }); } }
