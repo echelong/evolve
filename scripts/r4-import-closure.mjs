@@ -63,6 +63,7 @@ export const R4_BOUND_VALIDATORS = Object.freeze([
   'scripts/validate-market-outcomes.mjs',
   'scripts/validate-p3c-mutation.mjs',
   'scripts/validate-r4-approval-epochs.mjs',
+  'scripts/validate-r4-approval-fingerprint.mjs',
   'scripts/validate-r4-e1-mutation.mjs',
   'scripts/validate-r4-e1.mjs',
   'scripts/validate-r4-enforcement.mjs',

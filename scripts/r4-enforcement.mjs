@@ -152,6 +152,7 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
     if (plan.t0 !== approvalAuthority.t0) fail('R4_PLAN_T0_MISMATCH');
     if ((plan.approvalCommit ?? null) !== (approvalAuthority.approvalCommit ?? null)) fail('R4_PLAN_APPROVAL_COMMIT_MISMATCH');
     if (epochOf(plan.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_PLAN_APPROVAL_EPOCH_MISMATCH');
+    if ((plan.approvalFingerprint ?? null) !== (approvalAuthority.approvalFingerprint ?? null)) fail('R4_PLAN_APPROVAL_FINGERPRINT_MISMATCH');
   }
   // Frozen structural + membership hardening (throws on duplicate/excluded/late).
   const progress = evaluateCohortProgress(plan, attempts);
@@ -178,6 +179,8 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
     if (attestation.authorityCommit !== authority.sealAuthorityCommit) fail('R4_ATTEMPT_AUTHORITY_COMMIT_MISMATCH');
     if (approvalAuthority && attestation.approvalCommit !== approvalAuthority.approvalCommit) fail('R4_ATTEMPT_APPROVAL_COMMIT_MISMATCH');
     if (approvalAuthority && epochOf(attestation.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_ATTEMPT_APPROVAL_EPOCH_MISMATCH');
+    // The approval fingerprint is enforced by `verifySessionAttestation` above,
+    // against the same `approvalAuthority`; repeating it here would be unreachable.
     authenticated.push(attempt.sessionId);
   }
   // Canonical membership is an OUTPUT. It is derived from the completed attempts
@@ -388,6 +391,7 @@ export function buildOutcomeRunBinding({ seal, authority, approvalAuthority = nu
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
     authorityCommit: authority.sealAuthorityCommit, approvalCommit: approvalAuthority?.approvalCommit ?? null,
     approvalEpoch: approvalAuthority?.approvalEpoch ?? null,
+    approvalFingerprint: approvalAuthority?.approvalFingerprint ?? null,
     cohortMembershipDigest: digest([...cohortMembership].sort()),
     referenceSetDigest: referenceSetDigest(references),
     sourceSessionIds: deriveSourceSessionIds({ references }),
@@ -414,6 +418,7 @@ export function verifyOutcomeRunBinding({ binding, seal, authority, approvalAuth
   if (binding.authorityCommit !== authority.sealAuthorityCommit) fail('R4_BINDING_AUTHORITY_COMMIT_MISMATCH');
   if (approvalAuthority && (binding.approvalCommit ?? null) !== (approvalAuthority.approvalCommit ?? null)) fail('R4_BINDING_APPROVAL_COMMIT_MISMATCH');
   if (approvalAuthority && epochOf(binding.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_BINDING_APPROVAL_EPOCH_MISMATCH');
+  if (approvalAuthority && (binding.approvalFingerprint ?? null) !== (approvalAuthority.approvalFingerprint ?? null)) fail('R4_BINDING_APPROVAL_FINGERPRINT_MISMATCH');
   if (binding.cohortMembershipDigest !== digest([...cohortMembership].sort())) fail('R4_BINDING_COHORT_MISMATCH');
   if (binding.referenceSetDigest !== referenceSetDigest(references)) fail('R4_BINDING_REFERENCE_SET_MISMATCH');
   const expectedSourceSessionIds = deriveSourceSessionIds({ references });

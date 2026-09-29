@@ -35,7 +35,8 @@ import {
 import {
   R4_APPROVAL_EPOCHS_DIR, R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS, R4_RENEWAL_VERDICT,
   approvalPathForEpoch, renewalReviewPathForEpoch, approvalGovernancePathsForEpoch, buildRenewalApprovalRecord,
-  buildRenewalReviewRecord, assertNoRealR4AttemptArtifacts, listRealR4AttemptArtifacts, evaluateRenewalEligibility,
+  buildRenewalReviewRecord, renewalReviewFingerprint, reviewerIdentityFromRenewalReview, reviewerIdentityFromApproval,
+  assertNoRealR4AttemptArtifacts, listRealR4AttemptArtifacts, evaluateRenewalEligibility,
   assertRenewalEligible, resolveApprovalEpochChain, resolveLatestApprovalEpoch,
 } from './r4-approval-epochs.mjs';
 import { R4_ATTEMPT_AUTH_DIR, R4_ATTESTATION_DIR } from './r4-capability.mjs';
@@ -46,14 +47,27 @@ const A1_SHA = '9ae21e0a976a4f7ba363e04fa370eef23fd713af';
 const S3_SHA = 'a0be84c55aba60ee7fdbc3c5eaecc3acb64bac25';
 const A1_SEAL_FINGERPRINT = 'e788601471c4631e8752ee3611a29c6ced8b59e0d1516efa6dea1eb0def2da46';
 const A1_T0 = Date.UTC(2026, 8, 29, 6, 0, 0); // 2026-09-29T06:00:00Z
+// The REAL historical A1 reviewer identity, read from the A1 commit itself, so the
+// same-reviewer+same-model negative fixture is bound to history rather than to a
+// hand-copied string. Epoch 1 stores `reviewer` / `reviewerModel`.
+const REAL_A1_APPROVAL = JSON.parse(
+  spawnSync('git', ['show', `${A1_SHA}:${R4_APPROVAL_PATH}`], { cwd: REPO, encoding: 'utf8' }).stdout,
+);
+const REAL_A1_REVIEWER = REAL_A1_APPROVAL.reviewer;
+const REAL_A1_REVIEWER_MODEL = REAL_A1_APPROVAL.reviewerModel;
 const SYNTHETIC_A1_ISO = '2026-09-28T10:10:00Z';
 const A2_ISO = '2026-09-28T12:00:00Z';
 const CLEANUP = [];
 
 let failed = 0;
+let executed = 0;
 const failures = [];
 
+// The executed-case total is COUNTED, never declared. Every `test(...)` call —
+// including the ones a `for` loop expands — increments `executed`, so the report
+// can never disagree with what actually ran.
 function test(name, fn) {
+  executed++;
   try { fn(); console.log(`PASS ${name}`); }
   catch (e) { failed++; failures.push(name); console.error(`FAIL ${name}: ${String(e?.message ?? e).split('\n')[0]}`); }
 }
@@ -75,9 +89,10 @@ const gitText = (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' })
  * mutated to model one rejection case.
  */
 function buildEpochRepo(options = {}) {
-  const { reseal = true, a2 = {}, addA3 = false, a2Iso = A2_ISO, artifacts = [], duplicateA2 = false,
-    editA1 = false, headAfterA2 = false, intermediate = false, remoteMain = 'A2' } = options;
-  const fixture = syntheticAuthorityRepo({ remoteMain: 'A' });
+  const { reseal = true, a2 = {}, a3 = {}, addA3 = false, a2Iso = A2_ISO, artifacts = [], duplicateA2 = false,
+    editA1 = false, headAfterA2 = false, intermediate = false, remoteMain = 'A2', a1Identity = null } = options;
+  const fixture = syntheticAuthorityRepo({ remoteMain: 'A',
+    ...(a1Identity ? { approvalReviewer: a1Identity.reviewer, approvalReviewerModel: a1Identity.model } : {}) });
   CLEANUP.push(fixture.root);
   const { dir, run } = fixture;
   const state = { dir, run, fixture, a1: fixture.approvalCommit, s3: fixture.sealCommit, p3: fixture.protocolCommit,
@@ -103,7 +118,10 @@ function buildEpochRepo(options = {}) {
   for (const artifact of artifacts) writeArtifact(dir, artifact);
 
   const o = a2;
-  const review = buildRenewalReviewRecord({
+  // `reviewExtraFields` and `reviewOmit` model schema-shaped negatives: a review
+  // that supplies `reviewerModel` / `reauthorizationReviewerModel` INSTEAD of the
+  // schema field `model`, or that omits `reviewer` / `model` entirely.
+  const builtReview = buildRenewalReviewRecord({
     reviewer: o.reviewer ?? 'renewal-independent-reviewer',
     model: o.model ?? 'renewal-review-model',
     protocolCommit: currentSeal.protocolCommit, sealCommit: currentSealCommit, sealFingerprint: currentSeal.fingerprint,
@@ -111,6 +129,15 @@ function buildEpochRepo(options = {}) {
     verdict: o.reviewVerdict ?? R4_RENEWAL_VERDICT,
     reviewedAt: o.reviewedAt ?? Date.parse('2026-09-28T11:40:00Z'),
   });
+  let review = builtReview;
+  if (o.reviewMutate || o.reviewOmit?.length || o.reviewExtraFields) {
+    const content = { ...builtReview };
+    delete content.fingerprint;
+    for (const field of o.reviewOmit ?? []) delete content[field];
+    Object.assign(content, o.reviewExtraFields ?? {});
+    // Re-seal so the modelled defect is the ONLY anomaly under test.
+    review = { ...content, fingerprint: renewalReviewFingerprint(content) };
+  }
   const approval = buildRenewalApprovalRecord({
     approvalEpoch: o.approvalEpoch ?? 2,
     protocolCommit: o.protocolCommit ?? currentSeal.protocolCommit,
@@ -149,7 +176,7 @@ function buildEpochRepo(options = {}) {
     const t0_2 = approvalT0(Date.parse(a2Iso));
     const windowEnd_2 = t0_2 + R4_ATTEMPT1_WINDOW_MS;
     const review3 = buildRenewalReviewRecord({
-      reviewer: 'third-independent-reviewer', model: 'third-review-model',
+      reviewer: a3.reviewer ?? 'third-independent-reviewer', model: a3.model ?? 'third-review-model',
       protocolCommit: currentSeal.protocolCommit, sealCommit: currentSealCommit, sealFingerprint: currentSeal.fingerprint,
       previousApprovalCommit: state.a2, previousApprovalFingerprint: approval.fingerprint,
       reviewedAt: windowEnd_2 + 60_000,
@@ -339,6 +366,138 @@ test('16: an epoch-2 approval with a wrong renewal verdict is rejected', () => {
     `expected a verdict rejection, got ${code}`);
 });
 
+/* ===== 16a-16k: reviewer INDEPENDENCE is the canonical (reviewer, model) pair ===== */
+
+test('16a: a renewal review reusing the REAL A1 reviewer AND model is rejected', () => {
+  // The predecessor is a synthetic A1 carrying the REAL historical A1 identity,
+  // and the renewal review repeats that EXACT pair. This is the regression for
+  // the P1 defect: the review schema stores `model`, so the previous guard read an
+  // empty model segment and could never fire.
+  const state = buildEpochRepo({
+    a1Identity: { reviewer: REAL_A1_REVIEWER, model: REAL_A1_REVIEWER_MODEL },
+    a2: { reviewer: REAL_A1_REVIEWER, model: REAL_A1_REVIEWER_MODEL },
+  });
+  assert.equal(JSON.parse(gitText(state.dir, ['show', `${state.a1}:${R4_APPROVAL_PATH}`])).reviewer, REAL_A1_REVIEWER);
+  throwsCode('real A1 identity reused', () => resolveApprovalEpochChain({ cwd: state.dir }),
+    'R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT');
+  // ...and with the seal/proof control: a DISTINCT pair on the same fixture shape
+  // is accepted, so the rejection above is the identity rule and nothing else.
+  const control = buildEpochRepo({
+    a1Identity: { reviewer: REAL_A1_REVIEWER, model: REAL_A1_REVIEWER_MODEL },
+    a2: { reviewer: 'a-different-independent-reviewer', model: REAL_A1_REVIEWER_MODEL },
+  });
+  assert.equal(resolveApprovalEpochChain({ cwd: control.dir }).latest.epoch, 2);
+});
+
+test('16b: A — the exact same reviewer AND the exact same model is rejected', () => {
+  const state = buildEpochRepo({ a1Identity: { reviewer: 'shared-reviewer', model: 'shared-model' },
+    a2: { reviewer: 'shared-reviewer', model: 'shared-model' } });
+  throwsCode('identical pair', () => resolveApprovalEpochChain({ cwd: state.dir }),
+    'R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT');
+});
+
+test('16c: B — the same reviewer with a DIFFERENT model is a distinct pair and is accepted', () => {
+  const state = buildEpochRepo({ a1Identity: { reviewer: 'shared-reviewer', model: 'model-one' },
+    a2: { reviewer: 'shared-reviewer', model: 'model-two' } });
+  assert.equal(resolveApprovalEpochChain({ cwd: state.dir }).latest.epoch, 2);
+});
+
+test('16d: C — a DIFFERENT reviewer with the exact same model is a distinct pair and is accepted', () => {
+  const state = buildEpochRepo({ a1Identity: { reviewer: 'reviewer-one', model: 'shared-model' },
+    a2: { reviewer: 'reviewer-two', model: 'shared-model' } });
+  assert.equal(resolveApprovalEpochChain({ cwd: state.dir }).latest.epoch, 2);
+});
+
+test('16e: D — a different reviewer AND a different model is accepted when otherwise valid', () => {
+  const state = buildEpochRepo({ a1Identity: { reviewer: 'reviewer-one', model: 'model-one' },
+    a2: { reviewer: 'reviewer-two', model: 'model-two' } });
+  assert.equal(resolveApprovalEpochChain({ cwd: state.dir }).latest.epoch, 2);
+});
+
+test('16f: E — a renewal review with a MISSING reviewer is a schema rejection', () => {
+  // The approval record stays well-formed (`reauthorizationReviewer` pinned), so
+  // the ONLY anomaly under test is the review's missing `reviewer`.
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model', reviewOmit: ['reviewer'] } });
+  const onDisk = JSON.parse(gitText(state.dir, ['show', `${state.a2}:${renewalReviewPathForEpoch(2)}`]));
+  assert.equal(onDisk.reviewer, undefined, 'the schema field really is absent');
+  assert.equal(onDisk.reauthorizationReviewer, undefined, 'the approval-shaped field is not a review fallback');
+  throwsCode('missing reviewer', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_REVIEWER_INVALID');
+  throwsCode('missing reviewer (identity helper)', () => reviewerIdentityFromRenewalReview(onDisk), 'R4_RENEWAL_REVIEW_REVIEWER_INVALID');
+});
+
+test('16g: F — a renewal review with a MISSING model is a schema rejection', () => {
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model', reviewOmit: ['model'] } });
+  const onDisk = JSON.parse(gitText(state.dir, ['show', `${state.a2}:${renewalReviewPathForEpoch(2)}`]));
+  assert.equal(onDisk.model, undefined);
+  throwsCode('missing model', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+  throwsCode('missing model (identity helper)', () => reviewerIdentityFromRenewalReview(onDisk), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+});
+
+test('16h: G — a renewal review with an EMPTY reviewer is a schema rejection', () => {
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model', reviewExtraFields: { reviewer: '' } } });
+  throwsCode('empty reviewer', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_REVIEWER_INVALID');
+  throwsCode('empty reviewer (identity helper)', () => reviewerIdentityFromRenewalReview(state.a2Review), 'R4_RENEWAL_REVIEW_REVIEWER_INVALID');
+});
+
+test('16i: H — a renewal review with an EMPTY model is a schema rejection', () => {
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model', reviewExtraFields: { model: '   ' } } });
+  throwsCode('empty model', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+  throwsCode('empty model (identity helper)', () => reviewerIdentityFromRenewalReview(state.a2Review), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+});
+
+test('16j: I — `reviewerModel` instead of the schema field `model` does NOT bypass the review schema', () => {
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model',
+    reviewOmit: ['model'], reviewExtraFields: { reviewerModel: 'bypass-model' } } });
+  const onDisk = JSON.parse(gitText(state.dir, ['show', `${state.a2}:${renewalReviewPathForEpoch(2)}`]));
+  assert.equal(onDisk.reviewerModel, 'bypass-model', 'the misleading field really is present');
+  assert.equal(onDisk.model, undefined, 'the schema field really is absent');
+  throwsCode('reviewerModel instead of model', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+  throwsCode('reviewerModel is not an identity', () => reviewerIdentityFromRenewalReview(onDisk), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+});
+
+test('16k: J — `reauthorizationReviewerModel` instead of `model` does NOT bypass the review schema', () => {
+  const state = buildEpochRepo({ a2: { reviewer: 'pin-reviewer', model: 'pin-model',
+    reviewOmit: ['model'], reviewExtraFields: { reauthorizationReviewerModel: 'bypass-model' } } });
+  const onDisk = JSON.parse(gitText(state.dir, ['show', `${state.a2}:${renewalReviewPathForEpoch(2)}`]));
+  assert.equal(onDisk.reauthorizationReviewerModel, 'bypass-model');
+  assert.equal(onDisk.model, undefined);
+  throwsCode('reauthorizationReviewerModel instead of model', () => resolveApprovalEpochChain({ cwd: state.dir }), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+  throwsCode('reauthorizationReviewerModel is not an identity', () => reviewerIdentityFromRenewalReview(onDisk), 'R4_RENEWAL_REVIEW_MODEL_INVALID');
+});
+
+test('16l: K — epoch 3 compares against A2 `reauthorizationReviewer{,Model}`, not A1', () => {
+  // Reusing A1's identity at epoch 3 is fine: the rule is against the IMMEDIATE
+  // predecessor, not against all of history.
+  const againstA1 = buildEpochRepo({ a1Identity: { reviewer: 'first-reviewer', model: 'first-model' },
+    a2: { reviewer: 'second-reviewer', model: 'second-model' },
+    a3: { reviewer: 'first-reviewer', model: 'first-model' }, addA3: true });
+  assert.equal(resolveApprovalEpochChain({ cwd: againstA1.dir }).latest.epoch, 3);
+  // Reusing A2's reauthorization identity at epoch 3 is NOT independent.
+  const againstA2 = buildEpochRepo({ a1Identity: { reviewer: 'first-reviewer', model: 'first-model' },
+    a2: { reviewer: 'second-reviewer', model: 'second-model' },
+    a3: { reviewer: 'second-reviewer', model: 'second-model' }, addA3: true });
+  throwsCode('A2 identity reused at A3', () => resolveApprovalEpochChain({ cwd: againstA2.dir }),
+    'R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT');
+  // The compared pair is exactly A2's reauthorization identity, and the epoch-1
+  // and renewal-approvals extract through their OWN schema fields.
+  assert.equal(reviewerIdentityFromApproval(againstA2.a2Record).key,
+    `second-reviewer\u0000second-model`);
+  assert.equal(reviewerIdentityFromApproval(againstA2.a3Record).key, 'second-reviewer\u0000second-model');
+  assert.equal(reviewerIdentityFromApproval(againstA1.a3Record).key, 'first-reviewer\u0000first-model');
+});
+
+test('16m: the real A1 extracts its identity from the epoch-1 schema fields', () => {
+  assert.equal(REAL_A1_REVIEWER, 'Buffy (Freebuff independent adversarial reviewer)');
+  assert.equal(REAL_A1_REVIEWER_MODEL, 'deepseek/deepseek-v4-flash');
+  assert.equal(reviewerIdentityFromApproval(REAL_A1_APPROVAL).key, `${REAL_A1_REVIEWER}\u0000${REAL_A1_REVIEWER_MODEL}`);
+  // A renewal-review record exposes the same pair through `model`.
+  const asReview = buildRenewalReviewRecord({ reviewer: REAL_A1_REVIEWER, model: REAL_A1_REVIEWER_MODEL,
+    protocolCommit: REAL_A1_APPROVAL.protocolCommit, sealCommit: REAL_A1_APPROVAL.sealCommit,
+    sealFingerprint: REAL_A1_APPROVAL.sealFingerprint, previousApprovalCommit: REAL_A1_APPROVAL.sealCommit,
+    previousApprovalFingerprint: REAL_A1_APPROVAL.fingerprint, reviewedAt: A1_T0 });
+  assert.equal(reviewerIdentityFromRenewalReview(asReview).key, `${REAL_A1_REVIEWER}\u0000${REAL_A1_REVIEWER_MODEL}`);
+});
+
 /* ===================== 17-18: only the latest epoch authorizes; its own T0 ===================== */
 
 test('17: the old A1 cannot authorize once A2 exists', () => {
@@ -483,7 +642,8 @@ test('migration: A1 can be the predecessor of a valid future renewal (eligibilit
 for (const root of CLEANUP) { try { removeTree(root); } catch { /* best effort */ } }
 
 console.log('');
-console.log(`R4 approval epochs: ${failed ? failures.length : 0} failure(s); every synthetic chain lived in a disposable repository`);
+const passed = executed - failed;
+console.log(`R4 approval epochs: ${passed}/${executed} executed case(s) passed, ${failed} failure(s); every synthetic chain lived in a disposable repository`);
 if (failed) {
   console.error(`failures: ${failures.join(', ')}`);
   process.exitCode = 1;

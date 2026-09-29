@@ -132,7 +132,8 @@ export function writeDurableExclusive(file, body, { mode = 0o400 } = {}) {
 
 /** Build the pre-attempt authorization record. Content blinds the raw capability. */
 export function createAttemptAuthorization({
-  seal, authority, approvalCommit = null, approvalEpoch = null, attemptIndex, sessionId, t0, capabilityHash: hash, captureSpecDigest,
+  seal, authority, approvalCommit = null, approvalEpoch = null, approvalFingerprint = null,
+  attemptIndex, sessionId, t0, capabilityHash: hash, captureSpecDigest,
   authorizedAt = Date.now(), previousTerminalFingerprint = null,
 }) {
   if (!seal || typeof seal.fingerprint !== 'string') fail('R4_CAPABILITY_SEAL_INVALID');
@@ -146,6 +147,12 @@ export function createAttemptAuthorization({
   // Approval EPOCH (missed-window renewal governance): 1 is the historical
   // legacy approval; null means "not bound by this record".
   if (approvalEpoch !== null && (!Number.isInteger(approvalEpoch) || approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
+  // Approval FINGERPRINT: the self-contained content digest of the approval
+  // artifact located through the resolved Git authority. It is always taken from
+  // the independently resolved authority (`resolveR4ExecutionAuthority`); it is
+  // never a free-standing caller claim, and it binds `approvalCommit` +
+  // `approvalEpoch` so neither can be swapped for another approval.
+  if (approvalFingerprint !== null && !isDigest(approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
   if (!isStamp(authorizedAt)) fail('R4_CAPABILITY_AUTHORIZED_AT_INVALID');
   if (previousTerminalFingerprint !== null && !isDigest(previousTerminalFingerprint)) fail('R4_CAPABILITY_PREVIOUS_TERMINAL_INVALID');
   const content = {
@@ -153,7 +160,8 @@ export function createAttemptAuthorization({
     capabilityHash: hash, sealFingerprint: seal.fingerprint,
     protocolCommit: authority.protocolCommit, protocolTree: authority.protocolTree ?? seal.protocolTree,
     sealAuthorityCommit: authority.sealAuthorityCommit,
-    approvalCommit, approvalEpoch, attemptIndex, sessionId, t0, t0Iso: new Date(t0).toISOString(), captureSpecDigest,
+    approvalCommit, approvalEpoch, approvalFingerprint,
+    attemptIndex, sessionId, t0, t0Iso: new Date(t0).toISOString(), captureSpecDigest,
     authorizedAt, previousTerminalFingerprint,
   };
   return { ...content, fingerprint: digest(content) };
@@ -180,6 +188,7 @@ export function assertAttemptAuthorization(record) {
   if (!isSha(record.protocolCommit) || !isSha(record.sealAuthorityCommit)) fail('R4_CAPABILITY_AUTHORITY_INVALID');
   if (record.approvalCommit !== null && !isSha(record.approvalCommit)) fail('R4_CAPABILITY_APPROVAL_INVALID');
   if ((record.approvalEpoch ?? null) !== null && (!Number.isInteger(record.approvalEpoch) || record.approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
+  if ((record.approvalFingerprint ?? null) !== null && !isDigest(record.approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
   if (!Number.isInteger(record.attemptIndex) || record.attemptIndex < 1) fail('R4_CAPABILITY_ATTEMPT_INDEX_INVALID');
   if (typeof record.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(record.sessionId)) fail('R4_CAPABILITY_SESSION_ID_INVALID');
   if (!isStamp(record.t0) || !isStamp(record.authorizedAt)) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
@@ -212,6 +221,7 @@ export function assertAttemptClaim(claim) {
   if (!Number.isInteger(claim.attemptIndex) || claim.attemptIndex < 1) fail('R4_CLAIM_RECORD_INVALID');
   if (!isStamp(claim.claimedAt) || !isStamp(claim.t0)) fail('R4_CLAIM_RECORD_INVALID');
   if ((claim.approvalEpoch ?? null) !== null && (!Number.isInteger(claim.approvalEpoch) || claim.approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
+  if ((claim.approvalFingerprint ?? null) !== null && !isDigest(claim.approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
   return true;
 }
 
@@ -219,7 +229,7 @@ export function assertAttemptClaim(claim) {
 export function assertClaimBindsAuthorization(claim, record) {
   assertAttemptClaim(claim);
   assertAttemptAuthorization(record);
-  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'approvalEpoch', 'captureSpecDigest', 't0'];
+  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'approvalEpoch', 'approvalFingerprint', 'captureSpecDigest', 't0'];
   if (claim.authorizationFingerprint !== record.fingerprint) fail('R4_CLAIM_AUTHORIZATION_MISMATCH');
   for (const field of fields) if (claim[field] !== record[field]) fail('R4_CLAIM_IDENTITY_MISMATCH');
   return true;
@@ -279,6 +289,7 @@ export function claimAttemptAuthorization({
     attemptIndex: record.attemptIndex, sessionId: record.sessionId, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
     approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null,
+    approvalFingerprint: record.approvalFingerprint ?? null,
     captureSpecDigest: record.captureSpecDigest, t0: record.t0,
     claimedAt: now,
   };
@@ -299,7 +310,8 @@ export function proveCapability({ capability, record }) {
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail('R4_CAPABILITY_MISMATCH');
   return Object.freeze({ capability: Buffer.from(capability), capabilityHash: hash,
     authorizationFingerprint: record.fingerprint, sessionId: record.sessionId, attemptIndex: record.attemptIndex,
-    t0: record.t0, approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null, sealFingerprint: record.sealFingerprint,
+    t0: record.t0, approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null,
+    approvalFingerprint: record.approvalFingerprint ?? null, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
     captureSpecDigest: record.captureSpecDigest });
 }
@@ -311,6 +323,7 @@ export function assertAttemptProof(proof, { attemptIndex = null, sessionId = nul
   if (!Buffer.isBuffer(proof.capability) || capabilityHash(proof.capability) !== proof.capabilityHash) fail('R4_CAPABILITY_PROOF_INVALID');
   if (attemptIndex !== null && proof.attemptIndex !== attemptIndex) fail('R4_CAPABILITY_ATTEMPT_MISMATCH');
   if (sessionId !== null && proof.sessionId !== sessionId) fail('R4_CAPABILITY_SESSION_MISMATCH');
+  if ((proof.approvalFingerprint ?? null) !== null && !isDigest(proof.approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
   return true;
 }
 
@@ -356,10 +369,11 @@ export function acquireRunnerCapability({ fd = R4_CAPABILITY_FD, root = R4_ATTEM
 /* ------------------------------------------------------------- receipts */
 
 /** Receipt written by capture after finalization so the runner can finalize. */
-export function createSessionReceipt({ authorizationFingerprint, capabilityHash: hash, claimFingerprint = null, sessionId, sessionFingerprint, revisitCoverage = null }) {
+export function createSessionReceipt({ authorizationFingerprint, capabilityHash: hash, claimFingerprint = null, sessionId, sessionFingerprint, approvalFingerprint = null, revisitCoverage = null }) {
   if (!isDigest(sessionFingerprint)) fail('R4_RECEIPT_SESSION_FINGERPRINT_INVALID');
+  if (approvalFingerprint !== null && !isDigest(approvalFingerprint)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_INVALID');
   const content = { schemaVersion: 1, recordType: R4_SESSION_RECEIPT_RECORD_TYPE, authorizationFingerprint, capabilityHash: hash,
-    claimFingerprint, sessionId, sessionFingerprint, revisitCoverage };
+    claimFingerprint, sessionId, sessionFingerprint, approvalFingerprint, revisitCoverage };
   return { ...content, fingerprint: digest(content) };
 }
 
@@ -384,5 +398,10 @@ export function assertSessionReceipt(receipt, { proof, record, claim = null }) {
   if (receipt.sessionId !== record.sessionId) fail('R4_RECEIPT_SESSION_MISMATCH');
   if (receipt.sessionId !== proof.sessionId) fail('R4_RECEIPT_SESSION_MISMATCH');
   if (claim && receipt.claimFingerprint !== claim.fingerprint) fail('R4_RECEIPT_CLAIM_MISMATCH');
+  // The receipt carries the approval fingerprint explicitly, so a receipt is
+  // self-contained with respect to WHICH approval governed the attempt rather
+  // than only transitively through `authorizationFingerprint`.
+  if ((receipt.approvalFingerprint ?? null) !== (record.approvalFingerprint ?? null)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_MISMATCH');
+  if ((proof.approvalFingerprint ?? null) !== (record.approvalFingerprint ?? null)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_MISMATCH');
   return true;
 }

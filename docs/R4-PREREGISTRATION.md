@@ -191,6 +191,28 @@ approval window expired and before any cohort attempt.**
   `READY_TO_REAUTHORIZE_COHORT`) committed with it, and may only be created after
   the predecessor window fully elapsed with **zero real R4 attempt artifacts**.
   No existing approval is rewritten, and `A1` remains authentic epoch-1 history.
+- **Reviewer independence is the canonical `(reviewer, model)` pair**, compared
+  against the **immediately preceding** approval's own review identity, never
+  against all of history. A renewal review is not independent exactly when that
+  pair is identical to the predecessor's, and is rejected with
+  `R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT`. The pair is extracted
+  **per schema** — a renewal review record carries `reviewer`/`model`, an epoch-1
+  approval carries `reviewer`/`reviewerModel`, and a renewal approval carries
+  `reauthorizationReviewer`/`reauthorizationReviewerModel` — with schema
+  validation strictly before the comparison and no silent fallthrough between
+  incompatible record shapes. A distinct pair is not an automatic approval: every
+  other renewal requirement still applies.
+- **Approval artifacts are self-contained about WHICH approval governed an
+  attempt.** Alongside `approvalCommit` and `approvalEpoch`, the attempt
+  authorization, claim, capability proof, session receipt, terminal record, session
+  attestation, attempt history, sealed cohort plan, outcome-run binding and the
+  canonical analysis result identity all carry the approval **fingerprint** — the
+  content digest of the approval artifact located through the resolved Git
+  authority — and every canonical production verifier that already checks
+  `approvalCommit`/`approvalEpoch` also checks it, failing closed with a stable
+  `*_APPROVAL_FINGERPRINT_MISMATCH` code. The value is always taken from the
+  independently resolved authority and is never a caller-supplied input. This is
+  provenance hardening only: it changes no scientific rule.
 - Epoch 1 stays at `governance/r4/r4-precapture-approval.json`; renewals use the
   immutable paths `governance/r4/approvals/approval-000N.json` (with
   `approval-000N.review.json`). Authority remains derivable **entirely from Git**:
@@ -198,6 +220,13 @@ approval window expired and before any cohort attempt.**
   `P`, `S` or the seal, a fork, a skipped epoch, a wrong predecessor, an edited
   or deleted older approval artifact, a local-only or non-latest approval, or a
   `HEAD`/live-remote mismatch is **rejected**.
+- **Fork liveness is deliberately not a repair mechanism.** A forked or rewritten
+  approval path is reachable only through deliberate invalid Git history
+  manipulation, and the current behaviour is **fail-closed**: the offending epoch
+  is rejected and the chain stops resolving. There is intentionally no mutable
+  authority pointer, no automatic fork repair, no automatic epoch deletion and no
+  hidden branch selection, because each would replace a verifiable Git fact with
+  unrecoverable state. Recovery is a human, reviewable Git operation.
 - `T0_N` stays mechanical: the first whole UTC hour at least 30 minutes after
   `A_N`'s Git committer timestamp. Only the **LATEST** valid epoch may authorize
   attempt 1; every earlier epoch's window is permanently expired. No CLI option

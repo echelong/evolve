@@ -76,6 +76,12 @@ export function createSessionAttestation({ seal, authority, approvalAuthority, p
   const approvalEpoch = approvalAuthority.approvalEpoch ?? null;
   if (approvalEpoch !== null && (!Number.isInteger(approvalEpoch) || approvalEpoch < 1)) fail('R4_ATTESTATION_APPROVAL_EPOCH_INVALID');
   if (approvalEpoch !== null && (proof.approvalEpoch ?? null) !== approvalEpoch) fail('R4_ATTESTATION_APPROVAL_EPOCH_MISMATCH');
+  // Approval FINGERPRINT: the attestation is self-contained about WHICH approval
+  // governed the attempt. The expected value comes from the independently resolved
+  // authority; the record may not restate anything else.
+  const approvalFingerprint = approvalAuthority.approvalFingerprint ?? null;
+  if (approvalFingerprint !== null && !/^[0-9a-f]{64}$/.test(approvalFingerprint)) fail('R4_ATTESTATION_APPROVAL_FINGERPRINT_INVALID');
+  if ((proof.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_ATTESTATION_APPROVAL_FINGERPRINT_MISMATCH');
   if (proof.t0 !== approvalAuthority.t0) fail('R4_ATTESTATION_T0_MISMATCH');
   if (proof.captureSpecDigest !== captureSpecDigest()) fail('R4_ATTESTATION_CAPTURE_SPEC_MISMATCH');
   const attemptIndex = proof.attemptIndex;
@@ -86,7 +92,7 @@ export function createSessionAttestation({ seal, authority, approvalAuthority, p
   const content = {
     schemaVersion: 1, recordType: R4_ATTESTATION_RECORD_TYPE, role: R4_SESSION_ROLE, status: 'OPEN',
     authorizationChain: R4_AUTHORIZATION_CHAIN, approvalCommit: approvalAuthority.approvalCommit,
-    approvalEpoch,
+    approvalEpoch, approvalFingerprint,
     authorizationFingerprint: proof.authorizationFingerprint, capabilityHash: proof.capabilityHash,
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
     authorityCommit: authority.sealAuthorityCommit, specDigest: seal.specDigest, captureSpecDigest: seal.captureSpecDigest,
@@ -182,6 +188,9 @@ export function verifySessionAttestation({ attestation, session, seal, authority
   if (approvalAuthority && attestation.approvalCommit !== approvalAuthority.approvalCommit) fail('R4_ATTESTATION_APPROVAL_COMMIT_MISMATCH');
   if (approvalAuthority && approvalAuthority.approvalEpoch != null
     && (attestation.approvalEpoch ?? null) !== approvalAuthority.approvalEpoch) fail('R4_ATTESTATION_APPROVAL_EPOCH_MISMATCH');
+  if (approvalAuthority && (attestation.approvalFingerprint ?? null) !== (approvalAuthority.approvalFingerprint ?? null)) {
+    fail('R4_ATTESTATION_APPROVAL_FINGERPRINT_MISMATCH');
+  }
   if (authorizationRecord) {
     const authorizationEpoch = authorizationRecord.approvalEpoch ?? null;
     const attestationEpoch = attestation.approvalEpoch ?? null;
@@ -191,6 +200,7 @@ export function verifySessionAttestation({ attestation, session, seal, authority
     if (authorizationRecord.sessionId !== attestation.sessionId) fail('R4_ATTESTATION_AUTHORIZATION_SESSION_MISMATCH');
     if (authorizationRecord.attemptIndex !== attestation.attemptIndex) fail('R4_ATTESTATION_AUTHORIZATION_ATTEMPT_MISMATCH');
     if (authorizationRecord.approvalCommit !== attestation.approvalCommit) fail('R4_ATTESTATION_AUTHORIZATION_APPROVAL_MISMATCH');
+    if ((authorizationRecord.approvalFingerprint ?? null) !== (attestation.approvalFingerprint ?? null)) fail('R4_ATTESTATION_AUTHORIZATION_APPROVAL_FINGERPRINT_MISMATCH');
   }
   if (!session || typeof session !== 'object') fail('R4_ATTESTATION_SESSION_INVALID');
   if (attestation.sessionId !== session.sessionId) fail('R4_ATTESTATION_SESSION_ID_MISMATCH');

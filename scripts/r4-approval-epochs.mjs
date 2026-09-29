@@ -470,7 +470,16 @@ export function verifyRenewalBinding({ record, review, previous, commit, cwd = R
   if (!isStamp(committerTimestamp) || committerTimestamp < record.previousWindowEnd) fail('R4_APPROVAL_EPOCH_RENEWAL_BEFORE_WINDOW_END');
   // The independent reauthorization review is bound by digest and must agree on
   // every identity it attests.
-  if (reviewerKey(review) === reviewerKey(previous.record)) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT');
+  //
+  // Reviewer INDEPENDENCE is the canonical (reviewer, model) PAIR, extracted with
+  // explicit per-schema accessors (see `reviewerIdentityFromRenewalReview` /
+  // `reviewerIdentityFromApproval`). Never fall through to another record shape
+  // and never compare only the reviewer or only the model: the review schema
+  // carries `model`, the epoch-1 approval carries `reviewerModel` and a renewal
+  // approval carries `reauthorizationReviewer{,Model}`.
+  const renewalReviewer = reviewerIdentityFromRenewalReview(review);
+  const previousReviewer = reviewerIdentityFromApproval(previous.record);
+  if (renewalReviewer.key === previousReviewer.key) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_NOT_INDEPENDENT');
   if (record.reauthorizationReviewDigest !== renewalReviewFingerprint(review)) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEW_DIGEST_MISMATCH');
   if (record.reauthorizationVerdict !== review.verdict) fail('R4_APPROVAL_EPOCH_RENEWAL_VERDICT_MISMATCH');
   if (record.reauthorizationReviewer !== review.reviewer) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_MISMATCH');
@@ -485,7 +494,52 @@ export function verifyRenewalBinding({ record, review, previous, commit, cwd = R
   return { ok: true, previousEpoch: previous.epoch, epoch: record.approvalEpoch };
 }
 
-const reviewerKey = record => `${record?.reviewer ?? record?.reauthorizationReviewer ?? ''}\u0000${record?.reviewerModel ?? record?.reauthorizationReviewerModel ?? ''}`;
+/* -------------------------------------------------- reviewer independence */
+
+/** The canonical reviewer identity: the (reviewer, model) PAIR plus its key. */
+const reviewerIdentity = (reviewer, model) => Object.freeze({ reviewer, model, key: `${reviewer}\u0000${model}` });
+
+/**
+ * Canonical reviewer identity of an INDEPENDENT REAUTHORIZATION REVIEW record
+ * (recordType `r4_precapture_reauthorization_review`, schemaVersion 1).
+ *
+ * The review schema stores the model in `record.model`. It is NOT
+ * `record.reviewerModel` and NOT `record.reauthorizationReviewerModel`; reading
+ * those instead silently yields an empty model segment and makes the
+ * independence guard unreachable. Extraction is therefore schema-explicit: an
+ * incompatible record shape is rejected, never guessed.
+ */
+export function reviewerIdentityFromRenewalReview(record) {
+  if (!record || typeof record !== 'object') fail('R4_RENEWAL_REVIEW_INVALID');
+  if (record.recordType !== R4_RENEWAL_REVIEW_RECORD_TYPE) fail('R4_RENEWAL_REVIEW_RECORD_TYPE_INVALID');
+  if (record.schemaVersion !== R4_RENEWAL_REVIEW_SCHEMA_VERSION) fail('R4_RENEWAL_REVIEW_SCHEMA_INVALID');
+  if (!isNonEmptyString(record.reviewer)) fail('R4_RENEWAL_REVIEW_REVIEWER_INVALID');
+  if (!isNonEmptyString(record.model)) fail('R4_RENEWAL_REVIEW_MODEL_INVALID');
+  return reviewerIdentity(record.reviewer, record.model);
+}
+
+/**
+ * Canonical reviewer identity of an APPROVAL record, i.e. the review that
+ * authorized that approval epoch:
+ *   * epoch 1 (schemaVersion 1, the historical A1) -> `reviewer` / `reviewerModel`;
+ *   * epoch >= 2 (schemaVersion 2, a renewal)       -> `reauthorizationReviewer` /
+ *     `reauthorizationReviewerModel`.
+ */
+export function reviewerIdentityFromApproval(approval) {
+  if (!approval || typeof approval !== 'object') fail('R4_APPROVAL_EPOCH_RECORD_INVALID');
+  if (approval.recordType !== R4_APPROVAL_EPOCH_RECORD_TYPE) fail('R4_APPROVAL_EPOCH_RECORD_TYPE_INVALID');
+  if (approval.schemaVersion === R4_APPROVAL_EPOCH_LEGACY_SCHEMA_VERSION) {
+    if (!isNonEmptyString(approval.reviewer)) fail('R4_APPROVAL_REVIEWER_INVALID');
+    if (!isNonEmptyString(approval.reviewerModel)) fail('R4_APPROVAL_REVIEWER_MODEL_INVALID');
+    return reviewerIdentity(approval.reviewer, approval.reviewerModel);
+  }
+  if (approval.schemaVersion === R4_APPROVAL_EPOCH_SCHEMA_VERSION) {
+    if (!isNonEmptyString(approval.reauthorizationReviewer)) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_INVALID');
+    if (!isNonEmptyString(approval.reauthorizationReviewerModel)) fail('R4_APPROVAL_EPOCH_RENEWAL_REVIEWER_MODEL_INVALID');
+    return reviewerIdentity(approval.reauthorizationReviewer, approval.reauthorizationReviewerModel);
+  }
+  return fail('R4_APPROVAL_EPOCH_SCHEMA_INVALID');
+}
 
 /** Convenience: the latest valid approval epoch only. */
 export function resolveLatestApprovalEpoch(options = {}) {

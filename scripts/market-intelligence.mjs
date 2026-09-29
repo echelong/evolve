@@ -152,6 +152,7 @@ export async function main(args = process.argv.slice(2)) {
     if (sealed && !failed) {
       writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint,
         capabilityHash: sealed.capabilityHash, claimFingerprint: sealed.claimFingerprint, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
+        approvalFingerprint: sealed.approvalFingerprint ?? null,
         revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending } : null }), { cwd: process.cwd() });
     }
     console.log(`\n${recorder.dir}\nfingerprint ${manifest.fingerprint}`);

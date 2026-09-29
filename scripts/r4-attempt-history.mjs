@@ -73,6 +73,7 @@ export function assertAttemptTerminal(terminal) {
   if (!Object.values(R4_TERMINAL_STATES).includes(terminal.state)) fail('R4_TERMINAL_STATE_INVALID');
   if (!isDigest(terminal.authorizationFingerprint) || !isDigest(terminal.claimFingerprint) || !isDigest(terminal.capabilityHash)) fail('R4_TERMINAL_RECORD_INVALID');
   if (!Number.isInteger(terminal.attemptIndex) || terminal.attemptIndex < 1 || !isStamp(terminal.terminatedAt)) fail('R4_TERMINAL_RECORD_INVALID');
+  if ((terminal.approvalFingerprint ?? null) !== null && !isDigest(terminal.approvalFingerprint)) fail('R4_TERMINAL_APPROVAL_FINGERPRINT_INVALID');
   if (terminal.state === R4_TERMINAL_STATES.completed) {
     if (!isDigest(terminal.attestationFingerprint) || !isDigest(terminal.sessionFingerprint) || terminal.failureCode !== null) fail('R4_TERMINAL_STATE_INVALID');
   } else if (terminal.attestationFingerprint !== null || terminal.sessionFingerprint !== null
@@ -117,6 +118,9 @@ export function writeAttemptTerminal({
     schemaVersion: 1, recordType: R4_ATTEMPT_TERMINAL_RECORD_TYPE, state, attemptIndex: authorization.attemptIndex,
     sessionId: authorization.sessionId, authorizationFingerprint: authorization.fingerprint, claimFingerprint: claim.fingerprint,
     capabilityHash: authorization.capabilityHash, claimant: claim.claimant, attestationFingerprint, sessionFingerprint,
+    // Which approval governed the attempt, restated explicitly so the terminal
+    // record is self-contained rather than only transitively bound.
+    approvalFingerprint: authorization.approvalFingerprint ?? null,
     failureCode: state === R4_TERMINAL_STATES.failed ? failureCode : null, terminatedAt,
   };
   const terminal = { ...content, fingerprint: digest(content) };
@@ -186,10 +190,11 @@ const guard = (fn, code) => { try { return fn(); } catch { return fail(code); } 
  * `resolveR4ExecutionAuthority`). Throws a stable `R4_HISTORY_*` code on any
  * anomaly; returns the per-attempt canonical view otherwise.
  */
-export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0, approvalEpoch = null } = {}) {
+export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0, approvalEpoch = null, approvalFingerprint = null } = {}) {
   if (!history || !Array.isArray(history.authorizations)) fail('R4_HISTORY_INVALID');
   if (!seal || typeof seal.fingerprint !== 'string' || !authority || typeof authority.sealAuthorityCommit !== 'string') fail('R4_HISTORY_AUTHORITY_REQUIRED');
   if (typeof approvalCommit !== 'string' || !isStamp(t0)) fail('R4_HISTORY_AUTHORITY_REQUIRED');
+  if (approvalFingerprint !== null && !isDigest(approvalFingerprint)) fail('R4_HISTORY_AUTHORITY_REQUIRED');
   if (history.unknown.length) fail('R4_HISTORY_UNKNOWN_ARTIFACT');
   if (history.unreadable.length) fail('R4_HISTORY_RECORD_UNREADABLE');
   const expectedCaptureSpec = captureSpecDigest();
@@ -212,6 +217,9 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     // Approval EPOCH binding is enforced whenever the resolved authority carries
     // one: a record authorized under a different approval epoch is refused.
     if (approvalEpoch !== null && (record.approvalEpoch ?? null) !== approvalEpoch) fail('R4_HISTORY_AUTHORITY_MISMATCH');
+    // Approval FINGERPRINT binding: a record authorized under a different approval
+    // artifact — even with the same commit and epoch — is refused.
+    if (approvalFingerprint !== null && (record.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
     if (record.sessionId !== deriveSessionId({ sealFingerprint: record.sealFingerprint, approvalCommit: record.approvalCommit,
       attemptIndex: record.attemptIndex, capabilityHash: record.capabilityHash })) fail('R4_HISTORY_IDENTITY_MISMATCH');
     if (isR4Excluded(record.sessionId)) fail('R4_HISTORY_EXCLUDED_SESSION');
@@ -273,13 +281,14 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     if (!claim) fail('R4_HISTORY_TERMINAL_WITHOUT_CLAIM');
     if (record.claimFingerprint !== claim.fingerprint || record.authorizationFingerprint !== claim.authorizationFingerprint
       || record.capabilityHash !== claim.capabilityHash || record.sessionId !== claim.sessionId || record.claimant !== claim.claimant) fail('R4_HISTORY_IDENTITY_MISMATCH');
+    if (approvalFingerprint !== null && (record.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
     if (record.terminatedAt < claim.claimedAt) fail('R4_HISTORY_OUT_OF_ORDER');
     if (record.state === R4_TERMINAL_STATES.completed) {
       if (claim.claimant !== R4_CLAIMANTS.child) fail('R4_HISTORY_TERMINAL_STATE_INVALID');
       const attestation = attestationsBySession.get(claim.sessionId);
       if (!attestation || attestation.fingerprint !== record.attestationFingerprint || attestation.sessionFingerprint !== record.sessionFingerprint) fail('R4_HISTORY_TERMINAL_STATE_INVALID');
       guard(() => verifySessionAttestation({ attestation, session: { sessionId: claim.sessionId, fingerprint: attestation.sessionFingerprint },
-        seal, authority, approvalAuthority: { approvalCommit, t0, approvalEpoch }, authorizationRecord: byIndex.get(index).record, claimRecord: claim,
+        seal, authority, approvalAuthority: { approvalCommit, t0, approvalEpoch, approvalFingerprint }, authorizationRecord: byIndex.get(index).record, claimRecord: claim,
         attemptIndex: index }), 'R4_HISTORY_TERMINAL_STATE_INVALID');
     }
     terminals.set(index, record);
@@ -320,7 +329,7 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
       orphanAttestation: cohortStatus === 'COMPLETED' ? null : attestation }));
   }
   return Object.freeze({ attempts: Object.freeze(attempts), completedCount: completed, attemptsUsed: attempts.length,
-    authority: Object.freeze({ sealFingerprint: seal.fingerprint, sealAuthorityCommit: authority.sealAuthorityCommit, approvalCommit, approvalEpoch, t0 }) });
+    authority: Object.freeze({ sealFingerprint: seal.fingerprint, sealAuthorityCommit: authority.sealAuthorityCommit, approvalCommit, approvalEpoch, approvalFingerprint, t0 }) });
 }
 
 /**

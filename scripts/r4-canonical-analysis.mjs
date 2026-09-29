@@ -48,7 +48,7 @@ const fail = code => { throw new Error(code); };
 
 /** Authority facts and history a caller may never supply to the canonical path. */
 export const R4_CANONICAL_ANALYSIS_FORBIDDEN_INPUTS = Object.freeze([
-  'authorityResolution', 'stage', 'approvalCommit', 'approvalAuthority', 'approval', 'authority', 'seal', 't0',
+  'authorityResolution', 'stage', 'approvalCommit', 'approvalAuthority', 'approvalFingerprint', 'approval', 'authority', 'seal', 't0',
   'plan', 'attempts', 'attestations', 'readSession', 'sessionRoot', 'cwd',
 ]);
 const FORBIDDEN = new Set(R4_CANONICAL_ANALYSIS_FORBIDDEN_INPUTS);
@@ -79,12 +79,13 @@ export function runCanonicalR4Analysis(options = {}) {
   // which attempt 1 began. A later approval epoch can therefore never rewrite
   // which approval governed an existing capture.
   const approvalAuthority = Object.freeze({ approvalCommit: resolution.approvalCommit,
-    approvalEpoch: resolution.approvalEpoch ?? null, t0: resolution.t0 });
+    approvalEpoch: resolution.approvalEpoch ?? null, approvalFingerprint: resolution.approvalFingerprint ?? null,
+    t0: resolution.t0 });
 
   // 2. authenticated attempt history -> canonical cohort membership ----------
   const verifiedHistory = verifyR4AttemptHistory(loadR4AttemptHistory({ cwd: evidenceRoot }), {
     seal, authority, approvalCommit: approvalAuthority.approvalCommit, approvalEpoch: approvalAuthority.approvalEpoch,
-    t0: approvalAuthority.t0 });
+    approvalFingerprint: approvalAuthority.approvalFingerprint, t0: approvalAuthority.t0 });
   const plan = planSealedCohort({ seal, approvalAuthority });
   const attempts = historyToCohortAttempts(verifiedHistory);
   const attestations = historyAttestations(verifiedHistory);

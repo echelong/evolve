@@ -74,10 +74,13 @@ export function commitAll(run, message, iso) {
  *   supersededSeal      true: the tracked seal no longer verifies (drifted spec)
  *   headAfterA          true: an extra local commit on top of A (HEAD != A)
  *   approvalIso         committer time of A (T0 derives from it)
+ *   approvalReviewer    reviewer identity stored in the synthetic epoch-1 approval
+ *   approvalReviewerModel  (defaults to the synthetic reviewer/model pair)
  */
 export function syntheticAuthorityRepo({
   remoteMain = 'A', trackingRef = null, approvalCommitted = true, approvalParent = 'S', approvalSeal = 'current',
   supersededSeal = false, headAfterA = false, approvalIso = SYNTHETIC_APPROVAL_ISO,
+  approvalReviewer = 'synthetic-independent-reviewer', approvalReviewerModel = 'synthetic-model',
 } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'evolve-r4-synth-'));
   const dir = path.join(root, 'repo');
@@ -114,7 +117,7 @@ export function syntheticAuthorityRepo({
     ? buildSeal({ baseSha: protocolCommit, baseTree: protocolTree, sealedAt: Date.parse(S_ISO) - 86_400_000, load })
     : seal;
   const approval = buildApprovalRecord({ seal: bindSeal, authority: { protocolCommit, sealAuthorityCommit: sealCommit },
-    reviewer: 'synthetic-independent-reviewer', reviewerModel: 'synthetic-model', reviewVerdict: R4_APPROVAL_VERDICT,
+    reviewer: approvalReviewer, reviewerModel: approvalReviewerModel, reviewVerdict: R4_APPROVAL_VERDICT,
     reviewReportDigest: 'd'.repeat(64) });
   writeFileSync(path.join(dir, R4_APPROVAL_PATH), canonical(approval) + '\n');
   let approvalCommit = null;
@@ -208,6 +211,7 @@ export function syntheticChildSpawn({ behaviour = 'complete', now, sessionStartA
     const { manifest } = buildSyntheticEvidenceSession({ cwd: options.cwd, sessionId: sealed.sessionId, startAt: sessionStartAt ?? now });
     writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint, capabilityHash: sealed.capabilityHash,
       claimFingerprint: sealed.claimFingerprint, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
+      approvalFingerprint: sealed.approvalFingerprint ?? null,
       revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 } }), { cwd: options.cwd });
     return { status: 0 };
   };

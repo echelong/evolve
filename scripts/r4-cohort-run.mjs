@@ -150,7 +150,8 @@ export function canonicalAttemptHistory({ resolution, cwd }) {
   if (!resolution || resolution.stage !== 'A') throw new R4RunnerError('R4_HISTORY_REQUIRES_APPROVAL_AUTHORITY');
   const history = loadR4AttemptHistory({ cwd });
   const verified = verifyR4AttemptHistory(history, { seal: resolution.seal, authority: resolution.authority,
-    approvalCommit: resolution.approvalCommit, approvalEpoch: resolution.approvalEpoch ?? null, t0: resolution.t0 });
+    approvalCommit: resolution.approvalCommit, approvalEpoch: resolution.approvalEpoch ?? null,
+    approvalFingerprint: resolution.approvalFingerprint ?? null, t0: resolution.t0 });
   return { verified, next: deriveNextAttempt(verified) };
 }
 
@@ -305,6 +306,9 @@ export function issueSealedAttemptAuthorization({ authorized, now = Date.now(), 
   const authorization = createAttemptAuthorization({
     seal: resolution.seal, authority: resolution.authority, approvalCommit: resolution.approvalCommit,
     approvalEpoch: resolution.approvalEpoch ?? null,
+    // Always the fingerprint of the approval resolved from Git at stage A; never
+    // a caller-supplied value.
+    approvalFingerprint: resolution.approvalFingerprint ?? null,
     attemptIndex, sessionId, t0: resolution.t0, capabilityHash: hash, captureSpecDigest: captureSpecDigest(),
     authorizedAt: now, previousTerminalFingerprint: next.previousTerminalFingerprint ?? null,
   });

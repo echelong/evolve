@@ -87,7 +87,8 @@ function childClaim(fixture, capability, now, cwd = fixture.dir) {
 function verifiedHistory(fixture, evidenceRoot = fixture.dir) {
   const resolution = resolveR4ExecutionAuthority({ cwd: fixture.dir, requireApproval: true });
   return verifyR4AttemptHistory(loadR4AttemptHistory({ cwd: evidenceRoot }), { seal: resolution.seal, authority: resolution.authority,
-    approvalCommit: resolution.approvalCommit, t0: resolution.t0 });
+    approvalCommit: resolution.approvalCommit, approvalEpoch: resolution.approvalEpoch ?? null,
+    approvalFingerprint: resolution.approvalFingerprint ?? null, t0: resolution.t0 });
 }
 
 function persistentAttemptArtifacts(dir) {
@@ -282,8 +283,8 @@ test('M5 / 2E: a claim whose session exists but whose attestation is absent coun
   const history = verifiedHistory(fixture);
   assert.equal(history.attempts[0].state, 'CLAIMED');
   assert.equal(history.attempts[0].attestation, null);
-  const plan = planSealedCohort({ seal: fixture.seal, approvalAuthority: { approvalCommit: fixture.approvalCommit, t0: fixture.t0 } });
   const resolution = resolveR4ExecutionAuthority({ cwd: fixture.dir, requireApproval: true });
+  const plan = planSealedCohort({ seal: fixture.seal, approvalAuthority: resolution });
   const progress = evaluateSealedCohortProgress({ plan, attempts: historyToCohortAttempts(history), seal: resolution.seal,
     authority: resolution.authority, attestations: historyAttestations(history), approvalAuthority: resolution });
   assert.deepEqual(progress.canonicalMembership, []);
@@ -482,7 +483,7 @@ test('M14: an attempt after six completed sessions is rejected', () => {
   const capability = createAttemptCapability();
   const hash = capabilityHash(capability);
   const forged = createAttemptAuthorization({ seal: fixture.seal, authority: { protocolCommit: fixture.protocolCommit, protocolTree: fixture.seal.protocolTree, sealAuthorityCommit: fixture.sealCommit },
-    approvalCommit: fixture.approvalCommit, attemptIndex: 7, sessionId: deriveSessionId({ sealFingerprint: fixture.seal.fingerprint, approvalCommit: fixture.approvalCommit, attemptIndex: 7, capabilityHash: hash }),
+    approvalCommit: fixture.approvalCommit, approvalEpoch: history.authority.approvalEpoch, approvalFingerprint: history.authority.approvalFingerprint, attemptIndex: 7, sessionId: deriveSessionId({ sealFingerprint: fixture.seal.fingerprint, approvalCommit: fixture.approvalCommit, attemptIndex: 7, capabilityHash: hash }),
     t0: fixture.t0, capabilityHash: hash, captureSpecDigest: captureSpecDigest(), authorizedAt: attemptTime(fixture, 7), previousTerminalFingerprint: history.attempts[5].terminal.fingerprint });
   writeAttemptAuthorization(forged, { cwd: fixture.dir });
   throwsCode(() => verifiedHistory(fixture), 'R4_HISTORY_ATTEMPT_AFTER_COHORT_STOPPED');
@@ -622,12 +623,14 @@ test('M25 / 9G: live remote != A is rejected', () => {
   assert.match(analysisCode(behind), /^R4_AUTHORITY_REMOTE_MAIN_MISMATCH:APPROVAL_COMMIT_A/);
 });
 
-function analysisInputs(fixture, sessionId, { approvalCommit = null } = {}) {
+function analysisInputs(fixture, sessionId, { approvalCommit = null, approvalFingerprint = undefined } = {}) {
   const resolution = resolveR4ExecutionAuthority({ cwd: fixture.dir, requireApproval: true });
   const session = readSourceSession({ dir: path.join(fixture.dir, '.evolve/market-intelligence/sessions', sessionId), role: 'cohort' });
   const { references } = buildCanonicalReferenceSet({ sessions: [session], canonicalMembership: [session.sessionId] });
   const binding = buildOutcomeRunBinding({ seal: resolution.seal, authority: resolution.authority,
-    approvalAuthority: { approvalCommit: approvalCommit ?? resolution.approvalCommit }, cohortMembership: [session.sessionId], references });
+    approvalAuthority: { approvalCommit: approvalCommit ?? resolution.approvalCommit,
+      approvalFingerprint: approvalFingerprint === undefined ? (resolution.approvalFingerprint ?? null) : approvalFingerprint },
+    cohortMembership: [session.sessionId], references });
   const outcomes = references.map((reference, i) => ({ referenceSessionId: reference.sessionId, referenceSnapshotDigest: reference.snapshotDigest,
     status: 'resolved', absLogReturn300sBps: i + 1, mint: SYNTHETIC_MINT, referenceObservedAt: reference.referenceObservedAt ?? 0 }));
   return { binding, outcomes, references };
@@ -710,8 +713,10 @@ test('M29: an attestation without a claim is rejected (history and finalization)
   const now = attemptTime(other, 1);
   const { capability, authorization } = issueNext(other, now);
   const proof = proveCapability({ capability, record: authorization });
+  const otherResolution = resolveR4ExecutionAuthority({ cwd: other.dir, requireApproval: true });
   const open = createSessionAttestation({ seal: resolution.seal, authority: { ...resolution.authority, sealAuthorityCommit: other.sealCommit },
-    approvalAuthority: { approvalCommit: other.approvalCommit, t0: other.t0 }, proof });
+    approvalAuthority: { approvalCommit: other.approvalCommit, t0: other.t0,
+      approvalFingerprint: otherResolution.approvalFingerprint ?? null }, proof });
   throwsCode(() => finalizeSessionAttestation(open, { sessionFingerprint: 'f'.repeat(64), proof }), 'R4_ATTESTATION_CLAIM_REQUIRED');
   const recoveryClaim = claimAttemptAuthorization({ record: authorization, claimant: R4_CLAIMANTS.recovery, cwd: other.dir, now });
   throwsCode(() => finalizeSessionAttestation(open, { sessionFingerprint: 'f'.repeat(64), proof, claim: recoveryClaim }), 'R4_ATTESTATION_CLAIM_NOT_CAPTURE_CHILD');
