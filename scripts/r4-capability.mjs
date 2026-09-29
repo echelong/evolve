@@ -132,7 +132,7 @@ export function writeDurableExclusive(file, body, { mode = 0o400 } = {}) {
 
 /** Build the pre-attempt authorization record. Content blinds the raw capability. */
 export function createAttemptAuthorization({
-  seal, authority, approvalCommit = null, attemptIndex, sessionId, t0, capabilityHash: hash, captureSpecDigest,
+  seal, authority, approvalCommit = null, approvalEpoch = null, attemptIndex, sessionId, t0, capabilityHash: hash, captureSpecDigest,
   authorizedAt = Date.now(), previousTerminalFingerprint = null,
 }) {
   if (!seal || typeof seal.fingerprint !== 'string') fail('R4_CAPABILITY_SEAL_INVALID');
@@ -143,6 +143,9 @@ export function createAttemptAuthorization({
   if (!isStamp(t0)) fail('R4_CAPABILITY_T0_INVALID');
   if (!isDigest(captureSpecDigest)) fail('R4_CAPABILITY_CAPTURE_SPEC_INVALID');
   if (approvalCommit !== null && !isSha(approvalCommit)) fail('R4_CAPABILITY_APPROVAL_INVALID');
+  // Approval EPOCH (missed-window renewal governance): 1 is the historical
+  // legacy approval; null means "not bound by this record".
+  if (approvalEpoch !== null && (!Number.isInteger(approvalEpoch) || approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
   if (!isStamp(authorizedAt)) fail('R4_CAPABILITY_AUTHORIZED_AT_INVALID');
   if (previousTerminalFingerprint !== null && !isDigest(previousTerminalFingerprint)) fail('R4_CAPABILITY_PREVIOUS_TERMINAL_INVALID');
   const content = {
@@ -150,7 +153,7 @@ export function createAttemptAuthorization({
     capabilityHash: hash, sealFingerprint: seal.fingerprint,
     protocolCommit: authority.protocolCommit, protocolTree: authority.protocolTree ?? seal.protocolTree,
     sealAuthorityCommit: authority.sealAuthorityCommit,
-    approvalCommit, attemptIndex, sessionId, t0, t0Iso: new Date(t0).toISOString(), captureSpecDigest,
+    approvalCommit, approvalEpoch, attemptIndex, sessionId, t0, t0Iso: new Date(t0).toISOString(), captureSpecDigest,
     authorizedAt, previousTerminalFingerprint,
   };
   return { ...content, fingerprint: digest(content) };
@@ -176,6 +179,7 @@ export function assertAttemptAuthorization(record) {
   if (record.role !== R4_SESSION_ROLE) fail('R4_CAPABILITY_ROLE_INVALID');
   if (!isSha(record.protocolCommit) || !isSha(record.sealAuthorityCommit)) fail('R4_CAPABILITY_AUTHORITY_INVALID');
   if (record.approvalCommit !== null && !isSha(record.approvalCommit)) fail('R4_CAPABILITY_APPROVAL_INVALID');
+  if ((record.approvalEpoch ?? null) !== null && (!Number.isInteger(record.approvalEpoch) || record.approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
   if (!Number.isInteger(record.attemptIndex) || record.attemptIndex < 1) fail('R4_CAPABILITY_ATTEMPT_INDEX_INVALID');
   if (typeof record.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(record.sessionId)) fail('R4_CAPABILITY_SESSION_ID_INVALID');
   if (!isStamp(record.t0) || !isStamp(record.authorizedAt)) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
@@ -207,6 +211,7 @@ export function assertAttemptClaim(claim) {
   if (!isDigest(claim.authorizationFingerprint) || !isDigest(claim.capabilityHash) || !isDigest(claim.captureSpecDigest)) fail('R4_CLAIM_RECORD_INVALID');
   if (!Number.isInteger(claim.attemptIndex) || claim.attemptIndex < 1) fail('R4_CLAIM_RECORD_INVALID');
   if (!isStamp(claim.claimedAt) || !isStamp(claim.t0)) fail('R4_CLAIM_RECORD_INVALID');
+  if ((claim.approvalEpoch ?? null) !== null && (!Number.isInteger(claim.approvalEpoch) || claim.approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
   return true;
 }
 
@@ -214,7 +219,7 @@ export function assertAttemptClaim(claim) {
 export function assertClaimBindsAuthorization(claim, record) {
   assertAttemptClaim(claim);
   assertAttemptAuthorization(record);
-  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'captureSpecDigest', 't0'];
+  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'approvalEpoch', 'captureSpecDigest', 't0'];
   if (claim.authorizationFingerprint !== record.fingerprint) fail('R4_CLAIM_AUTHORIZATION_MISMATCH');
   for (const field of fields) if (claim[field] !== record[field]) fail('R4_CLAIM_IDENTITY_MISMATCH');
   return true;
@@ -273,7 +278,8 @@ export function claimAttemptAuthorization({
     authorizationFingerprint: record.fingerprint, capabilityHash: record.capabilityHash,
     attemptIndex: record.attemptIndex, sessionId: record.sessionId, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
-    approvalCommit: record.approvalCommit, captureSpecDigest: record.captureSpecDigest, t0: record.t0,
+    approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null,
+    captureSpecDigest: record.captureSpecDigest, t0: record.t0,
     claimedAt: now,
   };
   const claim = { ...content, fingerprint: digest(content) };
@@ -293,7 +299,7 @@ export function proveCapability({ capability, record }) {
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail('R4_CAPABILITY_MISMATCH');
   return Object.freeze({ capability: Buffer.from(capability), capabilityHash: hash,
     authorizationFingerprint: record.fingerprint, sessionId: record.sessionId, attemptIndex: record.attemptIndex,
-    t0: record.t0, approvalCommit: record.approvalCommit, sealFingerprint: record.sealFingerprint,
+    t0: record.t0, approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
     captureSpecDigest: record.captureSpecDigest });
 }

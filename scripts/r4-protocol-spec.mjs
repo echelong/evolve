@@ -35,6 +35,12 @@ const frozen = value => Object.freeze(value);
 // The historical `.evolve/governance/...` seal remains runtime/historical
 // evidence only and is not the committed authority.
 export const R4_TRACKED_SEAL_PATH = 'governance/r4/r4-preregistration-seal.json';
+// MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT: immutable per-epoch approval
+// artifacts live in `governance/r4/approvals/` (epoch >= 2). Epoch 1 is the
+// historical `governance/r4/r4-precapture-approval.json` and never moves.
+// Authority is still determined entirely by Git ancestry, so no mutable pointer
+// selects the approving epoch.
+export const R4_APPROVAL_EPOCHS_DIR = 'governance/r4/approvals';
 // PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT (round 2): the canonical approval
 // artifact lives beside the seal. Authority is determined by the canonical Git
 // ancestry P -> S -> A plus these fixed paths, so no redundant mutable
@@ -223,6 +229,11 @@ export const R4_CAPTURE_SPEC_DIGEST = captureSpecDigest();
 // builtins only (no third-party runtime package); binding the lockfile is
 // prospective defense-in-depth integrity hardening and changes no scientific
 // behaviour.
+//
+// MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT (enforcement only): the approval
+// EPOCH runtime (`scripts/r4-approval-epochs.mjs`) and its validator are bound
+// too. The amendment makes the already-required missed-window reauthorization
+// operationally repeatable; it reopens no scientific rule.
 export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'docs/R4-PREREGISTRATION.md',
   'package-lock.json',
@@ -261,6 +272,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/market/replay.mjs',
   'scripts/market/synthetic.mjs',
   'scripts/market/universe.mjs',
+  'scripts/r4-approval-epochs.mjs',
   'scripts/r4-approval.mjs',
   'scripts/r4-attempt-history.mjs',
   'scripts/r4-attestation.mjs',
@@ -279,6 +291,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/validate-market-outcomes-policy-b.mjs',
   'scripts/validate-market-outcomes.mjs',
   'scripts/validate-p3c-mutation.mjs',
+  'scripts/validate-r4-approval-epochs.mjs',
   'scripts/validate-r4-e1-mutation.mjs',
   'scripts/validate-r4-e1.mjs',
   'scripts/validate-r4-enforcement.mjs',

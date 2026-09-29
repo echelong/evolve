@@ -186,7 +186,7 @@ const guard = (fn, code) => { try { return fn(); } catch { return fail(code); } 
  * `resolveR4ExecutionAuthority`). Throws a stable `R4_HISTORY_*` code on any
  * anomaly; returns the per-attempt canonical view otherwise.
  */
-export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0 } = {}) {
+export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0, approvalEpoch = null } = {}) {
   if (!history || !Array.isArray(history.authorizations)) fail('R4_HISTORY_INVALID');
   if (!seal || typeof seal.fingerprint !== 'string' || !authority || typeof authority.sealAuthorityCommit !== 'string') fail('R4_HISTORY_AUTHORITY_REQUIRED');
   if (typeof approvalCommit !== 'string' || !isStamp(t0)) fail('R4_HISTORY_AUTHORITY_REQUIRED');
@@ -203,9 +203,15 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     if (record.attemptIndex !== index) fail('R4_HISTORY_RECORD_NAME_MISMATCH');
     if (byIndex.has(index) || seenHashes.has(record.capabilityHash) || seenSessions.has(record.sessionId)) fail('R4_HISTORY_DUPLICATE_AUTHORIZATION');
     if (index > MAX_ATTEMPTS) fail('R4_HISTORY_ATTEMPT_OUT_OF_RANGE');
+    // Index continuity is checked as records are admitted, so a missing index is
+    // reported as a gap before any later per-record binding rule.
+    if (index !== byIndex.size + 1) fail('R4_HISTORY_INDEX_GAP');
     if (record.sealFingerprint !== seal.fingerprint || record.protocolCommit !== seal.protocolCommit
       || record.protocolTree !== seal.protocolTree || record.sealAuthorityCommit !== authority.sealAuthorityCommit
       || record.approvalCommit !== approvalCommit || record.t0 !== t0 || record.captureSpecDigest !== expectedCaptureSpec) fail('R4_HISTORY_AUTHORITY_MISMATCH');
+    // Approval EPOCH binding is enforced whenever the resolved authority carries
+    // one: a record authorized under a different approval epoch is refused.
+    if (approvalEpoch !== null && (record.approvalEpoch ?? null) !== approvalEpoch) fail('R4_HISTORY_AUTHORITY_MISMATCH');
     if (record.sessionId !== deriveSessionId({ sealFingerprint: record.sealFingerprint, approvalCommit: record.approvalCommit,
       attemptIndex: record.attemptIndex, capabilityHash: record.capabilityHash })) fail('R4_HISTORY_IDENTITY_MISMATCH');
     if (isR4Excluded(record.sessionId)) fail('R4_HISTORY_EXCLUDED_SESSION');
@@ -273,7 +279,7 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
       const attestation = attestationsBySession.get(claim.sessionId);
       if (!attestation || attestation.fingerprint !== record.attestationFingerprint || attestation.sessionFingerprint !== record.sessionFingerprint) fail('R4_HISTORY_TERMINAL_STATE_INVALID');
       guard(() => verifySessionAttestation({ attestation, session: { sessionId: claim.sessionId, fingerprint: attestation.sessionFingerprint },
-        seal, authority, approvalAuthority: { approvalCommit, t0 }, authorizationRecord: byIndex.get(index).record, claimRecord: claim,
+        seal, authority, approvalAuthority: { approvalCommit, t0, approvalEpoch }, authorizationRecord: byIndex.get(index).record, claimRecord: claim,
         attemptIndex: index }), 'R4_HISTORY_TERMINAL_STATE_INVALID');
     }
     terminals.set(index, record);
@@ -314,7 +320,7 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
       orphanAttestation: cohortStatus === 'COMPLETED' ? null : attestation }));
   }
   return Object.freeze({ attempts: Object.freeze(attempts), completedCount: completed, attemptsUsed: attempts.length,
-    authority: Object.freeze({ sealFingerprint: seal.fingerprint, sealAuthorityCommit: authority.sealAuthorityCommit, approvalCommit, t0 }) });
+    authority: Object.freeze({ sealFingerprint: seal.fingerprint, sealAuthorityCommit: authority.sealAuthorityCommit, approvalCommit, approvalEpoch, t0 }) });
 }
 
 /**

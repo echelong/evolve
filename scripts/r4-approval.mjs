@@ -23,6 +23,14 @@
 // A missed window is NOT re-anchored: it requires a new independently approved
 // authorization commit.
 //
+// MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT: because that re-authorization
+// had no canonical representation, approval authority is generalized into
+// immutable approval EPOCHS whose additivity, ancestry, predecessor binding,
+// independent reauthorization review and mechanical T0 are enforced by
+// `scripts/r4-approval-epochs.mjs`. Real execution resolves only the LATEST valid
+// epoch, and that epoch must be bound to the CURRENT canonical seal. No
+// scientific rule and no frozen protocol value changed.
+//
 // This module reads Git only. It starts nothing, captures nothing and (unless the
 // caller explicitly asks) writes nothing.
 import { spawnSync } from 'node:child_process';
@@ -35,6 +43,10 @@ import {
 } from './r4-authority.mjs';
 import { digest, canonical } from './market-intelligence/definition.mjs';
 import { mechanicalT0, R4_COHORT_SPEC } from './r4-cohort-plan.mjs';
+import {
+  resolveApprovalEpochChain, approvalGovernancePathsForEpoch, assertRenewalApprovalRecord,
+  R4_APPROVAL_EPOCH_SCHEMA_VERSION, R4_LEGACY_APPROVAL_PATH,
+} from './r4-approval-epochs.mjs';
 
 export const R4_APPROVAL_RECORD_TYPE = 'r4_precapture_approval';
 export const R4_APPROVAL_PATH = 'governance/r4/r4-precapture-approval.json';
@@ -43,8 +55,9 @@ export const R4_APPROVAL_STATUS = 'APPROVED';
 export const R4_APPROVAL_SCHEMA_VERSION = 1;
 /** Attempt 1 may start only inside [T0, T0 + this window). */
 export const R4_ATTEMPT1_WINDOW_MS = R4_COHORT_SPEC.attempt1StartWindowMs;
-/** Approved governance paths that may appear in diff(S, A). */
+/** Approved governance paths that may appear in diff(S, A) for the legacy epoch 1. */
 export const R4_APPROVED_GOVERNANCE_PATHS = Object.freeze([R4_APPROVAL_PATH]);
+export { R4_LEGACY_APPROVAL_PATH, approvalGovernancePathsForEpoch };
 
 const fail = code => { throw new Error(code); };
 const isSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
@@ -70,10 +83,15 @@ export function buildApprovalRecord({ seal, authority, reviewer, reviewerModel, 
   return { ...content, fingerprint: digest(content) };
 }
 
-/** Structural validation of an approval artifact. */
+/**
+ * Structural validation of an approval artifact. Schema version 1 is the
+ * historical epoch-1 approval; schema version 2 is a missed-window renewal
+ * approval, validated by the approval-epoch module.
+ */
 export function assertApprovalRecord(record) {
   if (!record || typeof record !== 'object') fail('R4_APPROVAL_INVALID');
   if (record.recordType !== R4_APPROVAL_RECORD_TYPE) fail('R4_APPROVAL_RECORD_TYPE_INVALID');
+  if (record.schemaVersion === R4_APPROVAL_EPOCH_SCHEMA_VERSION) return assertRenewalApprovalRecord(record);
   if (record.schemaVersion !== R4_APPROVAL_SCHEMA_VERSION) fail('R4_APPROVAL_SCHEMA_VERSION_INVALID');
   if (record.status !== R4_APPROVAL_STATUS) fail('R4_APPROVAL_STATUS_INVALID');
   if (!isSha(record.protocolCommit)) fail('R4_APPROVAL_PROTOCOL_COMMIT_INVALID');
@@ -131,15 +149,19 @@ export function findApprovalCommit({ sealAuthorityCommit, approval = null, appro
  * `refs/remotes/origin/main` and never mere ancestry.
  */
 export function verifyApprovalGitContract({
-  sealAuthorityCommit, approval, approvalPath = R4_APPROVAL_PATH, cwd = R4_REPO_ROOT,
-  requireRemote = true, requireHead = true,
+  sealAuthorityCommit, approval, approvalPath = R4_APPROVAL_PATH, allowedPaths = null, cwd = R4_REPO_ROOT,
+  requireRemote = true, requireHead = true, expectedApprovalCommit = null, diffBase = null,
 } = {}) {
-  const discovery = findApprovalCommit({ sealAuthorityCommit, approval, approvalPath, cwd });
-  if (!discovery.found) fail(`R4_APPROVAL_${discovery.reason}`);
-  const approvalCommit = discovery.approvalCommit;
-  const changed = (gitText(['diff', '--name-only', sealAuthorityCommit, approvalCommit], cwd) ?? '').split('\n').filter(Boolean).sort();
+  let approvalCommit = expectedApprovalCommit;
+  if (approvalCommit === null) {
+    const discovery = findApprovalCommit({ sealAuthorityCommit, approval, approvalPath, cwd });
+    if (!discovery.found) fail(`R4_APPROVAL_${discovery.reason}`);
+    approvalCommit = discovery.approvalCommit;
+  }
+  const base = diffBase ?? sealAuthorityCommit;
+  const changed = (gitText(['diff', '--name-only', base, approvalCommit], cwd) ?? '').split('\n').filter(Boolean).sort();
   if (changed.length === 0) fail('R4_APPROVAL_EMPTY_DIFF');
-  const allowed = new Set(R4_APPROVED_GOVERNANCE_PATHS);
+  const allowed = new Set(allowedPaths ?? R4_APPROVED_GOVERNANCE_PATHS);
   for (const file of changed) if (!allowed.has(file)) fail(`R4_APPROVAL_GOVERNANCE_SCOPE_VIOLATION:${file}`);
   let remote = null;
   if (requireRemote) remote = assertLiveRemoteMainEquals(approvalCommit, { cwd, what: 'APPROVAL_COMMIT_A' });
@@ -196,10 +218,12 @@ export function readApprovalArtifact({ cwd = R4_REPO_ROOT, ref = null, approvalP
  * `requireApproval: false` is the S-stage dry run (authority = S): the LIVE
  * remote main must equal S exactly, and live worktree integrity against S is
  * enforced. `requireApproval: true` is the only path capable of `--execute` or
- * of a canonical analysis: it additionally requires the tracked approval
- * artifact, its content binding, S as A's direct parent, an approval-only diff,
- * LIVE remote main == A exactly, HEAD == A, integrity against A, and it derives
- * T0 from A.
+ * of a canonical analysis: it additionally requires the latest valid approval
+ * EPOCH, that epoch's content binding to the CURRENT canonical seal, its
+ * approval-governance-only diff, LIVE remote main == that approval commit
+ * exactly, HEAD == that approval commit, integrity against it, and it derives T0
+ * from it. Earlier epochs can never authorize execution once a later epoch
+ * exists.
  *
  * Fail-closed order (round-3 section 11, steps 1-6): canonical seal/Git
  * authority -> live remote -> HEAD -> worktree -> approval A -> T0. Approval
@@ -220,11 +244,29 @@ export function resolveR4ExecutionAuthority({
   }
   const approval = readApprovalArtifact({ cwd, approvalPath });
   if (!approval) fail('R4_APPROVAL_MISSING');
-  verifyApprovalBinding({ approval, seal, authority });
-  const contract = verifyApprovalGitContract({ sealAuthorityCommit: authority.sealAuthorityCommit, approval, approvalPath, cwd, requireRemote: true, requireHead: true });
+  // Approval EPOCHS (missed-window renewal governance). Resolve the latest valid
+  // epoch from Git; only the LATEST epoch may authorize attempt 1 and it must be
+  // bound to the CURRENT canonical seal. The epoch-1 record is verified against
+  // the current seal by `verifyApprovalBinding` immediately below, so the chain
+  // walk itself does not re-verify it and the canonical R4_APPROVAL_SEAL_MISMATCH
+  // / remote / HEAD error codes are unchanged.
+  const { latest, chain } = resolveApprovalEpochChain({ cwd, sealPath, legacyApprovalPath: approvalPath, verifySealBinding: false });
+  if (!latest) fail('R4_APPROVAL_MISSING');
+  if (latest.sealCommit !== authority.sealAuthorityCommit) fail('R4_APPROVAL_EPOCH_NOT_CURRENT_SEAL');
+  verifyApprovalBinding({ approval: latest.record, seal, authority });
+  // The approval epoch resolver already proved that the latest approval commit's
+  // direct parent is the current seal commit or the immediate previous approval
+  // commit, so the contract is verified against that resolved commit and diff
+  // base instead of re-discovering a seal-parent commit.
+  const contract = verifyApprovalGitContract({ sealAuthorityCommit: authority.sealAuthorityCommit, approval: latest.record,
+    approvalPath: latest.path, allowedPaths: approvalGovernancePathsForEpoch(latest.epoch), cwd,
+    expectedApprovalCommit: latest.commit, diffBase: latest.parentCommit ?? gitParents(latest.commit, cwd)[0] ?? null,
+    requireRemote: true, requireHead: true });
   assertWorktreeIntegrity({ cwd, requiredCommit: contract.approvalCommit, sealPath });
   const t0 = approvalT0(contract.approvalCommitterTimestamp);
-  return Object.freeze({ stage: 'A', seal, authority, approval, approvalCommit: contract.approvalCommit,
+  if (latest.t0 !== t0) fail('R4_APPROVAL_EPOCH_T0_MISMATCH');
+  return Object.freeze({ stage: 'A', seal, authority, approval: latest.record, approvalCommit: contract.approvalCommit,
+    approvalEpoch: latest.epoch, approvalFingerprint: latest.fingerprint, approvalChain: chain,
     approvalCommitterTimestamp: contract.approvalCommitterTimestamp, approvalCommitterIso: contract.committerIso,
     t0, t0Iso: new Date(t0).toISOString(), remoteSha: contract.remoteSha });
 }

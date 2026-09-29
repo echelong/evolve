@@ -160,6 +160,61 @@ The primary outcome primitive was frozen earlier by
 `docs/R4-P3C-PREREGISTRATION.md`. This document does not reopen either; it fixes
 the remaining protocol mechanics.
 
+## MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT
+
+**Narrowly scoped, prospective enforcement amendment, made after the first
+approval window expired and before any cohort attempt.**
+
+- The epoch-1 pre-capture approval commit `A1`
+  (`9ae21e0a976a4f7ba363e04fa370eef23fd713af`) declared attempt-1 window
+  **`2026-09-29T06:00:00Z` through `2026-09-29T06:05:00Z`**. That window was
+  **MISSED**: the final time check read `2026-09-29T06:41:33Z`, i.e. after
+  `A1`'s `T0 + 5 minutes`. The window is recorded here as **MISSED**.
+- **Capture was never started.** No attempt authorization, no capability, no
+  claim, no terminal record, no attestation, no R4 cohort session and no outcome
+  exists. `attemptsUsed` therefore remained **0** and `completedCount` remained
+  **0**; the missed window consumed **ZERO** attempts.
+- **No evidence and no outcomes existed** at the time of this amendment, and no
+  returns were inspected.
+- The existing frozen rule already prohibited automatic re-anchoring: a missed
+  window requires a **new independent approval/authorization commit** before
+  another `T0` can exist (`PRE-CAPTURE GOVERNANCE ENFORCEMENT AMENDMENT` above).
+  What was missing was a canonical, non-history-rewriting way to *represent* that
+  second and later approval.
+- **Approval EPOCHS make that already-required independent reauthorization
+  operationally repeatable.** Approval authority is generalized into immutable,
+  additive epochs: `S -> A1`, then `A1 -> A2`, then `A2 -> A3`, … Each renewal
+  approval commit is additive Git history, binds its **immediate predecessor**
+  (commit, fingerprint, T0, window end and `MISSED` window status), binds a new
+  **independent reauthorization review**
+  (`r4_precapture_reauthorization_review`, verdict
+  `READY_TO_REAUTHORIZE_COHORT`) committed with it, and may only be created after
+  the predecessor window fully elapsed with **zero real R4 attempt artifacts**.
+  No existing approval is rewritten, and `A1` remains authentic epoch-1 history.
+- Epoch 1 stays at `governance/r4/r4-precapture-approval.json`; renewals use the
+  immutable paths `governance/r4/approvals/approval-000N.json` (with
+  `approval-000N.review.json`). Authority remains derivable **entirely from Git**:
+  there is no free-floating mutable `AUTHORITY.json` pointer, and a change to
+  `P`, `S` or the seal, a fork, a skipped epoch, a wrong predecessor, an edited
+  or deleted older approval artifact, a local-only or non-latest approval, or a
+  `HEAD`/live-remote mismatch is **rejected**.
+- `T0_N` stays mechanical: the first whole UTC hour at least 30 minutes after
+  `A_N`'s Git committer timestamp. Only the **LATEST** valid epoch may authorize
+  attempt 1; every earlier epoch's window is permanently expired. No CLI option
+  may choose a date, hour, `T0`, window or offset, and no market-data query or
+  market-state input participates in renewal approval or `T0` calculation.
+- Session, attempt and outcome governance bind `approvalCommit`,
+  `approvalEpoch` and `approvalFingerprint`, so a later epoch can never rewrite
+  which approval governed an existing capture.
+
+**No scientific rule changed.** Target sessions (6), maximum attempts (8),
+duration (45 minutes), `--r4-revisits`, `COHORT_DRAIN_ONLY`, providers, universe,
+freshness, alignment, the 300 s horizon, the +60 s tolerance, Policy A/B, E1,
+reference selection, exposure, outcome, Kendall tau-b, the cluster bootstrap with
+10,000 replicates, the sample floors, storage provisioning and attempt
+accounting are all unchanged. **No renewal approval (`A2`) is created by this
+amendment**, and no second `T0` exists.
+
 ## Authority map and precedence
 
 | Rule | Document | Code | Validator | State |

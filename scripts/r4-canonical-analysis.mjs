@@ -73,11 +73,18 @@ export function runCanonicalR4Analysis(options = {}) {
   const resolution = resolveR4ExecutionAuthority({ cwd: repoRoot, requireApproval: true });
   if (resolution.stage !== 'A') fail('R4_CANONICAL_ANALYSIS_REQUIRES_APPROVAL_AUTHORITY');
   const { seal, authority } = resolution;
-  const approvalAuthority = Object.freeze({ approvalCommit: resolution.approvalCommit, t0: resolution.t0 });
+  // MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT: the resolved approval EPOCH is
+  // carried with the authority so every downstream binding (plan, attestation,
+  // outcome-run binding and this result's identity) binds the actual epoch under
+  // which attempt 1 began. A later approval epoch can therefore never rewrite
+  // which approval governed an existing capture.
+  const approvalAuthority = Object.freeze({ approvalCommit: resolution.approvalCommit,
+    approvalEpoch: resolution.approvalEpoch ?? null, t0: resolution.t0 });
 
   // 2. authenticated attempt history -> canonical cohort membership ----------
   const verifiedHistory = verifyR4AttemptHistory(loadR4AttemptHistory({ cwd: evidenceRoot }), {
-    seal, authority, approvalCommit: approvalAuthority.approvalCommit, t0: approvalAuthority.t0 });
+    seal, authority, approvalCommit: approvalAuthority.approvalCommit, approvalEpoch: approvalAuthority.approvalEpoch,
+    t0: approvalAuthority.t0 });
   const plan = planSealedCohort({ seal, approvalAuthority });
   const attempts = historyToCohortAttempts(verifiedHistory);
   const attestations = historyAttestations(verifiedHistory);
@@ -118,7 +125,9 @@ export function runCanonicalR4Analysis(options = {}) {
     schemaVersion: 1, recordType: 'r4_canonical_analysis_result', interface: 'R4_CANONICAL_ANALYSIS',
     authorizationChain: R4_AUTHORIZATION_CHAIN, authoritySource: 'RESOLVED_FROM_GIT_LIVE_REMOTE',
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
-    authorityCommit: authority.sealAuthorityCommit, approvalCommit: resolution.approvalCommit, liveRemoteMain: resolution.remoteSha,
+    authorityCommit: authority.sealAuthorityCommit, approvalCommit: resolution.approvalCommit,
+    approvalEpoch: resolution.approvalEpoch ?? null, approvalFingerprint: resolution.approvalFingerprint ?? null,
+    liveRemoteMain: resolution.remoteSha,
     t0: resolution.t0, attemptsUsed: verifiedHistory.attemptsUsed,
     canonicalMembership: [...canonicalMembership].sort(),
     canonicalMembershipDigest: digest([...canonicalMembership].sort()),

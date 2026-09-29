@@ -26,6 +26,13 @@ import { assembleAnalysisRows, runPrimaryAnalysis, kendallTauB } from './market-
 
 const fail = code => { throw new Error(code); };
 
+/**
+ * MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT: an ABSENT approval epoch means
+ * the historical legacy epoch 1, so a hand-built authority object that predates
+ * approval epochs is not silently re-interpreted as a renewal.
+ */
+const epochOf = value => (value === null || value === undefined ? 1 : value);
+
 export const R4_ANALYSIS_RECORD_TYPE = 'r4_real_primary_analysis';
 export const R4_OUTCOME_BINDING_RECORD_TYPE = 'r4_outcome_run_binding';
 export const R4_SESSION_DIR_ROOT = '.evolve/market-intelligence/sessions';
@@ -39,6 +46,7 @@ export const R4_SESSION_ELIGIBILITY_REQUIREMENTS = Object.freeze([
   'matching protocol commit',
   'matching seal authority commit',
   'matching pre-capture approval commit A',
+  'matching approval epoch (the latest valid epoch; earlier epochs cannot authorize attempt 1)',
   'attempt index in 1..maxAttempts',
   'exact sealed 45-minute reference window',
   'exact sealed provider configuration',
@@ -143,6 +151,7 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
     if (!Number.isSafeInteger(approvalAuthority.t0)) fail('R4_PLAN_APPROVAL_AUTHORITY_INVALID');
     if (plan.t0 !== approvalAuthority.t0) fail('R4_PLAN_T0_MISMATCH');
     if ((plan.approvalCommit ?? null) !== (approvalAuthority.approvalCommit ?? null)) fail('R4_PLAN_APPROVAL_COMMIT_MISMATCH');
+    if (epochOf(plan.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_PLAN_APPROVAL_EPOCH_MISMATCH');
   }
   // Frozen structural + membership hardening (throws on duplicate/excluded/late).
   const progress = evaluateCohortProgress(plan, attempts);
@@ -168,6 +177,7 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
     if (attestation.protocolCommit !== seal.protocolCommit) fail('R4_ATTEMPT_PROTOCOL_COMMIT_MISMATCH');
     if (attestation.authorityCommit !== authority.sealAuthorityCommit) fail('R4_ATTEMPT_AUTHORITY_COMMIT_MISMATCH');
     if (approvalAuthority && attestation.approvalCommit !== approvalAuthority.approvalCommit) fail('R4_ATTEMPT_APPROVAL_COMMIT_MISMATCH');
+    if (approvalAuthority && epochOf(attestation.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_ATTEMPT_APPROVAL_EPOCH_MISMATCH');
     authenticated.push(attempt.sessionId);
   }
   // Canonical membership is an OUTPUT. It is derived from the completed attempts
@@ -377,6 +387,7 @@ export function buildOutcomeRunBinding({ seal, authority, approvalAuthority = nu
     schemaVersion: 1, recordType: R4_OUTCOME_BINDING_RECORD_TYPE, ...CLASSIFICATION,
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
     authorityCommit: authority.sealAuthorityCommit, approvalCommit: approvalAuthority?.approvalCommit ?? null,
+    approvalEpoch: approvalAuthority?.approvalEpoch ?? null,
     cohortMembershipDigest: digest([...cohortMembership].sort()),
     referenceSetDigest: referenceSetDigest(references),
     sourceSessionIds: deriveSourceSessionIds({ references }),
@@ -402,6 +413,7 @@ export function verifyOutcomeRunBinding({ binding, seal, authority, approvalAuth
   if (binding.protocolTree !== seal.protocolTree) fail('R4_BINDING_PROTOCOL_TREE_MISMATCH');
   if (binding.authorityCommit !== authority.sealAuthorityCommit) fail('R4_BINDING_AUTHORITY_COMMIT_MISMATCH');
   if (approvalAuthority && (binding.approvalCommit ?? null) !== (approvalAuthority.approvalCommit ?? null)) fail('R4_BINDING_APPROVAL_COMMIT_MISMATCH');
+  if (approvalAuthority && epochOf(binding.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_BINDING_APPROVAL_EPOCH_MISMATCH');
   if (binding.cohortMembershipDigest !== digest([...cohortMembership].sort())) fail('R4_BINDING_COHORT_MISMATCH');
   if (binding.referenceSetDigest !== referenceSetDigest(references)) fail('R4_BINDING_REFERENCE_SET_MISMATCH');
   const expectedSourceSessionIds = deriveSourceSessionIds({ references });

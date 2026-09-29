@@ -60,7 +60,7 @@ export function sessionParameters() {
  * real-R4 execution must use `buildAuthorizedCohortPlan`, which derives T0 only
  * from the verified pre-capture approval commit A.
  */
-export function buildCohortPlan({ sealFingerprint, preregistrationDigest, sealCommittedAt, approvalCommit = null, t0 = null }) {
+export function buildCohortPlan({ sealFingerprint, preregistrationDigest, sealCommittedAt, approvalCommit = null, approvalEpoch = null, t0 = null }) {
   if (typeof sealFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(sealFingerprint)) throw new Error('PLAN_SEAL_INVALID');
   if (typeof preregistrationDigest !== 'string' || !/^[0-9a-f]{64}$/.test(preregistrationDigest)) throw new Error('PLAN_PREREGISTRATION_INVALID');
   const resolvedT0 = t0 ?? mechanicalT0(sealCommittedAt);
@@ -68,7 +68,7 @@ export function buildCohortPlan({ sealFingerprint, preregistrationDigest, sealCo
     schemaVersion: 1, recordType: 'r4_cohort_plan', planVersion: R4_PLAN_VERSION, b1Rule: R4_B1_RULE,
     sealFingerprint, preregistrationDigest, spec: R4_COHORT_SPEC,
     t0: resolvedT0, t0Iso: new Date(resolvedT0).toISOString(), sealCommittedAt: sealCommittedAt ?? null,
-    authorizationChain: R4_COHORT_SPEC.authorizationChain, approvalCommit: approvalCommit ?? null,
+    authorizationChain: R4_COHORT_SPEC.authorizationChain, approvalCommit: approvalCommit ?? null, approvalEpoch: approvalEpoch ?? null,
     attempts: Array.from({ length: R4_COHORT_SPEC.maxAttempts }, (_, i) => ({ index: i + 1, status: 'PLANNED', sessionId: null, failureCode: null, replacementOf: null })),
   };
 }
@@ -82,7 +82,8 @@ export function buildAuthorizedCohortPlan({ seal, approvalAuthority }) {
   if (!seal || typeof seal.fingerprint !== 'string') throw new Error('PLAN_SEAL_INVALID');
   if (!approvalAuthority || !Number.isSafeInteger(approvalAuthority.t0)) throw new Error('PLAN_APPROVAL_AUTHORITY_INVALID');
   return buildCohortPlan({ sealFingerprint: seal.fingerprint, preregistrationDigest: seal.preregistration.sha256,
-    t0: approvalAuthority.t0, approvalCommit: approvalAuthority.approvalCommit });
+    t0: approvalAuthority.t0, approvalCommit: approvalAuthority.approvalCommit,
+    approvalEpoch: approvalAuthority.approvalEpoch ?? null });
 }
 
 /**

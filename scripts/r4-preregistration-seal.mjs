@@ -40,7 +40,7 @@ import { PRIMARY_ANALYSIS_SPEC_VERSION, PRIMARY_EXPOSURE_FIELD, PRIMARY_OUTCOME_
   SEED_DERIVATION } from './market-outcomes/primary-analysis.mjs';
 import { SENSITIVITY_POLICY, PRIMARY_POLICY } from './market-outcomes/sensitivity.mjs';
 import { R4_COHORT_SPEC, R4_B1_RULE, sessionParameters } from './r4-cohort-plan.mjs';
-import { R4_SPEC, R4_SPEC_DIGEST, R4_CAPTURE_ENV_CLASSIFICATION, R4_REQUIRED_BOUND_FILES, R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, captureSpecDigest } from './r4-protocol-spec.mjs';
+import { R4_SPEC, R4_SPEC_DIGEST, R4_CAPTURE_ENV_CLASSIFICATION, R4_REQUIRED_BOUND_FILES, R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, R4_APPROVAL_EPOCHS_DIR, captureSpecDigest } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS } from './r4-exclusions.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -95,6 +95,19 @@ export const R4_ARTIFACT_AUTHORITY = Object.freeze({
   approvalCommitRole: 'pre-capture approval commit; direct parent is the seal commit; adds only the canonical approval artifact; only created after READY_TO_AUTHORIZE_COHORT',
   t0TimestampSource: 'PRECAPTURE_APPROVAL_COMMIT_A_COMMITTER_TIMESTAMP',
   attempt1StartWindowMs: 300_000,
+  // MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT (enforcement only). The already
+  // frozen rule that a missed attempt-1 window requires a NEW independent
+  // approval/authorization commit had no canonical representation for the second
+  // and later approvals; approval authority is therefore generalized into
+  // immutable, additive approval EPOCHS. No scientific value changed and the
+  // missed window consumed zero attempts.
+  approvalEpochModel: 'IMMUTABLE_ADDITIVE_APPROVAL_EPOCHS',
+  canonicalApprovalEpochsDir: R4_APPROVAL_EPOCHS_DIR,
+  canonicalApprovalEpochPath: `${R4_APPROVAL_EPOCHS_DIR}/approval-000N.json (epoch >= 2; epoch 1 is the frozen canonicalApprovalPath above and never moves)`,
+  renewalApprovalCommitRole: 'renewal approval commit; direct parent is the CURRENT seal commit; adds only that epoch approval artifact plus its independent reauthorization review record; binds its immediate predecessor epoch, a MISSED predecessor window and zero real attempt artifacts',
+  renewalReviewRole: 'r4_precapture_reauthorization_review: an independent verification that the prior window expired, no attempt happened, authority is unchanged, no evidence/outcome exists and renewal is safe',
+  t0TimestampSourcePerEpoch: 'PRECAPTURE_APPROVAL_COMMIT_A_N_COMMITTER_TIMESTAMP (only the LATEST valid epoch may authorize attempt 1; earlier windows are permanently expired)',
+  renewalEligibilityRule: 'now >= previousT0 + attempt1StartWindowMs AND zero real R4 attempt artifacts (authorization, claim, terminal, attestation, cohort session, outcome)',
   // No redundant mutable pointer is tracked: authority is determined by the
   // canonical Git ancestry P -> S -> A plus these fixed paths.
   historicalRuntimeSeal: '.evolve/governance/r4-preregistration-seal-*.json (historical/runtime evidence only; NOT authority; Git-ignored)',
@@ -161,7 +174,8 @@ export function sealContent({ baseSha, baseTree, sealedAt, boundFiles, protocol,
       staleSchedulerWording: 'The shakedown completion wording naming P3-C as the only remaining blocker is scoped to the live revisit scheduler and is stale; it is not global R4 authority.',
       directoryMtime: 'AUTHORITY_NOT_FOUND: no authoritative record of a .evolve directory-mtime observation exists; date, scope, cause and byte-change status are unknown; no scientific-evidence impact is asserted and the uncertainty is carried forward.',
       storageHeadroom: 'Storage provisioning (round-2 disclosure correction): the IMPLEMENTATION default remains 512 MiB (SESSION_CAPACITY_MIB.default); the R4 SEALED OPERATIONAL session cap is 1024 MiB; the estimated high-water volume for a 45-minute targeted window plus the bounded drain is ~561 MiB; the sealed-cap headroom is therefore ~463 MiB. The storage bound remains session-fatal (a session that reaches it finalizes incomplete and is governed by the fixed replacement rule). This provisioning choice was fixed before any cohort attempt and alters no science.',
-      enforcement: 'Pre-capture enforcement controls only: canonical tracked seal, P/S/A authority chain, sealed capture mode, runner capability over an inherited descriptor, effective-environment classification, mandatory origin/main proof, live worktree integrity, hard exclusion enforcement, authenticated session attestation, canonical cohort membership, canonical reference-set enforcement, evidence-reloaded exposure provenance, locked primary-analysis interface, outcome/cohort/reference binding, canonical analysis orchestrator, approval-commit schema/validator and the [T0, T0+5min) attempt-1 start window. No scientific rule was reopened.',
+      enforcement: 'Pre-capture enforcement controls only: canonical tracked seal, P/S/A authority chain, approval EPOCHS (immutable additive renewals with an independent reauthorization review, predecessor binding and mechanical per-epoch T0), sealed capture mode, runner capability over an inherited descriptor, effective-environment classification, mandatory origin/main proof, live worktree integrity, hard exclusion enforcement, authenticated session attestation, canonical cohort membership, canonical reference-set enforcement, evidence-reloaded exposure provenance, locked primary-analysis interface, outcome/cohort/reference binding, canonical analysis orchestrator, approval-commit schema/validator and the [T0, T0+5min) attempt-1 start window. No scientific rule was reopened.',
+      missedAttempt1Window: 'MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT (enforcement only): the epoch-1 approval window [2026-09-29T06:00:00Z, 2026-09-29T06:05:00Z) was MISSED without starting capture, so ZERO attempts were consumed (attemptsUsed = 0), no authorization/claim/terminal/attestation/session/outcome artifact exists and the already-frozen rule prohibited automatic T0 re-anchoring. Approval epochs make the already-required independent reauthorization operationally repeatable; no scientific value changed. No renewal approval epoch (A2) exists.',
       round3Enforcement: 'Round-3 enforcement clarifications only: single-use attempt capabilities (AUTHORIZED -> CLAIMED -> COMPLETED|FAILED) with an atomic O_CREAT|O_EXCL fsync\'d claim as the consumption boundary before any session/storage/provider/network access; a crash after the claim consumes the attempt (mechanically FAILED, never reused, explicit recover rule); write-once hash-chained terminal records; the only legal next attempt derived from authenticated attempt history; live `git ls-remote origin refs/heads/main` equality with the expected authority (S before approval, A at execution) instead of the cached tracking ref; canonical analysis resolves A from Git itself and rejects caller authority/history; package-lock.json bound as defense-in-depth. No scientific rule was reopened.',
     },
   };

@@ -38,6 +38,7 @@ import {
 } from './r4-capability.mjs';
 import { createSessionAttestation, finalizeSessionAttestation, writeSessionAttestation, R4_ATTESTATION_DIR, R4_SESSION_ROLE } from './r4-attestation.mjs';
 import { resolveR4ExecutionAuthority, evaluateAttemptStartWindow, assertAttemptStartAllowed, R4_ATTEMPT1_WINDOW_MS, R4_APPROVAL_PATH } from './r4-approval.mjs';
+import { R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS, resolveApprovalEpochChain } from './r4-approval-epochs.mjs';
 import { R4_REPO_ROOT, R4_REMOTE_MAIN } from './r4-authority.mjs';
 import {
   loadR4AttemptHistory, verifyR4AttemptHistory, deriveNextAttempt, writeAttemptTerminal, recoverInterruptedAttempt,
@@ -78,6 +79,12 @@ export function parseRunnerArgs(argv = []) {
     else if (arg === '--execute') options.execute = true;
     // `--require-remote` is deliberately NOT accepted: remote authority is
     // mandatory and no argument may make it optional.
+    // Anti-hand-picking: no argument may select an approval epoch, a T0, a
+    // window boundary, a date/hour or an offset. The T0 of the latest valid
+    // approval epoch is mechanical and no market-state input participates.
+    else if (R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS.includes(arg.replace(/^--?/, ''))) {
+      throw new R4RunnerError('R4_RUNNER_ARGUMENT_UNSUPPORTED', { arg, rejectedAs: 'R4_APPROVAL_EPOCH_OR_T0_OVERRIDE_FORBIDDEN' });
+    }
     else throw new R4RunnerError('R4_RUNNER_ARGUMENT_UNSUPPORTED', { arg });
   }
   if (options.attemptIndex !== null && (!Number.isInteger(options.attemptIndex) || options.attemptIndex < 1 || options.attemptIndex > R4_SPEC.cohort.maxAttempts)) {
@@ -143,7 +150,7 @@ export function canonicalAttemptHistory({ resolution, cwd }) {
   if (!resolution || resolution.stage !== 'A') throw new R4RunnerError('R4_HISTORY_REQUIRES_APPROVAL_AUTHORITY');
   const history = loadR4AttemptHistory({ cwd });
   const verified = verifyR4AttemptHistory(history, { seal: resolution.seal, authority: resolution.authority,
-    approvalCommit: resolution.approvalCommit, t0: resolution.t0 });
+    approvalCommit: resolution.approvalCommit, approvalEpoch: resolution.approvalEpoch ?? null, t0: resolution.t0 });
   return { verified, next: deriveNextAttempt(verified) };
 }
 
@@ -162,10 +169,31 @@ export function preflight({ argv = [], env = process.env, now = Date.now(), cwd 
   // pre-authorization state and degrades to the S stage; every other authority
   // failure propagates.
   let authorityResolution;
+  // The approval epoch chain is resolved independently of the current seal so a
+  // historical (expired) approval epoch stays visible and reportable even after
+  // an enforcement re-seal: the missed-window governance amendment must never
+  // make the expired approval invisible. Fail-closed: this read-only chain
+  // resolution never authorizes anything by itself.
+  let approvalEpochs = null;
+  try {
+    const chain = resolveApprovalEpochChain({ cwd: workdir, sealPath: options.sealPath, legacyApprovalPath: options.approvalPath, verifySealBinding: false });
+    approvalEpochs = { latest: chain.latest.epoch, latestCommit: chain.latest.commit, latestT0: chain.latest.t0,
+      latestWindowStatus: chain.latest.windowStatus, count: chain.chain.length,
+      epochs: chain.chain.map(entry => ({ epoch: entry.epoch, commit: entry.commit, t0: entry.t0Iso ?? new Date(entry.t0).toISOString(), windowStatus: entry.windowStatus })) };
+  } catch (error) {
+    const code = String(error?.message ?? '').split(':')[0];
+    if (code !== 'R4_APPROVAL_MISSING' && code !== 'R4_APPROVAL_APPROVAL_COMMIT_NOT_FOUND') throw error;
+  }
   try {
     authorityResolution = resolveR4ExecutionAuthority({ cwd: workdir, sealPath: options.sealPath, approvalPath: options.approvalPath, requireApproval: true });
   } catch (error) {
-    if (String(error?.message) !== 'R4_APPROVAL_MISSING' && String(error?.message) !== 'R4_APPROVAL_APPROVAL_COMMIT_NOT_FOUND') throw error;
+    const code = String(error?.message ?? '').split(':')[0];
+    // A missing approval is the expected pre-authorization state; an approval
+    // epoch that is bound to a HISTORICAL seal is the expected post-re-seal
+    // state (the current canonical seal has no governing approval yet). Both
+    // degrade to the S stage, which still proves live remote == current seal.
+    if (code !== 'R4_APPROVAL_MISSING' && code !== 'R4_APPROVAL_APPROVAL_COMMIT_NOT_FOUND'
+      && code !== 'R4_APPROVAL_EPOCH_NOT_CURRENT_SEAL') throw error;
     authorityResolution = resolveR4ExecutionAuthority({ cwd: workdir, sealPath: options.sealPath, approvalPath: options.approvalPath, requireApproval: false });
   }
   const { seal, authority } = authorityResolution;
@@ -182,6 +210,8 @@ export function preflight({ argv = [], env = process.env, now = Date.now(), cwd 
     protocolCommit: authority.protocolCommit, authorityCommit: authority.sealAuthorityCommit,
     sealCommitterTimestamp: authority.sealCommitterTimestamp, sealCommitterIso: authority.sealCommitterIso,
     authorityStage: authorityResolution.stage, approvalCommit: authorityResolution.approvalCommit,
+    approvalEpoch: authorityResolution.approvalEpoch ?? null, approvalEpochs,
+    approvalFingerprint: authorityResolution.approvalFingerprint ?? null,
     approvalCommitterTimestamp: authorityResolution.approvalCommitterTimestamp ?? null,
     liveRemoteMain: authorityResolution.remoteSha ?? null, remoteAuthority: R4_REMOTE_MAIN,
     t0, t0Iso: t0 === null ? null : new Date(t0).toISOString(), startWindow,
@@ -274,6 +304,7 @@ export function issueSealedAttemptAuthorization({ authorized, now = Date.now(), 
   const sessionId = deriveSessionId({ sealFingerprint: resolution.seal.fingerprint, approvalCommit: resolution.approvalCommit, attemptIndex, capabilityHash: hash });
   const authorization = createAttemptAuthorization({
     seal: resolution.seal, authority: resolution.authority, approvalCommit: resolution.approvalCommit,
+    approvalEpoch: resolution.approvalEpoch ?? null,
     attemptIndex, sessionId, t0: resolution.t0, capabilityHash: hash, captureSpecDigest: captureSpecDigest(),
     authorizedAt: now, previousTerminalFingerprint: next.previousTerminalFingerprint ?? null,
   });
@@ -391,7 +422,8 @@ export function main(argv = process.argv.slice(2), { env = process.env, now = Da
     terminalFingerprint: settled.terminal.fingerprint, exitCode };
 }
 
-export { R4_SESSION_ROLE, R4_ATTESTATION_DIR, R4_ATTEMPT_AUTH_DIR, R4_CAPABILITY_FD, R4_REMOTE_MAIN, R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, R4_ATTEMPT1_WINDOW_MS };
+export { R4_SESSION_ROLE, R4_ATTESTATION_DIR, R4_ATTEMPT_AUTH_DIR, R4_CAPABILITY_FD, R4_REMOTE_MAIN, R4_TRACKED_SEAL_PATH, R4_PRECAPTURE_APPROVAL_PATH, R4_ATTEMPT1_WINDOW_MS,
+  R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS, resolveApprovalEpochChain };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {

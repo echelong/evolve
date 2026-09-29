@@ -48,7 +48,7 @@ export function makeWritable(target) {
 
 export function removeTree(target) { makeWritable(target); rmSync(target, { recursive: true, force: true }); }
 
-function gitRunner(dir) {
+export function gitRunner(dir) {
   return (args, env = {}) => {
     const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', ...env } });
     if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
@@ -56,7 +56,7 @@ function gitRunner(dir) {
   };
 }
 
-function commitAll(run, message, iso) {
+export function commitAll(run, message, iso) {
   run(['add', '-A']);
   run(['commit', '-q', '--no-verify', '-m', message], { GIT_AUTHOR_DATE: stampOf(iso), GIT_COMMITTER_DATE: stampOf(iso) });
   return run(['rev-parse', 'HEAD']);
