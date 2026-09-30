@@ -39,6 +39,7 @@ import {
 import { createSessionAttestation, finalizeSessionAttestation, writeSessionAttestation, R4_ATTESTATION_DIR, R4_SESSION_ROLE } from './r4-attestation.mjs';
 import { resolveR4ExecutionAuthority, evaluateAttemptStartWindow, assertAttemptStartAllowed, R4_ATTEMPT1_WINDOW_MS, R4_APPROVAL_PATH } from './r4-approval.mjs';
 import { R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS, resolveApprovalEpochChain } from './r4-approval-epochs.mjs';
+import { R4_CONTINUATION_FORBIDDEN_OPTION_KEYS } from './r4-continuation.mjs';
 import { R4_REPO_ROOT, R4_REMOTE_MAIN } from './r4-authority.mjs';
 import {
   loadR4AttemptHistory, verifyR4AttemptHistory, deriveNextAttempt, writeAttemptTerminal, recoverInterruptedAttempt,
@@ -84,6 +85,9 @@ export function parseRunnerArgs(argv = []) {
     // approval epoch is mechanical and no market-state input participates.
     else if (R4_APPROVAL_EPOCH_FORBIDDEN_OPTION_KEYS.includes(arg.replace(/^--?/, ''))) {
       throw new R4RunnerError('R4_RUNNER_ARGUMENT_UNSUPPORTED', { arg, rejectedAs: 'R4_APPROVAL_EPOCH_OR_T0_OVERRIDE_FORBIDDEN' });
+    }
+    else if (R4_CONTINUATION_FORBIDDEN_OPTION_KEYS.includes(arg.replace(/^--?/, ''))) {
+      throw new R4RunnerError('R4_RUNNER_ARGUMENT_UNSUPPORTED', { arg, rejectedAs: 'R4_CONTINUATION_OVERRIDE_FORBIDDEN' });
     }
     else throw new R4RunnerError('R4_RUNNER_ARGUMENT_UNSUPPORTED', { arg });
   }
@@ -147,11 +151,12 @@ export function assertStoragePreflight(preflight) {
 
 /** Load and authenticate the canonical attempt history against resolved authority A. */
 export function canonicalAttemptHistory({ resolution, cwd }) {
-  if (!resolution || resolution.stage !== 'A') throw new R4RunnerError('R4_HISTORY_REQUIRES_APPROVAL_AUTHORITY');
+  if (!resolution || !['A', 'C'].includes(resolution.stage)) throw new R4RunnerError('R4_HISTORY_REQUIRES_APPROVAL_AUTHORITY');
   const history = loadR4AttemptHistory({ cwd });
   const verified = verifyR4AttemptHistory(history, { seal: resolution.seal, authority: resolution.authority,
     approvalCommit: resolution.approvalCommit, approvalEpoch: resolution.approvalEpoch ?? null,
-    approvalFingerprint: resolution.approvalFingerprint ?? null, t0: resolution.t0 });
+    approvalFingerprint: resolution.approvalFingerprint ?? null, t0: resolution.t0,
+    continuation: resolution.continuationContext ?? null });
   return { verified, next: deriveNextAttempt(verified) };
 }
 
@@ -201,7 +206,7 @@ export function preflight({ argv = [], env = process.env, now = Date.now(), cwd 
   const t0 = authorityResolution.t0;
   const startWindow = t0 === null ? null : evaluateAttemptStartWindow({ t0, now });
   let attemptHistory = null;
-  if (authorityResolution.stage === 'A') {
+  if (authorityResolution.stage === 'A' || authorityResolution.stage === 'C') {
     const { verified, next } = canonicalAttemptHistory({ resolution: authorityResolution, cwd: workdir });
     attemptHistory = { attemptsUsed: verified.attemptsUsed, completedCount: verified.completedCount,
       states: verified.attempts.map(attempt => ({ index: attempt.index, state: attempt.state })), next };
@@ -267,7 +272,7 @@ export function authorizeSealedAttempt({ argv = [], env = process.env, now = Dat
   if (!options.execute) throw new R4RunnerError('R4_SEALED_CAPTURE_REQUIRES_EXECUTE');
   // 1-6
   const resolution = resolveR4ExecutionAuthority({ cwd: workdir, sealPath: options.sealPath, approvalPath: options.approvalPath, requireApproval: true });
-  if (resolution.stage !== 'A') throw new R4RunnerError('R4_SEALED_CAPTURE_REQUIRES_APPROVAL_COMMIT');
+  if (resolution.stage !== 'A' && resolution.stage !== 'C') throw new R4RunnerError('R4_SEALED_CAPTURE_REQUIRES_APPROVAL_COMMIT');
   // 7
   const { effective, loaded } = effectiveSealedEnvironment({ cwd: workdir, env });
   const environment = enforceSealedCaptureEnvironment(effective);
@@ -311,6 +316,7 @@ export function issueSealedAttemptAuthorization({ authorized, now = Date.now(), 
     approvalFingerprint: resolution.approvalFingerprint ?? null,
     attemptIndex, sessionId, t0: resolution.t0, capabilityHash: hash, captureSpecDigest: captureSpecDigest(),
     authorizedAt: now, previousTerminalFingerprint: next.previousTerminalFingerprint ?? null,
+    continuation: resolution.continuationContext ?? null,
   });
   writeAttemptAuthorization(authorization, { cwd: workdir });
   return { capability, authorization, sessionId };

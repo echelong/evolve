@@ -56,6 +56,15 @@ export const R4_CAPTURE_SESSION_ROOT = '.evolve/market-intelligence/sessions';
 export const R4_ATTEMPT_AUTH_RECORD_TYPE = 'r4_attempt_authorization';
 export const R4_ATTEMPT_CLAIM_RECORD_TYPE = 'r4_attempt_claim';
 export const R4_SESSION_RECEIPT_RECORD_TYPE = 'r4_session_capability_receipt';
+// SCHEMA VERSIONING for the post-start continuation. A pre-C1 record is
+// schemaVersion 1 and legitimately carries NO continuation fields; a post-C1
+// record is schemaVersion 2 and MUST carry the exact continuation identity.
+// Explicit versions (rather than optional fields) mean a post-C1 record can
+// never be mistaken for a pre-C1 one, so evidence cannot be mixed across
+// continuation states.
+export const R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION = 2;
+export const R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION = 2;
+export const R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION = 2;
 /** Fixed inherited descriptor. The capability is a credential, not an env var. */
 export const R4_CAPABILITY_FD = 3;
 export const R4_CAPABILITY_BYTES = 32;
@@ -135,6 +144,7 @@ export function createAttemptAuthorization({
   seal, authority, approvalCommit = null, approvalEpoch = null, approvalFingerprint = null,
   attemptIndex, sessionId, t0, capabilityHash: hash, captureSpecDigest,
   authorizedAt = Date.now(), previousTerminalFingerprint = null,
+  continuation = null,
 }) {
   if (!seal || typeof seal.fingerprint !== 'string') fail('R4_CAPABILITY_SEAL_INVALID');
   if (!authority || !isSha(authority.protocolCommit) || !isSha(authority.sealAuthorityCommit)) fail('R4_CAPABILITY_AUTHORITY_INVALID');
@@ -156,13 +166,22 @@ export function createAttemptAuthorization({
   if (!isStamp(authorizedAt)) fail('R4_CAPABILITY_AUTHORIZED_AT_INVALID');
   if (previousTerminalFingerprint !== null && !isDigest(previousTerminalFingerprint)) fail('R4_CAPABILITY_PREVIOUS_TERMINAL_INVALID');
   const content = {
-    schemaVersion: 1, recordType: R4_ATTEMPT_AUTH_RECORD_TYPE, role: R4_SESSION_ROLE, state: 'AUTHORIZED',
+    schemaVersion: continuation === null ? 1 : R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION,
+    recordType: R4_ATTEMPT_AUTH_RECORD_TYPE, role: R4_SESSION_ROLE, state: 'AUTHORIZED',
     capabilityHash: hash, sealFingerprint: seal.fingerprint,
     protocolCommit: authority.protocolCommit, protocolTree: authority.protocolTree ?? seal.protocolTree,
     sealAuthorityCommit: authority.sealAuthorityCommit,
     approvalCommit, approvalEpoch, approvalFingerprint,
     attemptIndex, sessionId, t0, t0Iso: new Date(t0).toISOString(), captureSpecDigest,
     authorizedAt, previousTerminalFingerprint,
+    // POST-START CONTINUATION binding. Absent (schemaVersion 1) for a pre-C1
+    // authorization; present and exact for a post-C1 one. The scientific A2
+    // approval identity and the original T0 above are UNCHANGED either way.
+    ...(continuation === null ? {} : {
+      continuation: continuation.generation,
+      continuationFingerprint: continuation.fingerprint,
+      continuationCommit: continuation.commit,
+    }),
   };
   return { ...content, fingerprint: digest(content) };
 }
@@ -179,7 +198,11 @@ export function writeAttemptAuthorization(record, { root = R4_ATTEMPT_AUTH_DIR, 
 }
 
 export function assertAttemptAuthorization(record) {
-  if (!record || record.recordType !== R4_ATTEMPT_AUTH_RECORD_TYPE || record.schemaVersion !== 1) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
+  if (!record || record.recordType !== R4_ATTEMPT_AUTH_RECORD_TYPE) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
+  // schemaVersion 1 = pre-C1 (no continuation fields); 2 = post-C1 (must carry
+  // them). Both are structurally valid; the history verifier decides which one is
+  // correct for a given attempt's position relative to the continuation boundary.
+  if (record.schemaVersion !== 1 && record.schemaVersion !== R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
   const { fingerprint, ...content } = record;
   if (digest(content) !== fingerprint) fail('R4_CAPABILITY_AUTH_FINGERPRINT_MISMATCH');
   if (record.state !== 'AUTHORIZED') fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
@@ -193,6 +216,13 @@ export function assertAttemptAuthorization(record) {
   if (typeof record.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(record.sessionId)) fail('R4_CAPABILITY_SESSION_ID_INVALID');
   if (!isStamp(record.t0) || !isStamp(record.authorizedAt)) fail('R4_CAPABILITY_AUTH_RECORD_INVALID');
   if (record.previousTerminalFingerprint !== null && !isDigest(record.previousTerminalFingerprint)) fail('R4_CAPABILITY_PREVIOUS_TERMINAL_INVALID');
+  // Schema 1 must carry NO continuation fields; schema 2 must carry all three.
+  const hasContinuationFields = record.continuationFingerprint !== undefined;
+  if (record.schemaVersion === 1 && hasContinuationFields) fail('R4_CAPABILITY_CONTINUATION_FIELDS_UNEXPECTED');
+  if (record.schemaVersion === R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION) {
+    if (!hasContinuationFields || !isDigest(record.continuationFingerprint) || !isSha(record.continuationCommit)
+      || !Number.isInteger(record.continuation) || record.continuation < 1) fail('R4_CAPABILITY_CONTINUATION_FIELDS_MISSING');
+  }
   return true;
 }
 
@@ -212,7 +242,8 @@ export function listAttemptAuthorizations({ root = R4_ATTEMPT_AUTH_DIR, cwd = R4
 /* ---------------------------------------------------------- claim (CLAIMED) */
 
 export function assertAttemptClaim(claim) {
-  if (!claim || claim.recordType !== R4_ATTEMPT_CLAIM_RECORD_TYPE || claim.schemaVersion !== 1) fail('R4_CLAIM_RECORD_INVALID');
+  if (!claim || claim.recordType !== R4_ATTEMPT_CLAIM_RECORD_TYPE) fail('R4_CLAIM_RECORD_INVALID');
+  if (claim.schemaVersion !== 1 && claim.schemaVersion !== R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_CLAIM_RECORD_INVALID');
   const { fingerprint, ...content } = claim;
   if (digest(content) !== fingerprint) fail('R4_CLAIM_FINGERPRINT_MISMATCH');
   if (claim.state !== 'CLAIMED') fail('R4_CLAIM_RECORD_INVALID');
@@ -222,6 +253,10 @@ export function assertAttemptClaim(claim) {
   if (!isStamp(claim.claimedAt) || !isStamp(claim.t0)) fail('R4_CLAIM_RECORD_INVALID');
   if ((claim.approvalEpoch ?? null) !== null && (!Number.isInteger(claim.approvalEpoch) || claim.approvalEpoch < 1)) fail('R4_CAPABILITY_APPROVAL_EPOCH_INVALID');
   if ((claim.approvalFingerprint ?? null) !== null && !isDigest(claim.approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
+  if (claim.schemaVersion === 1 && claim.continuationFingerprint !== undefined) fail('R4_CAPABILITY_CONTINUATION_FIELDS_UNEXPECTED');
+  if (claim.schemaVersion === R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION
+    && (!isDigest(claim.continuationFingerprint) || !isSha(claim.continuationCommit)
+      || !Number.isInteger(claim.continuation) || claim.continuation < 1)) fail('R4_CAPABILITY_CONTINUATION_FIELDS_MISSING');
   return true;
 }
 
@@ -229,7 +264,8 @@ export function assertAttemptClaim(claim) {
 export function assertClaimBindsAuthorization(claim, record) {
   assertAttemptClaim(claim);
   assertAttemptAuthorization(record);
-  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'approvalEpoch', 'approvalFingerprint', 'captureSpecDigest', 't0'];
+  const fields = ['capabilityHash', 'attemptIndex', 'sessionId', 'sealFingerprint', 'protocolCommit', 'sealAuthorityCommit', 'approvalCommit', 'approvalEpoch', 'approvalFingerprint', 'captureSpecDigest', 't0',
+    'continuationFingerprint', 'continuation', 'continuationCommit'];
   if (claim.authorizationFingerprint !== record.fingerprint) fail('R4_CLAIM_AUTHORIZATION_MISMATCH');
   for (const field of fields) if (claim[field] !== record[field]) fail('R4_CLAIM_IDENTITY_MISMATCH');
   return true;
@@ -284,7 +320,8 @@ export function claimAttemptAuthorization({
     if (now >= record.t0 + R4_COHORT_SPEC.attempt1StartWindowMs) fail('R4_CLAIM_ATTEMPT1_START_WINDOW_MISSED');
   }
   const content = {
-    schemaVersion: 1, recordType: R4_ATTEMPT_CLAIM_RECORD_TYPE, state: 'CLAIMED', claimant,
+    schemaVersion: record.continuationFingerprint === undefined ? 1 : R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION,
+    recordType: R4_ATTEMPT_CLAIM_RECORD_TYPE, state: 'CLAIMED', claimant,
     authorizationFingerprint: record.fingerprint, capabilityHash: record.capabilityHash,
     attemptIndex: record.attemptIndex, sessionId: record.sessionId, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
@@ -292,6 +329,13 @@ export function claimAttemptAuthorization({
     approvalFingerprint: record.approvalFingerprint ?? null,
     captureSpecDigest: record.captureSpecDigest, t0: record.t0,
     claimedAt: now,
+    // POST-START CONTINUATION binding, copied verbatim from the authorization it
+    // consumes, so a claim can never be moved across continuation states.
+    ...(record.continuationFingerprint === undefined ? {} : {
+      continuation: record.continuation,
+      continuationFingerprint: record.continuationFingerprint,
+      continuationCommit: record.continuationCommit,
+    }),
   };
   const claim = { ...content, fingerprint: digest(content) };
   try { writeDurableExclusive(claimFile, canonical(claim) + '\n'); }
@@ -313,7 +357,12 @@ export function proveCapability({ capability, record }) {
     t0: record.t0, approvalCommit: record.approvalCommit, approvalEpoch: record.approvalEpoch ?? null,
     approvalFingerprint: record.approvalFingerprint ?? null, sealFingerprint: record.sealFingerprint,
     protocolCommit: record.protocolCommit, sealAuthorityCommit: record.sealAuthorityCommit,
-    captureSpecDigest: record.captureSpecDigest });
+    captureSpecDigest: record.captureSpecDigest,
+    ...(record.continuationFingerprint === undefined ? {} : {
+      continuation: record.continuation,
+      continuationFingerprint: record.continuationFingerprint,
+      continuationCommit: record.continuationCommit,
+    }) });
 }
 
 export function assertAttemptProof(proof, { attemptIndex = null, sessionId = null } = {}) {
@@ -324,6 +373,9 @@ export function assertAttemptProof(proof, { attemptIndex = null, sessionId = nul
   if (attemptIndex !== null && proof.attemptIndex !== attemptIndex) fail('R4_CAPABILITY_ATTEMPT_MISMATCH');
   if (sessionId !== null && proof.sessionId !== sessionId) fail('R4_CAPABILITY_SESSION_MISMATCH');
   if ((proof.approvalFingerprint ?? null) !== null && !isDigest(proof.approvalFingerprint)) fail('R4_CAPABILITY_APPROVAL_FINGERPRINT_INVALID');
+  if (proof.continuationFingerprint !== undefined
+    && (!isDigest(proof.continuationFingerprint) || !isSha(proof.continuationCommit)
+      || !Number.isInteger(proof.continuation) || proof.continuation < 1)) fail('R4_CAPABILITY_PROOF_INVALID');
   return true;
 }
 
@@ -369,11 +421,21 @@ export function acquireRunnerCapability({ fd = R4_CAPABILITY_FD, root = R4_ATTEM
 /* ------------------------------------------------------------- receipts */
 
 /** Receipt written by capture after finalization so the runner can finalize. */
-export function createSessionReceipt({ authorizationFingerprint, capabilityHash: hash, claimFingerprint = null, sessionId, sessionFingerprint, approvalFingerprint = null, revisitCoverage = null }) {
+export function createSessionReceipt({ authorizationFingerprint, capabilityHash: hash, claimFingerprint = null, sessionId, sessionFingerprint, approvalFingerprint = null, revisitCoverage = null, continuation = null }) {
   if (!isDigest(sessionFingerprint)) fail('R4_RECEIPT_SESSION_FINGERPRINT_INVALID');
   if (approvalFingerprint !== null && !isDigest(approvalFingerprint)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_INVALID');
-  const content = { schemaVersion: 1, recordType: R4_SESSION_RECEIPT_RECORD_TYPE, authorizationFingerprint, capabilityHash: hash,
-    claimFingerprint, sessionId, sessionFingerprint, approvalFingerprint, revisitCoverage };
+  if (continuation !== null && (!Number.isInteger(continuation.generation) || continuation.generation < 1
+    || !isDigest(continuation.fingerprint) || !isSha(continuation.commit))) fail('R4_RECEIPT_CONTINUATION_INVALID');
+  const content = { schemaVersion: continuation === null ? 1 : R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION,
+    recordType: R4_SESSION_RECEIPT_RECORD_TYPE, authorizationFingerprint, capabilityHash: hash,
+    claimFingerprint, sessionId, sessionFingerprint, approvalFingerprint, revisitCoverage,
+    // POST-START CONTINUATION binding, so a receipt can never be replayed across
+    // continuation states.
+    ...(continuation === null ? {} : {
+      continuation: continuation.generation,
+      continuationFingerprint: continuation.fingerprint,
+      continuationCommit: continuation.commit,
+    }) };
   return { ...content, fingerprint: digest(content) };
 }
 
@@ -390,7 +452,8 @@ export function readSessionReceipt(sessionId, { root = R4_ATTEMPT_AUTH_DIR, cwd 
 }
 
 export function assertSessionReceipt(receipt, { proof, record, claim = null }) {
-  if (!receipt || receipt.recordType !== R4_SESSION_RECEIPT_RECORD_TYPE || receipt.schemaVersion !== 1) fail('R4_RECEIPT_INVALID');
+  if (!receipt || receipt.recordType !== R4_SESSION_RECEIPT_RECORD_TYPE) fail('R4_RECEIPT_INVALID');
+  if (receipt.schemaVersion !== 1 && receipt.schemaVersion !== R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_RECEIPT_INVALID');
   const { fingerprint, ...content } = receipt;
   if (digest(content) !== fingerprint) fail('R4_RECEIPT_FINGERPRINT_MISMATCH');
   if (receipt.capabilityHash !== record.capabilityHash) fail('R4_RECEIPT_CAPABILITY_MISMATCH');
@@ -403,5 +466,17 @@ export function assertSessionReceipt(receipt, { proof, record, claim = null }) {
   // than only transitively through `authorizationFingerprint`.
   if ((receipt.approvalFingerprint ?? null) !== (record.approvalFingerprint ?? null)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_MISMATCH');
   if ((proof.approvalFingerprint ?? null) !== (record.approvalFingerprint ?? null)) fail('R4_RECEIPT_APPROVAL_FINGERPRINT_MISMATCH');
+  const expectedContinuation = record.continuationFingerprint ?? null;
+  if (expectedContinuation === null) {
+    if (receipt.schemaVersion !== 1 || (receipt.continuationFingerprint ?? null) !== null) fail('R4_RECEIPT_CONTINUATION_MISMATCH');
+  } else {
+    if (receipt.schemaVersion !== R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_RECEIPT_CONTINUATION_SCHEMA_REQUIRED');
+    if (receipt.continuationFingerprint !== expectedContinuation
+      || receipt.continuation !== record.continuation || receipt.continuationCommit !== record.continuationCommit
+      || proof.continuationFingerprint !== expectedContinuation || proof.continuation !== record.continuation
+      || proof.continuationCommit !== record.continuationCommit) fail('R4_RECEIPT_CONTINUATION_MISMATCH');
+    if (claim && (claim.continuationFingerprint !== expectedContinuation || claim.continuation !== record.continuation
+      || claim.continuationCommit !== record.continuationCommit)) fail('R4_RECEIPT_CONTINUATION_MISMATCH');
+  }
   return true;
 }

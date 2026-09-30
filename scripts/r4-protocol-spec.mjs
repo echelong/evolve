@@ -235,6 +235,7 @@ export const R4_CAPTURE_SPEC_DIGEST = captureSpecDigest();
 // too. The amendment makes the already-required missed-window reauthorization
 // operationally repeatable; it reopens no scientific rule.
 export const R4_REQUIRED_BOUND_FILES = Object.freeze([
+  'docs/R4-POSTSTART-CONTINUATION.md',
   'docs/R4-PREREGISTRATION.md',
   'package-lock.json',
   'package.json',
@@ -281,6 +282,8 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/r4-capability.mjs',
   'scripts/r4-cohort-plan.mjs',
   'scripts/r4-cohort-run.mjs',
+  'scripts/r4-continuation-binding.mjs',
+  'scripts/r4-continuation.mjs',
   'scripts/r4-e1-cases.mjs',
   'scripts/r4-enforcement.mjs',
   'scripts/r4-exclusions.mjs',
@@ -293,6 +296,7 @@ export const R4_REQUIRED_BOUND_FILES = Object.freeze([
   'scripts/validate-p3c-mutation.mjs',
   'scripts/validate-r4-approval-epochs.mjs',
   'scripts/validate-r4-approval-fingerprint.mjs',
+  'scripts/validate-r4-continuation.mjs',
   'scripts/validate-r4-e1-mutation.mjs',
   'scripts/validate-r4-e1.mjs',
   'scripts/validate-r4-enforcement.mjs',

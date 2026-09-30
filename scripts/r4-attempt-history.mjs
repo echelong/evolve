@@ -44,7 +44,14 @@ import {
   assertAttemptAuthorization, assertAttemptClaim, assertClaimBindsAuthorization, claimAttemptAuthorization,
   readAttemptAuthorization, readAttemptClaim, writeDurableExclusive, deriveSessionId, R4_SESSION_RECEIPT_RECORD_TYPE,
 } from './r4-capability.mjs';
-import { R4_ATTESTATION_RECORD_TYPE, verifySessionAttestation } from './r4-attestation.mjs';
+import { R4_ATTESTATION_RECORD_TYPE, verifySessionAttestation, R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION } from './r4-attestation.mjs';
+import { attemptHistoryDigest, attemptIdentity } from './r4-continuation.mjs';
+import {
+  R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION, R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION,
+  R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION,
+} from './r4-capability.mjs';
+
+export const R4_ATTEMPT_TERMINAL_SCHEMA_VERSION_POST_CONTINUATION = 2;
 
 export const R4_ATTEMPT_TERMINAL_RECORD_TYPE = 'r4_attempt_terminal';
 export const R4_TERMINAL_STATES = Object.freeze({ completed: 'COMPLETED', failed: 'FAILED' });
@@ -67,7 +74,8 @@ const WINDOW_MS = R4_SPEC.cohort.attempt1StartWindowMs;
 /* ------------------------------------------------------ terminal records */
 
 export function assertAttemptTerminal(terminal) {
-  if (!terminal || terminal.recordType !== R4_ATTEMPT_TERMINAL_RECORD_TYPE || terminal.schemaVersion !== 1) fail('R4_TERMINAL_RECORD_INVALID');
+  if (!terminal || terminal.recordType !== R4_ATTEMPT_TERMINAL_RECORD_TYPE) fail('R4_TERMINAL_RECORD_INVALID');
+  if (terminal.schemaVersion !== 1 && terminal.schemaVersion !== R4_ATTEMPT_TERMINAL_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_TERMINAL_RECORD_INVALID');
   const { fingerprint, ...content } = terminal;
   if (digest(content) !== fingerprint) fail('R4_TERMINAL_FINGERPRINT_MISMATCH');
   if (!Object.values(R4_TERMINAL_STATES).includes(terminal.state)) fail('R4_TERMINAL_STATE_INVALID');
@@ -78,6 +86,12 @@ export function assertAttemptTerminal(terminal) {
     if (!isDigest(terminal.attestationFingerprint) || !isDigest(terminal.sessionFingerprint) || terminal.failureCode !== null) fail('R4_TERMINAL_STATE_INVALID');
   } else if (terminal.attestationFingerprint !== null || terminal.sessionFingerprint !== null
     || typeof terminal.failureCode !== 'string' || !/^[A-Z0-9_:]{1,120}$/.test(terminal.failureCode)) fail('R4_TERMINAL_STATE_INVALID');
+  // Schema 1 must carry NO continuation fields; schema 2 must carry the identity.
+  if (terminal.schemaVersion === 1 && terminal.continuationFingerprint !== undefined) fail('R4_TERMINAL_CONTINUATION_FIELDS_UNEXPECTED');
+  if (terminal.schemaVersion === R4_ATTEMPT_TERMINAL_SCHEMA_VERSION_POST_CONTINUATION
+    && (!isDigest(terminal.continuationFingerprint) || !Number.isInteger(terminal.continuation) || terminal.continuation < 1)) {
+    fail('R4_TERMINAL_CONTINUATION_FIELDS_MISSING');
+  }
   return true;
 }
 
@@ -115,12 +129,18 @@ export function writeAttemptTerminal({
     sessionFingerprint = attestation.sessionFingerprint;
   } else if (state !== R4_TERMINAL_STATES.failed) fail('R4_TERMINAL_STATE_INVALID');
   const content = {
-    schemaVersion: 1, recordType: R4_ATTEMPT_TERMINAL_RECORD_TYPE, state, attemptIndex: authorization.attemptIndex,
+    schemaVersion: authorization.continuationFingerprint === undefined ? 1 : R4_ATTEMPT_TERMINAL_SCHEMA_VERSION_POST_CONTINUATION,
+    recordType: R4_ATTEMPT_TERMINAL_RECORD_TYPE, state, attemptIndex: authorization.attemptIndex,
     sessionId: authorization.sessionId, authorizationFingerprint: authorization.fingerprint, claimFingerprint: claim.fingerprint,
     capabilityHash: authorization.capabilityHash, claimant: claim.claimant, attestationFingerprint, sessionFingerprint,
     // Which approval governed the attempt, restated explicitly so the terminal
     // record is self-contained rather than only transitively bound.
     approvalFingerprint: authorization.approvalFingerprint ?? null,
+    // POST-START CONTINUATION binding, copied verbatim from the authorization, so a
+    // terminal record can never be moved across continuation states.
+    ...(authorization.continuationFingerprint === undefined ? {} : {
+      continuation: authorization.continuation, continuationFingerprint: authorization.continuationFingerprint,
+    }),
     failureCode: state === R4_TERMINAL_STATES.failed ? failureCode : null, terminatedAt,
   };
   const terminal = { ...content, fingerprint: digest(content) };
@@ -185,12 +205,66 @@ export function loadR4AttemptHistory({ cwd = R4_REPO_ROOT, root = R4_ATTEMPT_AUT
 const guard = (fn, code) => { try { return fn(); } catch { return fail(code); } };
 
 /**
- * Authenticate a loaded history against the INTERNALLY resolved execution
- * authority `{ seal, authority, approvalCommit, t0 }` (the A-stage output of
- * `resolveR4ExecutionAuthority`). Throws a stable `R4_HISTORY_*` code on any
- * anomaly; returns the per-attempt canonical view otherwise.
+ * The authority an attempt must be verified against, resolved PER ATTEMPT.
+ *
+ * Before the post-start continuation existed, every attempt was verified against
+ * the single CURRENT seal/approval, which meant a new seal retroactively
+ * invalidated historical attempts. That is exactly wrong for a cohort that
+ * already started, so the authority is now resolved per attempt:
+ *
+ *   * attempt index <= `continuation.boundHistory.attemptsUsed` is a
+ *     GRANDFATHERED pre-boundary attempt. It is verified against the HISTORICAL
+ *     authority it was actually authorized under — the continuation's
+ *     `priorSeal` (P5/S5) and `priorApproval` (A2) and the ORIGINAL A2 T0 — and
+ *     every one of its durable fingerprints must equal the bound identity in
+ *     `boundHistory.attemptIdentities`. Grandfathering is unconditional: the
+ *     boundary is a property of the continuation record, never a caller
+ *     selection, and no parameter can exclude an attempt from it.
+ *   * attempt index > boundary is authorized under the CURRENT runtime
+ *     authority (P6/S6/C1) while still carrying the SAME scientific A2 approval
+ *     identity and the SAME original T0, and must carry the continuation
+ *     fingerprint.
+ *
+ * Without a continuation the single-authority behaviour is unchanged.
  */
-export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0, approvalEpoch = null, approvalFingerprint = null } = {}) {
+function attemptAuthorityFor(index, { seal, authority, approvalCommit, t0, approvalEpoch, approvalFingerprint, continuation }) {
+  if (!continuation) return { seal, authority, approvalCommit, t0, approvalEpoch, approvalFingerprint,
+    continuationFingerprint: null, continuationGeneration: 0, grandfathered: false };
+  const boundary = continuation.record.boundHistory.attemptsUsed;
+  if (index <= boundary) {
+    const bound = continuation.record.boundHistory.attemptIdentities[index - 1];
+    if (!bound) fail('R4_HISTORY_CONTINUATION_BOUND_ATTEMPT_MISSING');
+    // The grandfathethered attempt's own recorded authority must be the historical
+    // one the continuation pinned, not the current one.
+    return {
+      seal: continuation.priorSeal,
+      authority: { protocolCommit: continuation.priorSeal.protocolCommit, protocolTree: continuation.priorSeal.protocolTree,
+        sealAuthorityCommit: continuation.record.priorSeal.sealCommit },
+      approvalCommit: continuation.record.priorApproval.approvalCommit,
+      approvalEpoch: continuation.record.priorApproval.approvalEpoch,
+      approvalFingerprint: continuation.record.priorApproval.approvalFingerprint,
+      t0: continuation.record.t0,
+      continuationFingerprint: null, continuationGeneration: 0,
+      grandfathered: true, bound,
+    };
+  }
+  return { seal, authority, approvalCommit, t0, approvalEpoch, approvalFingerprint,
+    continuationFingerprint: continuation.fingerprint, continuationGeneration: continuation.generation,
+    grandfathered: false };
+}
+
+/**
+ * Authenticate a loaded history against the INTERNALLY resolved execution
+ * authority. Throws a stable `R4_HISTORY_*` code on any anomaly; returns the
+ * per-attempt canonical view otherwise.
+ *
+ * `continuation` is the resolved stage-C continuation (`{ record, priorSeal,
+ * fingerprint, ... }`) or `null` before a continuation exists. When present,
+ * every attempt is verified against the authority it was ACTUALLY authorized
+ * under, and the bound pre-boundary history is checked fingerprint by
+ * fingerprint, so dropping, renumbering or rewriting any attempt fails closed.
+ */
+export function verifyR4AttemptHistory(history, { seal, authority, approvalCommit, t0, approvalEpoch = null, approvalFingerprint = null, continuation = null } = {}) {
   if (!history || !Array.isArray(history.authorizations)) fail('R4_HISTORY_INVALID');
   if (!seal || typeof seal.fingerprint !== 'string' || !authority || typeof authority.sealAuthorityCommit !== 'string') fail('R4_HISTORY_AUTHORITY_REQUIRED');
   if (typeof approvalCommit !== 'string' || !isStamp(t0)) fail('R4_HISTORY_AUTHORITY_REQUIRED');
@@ -201,6 +275,7 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
 
   // Authorizations ---------------------------------------------------------
   const byIndex = new Map();
+  const attemptAuthority = new Map();
   const seenHashes = new Set();
   const seenSessions = new Set();
   for (const { name, index, record } of history.authorizations) {
@@ -211,15 +286,46 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     // Index continuity is checked as records are admitted, so a missing index is
     // reported as a gap before any later per-record binding rule.
     if (index !== byIndex.size + 1) fail('R4_HISTORY_INDEX_GAP');
-    if (record.sealFingerprint !== seal.fingerprint || record.protocolCommit !== seal.protocolCommit
-      || record.protocolTree !== seal.protocolTree || record.sealAuthorityCommit !== authority.sealAuthorityCommit
-      || record.approvalCommit !== approvalCommit || record.t0 !== t0 || record.captureSpecDigest !== expectedCaptureSpec) fail('R4_HISTORY_AUTHORITY_MISMATCH');
+    // The authority this attempt is checked against is the one it was ACTUALLY
+    // authorized under: historical for a grandfathered pre-boundary attempt,
+    // current for a post-continuation attempt.
+    const perAttempt = attemptAuthorityFor(index, { seal, authority, approvalCommit, t0, approvalEpoch, approvalFingerprint, continuation });
+    attemptAuthority.set(index, perAttempt);
+    const attemptSeal = perAttempt.seal;
+    if (record.sealFingerprint !== attemptSeal.fingerprint || record.protocolCommit !== attemptSeal.protocolCommit
+      || record.protocolTree !== attemptSeal.protocolTree || record.sealAuthorityCommit !== perAttempt.authority.sealAuthorityCommit
+      || record.approvalCommit !== perAttempt.approvalCommit || record.t0 !== perAttempt.t0
+      || record.captureSpecDigest !== expectedCaptureSpec) fail('R4_HISTORY_AUTHORITY_MISMATCH');
     // Approval EPOCH binding is enforced whenever the resolved authority carries
     // one: a record authorized under a different approval epoch is refused.
-    if (approvalEpoch !== null && (record.approvalEpoch ?? null) !== approvalEpoch) fail('R4_HISTORY_AUTHORITY_MISMATCH');
+    if (perAttempt.approvalEpoch !== null && (record.approvalEpoch ?? null) !== perAttempt.approvalEpoch) fail('R4_HISTORY_AUTHORITY_MISMATCH');
     // Approval FINGERPRINT binding: a record authorized under a different approval
     // artifact — even with the same commit and epoch — is refused.
-    if (approvalFingerprint !== null && (record.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
+    if (perAttempt.approvalFingerprint !== null && (record.approvalFingerprint ?? null) !== perAttempt.approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
+    // CONTINUATION BINDING (post-C1 only). A pre-boundary historical record
+    // legitimately has no continuation fields; a post-C1 record must carry the
+    // exact continuation identity, so evidence cannot be mixed across
+    // continuation states.
+    if (!perAttempt.grandfathered && continuation) {
+      if (record.schemaVersion !== R4_ATTEMPT_AUTH_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_HISTORY_CONTINUATION_SCHEMA_REQUIRED');
+      if (record.continuationFingerprint !== continuation.fingerprint) fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+      if (record.continuation !== continuation.generation) fail('R4_HISTORY_CONTINUATION_GENERATION_MISMATCH');
+    }
+    if (perAttempt.grandfathered && continuation && (record.continuationFingerprint ?? null) !== null) {
+      fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
+    // A grandfathered attempt must match, fingerprint for fingerprint, the identity
+    // the continuation bound. This is what makes dropping, renumbering or
+    // rewriting a historical attempt fail closed.
+    if (perAttempt.grandfathered) {
+      const bound = perAttempt.bound;
+      if (record.fingerprint !== bound.authorizationFingerprint || record.sessionId !== bound.sessionId
+        || record.sealFingerprint !== bound.sealFingerprint || record.protocolCommit !== bound.protocolCommit
+        || record.protocolTree !== bound.protocolTree || record.sealAuthorityCommit !== bound.sealAuthorityCommit
+        || record.approvalCommit !== bound.approvalCommit || record.t0 !== bound.t0) {
+        fail('R4_HISTORY_GRANDFATHERED_ATTEMPT_MISMATCH');
+      }
+    }
     if (record.sessionId !== deriveSessionId({ sealFingerprint: record.sealFingerprint, approvalCommit: record.approvalCommit,
       attemptIndex: record.attemptIndex, capabilityHash: record.capabilityHash })) fail('R4_HISTORY_IDENTITY_MISMATCH');
     if (isR4Excluded(record.sessionId)) fail('R4_HISTORY_EXCLUDED_SESSION');
@@ -229,6 +335,13 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
   }
   const indexes = [...byIndex.keys()].sort((a, b) => a - b);
   indexes.forEach((index, i) => { if (index !== i + 1) fail('R4_HISTORY_INDEX_GAP'); });
+  // Every pre-boundary attempt must be PRESENT: a continuation may not drop one.
+  if (continuation) {
+    const boundary = continuation.record.boundHistory.attemptsUsed;
+    const preBoundary = indexes.filter(index => index <= boundary);
+    if (preBoundary.length !== boundary) fail('R4_HISTORY_CONTINUATION_BOUND_ATTEMPT_MISSING');
+    if (indexes.length < boundary) fail('R4_HISTORY_CONTINUATION_BOUND_ATTEMPT_MISSING');
+  }
 
   // Claims -----------------------------------------------------------------
   const claims = new Map();
@@ -241,6 +354,15 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     guard(() => assertClaimBindsAuthorization(record, authorization), 'R4_HISTORY_IDENTITY_MISMATCH');
     if (record.claimant === R4_CLAIMANTS.child && index === 1 && (record.claimedAt < t0 || record.claimedAt >= t0 + WINDOW_MS)) fail('R4_HISTORY_ATTEMPT1_OUTSIDE_START_WINDOW');
     if (record.claimedAt < authorization.authorizedAt) fail('R4_HISTORY_OUT_OF_ORDER');
+    // A post-C1 claim carries the continuation identity; a grandfathered one must not.
+    const perAttempt = attemptAuthority.get(index);
+    if (perAttempt && !perAttempt.grandfathered && continuation) {
+      if (record.schemaVersion !== R4_ATTEMPT_CLAIM_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_HISTORY_CONTINUATION_SCHEMA_REQUIRED');
+      if (record.continuationFingerprint !== continuation.fingerprint) fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
+    if (perAttempt && perAttempt.grandfathered && continuation && (record.continuationFingerprint ?? null) !== null) {
+      fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
     claims.set(index, record);
   }
 
@@ -255,6 +377,17 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     const claim = claims.get(record.attemptIndex);
     if (!claim || claim.sessionId !== sessionId || claim.fingerprint !== record.claimFingerprint) fail('R4_HISTORY_ATTESTATION_WITHOUT_CLAIM');
     if (record.authorizationFingerprint !== claim.authorizationFingerprint || record.capabilityHash !== claim.capabilityHash) fail('R4_HISTORY_IDENTITY_MISMATCH');
+    // CONTINUATION BINDING: a post-C1 attestation must carry the exact
+    // continuation identity and schema version; a grandfathered pre-boundary
+    // attestation legitimately has neither.
+    const perAttempt = attemptAuthority.get(claim.attemptIndex);
+    if (perAttempt && !perAttempt.grandfathered && continuation) {
+      if (record.schemaVersion !== R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_HISTORY_CONTINUATION_SCHEMA_REQUIRED');
+      if (record.continuationFingerprint !== continuation.fingerprint) fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
+    if (perAttempt && perAttempt.grandfathered && continuation && (record.continuationFingerprint ?? null) !== null) {
+      fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
     attestationsBySession.set(sessionId, record);
   }
 
@@ -268,6 +401,15 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     const claim = [...claims.values()].find(entry => entry.sessionId === sessionId);
     if (!claim || record.claimFingerprint !== claim.fingerprint) fail('R4_HISTORY_RECEIPT_WITHOUT_CLAIM');
     if (record.authorizationFingerprint !== claim.authorizationFingerprint || record.capabilityHash !== claim.capabilityHash) fail('R4_HISTORY_IDENTITY_MISMATCH');
+    // A post-C1 receipt carries the continuation identity; a grandfathered one must not.
+    const perAttempt = attemptAuthority.get(claim.attemptIndex);
+    if (perAttempt && !perAttempt.grandfathered && continuation) {
+      if (record.schemaVersion !== R4_SESSION_RECEIPT_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_HISTORY_CONTINUATION_SCHEMA_REQUIRED');
+      if (record.continuationFingerprint !== continuation.fingerprint) fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
+    if (perAttempt && perAttempt.grandfathered && continuation && (record.continuationFingerprint ?? null) !== null) {
+      fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
     receiptsBySession.set(sessionId, record);
   }
 
@@ -281,15 +423,46 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     if (!claim) fail('R4_HISTORY_TERMINAL_WITHOUT_CLAIM');
     if (record.claimFingerprint !== claim.fingerprint || record.authorizationFingerprint !== claim.authorizationFingerprint
       || record.capabilityHash !== claim.capabilityHash || record.sessionId !== claim.sessionId || record.claimant !== claim.claimant) fail('R4_HISTORY_IDENTITY_MISMATCH');
-    if (approvalFingerprint !== null && (record.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
+    const perAttempt = attemptAuthority.get(index);
+    if (perAttempt?.approvalFingerprint !== null && perAttempt?.approvalFingerprint !== undefined
+      && (record.approvalFingerprint ?? null) !== perAttempt.approvalFingerprint) fail('R4_HISTORY_APPROVAL_FINGERPRINT_MISMATCH');
     if (record.terminatedAt < claim.claimedAt) fail('R4_HISTORY_OUT_OF_ORDER');
+    if (perAttempt && !perAttempt.grandfathered && continuation) {
+      if (record.schemaVersion !== R4_ATTEMPT_TERMINAL_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_HISTORY_CONTINUATION_SCHEMA_REQUIRED');
+      if (record.continuationFingerprint !== continuation.fingerprint) fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
+    if (perAttempt && perAttempt.grandfathered && continuation && (record.continuationFingerprint ?? null) !== null) {
+      fail('R4_HISTORY_CONTINUATION_FINGERPRINT_MISMATCH');
+    }
     if (record.state === R4_TERMINAL_STATES.completed) {
       if (claim.claimant !== R4_CLAIMANTS.child) fail('R4_HISTORY_TERMINAL_STATE_INVALID');
       const attestation = attestationsBySession.get(claim.sessionId);
       if (!attestation || attestation.fingerprint !== record.attestationFingerprint || attestation.sessionFingerprint !== record.sessionFingerprint) fail('R4_HISTORY_TERMINAL_STATE_INVALID');
+      // The attestation is verified against the SAME authority the attempt was
+      // authorized under (historical for a grandfathered attempt).
       guard(() => verifySessionAttestation({ attestation, session: { sessionId: claim.sessionId, fingerprint: attestation.sessionFingerprint },
-        seal, authority, approvalAuthority: { approvalCommit, t0, approvalEpoch, approvalFingerprint }, authorizationRecord: byIndex.get(index).record, claimRecord: claim,
+        seal: perAttempt.seal, authority: perAttempt.authority,
+        approvalAuthority: { approvalCommit: perAttempt.approvalCommit, t0: perAttempt.t0,
+          approvalEpoch: perAttempt.approvalEpoch, approvalFingerprint: perAttempt.approvalFingerprint,
+          continuationFingerprint: perAttempt.continuationFingerprint, continuationGeneration: perAttempt.continuationGeneration },
+        authorizationRecord: byIndex.get(index).record, claimRecord: claim,
         attemptIndex: index }), 'R4_HISTORY_TERMINAL_STATE_INVALID');
+      // A grandfathered COMPLETED attempt's terminal/attestation/session
+      // fingerprints must equal the bound identity exactly.
+      if (perAttempt.grandfathered) {
+        const bound = perAttempt.bound;
+        if (record.fingerprint !== bound.terminalFingerprint
+          || record.attestationFingerprint !== bound.attestationFingerprint
+          || record.sessionFingerprint !== bound.sessionFingerprint) {
+          fail('R4_HISTORY_GRANDFATHERED_ATTEMPT_MISMATCH');
+        }
+      }
+    }
+    if (perAttempt?.grandfathered) {
+      const bound = perAttempt.bound;
+      if (record.fingerprint !== bound.terminalFingerprint || claim.fingerprint !== bound.claimFingerprint) {
+        fail('R4_HISTORY_GRANDFATHERED_ATTEMPT_MISMATCH');
+      }
     }
     terminals.set(index, record);
   }
@@ -325,10 +498,33 @@ export function verifyR4AttemptHistory(history, { seal, authority, approvalCommi
     // inert — it never contributes cohort membership or evidence.
     attempts.push(Object.freeze({ index, sessionId: authorization.sessionId, state, isTerminal: terminal !== null, cohortStatus, failureCode,
       authorization, claim, terminal, receipt,
+      // `grandfathered`: this attempt predates the continuation boundary and is
+      // therefore verified against its HISTORICAL authority, unconditionally.
+      grandfathered: attemptAuthority.get(index)?.grandfathered === true,
+      continuationFingerprint: authorization.continuationFingerprint ?? null,
       attestation: cohortStatus === 'COMPLETED' ? attestation : null,
       orphanAttestation: cohortStatus === 'COMPLETED' ? null : attestation }));
   }
+  // The pre-boundary history the continuation bound must still hold exactly. This
+  // is the immutable deterministic digest over ALL pre-boundary attempt
+  // identities, recomputed from the freshly verified history.
+  if (continuation) {
+    const boundary = continuation.record.boundHistory.attemptsUsed;
+    const preBoundary = attempts.filter(attempt => attempt.index <= boundary);
+    const identities = preBoundary.map(attemptIdentity);
+    if (attemptHistoryDigest(identities) !== continuation.record.boundHistory.historyDigest) {
+      fail('R4_HISTORY_CONTINUATION_BOUND_HISTORY_DIGEST_MISMATCH');
+    }
+    const completedPreBoundary = preBoundary.filter(attempt => attempt.cohortStatus === 'COMPLETED').length;
+    if (completedPreBoundary !== continuation.record.boundHistory.completedCount
+      || preBoundary.at(-1)?.terminal?.fingerprint !== continuation.record.boundHistory.latestTerminalFingerprint) {
+      fail('R4_HISTORY_CONTINUATION_BOUND_HISTORY_MISMATCH');
+    }
+  }
   return Object.freeze({ attempts: Object.freeze(attempts), completedCount: completed, attemptsUsed: attempts.length,
+    continuationFingerprint: continuation?.fingerprint ?? null,
+    continuationGeneration: continuation?.generation ?? 0,
+    grandfatheredAttempts: Object.freeze(attempts.filter(attempt => attempt.grandfathered).map(attempt => attempt.index)),
     authority: Object.freeze({ sealFingerprint: seal.fingerprint, sealAuthorityCommit: authority.sealAuthorityCommit, approvalCommit, approvalEpoch, approvalFingerprint, t0 }) });
 }
 
