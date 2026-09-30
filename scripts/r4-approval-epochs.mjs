@@ -363,8 +363,11 @@ function readArtifactAt(commit, file, cwd) {
  *   * its diff is limited to the epoch's approval-governance paths;
  *   * epochs are consecutive from 1, never forked and never skipped;
  *   * every renewal binds its IMMEDIATE predecessor (commit, fingerprint, T0,
- *     window end, MISSED status), a valid independent reauthorization review and
- *     zero real attempt artifacts;
+ *     window end, MISSED status) and a valid independent reauthorization review;
+ *   * zero real attempt artifacts are enforced prospectively by
+ *     `evaluateRenewalEligibility` / `assertRenewalEligible` before a renewal is
+ *     created. Chain resolution must remain valid after that renewal authorizes
+ *     legitimate cohort attempts;
  *   * every renewal is committed only AFTER the previous window fully elapsed;
  *   * a renewal's parent seal must descend from the previous approval commit.
  *
@@ -445,7 +448,11 @@ export function resolveApprovalEpochChain({
     entry.windowStatus = now >= entry.windowEnd ? R4_WINDOW_STATUS.missing : now < entry.t0 ? 'BEFORE_T0' : 'OPEN';
     chain.push(Object.freeze(entry));
   }
-  if (chain.length > 1) assertNoRealR4AttemptArtifacts({ cwd });
+  // Do NOT require the evidence root to remain empty after a renewal has been
+  // accepted. Once the latest approval authorizes the cohort, its own attempt
+  // artifacts are expected and must not invalidate the immutable Git approval
+  // chain. The zero-artifact gate is prospective and lives in renewal
+  // eligibility above; authenticated attempt history governs post-approval use.
   const latest = chain.at(-1) ?? null;
   return Object.freeze({ chain: Object.freeze(chain), latest, latestEpoch: latest?.epoch ?? 0 });
 }
