@@ -12,10 +12,11 @@
 // mismatch and HEAD mismatch fails closed, and no CLI option can select a T0 or
 // an approval epoch.
 //
-// Migration proof: the REAL historical A1 of this repository is used as the
-// epoch-1 fixture — its original T0 is recovered exactly, its window is MISSED,
-// attemptsUsed remains 0, it cannot execute now and it can be the predecessor of
-// a valid future A2. No A2 is created.
+// Historical/current-chain proof: the REAL A1 remains immutable with its exact
+// mechanical T0 and no A2 in A1's own tree; the tracked A2 is then recovered as
+// epoch 2. Runtime attempt artifacts are deliberately irrelevant to structural
+// approval-chain resolution after A2, while prospective renewal eligibility
+// remains zero-artifact-gated by the dedicated tests above.
 //
 // Read-only with respect to evidence: synthetic chains live in fresh `mkdtemp`
 // repositories that are removed again; nothing under this repository's `.evolve`
@@ -44,6 +45,7 @@ import { parseRunnerArgs } from './r4-cohort-run.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A1_SHA = '9ae21e0a976a4f7ba363e04fa370eef23fd713af';
+const A2_SHA = '9dc30de45ee0fc8c493c2582bae6378dae1fdc7b';
 const S3_SHA = 'a0be84c55aba60ee7fdbc3c5eaecc3acb64bac25';
 const A1_SEAL_FINGERPRINT = 'e788601471c4631e8752ee3611a29c6ced8b59e0d1516efa6dea1eb0def2da46';
 const A1_T0 = Date.UTC(2026, 8, 29, 6, 0, 0); // 2026-09-29T06:00:00Z
@@ -272,24 +274,39 @@ test('3: an epoch-1 renewal committed before the previous window ends is rejecte
 
 for (const [index, kind] of [[4, 'authorization'], [5, 'claim'], [6, 'session'], [7, 'outcome']]) {
   test(`${index}: an existing ${kind} artifact forbids approval renewal`, () => {
-    const state = buildEpochRepo({ artifacts: [kind] });
-    const artifacts = listRealR4AttemptArtifacts({ cwd: state.dir });
+    const fixture = syntheticAuthorityRepo({ remoteMain: 'A' });
+    CLEANUP.push(fixture.root);
+    writeArtifact(fixture.dir, kind);
+    const { latest } = resolveLatestApprovalEpoch({ cwd: fixture.dir });
+    const artifacts = listRealR4AttemptArtifacts({ cwd: fixture.dir });
     assert(artifacts.length > 0, `expected a detected ${kind} artifact`);
-    throwsCode(`${kind} artifact`, () => assertNoRealR4AttemptArtifacts({ cwd: state.dir }),
+    throwsCode(`${kind} artifact`, () => assertNoRealR4AttemptArtifacts({ cwd: fixture.dir }),
       'R4_APPROVAL_EPOCH_ATTEMPT_ARTIFACTS_PRESENT');
-    throwsCode(`${kind} artifact chain`, () => resolveApprovalEpochChain({ cwd: state.dir }),
-      'R4_APPROVAL_EPOCH_ATTEMPT_ARTIFACTS_PRESENT');
-    const eligibility = evaluateRenewalEligibility({ previousEpoch: { epoch: 1, t0: state.t0_1 },
-      now: Date.parse('2026-09-28T12:00:00Z'), cwd: state.dir });
+    const eligibility = evaluateRenewalEligibility({ previousEpoch: latest, latestEpoch: latest,
+      now: Date.parse('2026-09-28T12:00:00Z'), cwd: fixture.dir });
     assert.equal(eligibility.eligible, false);
     assert.equal(eligibility.reason, 'R4_APPROVAL_EPOCH_ATTEMPT_ARTIFACTS_PRESENT');
   });
 }
 
 test('4b: a session attestation also forbids renewal', () => {
-  const state = buildEpochRepo({ artifacts: ['attestation'] });
-  throwsCode('attestation artifact', () => resolveApprovalEpochChain({ cwd: state.dir }),
-    'R4_APPROVAL_EPOCH_ATTEMPT_ARTIFACTS_PRESENT');
+  const fixture = syntheticAuthorityRepo({ remoteMain: 'A' });
+  CLEANUP.push(fixture.root);
+  writeArtifact(fixture.dir, 'attestation');
+  const { latest } = resolveLatestApprovalEpoch({ cwd: fixture.dir });
+  const eligibility = evaluateRenewalEligibility({ previousEpoch: latest, latestEpoch: latest,
+    now: Date.parse('2026-09-28T12:00:00Z'), cwd: fixture.dir });
+  assert.equal(eligibility.eligible, false);
+  assert.equal(eligibility.reason, 'R4_APPROVAL_EPOCH_ATTEMPT_ARTIFACTS_PRESENT');
+});
+
+test('7b: legitimate post-A2 attempt artifacts do not invalidate the immutable approval chain', () => {
+  const state = buildEpochRepo({});
+  writeArtifact(state.dir, 'authorization');
+  const { chain, latest } = resolveApprovalEpochChain({ cwd: state.dir, verifySealBinding: true });
+  assert.equal(chain.length, 2);
+  assert.equal(latest.epoch, 2);
+  assert.equal(latest.commit, state.a2);
 });
 
 /* ===================== 8-13: renewal chain binding rules ===================== */
@@ -599,42 +616,40 @@ test('a valid resealed renewal authorizes execution with its own epoch and T0', 
   assert.equal(renewalReviewPathForEpoch(2), `${R4_APPROVAL_EPOCHS_DIR}/approval-0002.review.json`);
 });
 
-/* ===================== 10 (migration): the REAL historical A1 ===================== */
+/* ===================== 10 (migration): real A1 -> tracked A2 ===================== */
 
-test('migration: the real A1 is recovered as epoch 1 with its exact T0, MISSED, zero attempts, no A2', () => {
+test('migration: historical A1 remains immutable with its exact T0 and contains no A2', () => {
   assert.equal(gitText(REPO, ['rev-parse', `${A1_SHA}^{commit}`]), A1_SHA);
+  assert.equal(REAL_A1_APPROVAL.sealCommit, S3_SHA);
+  assert.equal(REAL_A1_APPROVAL.sealFingerprint, A1_SEAL_FINGERPRINT);
+  const a1CommittedAt = Number(gitText(REPO, ['show', '-s', '--format=%ct', A1_SHA])) * 1000;
+  assert.equal(approvalT0(a1CommittedAt), A1_T0,
+    'A1 T0 must remain exactly 2026-09-29T06:00:00Z');
+  const a2AtA1 = spawnSync('git', ['cat-file', '-e',
+    `${A1_SHA}:${approvalPathForEpoch(2)}`], { cwd: REPO, encoding: 'utf8' });
+  assert.notEqual(a2AtA1.status, 0, 'A1 tree must not contain a future A2');
+});
+
+test('migration: the tracked real chain resolves A1 -> A2 even after cohort artifacts may exist', () => {
   const { chain, latest } = resolveApprovalEpochChain({ cwd: REPO, verifySealBinding: true });
-  assert.equal(chain.length, 1, 'A1 must be the only approval epoch');
-  assert.equal(latest.epoch, 1);
-  assert.equal(latest.commit, A1_SHA);
-  assert.equal(latest.sealCommit, S3_SHA);
-  assert.equal(latest.record.sealFingerprint, A1_SEAL_FINGERPRINT);
-  assert.equal(latest.t0, A1_T0, 'A1 T0 must be recovered exactly as 2026-09-29T06:00:00Z');
-  assert.equal(latest.t0Iso, '2026-09-29T06:00:00.000Z');
-  assert.equal(latest.windowEnd, A1_T0 + R4_ATTEMPT1_WINDOW_MS);
-  assert.equal(latest.windowStatus, 'MISSED');
-  assert.equal(!existsSync(path.join(REPO, R4_APPROVAL_EPOCHS_DIR)), true, 'no approval epoch directory exists yet');
-  assert.equal(existsSync(path.join(REPO, R4_APPROVAL_EPOCHS_DIR, 'approval-0002.json')), false, 'no A2 exists');
+  assert.equal(chain.length, 2);
+  assert.equal(chain[0].epoch, 1);
+  assert.equal(chain[0].commit, A1_SHA);
+  assert.equal(chain[0].t0, A1_T0);
+  assert.equal(latest.epoch, 2);
+  assert.equal(latest.commit, A2_SHA);
+  assert.equal(latest.record.previousApprovalCommit, A1_SHA);
+  assert.equal(latest.record.realAttemptsUsed, 0);
+  assert.equal(latest.record.realSessionsCreated, 0);
+  assert.equal(latest.record.realOutcomesCreated, 0);
 });
 
-test('migration: attemptsUsed is 0 and no real R4 attempt artifact exists', () => {
-  assert.deepEqual(listRealR4AttemptArtifacts({ cwd: REPO }), []);
-  assert.equal(assertNoRealR4AttemptArtifacts({ cwd: REPO }).ok, true);
-});
-
-test('migration: A1 cannot execute now', () => {
-  const code = codeOf(() => resolveR4ExecutionAuthority({ cwd: REPO, requireApproval: true }));
-  assert(code !== null, 'A1 must not authorize execution');
-  assert(/^R4_APPROVAL_EPOCH_NOT_CURRENT_SEAL|^R4_AUTHORITY_SEAL_SUPERSEDED|^R4_APPROVAL_SEAL_MISMATCH/.test(code),
-    `expected a fail-closed approval rejection, got ${code}`);
-});
-
-test('migration: A1 can be the predecessor of a valid future renewal (eligibility only)', () => {
-  const { latest } = resolveLatestApprovalEpoch({ cwd: REPO });
-  const eligibility = evaluateRenewalEligibility({ previousEpoch: latest, latestEpoch: latest, cwd: REPO });
-  assert.equal(eligibility.eligible, true, eligibility.reason ?? 'expected renewal eligibility');
-  assert.equal(eligibility.previousWindowStatus, 'MISSED');
-  assert.equal(eligibility.requiredNewIndependentReview, true);
+test('migration: A1 is permanently superseded by tracked epoch 2', () => {
+  const { chain, latest } = resolveLatestApprovalEpoch({ cwd: REPO });
+  assert.equal(chain.length, 2);
+  assert.equal(latest.epoch, 2);
+  assert.equal(latest.commit, A2_SHA);
+  assert.notEqual(latest.commit, A1_SHA);
 });
 
 /* ===================== report ===================== */
