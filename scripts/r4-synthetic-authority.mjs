@@ -212,6 +212,9 @@ export function syntheticChildSpawn({ behaviour = 'complete', now, sessionStartA
     writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint, capabilityHash: sealed.capabilityHash,
       claimFingerprint: sealed.claimFingerprint, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
       approvalFingerprint: sealed.approvalFingerprint ?? null,
+      continuation: sealed.continuationFingerprint === undefined ? null : {
+        generation: sealed.continuation, fingerprint: sealed.continuationFingerprint, commit: sealed.continuationCommit,
+      },
       revisitCoverage: { scheduled: 1, completed: 1, failed: 0, pending: 0 } }), { cwd: options.cwd });
     return { status: 0 };
   };

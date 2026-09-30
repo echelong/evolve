@@ -43,6 +43,8 @@ import {
 } from './r4-capability.mjs';
 
 export const R4_ATTESTATION_RECORD_TYPE = 'r4_cohort_session_attestation';
+/** schemaVersion 2 = post-C1; it MUST carry the continuation identity. */
+export const R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION = 2;
 export { R4_SESSION_ROLE, R4_CAPABILITY_FD, R4_ATTESTATION_DIR };
 export const R4_AUTHORIZATION_CHAIN = 'P_S_A';
 
@@ -84,15 +86,32 @@ export function createSessionAttestation({ seal, authority, approvalAuthority, p
   if ((proof.approvalFingerprint ?? null) !== approvalFingerprint) fail('R4_ATTESTATION_APPROVAL_FINGERPRINT_MISMATCH');
   if (proof.t0 !== approvalAuthority.t0) fail('R4_ATTESTATION_T0_MISMATCH');
   if (proof.captureSpecDigest !== captureSpecDigest()) fail('R4_ATTESTATION_CAPTURE_SPEC_MISMATCH');
+  // POST-START CONTINUATION binding, taken from the resolved stage-C authority
+  // and required to match the capability proof's own record exactly.
+  const continuationFingerprint = approvalAuthority.continuationFingerprint ?? null;
+  const continuationGeneration = approvalAuthority.continuationGeneration ?? 0;
+  if (continuationFingerprint !== null) {
+    if (!/^[0-9a-f]{64}$/.test(continuationFingerprint)) fail('R4_ATTESTATION_CONTINUATION_FINGERPRINT_INVALID');
+    if (continuationGeneration < 1) fail('R4_ATTESTATION_CONTINUATION_GENERATION_INVALID');
+    if ((proof.continuationFingerprint ?? null) !== continuationFingerprint) fail('R4_ATTESTATION_CONTINUATION_FINGERPRINT_MISMATCH');
+    if ((proof.continuation ?? null) !== continuationGeneration) fail('R4_ATTESTATION_CONTINUATION_GENERATION_MISMATCH');
+  } else if ((proof.continuationFingerprint ?? null) !== null) {
+    fail('R4_ATTESTATION_CONTINUATION_FINGERPRINT_MISMATCH');
+  }
   const attemptIndex = proof.attemptIndex;
   assertAttemptIndex(attemptIndex);
   const sessionId = proof.sessionId;
   if (typeof sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(sessionId)) fail('R4_ATTESTATION_SESSION_ID_INVALID');
   if (isR4Excluded(sessionId)) fail('R4_EXCLUDED_SESSION');
   const content = {
-    schemaVersion: 1, recordType: R4_ATTESTATION_RECORD_TYPE, role: R4_SESSION_ROLE, status: 'OPEN',
+    schemaVersion: continuationFingerprint === null ? 1 : R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION,
+    recordType: R4_ATTESTATION_RECORD_TYPE, role: R4_SESSION_ROLE, status: 'OPEN',
     authorizationChain: R4_AUTHORIZATION_CHAIN, approvalCommit: approvalAuthority.approvalCommit,
     approvalEpoch, approvalFingerprint,
+    // POST-START CONTINUATION binding. Absent for a grandfathered pre-C1
+    // attestation; present and exact for a post-C1 one. The scientific A2
+    // approval identity and the ORIGINAL T0 above are unchanged either way.
+    ...(continuationFingerprint === null ? {} : { continuation: continuationGeneration, continuationFingerprint }),
     authorizationFingerprint: proof.authorizationFingerprint, capabilityHash: proof.capabilityHash,
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
     authorityCommit: authority.sealAuthorityCommit, specDigest: seal.specDigest, captureSpecDigest: seal.captureSpecDigest,
@@ -152,7 +171,8 @@ export function finalizeSessionAttestation(attestation, { sessionFingerprint, re
  * approval anchor and an authenticated session. Throws a fixed code on mismatch.
  */
 export function verifySessionAttestation({ attestation, session, seal, authority, approvalAuthority = null, authorizationRecord = null, claimRecord = null, attemptIndex = null }) {
-  if (!attestation || typeof attestation !== 'object' || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE || attestation.schemaVersion !== 1) fail('R4_ATTESTATION_INVALID');
+  if (!attestation || typeof attestation !== 'object' || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE) fail('R4_ATTESTATION_INVALID');
+  if (attestation.schemaVersion !== 1 && attestation.schemaVersion !== R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_ATTESTATION_INVALID');
   const { fingerprint, ...content } = attestation;
   if (attestationFingerprint(content) !== fingerprint) fail('R4_ATTESTATION_FINGERPRINT_MISMATCH');
   if (attestation.status !== 'FINALIZED') fail('R4_ATTESTATION_NOT_FINALIZED');
@@ -190,6 +210,17 @@ export function verifySessionAttestation({ attestation, session, seal, authority
     && (attestation.approvalEpoch ?? null) !== approvalAuthority.approvalEpoch) fail('R4_ATTESTATION_APPROVAL_EPOCH_MISMATCH');
   if (approvalAuthority && (attestation.approvalFingerprint ?? null) !== (approvalAuthority.approvalFingerprint ?? null)) {
     fail('R4_ATTESTATION_APPROVAL_FINGERPRINT_MISMATCH');
+  }
+  // POST-START CONTINUATION binding. When the expected authority carries a
+  // continuation, the attestation must carry exactly that identity; when it does
+  // not, the attestation must not claim one.
+  const expectedContinuation = approvalAuthority?.continuationFingerprint ?? null;
+  if (expectedContinuation !== null) {
+    if (attestation.schemaVersion !== R4_ATTESTATION_SCHEMA_VERSION_POST_CONTINUATION) fail('R4_ATTESTATION_CONTINUATION_SCHEMA_REQUIRED');
+    if ((attestation.continuationFingerprint ?? null) !== expectedContinuation) fail('R4_ATTESTATION_CONTINUATION_FINGERPRINT_MISMATCH');
+    if ((attestation.continuation ?? null) !== (approvalAuthority.continuationGeneration ?? 0)) fail('R4_ATTESTATION_CONTINUATION_GENERATION_MISMATCH');
+  } else if ((attestation.continuationFingerprint ?? null) !== null) {
+    fail('R4_ATTESTATION_CONTINUATION_FINGERPRINT_MISMATCH');
   }
   if (authorizationRecord) {
     const authorizationEpoch = authorizationRecord.approvalEpoch ?? null;

@@ -153,6 +153,9 @@ export async function main(args = process.argv.slice(2)) {
       writeSessionReceipt(createSessionReceipt({ authorizationFingerprint: sealed.authorizationFingerprint,
         capabilityHash: sealed.capabilityHash, claimFingerprint: sealed.claimFingerprint, sessionId: manifest.sessionId, sessionFingerprint: manifest.fingerprint,
         approvalFingerprint: sealed.approvalFingerprint ?? null,
+        continuation: sealed.continuationFingerprint === undefined ? null : {
+          generation: sealed.continuation, fingerprint: sealed.continuationFingerprint, commit: sealed.continuationCommit,
+        },
         revisitCoverage: revisits ? { scheduled: revisits.status().scheduled, completed: revisits.status().completed, failed: revisits.status().failed, pending: revisits.status().pending } : null }), { cwd: process.cwd() });
     }
     console.log(`\n${recorder.dir}\nfingerprint ${manifest.fingerprint}`);
