@@ -78,7 +78,10 @@ check('the canonical tracked seal verifies against the external Git authority ch
 
 check('the historical .evolve seal is retained unchanged and is NOT canonical authority', () => {
   const historicalDir = path.resolve(REPO, R4_SEAL_DIR);
-  assert(existsSync(historicalDir), 'the historical governance directory must exist');
+  if (!existsSync(historicalDir)) {
+    console.log('      (historical Git-ignored governance directory absent in this isolated worktree)');
+    return;
+  }
   const files = readdirSync(historicalDir).filter(name => /^r4-preregistration-seal-.*\.json$/.test(name)).sort();
   if (!files.length) return;
   const historical = JSON.parse(readFileSync(path.join(historicalDir, files.at(-1)), 'utf8'));
@@ -163,7 +166,7 @@ tamper('seal record type', s => { s.recordType = 'other_seal'; }, 'R4_SEAL_INVAL
 // Round-2 runtime modules that must be bound: altering any of them is a seal
 // failure. (environment loader, attestation, capability verifier, canonical
 // orchestrator, approval schema/validator.)
-for (const moduleFile of ['scripts/lib/env.mjs', 'scripts/r4-attestation.mjs', 'scripts/r4-capability.mjs', 'scripts/r4-canonical-analysis.mjs', 'scripts/r4-approval.mjs', 'scripts/r4-authority.mjs', 'scripts/r4-cohort-run.mjs']) {
+for (const moduleFile of ['scripts/lib/env.mjs', 'scripts/r4-attestation.mjs', 'scripts/r4-capability.mjs', 'scripts/r4-canonical-analysis.mjs', 'scripts/r4-approval.mjs', 'scripts/r4-authority.mjs', 'scripts/r4-cohort-run.mjs', 'scripts/r4-continuation.mjs', 'scripts/r4-continuation-binding.mjs']) {
   tamper(`altered ${moduleFile}`, () => {}, 'R4_SEAL_FILE_DIGEST_MISMATCH', { refingerprintAfter: false,
     loadOverride: file => (file === moduleFile ? Buffer.from('altered runtime module') : load(file)) });
 }
@@ -171,6 +174,17 @@ for (const moduleFile of ['scripts/lib/env.mjs', 'scripts/r4-attestation.mjs', '
 /* ------------------------------------------- external authority tamper gate */
 
 function authorityTamper(name, mutate, expected) {
+  // Before the new protocol commit P exists, newly bound files legitimately
+  // exist only in the working tree and cannot yet be verified against HEAD.
+  // The external Git tamper gate runs in full immediately after P is committed.
+  // This SKIP is a pre-P DEVELOPMENT state only: once the tree is clean it MUST
+  // execute, and the summary below fails the run if a clean tree ever skipped.
+  if (!treeIsClean(REPO)) {
+    SKIPPED_AUTHORITY_TAMPERS.push(name);
+    console.log('SKIP authority tamper ' + name + ' (pre-P dirty-tree dry run; NOT valid evidence)');
+    return;
+  }
+  EXECUTED_AUTHORITY_TAMPERS.push(name);
   const seal = clone(baseSeal);
   mutate(seal);
   refingerprint(seal);
@@ -178,6 +192,8 @@ function authorityTamper(name, mutate, expected) {
     error => String(error.message).startsWith(expected), `${name} must be rejected with ${expected}`);
   console.log(`PASS authority tamper ${name} -> ${expected}`);
 }
+const SKIPPED_AUTHORITY_TAMPERS = [];
+const EXECUTED_AUTHORITY_TAMPERS = [];
 authorityTamper('changed protocol SHA', s => { s.protocolCommit = 'b'.repeat(40); }, 'R4_AUTHORITY_PROTOCOL_COMMIT_MISSING');
 authorityTamper('changed protocol tree', s => { s.protocolTree = 'b'.repeat(40); }, 'R4_AUTHORITY_PROTOCOL_TREE_MISMATCH');
 authorityTamper('changed bound file digest record', s => { s.boundFiles['scripts/r4-cohort-plan.mjs'].sha256 = '0'.repeat(64); }, 'R4_AUTHORITY_BOUND_FILE_MISMATCH');
@@ -188,6 +204,65 @@ check('authority contract accepts the unaltered scratch seal when the tree match
   const result = verifyR4SealAuthority(baseSeal, { cwd: REPO, requireSealCommit: false, requireHead: false });
   assert.equal(result.ok, true);
   assert.equal(result.protocolCommit, baseSeal.protocolCommit);
+});
+
+/* ------------------------- Git-backed HISTORICAL seal coverage (no .evolve) ---
+ *
+ * The independent review flagged that the historical-seal check above silently
+ * passes when the Git-ignored `.evolve` directory is absent, and that the external
+ * authority tamper tests skip on a dirty tree. Neither may be relied on as proof
+ * for this transition, so the historical-seal contract is additionally covered
+ * entirely from GIT TRACKED history: the real S5 seal is authenticated against the
+ * real P5 tree it sealed, from whatever worktree the validator happens to run in,
+ * with no dependency on any ignored file.
+ * --------------------------------------------------------------------------- */
+import { verifyHistoricalSealArtifact, readHistoricalSealArtifact } from './r4-continuation.mjs';
+import { gitShowFile } from './r4-authority.mjs';
+
+const REAL_S5 = 'e54488305d742624106e20e808b65c2c4fe94a15';
+const REAL_P5 = 'b6aa11554022d309a8b8566d96e824f72dcacae3';
+const REAL_S5_FINGERPRINT = '9bf7ee3be2821116bcd2596c06c3e2e75f06f3c0de68a7e85f656d33b0cb5269';
+const gitSealAt = (commit, file = R4_TRACKED_SEAL_PATH) => {
+  const bytes = gitShowFile(commit, file, REPO);
+  return bytes === null ? null : JSON.parse(bytes.toString('utf8'));
+};
+
+check('the real historical S5 seal authenticates from Git against the P5 tree it sealed', () => {
+  const s5 = gitSealAt(REAL_S5);
+  assert(s5, 'the real historical S5 seal must be readable from Git');
+  assert.equal(s5.fingerprint, REAL_S5_FINGERPRINT);
+  assert.equal(s5.protocolCommit, REAL_P5);
+  const proof = verifyHistoricalSealArtifact(s5, { cwd: REPO, sealPath: R4_TRACKED_SEAL_PATH,
+    expected: { sealCommit: REAL_S5, sealFingerprint: REAL_S5_FINGERPRINT,
+      protocolCommit: REAL_P5, protocolTree: s5.protocolTree } });
+  assert.equal(proof.ok, true);
+  assert.equal(proof.sealAuthorityCommit, REAL_S5, 'Git must discover S5 as its own seal authority commit');
+  assert.equal(proof.boundFileCount, Object.keys(s5.boundFiles).length);
+  console.log(`      historical S5 verified: ${proof.boundFileCount} bound files at P5 ${REAL_P5.slice(0, 8)}`);
+});
+
+check('the historical seal is a strict ancestor of the current runtime and shares the frozen science', () => {
+  const s5 = gitSealAt(REAL_S5);
+  // The frozen scientific identity is identical across the repair; only enforcement changed.
+  assert.equal(s5.specDigest, R4_SPEC_DIGEST, 'the historical seal must carry the unchanged spec digest');
+  assert.equal(s5.captureSpecDigest, captureSpecDigest(), 'the historical capture-spec digest must be unchanged');
+  assert.equal(canonical(s5.spec), canonical(R4_SPEC));
+  // The historical seal genuinely predates and is superseded by the current runtime.
+  const artifact = readHistoricalSealArtifact({ cwd: REPO, sealPath: R4_TRACKED_SEAL_PATH,
+    record: { priorSeal: { sealCommit: REAL_S5, sealFingerprint: REAL_S5_FINGERPRINT,
+      protocolCommit: REAL_P5, protocolTree: s5.protocolTree } } });
+  assert.equal(artifact.fingerprint, REAL_S5_FINGERPRINT);
+});
+
+check('a clean tree never skips the external Git authority tamper tests', () => {
+  // A SKIP is legitimate ONLY pre-P (dirty tree). If the tree is clean the gate must
+  // have executed in full, so a clean-tree run cannot silently pass on skips.
+  if (!treeIsClean(REPO)) return;
+  assert.equal(SKIPPED_AUTHORITY_TAMPERS.length, 0,
+    'a clean tree must execute every authority tamper test, skipped: ' + SKIPPED_AUTHORITY_TAMPERS.join(', '));
+  assert.equal(EXECUTED_AUTHORITY_TAMPERS.length, 3,
+    'all three external authority tamper tests must execute on a clean tree');
+  console.log(`      external authority tamper tests executed: ${EXECUTED_AUTHORITY_TAMPERS.length}/3`);
 });
 
 /* ------------------------------- failed-vs-pending and reference boundary ---- */

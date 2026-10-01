@@ -37,7 +37,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
-  R4_REPO_ROOT, R4_TRACKED_SEAL_PATH, gitParents, gitShowFile, gitCommitterTimestamp, gitHead,
+  R4_REPO_ROOT, R4_TRACKED_SEAL_PATH, gitParents, gitShowFile, gitCommitterTimestamp, gitHead, gitCommitterIso,
   gitCommitExists, loadCanonicalTrackedSeal, assertWorktreeIntegrity, assertSealCommitShape,
   assertLiveRemoteMainEquals, isCanonicalSealSuperseded,
 } from './r4-authority.mjs';
@@ -47,6 +47,9 @@ import {
   resolveApprovalEpochChain, approvalGovernancePathsForEpoch, assertRenewalApprovalRecord,
   R4_APPROVAL_EPOCH_SCHEMA_VERSION, R4_LEGACY_APPROVAL_PATH,
 } from './r4-approval-epochs.mjs';
+import {
+  resolveContinuationChain, assertContinuationGitContract, R4_CONTINUATION_INELIGIBLE,
+} from './r4-continuation.mjs';
 
 export const R4_APPROVAL_RECORD_TYPE = 'r4_precapture_approval';
 export const R4_APPROVAL_PATH = 'governance/r4/r4-precapture-approval.json';
@@ -230,6 +233,64 @@ export function readApprovalArtifact({ cwd = R4_REPO_ROOT, ref = null, approvalP
  * discovery precedes the remote check at the A stage only because the expected
  * live SHA *is* A.
  */
+/**
+ * Resolve the POST-START CONTINUATION authority (stage C).
+ *
+ * After the enforcement repair supersedes the historical seal, A2 can no longer
+ * be the current RUNTIME authority: the canonical tracked seal is now S6 (bound
+ * to P6), so the old A stage would refuse with
+ * `R4_APPROVAL_EPOCH_NOT_CURRENT_SEAL` and normal execution would be impossible.
+ * C1 is the third, separate authority that carries the existing cohort across
+ * that repair:
+ *
+ *   * current RUNTIME authority = P6 / S6 / C1, with LIVE remote main == C1 and
+ *     HEAD == C1 EXACTLY;
+ *   * SCIENTIFIC approval identity stays A2 (commit, epoch, fingerprint) — C1
+ *     is not approval epoch A3 and creates no new approval;
+ *   * SCIENTIFIC T0 stays the A2 T0 verbatim. C1 derives NO new T0, so there is
+ *     no new schedule and no hand-picked start;
+ *   * C1 resolves ITSELF from Git: it accepts no caller-supplied continuation
+ *     commit, fingerprint or generation.
+ *
+ * Returns `null` when no continuation exists, in which case the A-stage
+ * behaviour below is byte-for-byte unchanged.
+ */
+function resolveContinuationAuthority({ cwd, seal, authority, sealPath, chain }) {
+  const { latest: continuation, chain: continuationChain } = resolveContinuationChain({ cwd, sealPath, seal, authority });
+  if (!continuation) return null;
+  // The scientific approval identity is the PRIOR approval C1 bound, which must
+  // still be an epoch of the immutable approval chain with the same commit AND
+  // fingerprint. A continuation can never introduce a new approval.
+  const scientific = chain.find(entry => entry.epoch === continuation.record.priorApproval.approvalEpoch);
+  if (!scientific) fail('R4_CONTINUATION_PRIOR_APPROVAL_NOT_IN_EPOCH_CHAIN');
+  if (scientific.commit !== continuation.record.priorApproval.approvalCommit
+    || scientific.fingerprint !== continuation.record.priorApproval.approvalFingerprint) {
+    fail('R4_CONTINUATION_PRIOR_APPROVAL_IDENTITY_MISMATCH');
+  }
+  // NO T0 REANCHOR: the scientific T0 remains the A2 epoch's own mechanical T0,
+  // recomputed here from the A2 commit timestamp, and it must equal what C1 bound.
+  const t0 = approvalT0(scientific.committerTimestamp);
+  if (continuation.record.t0 !== t0) fail(R4_CONTINUATION_INELIGIBLE.t0Reanchor);
+  if (scientific.t0 !== t0) fail('R4_APPROVAL_EPOCH_T0_MISMATCH');
+  const contract = assertContinuationGitContract({ commit: continuation.commit, cwd });
+  assertWorktreeIntegrity({ cwd, requiredCommit: continuation.commit, sealPath });
+  return Object.freeze({
+    stage: 'C', seal, authority, approval: scientific.record, approvalCommit: scientific.commit,
+    approvalEpoch: scientific.epoch, approvalFingerprint: scientific.fingerprint, approvalChain: chain,
+    approvalCommitterTimestamp: scientific.committerTimestamp, approvalCommitterIso: gitCommitterIso(scientific.commit, cwd),
+    t0, t0Iso: new Date(t0).toISOString(), remoteSha: contract.remoteSha,
+    continuation: continuation.record, continuationFingerprint: continuation.fingerprint,
+    continuationGeneration: continuation.generation, continuationCommit: continuation.commit,
+    continuationChain, continuationReviewFingerprint: continuation.reviewFingerprint,
+    continuationParentSealCommit: continuation.parentCommit,
+    continuationContext: Object.freeze({
+      record: continuation.record, priorSeal: continuation.priorSeal,
+      fingerprint: continuation.fingerprint, generation: continuation.generation,
+      commit: continuation.commit,
+    }),
+  });
+}
+
 export function resolveR4ExecutionAuthority({
   cwd = R4_REPO_ROOT, sealPath = R4_TRACKED_SEAL_PATH, approvalPath = R4_APPROVAL_PATH, requireApproval = true,
 } = {}) {
@@ -240,7 +301,8 @@ export function resolveR4ExecutionAuthority({
     const remote = assertLiveRemoteMainEquals(authority.sealAuthorityCommit, { cwd, what: 'SEAL_COMMIT_S' });
     assertWorktreeIntegrity({ cwd, requiredCommit: authority.sealAuthorityCommit, sealPath });
     return { stage: 'S', seal, authority, approval: null, approvalCommit: null, approvalCommitterTimestamp: null, t0: null, t0Iso: null,
-      remoteSha: remote.remoteSha };
+      remoteSha: remote.remoteSha, continuation: null, continuationFingerprint: null,
+      continuationGeneration: 0, continuationCommit: null, continuationContext: null };
   }
   const approval = readApprovalArtifact({ cwd, approvalPath });
   if (!approval) fail('R4_APPROVAL_MISSING');
@@ -252,6 +314,12 @@ export function resolveR4ExecutionAuthority({
   // / remote / HEAD error codes are unchanged.
   const { latest, chain } = resolveApprovalEpochChain({ cwd, sealPath, legacyApprovalPath: approvalPath, verifySealBinding: false });
   if (!latest) fail('R4_APPROVAL_MISSING');
+  // POST-START CONTINUATION (stage C). When a continuation exists it supersedes
+  // the A stage as the RUNTIME authority, because the repair necessarily
+  // superseded the seal A2 was bound to. The scientific identity (A2) and the
+  // scientific T0 are carried through unchanged.
+  const continuation = resolveContinuationAuthority({ cwd, seal, authority, sealPath, chain });
+  if (continuation) return continuation;
   if (latest.sealCommit !== authority.sealAuthorityCommit) fail('R4_APPROVAL_EPOCH_NOT_CURRENT_SEAL');
   verifyApprovalBinding({ approval: latest.record, seal, authority });
   // The approval epoch resolver already proved that the latest approval commit's
@@ -268,7 +336,9 @@ export function resolveR4ExecutionAuthority({
   return Object.freeze({ stage: 'A', seal, authority, approval: latest.record, approvalCommit: contract.approvalCommit,
     approvalEpoch: latest.epoch, approvalFingerprint: latest.fingerprint, approvalChain: chain,
     approvalCommitterTimestamp: contract.approvalCommitterTimestamp, approvalCommitterIso: contract.committerIso,
-    t0, t0Iso: new Date(t0).toISOString(), remoteSha: contract.remoteSha });
+    t0, t0Iso: new Date(t0).toISOString(), remoteSha: contract.remoteSha,
+    continuation: null, continuationFingerprint: null, continuationGeneration: 0, continuationCommit: null,
+    continuationContext: null });
 }
 
 export { gitCommitExists };

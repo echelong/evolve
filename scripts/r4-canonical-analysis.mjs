@@ -40,7 +40,7 @@ import { R4_AUTHORIZATION_CHAIN } from './r4-attestation.mjs';
 import { R4_SPEC } from './r4-protocol-spec.mjs';
 import { R4_REPO_ROOT } from './r4-authority.mjs';
 import { resolveR4ExecutionAuthority } from './r4-approval.mjs';
-import { loadR4AttemptHistory, verifyR4AttemptHistory, historyToCohortAttempts, historyAttestations } from './r4-attempt-history.mjs';
+import { loadR4AttemptHistory, verifyR4AttemptHistory, historyToCohortAttempts, historyAttestations, historyAttemptAuthorityIndex } from './r4-attempt-history.mjs';
 
 export { R4_ANALYSIS_RECORD_TYPE, R4_AUTHORIZATION_CHAIN };
 
@@ -71,30 +71,48 @@ export function runCanonicalR4Analysis(options = {}) {
 
   // 1. authority chain, resolved and verified HERE from Git -------------------
   const resolution = resolveR4ExecutionAuthority({ cwd: repoRoot, requireApproval: true });
-  if (resolution.stage !== 'A') fail('R4_CANONICAL_ANALYSIS_REQUIRES_APPROVAL_AUTHORITY');
+  // STAGE C (post-start continuation). After an enforcement-only reseal the A2
+  // approval can no longer be the RUNTIME authority — the canonical tracked seal
+  // is now S6 — so the current RUNTIME authority is resolved at stage C. The
+  // SCIENTIFIC approval identity is unchanged: `resolveContinuationAuthority`
+  // carries A2's commit, epoch, fingerprint and T0 verbatim, and C1 is not
+  // approval epoch A3. Only stages A and C are accepted; S (pre-approval) and any
+  // unknown stage are refused exactly as before.
+  if (resolution.stage !== 'A' && resolution.stage !== 'C') fail('R4_CANONICAL_ANALYSIS_REQUIRES_APPROVAL_AUTHORITY');
   const { seal, authority } = resolution;
+  // The continuation context is resolved from Git, never supplied by the caller
+  // (see `R4_CANONICAL_ANALYSIS_FORBIDDEN_INPUTS`).
+  const continuation = resolution.continuationContext ?? null;
   // MISSED ATTEMPT-1 WINDOW GOVERNANCE AMENDMENT: the resolved approval EPOCH is
   // carried with the authority so every downstream binding (plan, attestation,
   // outcome-run binding and this result's identity) binds the actual epoch under
   // which attempt 1 began. A later approval epoch can therefore never rewrite
-  // which approval governed an existing capture.
+  // which approval governed an existing capture. The same holds across a
+  // continuation: the approval identity stays A2.
   const approvalAuthority = Object.freeze({ approvalCommit: resolution.approvalCommit,
     approvalEpoch: resolution.approvalEpoch ?? null, approvalFingerprint: resolution.approvalFingerprint ?? null,
     t0: resolution.t0 });
 
   // 2. authenticated attempt history -> canonical cohort membership ----------
+  // At stage C the resolved continuation context is passed through, so a
+  // grandfathered pre-boundary attempt is verified against its HISTORICAL S5/A2
+  // authority while post-boundary attempts are verified against current S6/C1.
+  // No attempt is collapsed onto a single authority.
   const verifiedHistory = verifyR4AttemptHistory(loadR4AttemptHistory({ cwd: evidenceRoot }), {
     seal, authority, approvalCommit: approvalAuthority.approvalCommit, approvalEpoch: approvalAuthority.approvalEpoch,
-    approvalFingerprint: approvalAuthority.approvalFingerprint, t0: approvalAuthority.t0 });
+    approvalFingerprint: approvalAuthority.approvalFingerprint, t0: approvalAuthority.t0, continuation });
   const plan = planSealedCohort({ seal, approvalAuthority });
   const attempts = historyToCohortAttempts(verifiedHistory);
   const attestations = historyAttestations(verifiedHistory);
-  const { canonicalMembership } = deriveCanonicalCohortMembership({ plan, attempts, seal, authority, attestations, approvalAuthority });
+  // The per-session authority index, derived from authenticated history only.
+  const attemptAuthorities = historyAttemptAuthorityIndex(verifiedHistory);
+  const { canonicalMembership } = deriveCanonicalCohortMembership({ plan, attempts, seal, authority, attestations, approvalAuthority, continuation });
   if (canonicalMembership.length === 0) fail('R4_CANONICAL_MEMBERSHIP_EMPTY');
 
   // 3 + 4. reload authenticated evidence, build canonical references --------
   const canonicalSet = buildCanonicalReferenceSetFromEvidence({
     seal, authority, approvalAuthority, canonicalMembership, attestations, sessionRoot: R4_SESSION_DIR_ROOT, cwd: evidenceRoot,
+    attemptAuthorities, continuation,
   });
   if (references !== null) verifyCanonicalReferenceSet({ references, canonicalReferences: canonicalSet.references });
 
@@ -116,7 +134,8 @@ export function runCanonicalR4Analysis(options = {}) {
 
   // 7. certified exposures from authenticated evidence ----------------------
   const exposure = certifyExposureRowsFromEvidence({ seal, authority, approvalAuthority, canonicalMembership,
-    references: canonicalSet.references, attestations, sessionRoot: R4_SESSION_DIR_ROOT, cwd: evidenceRoot });
+    references: canonicalSet.references, attestations, sessionRoot: R4_SESSION_DIR_ROOT, cwd: evidenceRoot,
+    attemptAuthorities, continuation });
 
   // 8. locked primary analysis ---------------------------------------------
   const analysis = runRealR4PrimaryAnalysis({ exposureRows: exposure.rows, outcomes: resolvedOutcomes, seal });
@@ -125,6 +144,17 @@ export function runCanonicalR4Analysis(options = {}) {
   const identity = {
     schemaVersion: 1, recordType: 'r4_canonical_analysis_result', interface: 'R4_CANONICAL_ANALYSIS',
     authorizationChain: R4_AUTHORIZATION_CHAIN, authoritySource: 'RESOLVED_FROM_GIT_LIVE_REMOTE',
+    // The RUNTIME authority that governed execution. At stage C this is the
+    // continuation runtime (S6/C1) while the SCIENTIFIC approval identity below
+    // remains A2 exactly, so the result states both without conflating them.
+    authorityStage: resolution.stage,
+    continuationFingerprint: continuation?.fingerprint ?? null,
+    continuationGeneration: continuation?.generation ?? 0,
+    // Per-attempt authority actually used for cohort governance, so a reviewer can
+    // see that the grandfathered attempt was governed under historical S5/A2 and
+    // post-boundary attempts under current S6/C1. Derived from authenticated
+    // history only.
+    attemptAuthorities: attemptAuthorities.map(entry => ({ ...entry })),
     sealFingerprint: seal.fingerprint, protocolCommit: seal.protocolCommit, protocolTree: seal.protocolTree,
     authorityCommit: authority.sealAuthorityCommit, approvalCommit: resolution.approvalCommit,
     approvalEpoch: resolution.approvalEpoch ?? null, approvalFingerprint: resolution.approvalFingerprint ?? null,

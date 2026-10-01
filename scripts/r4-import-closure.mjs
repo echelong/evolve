@@ -44,6 +44,7 @@ export const R4_RUNTIME_ROOTS = Object.freeze([
  * definition of "frozen" that a reviewer runs.
  */
 export const R4_BOUND_NON_RUNTIME_ARTIFACTS = Object.freeze([
+  'docs/R4-POSTSTART-CONTINUATION.md',
   'docs/R4-PREREGISTRATION.md',
   // Defense-in-depth (round 3): the runtime closure above is local modules plus
   // Node builtins only, so no third-party package reaches R4 execution today.
@@ -64,6 +65,7 @@ export const R4_BOUND_VALIDATORS = Object.freeze([
   'scripts/validate-p3c-mutation.mjs',
   'scripts/validate-r4-approval-epochs.mjs',
   'scripts/validate-r4-approval-fingerprint.mjs',
+  'scripts/validate-r4-continuation.mjs',
   'scripts/validate-r4-e1-mutation.mjs',
   'scripts/validate-r4-e1.mjs',
   'scripts/validate-r4-enforcement.mjs',

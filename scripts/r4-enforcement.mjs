@@ -20,6 +20,7 @@ import { R4_SPEC, captureSpecDigest } from './r4-protocol-spec.mjs';
 import { R4_EXCLUSIONS, isR4Excluded, assertR4NotExcluded } from './r4-exclusions.mjs';
 import { R4_COHORT_SPEC, buildAuthorizedCohortPlan, evaluateCohortProgress, mechanicalT0 } from './r4-cohort-plan.mjs';
 import { R4_ATTESTATION_RECORD_TYPE, verifySessionAttestation } from './r4-attestation.mjs';
+import { attemptAuthorityForGovernance } from './r4-attempt-history.mjs';
 import { readSourceSession, CLASSIFICATION, R4_SOURCE_POLICY, R4_AUTHENTICATED_SESSION } from './market-outcomes/index.mjs';
 import { selectAllEligibleReferences } from './market-outcomes/reference-selection.mjs';
 import { assembleAnalysisRows, runPrimaryAnalysis, kendallTauB } from './market-outcomes/primary-analysis.mjs';
@@ -32,6 +33,33 @@ const fail = code => { throw new Error(code); };
  * approval epochs is not silently re-interpreted as a renewal.
  */
 const epochOf = value => (value === null || value === undefined ? 1 : value);
+
+/**
+ * The seal IDENTITY an attempt must be verified against.
+ *
+ * `verifySessionAttestation` binds an attestation to a seal's fingerprint,
+ * protocol commit, protocol tree, spec digest and capture-spec digest. After a
+ * post-start continuation those are NOT all the same object: a grandfathered
+ * pre-boundary attempt legitimately carries the HISTORICAL seal's identity, while
+ * a post-boundary attempt carries the current one. The scientific values those
+ * checks enforce (`specDigest`, `captureSpecDigest`, `spec`, `exclusions`,
+ * `providers`, `cohortPlan`) are frozen and identical across both generations —
+ * the continuation is enforcement-only — so the historical identity is projected
+ * onto the current seal object and only its Git identity fields are replaced.
+ *
+ * Nothing here relaxes verification: every field the attestation is checked
+ * against is still the canonical frozen value, and the Git identity is still the
+ * authenticated per-attempt authority.
+ */
+function sealIdentityFor(perAttempt, currentSeal) {
+  if (!currentSeal || typeof currentSeal !== 'object') fail('R4_GOVERNANCE_CURRENT_SEAL_REQUIRED');
+  return Object.freeze({
+    ...currentSeal,
+    fingerprint: perAttempt.sealFingerprint,
+    protocolCommit: perAttempt.protocolCommit,
+    protocolTree: perAttempt.protocolTree,
+  });
+}
 
 export const R4_ANALYSIS_RECORD_TYPE = 'r4_real_primary_analysis';
 export const R4_OUTCOME_BINDING_RECORD_TYPE = 'r4_outcome_run_binding';
@@ -88,7 +116,7 @@ export function assertNoAnalysisOverrides(options = {}) {
  * `attestation` must be the finalized attestation record. `canonicalMembership`
  * is the evaluator-derived membership, never a caller-authored array.
  */
-export function verifyR4SourceEligibility({ session, attestation, seal, authority, approvalAuthority = null, attemptIndex = null, canonicalMembership = null }) {
+export function verifyR4SourceEligibility({ session, attestation, seal, authority, approvalAuthority = null, attemptIndex = null, canonicalMembership = null, attemptAuthority = null }) {
   if (!session || typeof session !== 'object') fail('R4_SOURCE_INVALID');
   if (typeof session.sessionId !== 'string' || !session.sessionId) fail('R4_SOURCE_INVALID');
   if (session[R4_AUTHENTICATED_SESSION] !== true) fail('R4_SOURCE_NOT_AUTHENTICATED');
@@ -98,7 +126,23 @@ export function verifyR4SourceEligibility({ session, attestation, seal, authorit
   if (!session.policy || session.policy.requireDurationComplete !== true) fail('R4_SOURCE_NOT_DURATION_VERIFIED');
   if (typeof session.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(session.fingerprint)) fail('R4_SOURCE_NOT_AUTHENTICATED');
   if (!attestation || attestation.recordType !== R4_ATTESTATION_RECORD_TYPE) fail('R4_ATTESTATION_REQUIRED');
-  const proof = verifySessionAttestation({ attestation, session, seal, authority, approvalAuthority, attemptIndex });
+  // PER-ATTEMPT AUTHORITY. When this session's attempt is grandfathered, its
+  // attestation legitimately carries the HISTORICAL seal identity, so evidence
+  // verification must use that identity rather than the current one. The
+  // `attemptAuthority` supplied here is the authenticated per-attempt projection
+  // from `verifyR4AttemptHistory` (see `buildCanonicalReferenceSetFromEvidence`),
+  // never a caller-authored map, and verification is otherwise unchanged.
+  const effectiveSeal = attemptAuthority === null ? seal : sealIdentityFor(attemptAuthority, seal);
+  const effectiveAuthority = attemptAuthority === null ? authority : {
+    protocolCommit: attemptAuthority.protocolCommit, protocolTree: attemptAuthority.protocolTree,
+    sealAuthorityCommit: attemptAuthority.sealAuthorityCommit };
+  const effectiveApproval = attemptAuthority === null ? approvalAuthority : {
+    approvalCommit: attemptAuthority.approvalCommit, approvalEpoch: attemptAuthority.approvalEpoch,
+    approvalFingerprint: attemptAuthority.approvalFingerprint, t0: attemptAuthority.t0,
+    continuationFingerprint: attemptAuthority.continuationFingerprint,
+    continuationGeneration: attemptAuthority.continuationGeneration };
+  const proof = verifySessionAttestation({ attestation, session, seal: effectiveSeal,
+    authority: effectiveAuthority, approvalAuthority: effectiveApproval, attemptIndex });
   if (canonicalMembership !== null) {
     if (!Array.isArray(canonicalMembership)) fail('R4_CANONICAL_MEMBERSHIP_INVALID');
     if (!canonicalMembership.includes(session.sessionId)) fail('R4_SESSION_NOT_IN_CANONICAL_MEMBERSHIP');
@@ -140,7 +184,7 @@ export function resolveSealedR4Sources({ sources, attestations, seal, authority,
  * verified approval authority is supplied, the plan's T0 anchor is cross-checked
  * against the authority-derived value and may never be caller-chosen.
  */
-export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations = [], approvalAuthority = null }) {
+export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations = [], approvalAuthority = null, continuation = null }) {
   if (!plan || plan.recordType !== 'r4_cohort_plan') fail('R4_PLAN_INVALID');
   if (!seal || typeof seal.fingerprint !== 'string') fail('R4_PLAN_SEAL_INVALID');
   if (plan.sealFingerprint !== seal.fingerprint) fail('R4_PLAN_SEAL_MISMATCH');
@@ -168,19 +212,37 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
     if (typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(fingerprint)) fail('R4_ATTEMPT_NOT_AUTHENTICATED');
     const attestation = byFingerprint.get(fingerprint);
     if (!attestation) fail('R4_ATTEMPT_ATTESTATION_NOT_FOUND');
+    // PER-ATTEMPT AUTHORITY. Every completed attempt is verified against the
+    // authority it was ACTUALLY authorized under, taken from the authenticated
+    // projection `verifyR4AttemptHistory` attached to the attempt — never from the
+    // current seal. A grandfathered pre-boundary attempt therefore keeps its
+    // historical S5/A2 identity and a post-boundary attempt carries current S6/C1,
+    // and BOTH may sit in canonical membership at the same time. With no
+    // continuation in force this authority is the current one, so the
+    // pre-continuation behaviour is byte-for-byte unchanged.
+    const perAttempt = attemptAuthorityForGovernance(attempt, { continuationActive: continuation !== null });
+    const effectiveSeal = perAttempt === null ? seal : sealIdentityFor(perAttempt, seal);
+    const effectiveAuthority = perAttempt === null
+      ? authority
+      : { protocolCommit: perAttempt.protocolCommit, protocolTree: perAttempt.protocolTree, sealAuthorityCommit: perAttempt.sealAuthorityCommit };
+    const effectiveApproval = perAttempt === null ? approvalAuthority : {
+      approvalCommit: perAttempt.approvalCommit, approvalEpoch: perAttempt.approvalEpoch,
+      approvalFingerprint: perAttempt.approvalFingerprint, t0: perAttempt.t0,
+      continuationFingerprint: perAttempt.continuationFingerprint,
+      continuationGeneration: perAttempt.continuationGeneration };
     const proof = verifySessionAttestation({
       attestation, session: { sessionId: attempt.sessionId, fingerprint: attestation.sessionFingerprint },
-      seal, authority, approvalAuthority, attemptIndex: attempt.index,
+      seal: effectiveSeal, authority: effectiveAuthority, approvalAuthority: effectiveApproval, attemptIndex: attempt.index,
     });
     if (proof.sessionId !== attempt.sessionId) fail('R4_ATTEMPT_SESSION_MISMATCH');
     if (attestation.captureSpecDigest !== expectedCaptureSpec) fail('R4_ATTEMPT_CAPTURE_SPEC_MISMATCH');
-    if (attestation.sealFingerprint !== seal.fingerprint) fail('R4_ATTEMPT_SEAL_MISMATCH');
-    if (attestation.protocolCommit !== seal.protocolCommit) fail('R4_ATTEMPT_PROTOCOL_COMMIT_MISMATCH');
-    if (attestation.authorityCommit !== authority.sealAuthorityCommit) fail('R4_ATTEMPT_AUTHORITY_COMMIT_MISMATCH');
-    if (approvalAuthority && attestation.approvalCommit !== approvalAuthority.approvalCommit) fail('R4_ATTEMPT_APPROVAL_COMMIT_MISMATCH');
-    if (approvalAuthority && epochOf(attestation.approvalEpoch) !== epochOf(approvalAuthority.approvalEpoch)) fail('R4_ATTEMPT_APPROVAL_EPOCH_MISMATCH');
+    if (attestation.sealFingerprint !== effectiveSeal.fingerprint) fail('R4_ATTEMPT_SEAL_MISMATCH');
+    if (attestation.protocolCommit !== effectiveSeal.protocolCommit) fail('R4_ATTEMPT_PROTOCOL_COMMIT_MISMATCH');
+    if (attestation.authorityCommit !== effectiveAuthority.sealAuthorityCommit) fail('R4_ATTEMPT_AUTHORITY_COMMIT_MISMATCH');
+    if (effectiveApproval && attestation.approvalCommit !== effectiveApproval.approvalCommit) fail('R4_ATTEMPT_APPROVAL_COMMIT_MISMATCH');
+    if (effectiveApproval && epochOf(attestation.approvalEpoch) !== epochOf(effectiveApproval.approvalEpoch)) fail('R4_ATTEMPT_APPROVAL_EPOCH_MISMATCH');
     // The approval fingerprint is enforced by `verifySessionAttestation` above,
-    // against the same `approvalAuthority`; repeating it here would be unreachable.
+    // against the same `effectiveApproval`; repeating it here would be unreachable.
     authenticated.push(attempt.sessionId);
   }
   // Canonical membership is an OUTPUT. It is derived from the completed attempts
@@ -191,8 +253,8 @@ export function evaluateSealedCohortProgress({ plan, attempts, seal, authority, 
 }
 
 /** Canonical membership as an explicit evaluator output. */
-export function deriveCanonicalCohortMembership({ plan, attempts, seal, authority, attestations = [], approvalAuthority = null }) {
-  const progress = evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations, approvalAuthority });
+export function deriveCanonicalCohortMembership({ plan, attempts, seal, authority, attestations = [], approvalAuthority = null, continuation = null }) {
+  const progress = evaluateSealedCohortProgress({ plan, attempts, seal, authority, attestations, approvalAuthority, continuation });
   return { canonicalMembership: progress.canonicalMembership, progress };
 }
 
@@ -249,9 +311,27 @@ export function buildCanonicalReferenceSet({ sessions, canonicalMembership }) {
 export function buildCanonicalReferenceSetFromEvidence({
   seal, authority, approvalAuthority = null, canonicalMembership, attestations = [],
   sessionRoot = R4_SESSION_DIR_ROOT, cwd = process.cwd(), readSession = readSourceSession,
+  attemptAuthorities = null, continuation = null,
 }) {
   if (!Array.isArray(canonicalMembership) || canonicalMembership.length === 0) fail('R4_CANONICAL_MEMBERSHIP_REQUIRED');
   if (new Set(canonicalMembership).size !== canonicalMembership.length) fail('R4_CANONICAL_MEMBERSHIP_DUPLICATE');
+  // PER-SESSION AUTHORITY INDEX. Built from the AUTHENTICATED per-attempt authority
+  // projection produced by `verifyR4AttemptHistory`, keyed by session id. This is
+  // what lets a grandfathered pre-boundary session (historical S5/A2) and a
+  // post-boundary session (current S6/C1) both enter canonical reference/source
+  // verification simultaneously without either being reinterpreted.
+  //
+  // It is required whenever a continuation is in force: without it a caller could
+  // make a historical session be verified under the current seal (or vice versa).
+  // It is never a caller-authored authority map — `r4-canonical-analysis.mjs` builds
+  // it from verified history via `historyAttemptAuthorityIndex`.
+  const index = new Map();
+  if (attemptAuthorities !== null) {
+    if (attemptAuthorities instanceof Map) for (const [k, v] of attemptAuthorities) index.set(k, v);
+    else if (Array.isArray(attemptAuthorities)) for (const entry of attemptAuthorities) index.set(entry.sessionId, entry);
+    else fail('R4_ATTEMPT_AUTHORITY_INDEX_INVALID');
+  }
+  if (continuation !== null && index.size === 0) fail('R4_ATTEMPT_AUTHORITY_INDEX_REQUIRED');
   const bySession = new Map();
   for (const attestation of Array.isArray(attestations) ? attestations : []) {
     if (attestation && typeof attestation.sessionId === 'string') bySession.set(attestation.sessionId, attestation);
@@ -262,7 +342,12 @@ export function buildCanonicalReferenceSetFromEvidence({
     const dir = path.resolve(cwd, sessionRoot, sessionId);
     const session = readSession({ dir, role: R4_COHORT_SPEC.referenceRole }, R4_SOURCE_POLICY);
     const attestation = bySession.get(sessionId) ?? null;
-    const proof = verifyR4SourceEligibility({ session, attestation, seal, authority, approvalAuthority, canonicalMembership });
+    // Only a session whose attempt is COMPLETED in authenticated history may carry
+    // an authority; a membership entry with no authenticated authority is refused.
+    const attemptAuthority = index.get(sessionId) ?? null;
+    if (continuation !== null && attemptAuthority === null) fail('R4_ATTEMPT_AUTHORITY_MISSING_FOR_SESSION');
+    const proof = verifyR4SourceEligibility({ session, attestation, seal, authority, approvalAuthority,
+      canonicalMembership, attemptAuthority, attemptIndex: attemptAuthority?.index ?? null });
     sessions.push(session);
     verified.push({ session, attestation, proof });
   }
@@ -323,12 +408,13 @@ export function certifyExposureRows({ references, sessions }) {
 export function certifyExposureRowsFromEvidence({
   seal, authority, approvalAuthority = null, canonicalMembership, references, attestations = [],
   sessionRoot = R4_SESSION_DIR_ROOT, cwd = process.cwd(), readSession = readSourceSession,
+  attemptAuthorities = null, continuation = null,
 }) {
   if (!Array.isArray(references) || references.length === 0) fail('R4_EXPOSURE_REFERENCES_INVALID');
   const referenceSessionIds = [...new Set(references.map(reference => reference.sessionId))].sort();
   const membership = new Set(canonicalMembership ?? []);
   for (const sessionId of referenceSessionIds) if (!membership.has(sessionId)) fail('R4_EXPOSURE_REFERENCE_NOT_IN_MEMBERSHIP');
-  const evidence = buildCanonicalReferenceSetFromEvidence({ seal, authority, approvalAuthority, canonicalMembership: referenceSessionIds, attestations, sessionRoot, cwd, readSession });
+  const evidence = buildCanonicalReferenceSetFromEvidence({ seal, authority, approvalAuthority, canonicalMembership: referenceSessionIds, attestations, sessionRoot, cwd, readSession, attemptAuthorities, continuation });
   const certified = certifyExposureRows({ references, sessions: evidence.sessions });
   return { ...certified, sessions: evidence.sessions, verified: evidence.verified };
 }
