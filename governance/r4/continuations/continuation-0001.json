@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "recordType": "r4_poststart_continuation",
+  "status": "CONTINUATION_APPROVED",
+  "reason": "POSTSTART_ENFORCEMENT_REPAIR_CONTINUATION",
+  "continuation": 1,
+  "priorApproval": {
+    "approvalEpoch": 2,
+    "approvalCommit": "9dc30de45ee0fc8c493c2582bae6378dae1fdc7b",
+    "approvalFingerprint": "a177be24986b0dfe511b40d16346a14b71c097db347f6d98fd622fa5d893c60d"
+  },
+  "priorSeal": {
+    "sealCommit": "e54488305d742624106e20e808b65c2c4fe94a15",
+    "sealFingerprint": "9bf7ee3be2821116bcd2596c06c3e2e75f06f3c0de68a7e85f656d33b0cb5269",
+    "protocolCommit": "b6aa11554022d309a8b8566d96e824f72dcacae3",
+    "protocolTree": "b32f03abf3f425754af90770e86ae931700976a5"
+  },
+  "newRuntime": {
+    "protocolCommit": "d0d6bf130fd894dc298c6f16a2c6b3fe2bb8afa6",
+    "protocolTree": "f705dc4b19d56ac3c5b56182571e6219ad55f811",
+    "sealCommit": "f6583433eba00de1558a9f0c4845e1e7905e9877",
+    "sealFingerprint": "f4bda437fb48e1782fe7a42c9683b87dd5d3c15cb503b9099bc424ed6fbfc0c4"
+  },
+  "specDigest": "a01c42689ddbb6986d6a67182459338d925f019ae661aa0bc986101a1309c8c6",
+  "captureSpecDigest": "897cbbb57a5d98e76d7d9190aaef6663777162a8741c05c76bc88b1e4866f08a",
+  "providers": "7a670d8e2b98043e2656be3ce88cc6b888a315eb45857e3c849c610561a29dc1",
+  "boundHistory": {
+    "attemptsUsed": 1,
+    "completedCount": 1,
+    "nextAttemptIndex": 2,
+    "latestTerminalFingerprint": "35be1db3b73de3360c6dd231034bbfa6b927f55e980abfb008b56abf7c8d80ab",
+    "historyDigest": "900901682e88810a84dcc46c6d84e6a684db4861e30e10262b09ed385de8a805",
+    "attemptIdentities": [
+      {
+        "index": 1,
+        "sessionId": "d63e36c8efced2492ef5d44df8d6d7b7",
+        "cohortStatus": "COMPLETED",
+        "authorizationFingerprint": "373f5244a7327cc3e9973e278e60b90bab6ee556422f43465d1c8e93b9be3a68",
+        "claimFingerprint": "e8f3bd06cb8d090e20e9c929dc589a05e192b2f36801a4477b1bdfa600de9bee",
+        "terminalFingerprint": "35be1db3b73de3360c6dd231034bbfa6b927f55e980abfb008b56abf7c8d80ab",
+        "attestationFingerprint": "49770a555b90887d735ead72c0b2607fd60c17dc5ea8c29a8cff2d09b05cd381",
+        "sessionFingerprint": "b7eb769be9941f7d38a86d8d4e3976dc6a2caf24e67203da133ce6a9b39f3df8",
+        "sealFingerprint": "9bf7ee3be2821116bcd2596c06c3e2e75f06f3c0de68a7e85f656d33b0cb5269",
+        "protocolCommit": "b6aa11554022d309a8b8566d96e824f72dcacae3",
+        "protocolTree": "b32f03abf3f425754af90770e86ae931700976a5",
+        "sealAuthorityCommit": "e54488305d742624106e20e808b65c2c4fe94a15",
+        "approvalCommit": "9dc30de45ee0fc8c493c2582bae6378dae1fdc7b",
+        "approvalEpoch": 2,
+        "approvalFingerprint": "a177be24986b0dfe511b40d16346a14b71c097db347f6d98fd622fa5d893c60d",
+        "t0": 1790690400000
+      }
+    ]
+  },
+  "t0": 1790690400000,
+  "t0Iso": "2026-09-29T14:00:00.000Z",
+  "t0Source": "INHERITED_FROM_BOUND_APPROVAL_EPOCH_T0",
+  "reanchorsT0": false,
+  "maxAttempts": 8,
+  "targetCompletedSessions": 6,
+  "newAttemptBudget": 0,
+  "discretionaryAttemptsPermitted": false,
+  "outcomeDependentExtensionPermitted": false,
+  "outcomeArtifactsPresentAtCreation": false,
+  "outcomeRootsInspectedAtCreation": [
+    ".evolve/market-outcomes",
+    ".evolve/market-intelligence/outcomes",
+    ".evolve/outcomes"
+  ],
+  "allPreBoundaryAttemptsGrandfathered": true,
+  "reviewDigest": "6566b11a5e43135ebbf78cf149c063185d0d2f4b294ccc521d62e25cac05dcf1",
+  "continuationReviewer": "DeepSeek V4.1 Flash independent R4 continuation reviewer",
+  "continuationReviewerModel": "deepseek/deepseek-v4.1-flash",
+  "continuationVerdict": "READY_TO_CONTINUE_COHORT",
+  "continuedAt": null,
+  "fingerprint": "b2ebb644f4a768d0ec84829c43848310b3db67b450190a1d0007be03efa0ec5c"
+}
