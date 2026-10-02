@@ -50,3 +50,6 @@ next-env.d.ts
 # project-local, isolated external tooling (e.g. the pinned Agent-Reach venv).
 # Installed per-checkout by the operator, never committed and never global.
 .tools/
+
+# Phase 5K.3 runtime collection runs (never commit captured public data)
+/var/

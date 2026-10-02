@@ -181,3 +181,26 @@ export function assertNoCredentialOrPrivateLeak(record, consumedStrings = []) {
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// QUERY / HOST CONTRACT (shared by transport and 5K.3 collection plans)
+// ---------------------------------------------------------------------------
+
+const HOST_PATTERN = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}$/;
+const REFUSED_HOST_SUFFIXES = Object.freeze(['.local', '.localhost', '.internal', '.lan', '.home', '.corp', '.onion']);
+const HASHTAG_PATTERN = /^[A-Za-z0-9_]{1,64}$/;
+
+/** Public DNS hostnames only: no IP literal, port, userinfo, or private suffix. */
+export function assertPublicHost(host) {
+  if (typeof host !== 'string') providerFail(PROVIDER_ERROR_CODES.HOST_INVALID);
+  const lowered = host.toLowerCase();
+  if (!HOST_PATTERN.test(lowered) || REFUSED_HOST_SUFFIXES.some(suffix => lowered.endsWith(suffix))) {
+    providerFail(PROVIDER_ERROR_CODES.HOST_INVALID);
+  }
+  return lowered;
+}
+
+export function assertHashtag(hashtag) {
+  if (typeof hashtag !== 'string' || !HASHTAG_PATTERN.test(hashtag)) providerFail(PROVIDER_ERROR_CODES.QUERY_INVALID);
+  return hashtag;
+}

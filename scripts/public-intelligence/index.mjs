@@ -4,3 +4,4 @@ export * from './observation.mjs';
 export { ingestPublicObservation, PUBLIC_INTELLIGENCE_5K1_INGEST_OUTCOMES } from './ingest.mjs';
 export { createMemoryStore, createNdjsonStore, assertSafeStoreDirectory } from './store.mjs';
 export { dedupIdentity5K1 } from './dedup.mjs';
+export { PROVIDER_HARD_CEILINGS, PROVIDER_ERROR_CODES } from './providers/common.mjs';

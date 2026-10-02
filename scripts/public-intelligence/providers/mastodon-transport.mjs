@@ -14,7 +14,12 @@
 // with a typed error. The module never sleeps and never loops on failure.
 import {
   PROVIDER_ERROR_CODES, ProviderAdapterError, providerFail, resolveBounds, parseProviderTimestamp,
+  assertPublicHost, assertHashtag,
 } from './common.mjs';
+
+// Validators live in common.mjs (pure, network-free) so plan validation and
+// offline replay can use them without importing this network-capable module.
+export { assertPublicHost, assertHashtag };
 
 export const MASTODON_TRANSPORT = Object.freeze({
   endpointTemplate: 'https://{host}/api/v1/timelines/tag/{hashtag}',
@@ -27,25 +32,6 @@ export const MASTODON_TRANSPORT = Object.freeze({
   pageSizeCeiling: 40, // Mastodon's documented maximum for `limit`
   userAgent: 'evolve-public-intelligence/5k2 (read-only research observer)',
 });
-
-const HOST_PATTERN = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}$/;
-const REFUSED_HOST_SUFFIXES = Object.freeze(['.local', '.localhost', '.internal', '.lan', '.home', '.corp', '.onion']);
-const HASHTAG_PATTERN = /^[A-Za-z0-9_]{1,64}$/;
-
-/** Public DNS hostnames only: no IP literal, port, userinfo, or private suffix. */
-export function assertPublicHost(host) {
-  if (typeof host !== 'string') providerFail(PROVIDER_ERROR_CODES.HOST_INVALID);
-  const lowered = host.toLowerCase();
-  if (!HOST_PATTERN.test(lowered) || REFUSED_HOST_SUFFIXES.some(suffix => lowered.endsWith(suffix))) {
-    providerFail(PROVIDER_ERROR_CODES.HOST_INVALID);
-  }
-  return lowered;
-}
-
-export function assertHashtag(hashtag) {
-  if (typeof hashtag !== 'string' || !HASHTAG_PATTERN.test(hashtag)) providerFail(PROVIDER_ERROR_CODES.QUERY_INVALID);
-  return hashtag;
-}
 
 function numberHeader(headers, name) {
   const raw = headers.get(name);
@@ -71,7 +57,7 @@ async function readBoundedBody(response, maxBytes) {
   if (!response.body || typeof response.body.getReader !== 'function') {
     const buffer = await response.arrayBuffer();
     if (buffer.byteLength > maxBytes) providerFail(PROVIDER_ERROR_CODES.RESPONSE_TOO_LARGE);
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(buffer), bytes: buffer.byteLength };
   }
   const reader = response.body.getReader();
   const chunks = [];
@@ -89,7 +75,7 @@ async function readBoundedBody(response, maxBytes) {
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), bytes: total };
 }
 
 /** One bounded request. Returns the parsed JSON array. */
@@ -129,8 +115,9 @@ async function requestPage(url, bounds, fetchImpl) {
     }
 
     let text;
+    let responseBytes;
     try {
-      text = await readBoundedBody(response, bounds.maxResponseBytes);
+      ({ text, bytes: responseBytes } = await readBoundedBody(response, bounds.maxResponseBytes));
     } catch (error) {
       if (error instanceof ProviderAdapterError) throw error;
       if (controller.signal.aborted || error?.name === 'AbortError') providerFail(PROVIDER_ERROR_CODES.TIMEOUT);
@@ -139,7 +126,7 @@ async function requestPage(url, bounds, fetchImpl) {
     let parsed;
     try { parsed = JSON.parse(text); } catch { providerFail(PROVIDER_ERROR_CODES.MALFORMED_RESPONSE, { reason: 'NOT_JSON' }); }
     if (!Array.isArray(parsed)) providerFail(PROVIDER_ERROR_CODES.MALFORMED_RESPONSE, { reason: 'NOT_AN_ARRAY' });
-    return { records: parsed, rateLimit: rateLimitMetadata(response.headers) };
+    return { records: parsed, rateLimit: rateLimitMetadata(response.headers), httpStatus: response.status, responseBytes };
   } finally {
     clearTimeout(timer);
   }
@@ -166,48 +153,85 @@ export async function fetchHashtagTimeline(options) {
   const now = options.now ?? Date.now;
   if (typeof fetchImpl !== 'function' || typeof now !== 'function') providerFail(PROVIDER_ERROR_CODES.BOUNDS_INVALID);
 
+  // Optional per-request observer (5K.3 request manifests). It receives
+  // structural metadata ONLY: never a header, body, cookie or credential.
+  const onRequest = typeof options.onRequest === 'function' ? options.onRequest : null;
+
   const startedAt = now();
   const earliest = startedAt - bounds.lookbackMs;
   const pageSize = Math.min(MASTODON_TRANSPORT.pageSizeCeiling, bounds.maxRecords);
   const records = [];
   let maxId = null;
   let pagesFetched = 0;
+  let requestsMade = 0;
   let stopReason = 'MAX_PAGES';
   let fetchedAt = startedAt;
   let rateLimit = null;
 
-  while (pagesFetched < bounds.maxPages) {
-    const url = new URL(`https://${host}/api/v1/timelines/tag/${hashtag}`);
-    url.searchParams.set('limit', String(pageSize));
-    if (maxId !== null) url.searchParams.set('max_id', maxId);
+  try {
+    while (pagesFetched < bounds.maxPages) {
+      const url = new URL(`https://${host}/api/v1/timelines/tag/${hashtag}`);
+      url.searchParams.set('limit', String(pageSize));
+      if (maxId !== null) url.searchParams.set('max_id', maxId);
 
-    const page = await requestPage(url.toString(), bounds, fetchImpl);
-    pagesFetched += 1;
-    fetchedAt = now();
-    rateLimit = page.rateLimit;
+      const requestIndex = requestsMade;
+      const requestedAt = now();
+      requestsMade += 1;
+      let page;
+      try {
+        page = await requestPage(url.toString(), bounds, fetchImpl);
+      } catch (error) {
+        if (onRequest && error instanceof ProviderAdapterError) {
+          onRequest({
+            requestIndex, requestedAt, completedAt: now(), cursor: maxId, outcome: error.code,
+            httpStatus: error.details.status ?? null, recordsReturned: null, responseBytes: null,
+            rateLimit: error.code === PROVIDER_ERROR_CODES.RATE_LIMITED
+              ? { retryAfterSeconds: error.details.retryAfterSeconds ?? null, rateLimitLimit: error.details.rateLimitLimit ?? null,
+                rateLimitRemaining: error.details.rateLimitRemaining ?? null, rateLimitReset: error.details.rateLimitReset ?? null }
+              : null,
+            nextCursor: null,
+          });
+        }
+        throw error;
+      }
+      pagesFetched += 1;
+      fetchedAt = now();
+      rateLimit = page.rateLimit;
+      const lastId = page.records[page.records.length - 1]?.id;
+      const cursorUsable = typeof lastId === 'string' && /^[0-9]{1,32}$/.test(lastId) && lastId !== maxId;
+      if (onRequest) {
+        onRequest({
+          requestIndex, requestedAt, completedAt: fetchedAt, cursor: maxId, outcome: 'OK',
+          httpStatus: page.httpStatus, recordsReturned: page.records.length, responseBytes: page.responseBytes,
+          rateLimit: page.rateLimit, nextCursor: cursorUsable ? lastId : null,
+        });
+      }
 
-    if (page.records.length === 0) { stopReason = 'END_OF_TIMELINE'; break; }
+      if (page.records.length === 0) { stopReason = 'END_OF_TIMELINE'; break; }
 
-    let reachedLookback = false;
-    for (const record of page.records) {
-      // Lookback only drops records whose timestamp parses AND is too old;
-      // anything else flows to the mapper, which refuses malformed ones.
-      let publishedAt = null;
-      try { publishedAt = parseProviderTimestamp(record?.created_at); } catch { /* mapper decides */ }
-      if (publishedAt !== null && publishedAt < earliest) { reachedLookback = true; continue; }
-      if (records.length >= bounds.maxRecords) break;
-      records.push(record);
+      let reachedLookback = false;
+      for (const record of page.records) {
+        // Lookback only drops records whose timestamp parses AND is too old;
+        // anything else flows to the mapper, which refuses malformed ones.
+        let publishedAt = null;
+        try { publishedAt = parseProviderTimestamp(record?.created_at); } catch { /* mapper decides */ }
+        if (publishedAt !== null && publishedAt < earliest) { reachedLookback = true; continue; }
+        if (records.length >= bounds.maxRecords) break;
+        records.push(record);
+      }
+      if (records.length >= bounds.maxRecords) { stopReason = 'MAX_RECORDS'; break; }
+      if (reachedLookback) { stopReason = 'LOOKBACK_REACHED'; break; }
+
+      if (!cursorUsable) { stopReason = 'PAGINATION_CURSOR_UNUSABLE'; break; }
+      maxId = lastId;
     }
-    if (records.length >= bounds.maxRecords) { stopReason = 'MAX_RECORDS'; break; }
-    if (reachedLookback) { stopReason = 'LOOKBACK_REACHED'; break; }
-
-    const lastId = page.records[page.records.length - 1]?.id;
-    if (typeof lastId !== 'string' || !/^[0-9]{1,32}$/.test(lastId) || lastId === maxId) {
-      stopReason = 'PAGINATION_CURSOR_UNUSABLE';
-      break;
+  } catch (error) {
+    // A failed request must not silently discard evidence already acquired.
+    if (error instanceof ProviderAdapterError) {
+      error.partial = Object.freeze({ records: Object.freeze([...records]), pagesFetched, fetchedAt });
     }
-    maxId = lastId;
+    throw error;
   }
 
-  return Object.freeze({ records, fetchedAt, pagesFetched, stopReason, rateLimit });
+  return Object.freeze({ records, fetchedAt, pagesFetched, requestsMade, stopReason, rateLimit });
 }
