@@ -91,6 +91,18 @@ export const PUBLIC_INTELLIGENCE_5K1_SOURCE_TYPES = Object.freeze([
  */
 export const PUBLIC_INTELLIGENCE_5K1_COLLECTOR_MODES = Object.freeze(['OFFLINE_FIXTURE']);
 
+/**
+ * Phase 5K.2 adds exactly one additional mode, declared separately so the 5K.1
+ * constant above stays byte-for-byte what 5K.1 froze. It labels evidence that a
+ * bounded, read-only, public-data transport acquired. Any other value (for
+ * example `LIVE_API`) is still refused.
+ */
+export const PUBLIC_INTELLIGENCE_5K2_LIVE_COLLECTOR_MODES = Object.freeze(['LIVE_PUBLIC_PROVIDER']);
+const ALLOWED_COLLECTOR_MODES = Object.freeze([
+  ...PUBLIC_INTELLIGENCE_5K1_COLLECTOR_MODES,
+  ...PUBLIC_INTELLIGENCE_5K2_LIVE_COLLECTOR_MODES,
+]);
+
 /** Collection provenance, carried with the evidence, closed schema. */
 export const PUBLIC_INTELLIGENCE_5K1_COLLECTION_CONTEXT_SCHEMA = Object.freeze({
   closed: true,
@@ -274,7 +286,7 @@ export function validateRawObservation5K1(raw) {
   if (typeof raw.collectionContext.adapterVersion !== 'string' || !raw.collectionContext.adapterVersion.trim()) {
     failClosed('PUBLIC_INTELLIGENCE_5K1_ADAPTER_VERSION_REQUIRED');
   }
-  if (!PUBLIC_INTELLIGENCE_5K1_COLLECTOR_MODES.includes(raw.collectionContext.collectorMode)) {
+  if (!ALLOWED_COLLECTOR_MODES.includes(raw.collectionContext.collectorMode)) {
     failClosed(`PUBLIC_INTELLIGENCE_5K1_COLLECTOR_MODE_INVALID:${String(raw.collectionContext.collectorMode)}`);
   }
   return true;
