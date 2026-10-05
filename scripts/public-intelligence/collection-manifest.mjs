@@ -19,6 +19,7 @@
 // credential or raw body.
 import { PUBLIC_INTELLIGENCE_CLASSIFICATION, canonical, digest, isValidTimestamp } from './definition.mjs';
 import { failClosed } from './observation.mjs';
+import { assertPaginationCursor } from './pagination-cursor.mjs';
 import {
   PUBLIC_INTELLIGENCE_5K3_PHASE, PUBLIC_INTELLIGENCE_5K3_SCHEMA_VERSION, validateCollectionPlan,
   collectionPlanFingerprint,
@@ -198,7 +199,14 @@ export function validateRequestRecord(record, plan = null) {
   if (!isCount(record.requestIndex)) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_INDEX_INVALID');
   if (typeof record.provider !== 'string' || typeof record.instance !== 'string') failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_PROVIDER_INVALID');
   assertClosed(record.query, ['type', 'value'], 'PUBLIC_INTELLIGENCE_5K3_REQUEST_QUERY');
-  if (record.cursor !== null && !/^[0-9]{1,32}$/.test(String(record.cursor))) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_CURSOR_INVALID');
+  // CURSORS ARE PROVIDER-NEUTRAL HERE. The generic layer governs a pagination
+  // cursor only as an OPAQUE BOUNDED TOKEN (see pagination-cursor.mjs). Whether a
+  // cursor is valid FOR a provider is that provider adapter's decision and stays
+  // there: the Mastodon transport still requires its numeric IDs, the Bluesky
+  // transport treats the token as opaque. This schema used to enforce the
+  // Mastodon rule, which rejected every legitimate opaque Bluesky cursor as an
+  // integrity failure once a second provider was governed.
+  assertPaginationCursor(record.cursor, 'PUBLIC_INTELLIGENCE_5K3_REQUEST_CURSOR_INVALID');
   if (!isValidTimestamp(record.requestedAt) || !isValidTimestamp(record.completedAt)) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_TIMESTAMP_INVALID');
   if (record.completedAt < record.requestedAt) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_TIME_REVERSED');
   if (record.outcome !== 'OK' && !PUBLIC_INTELLIGENCE_5K3_REQUEST_FAILURE_VALUES.includes(record.outcome)) {
@@ -224,7 +232,7 @@ export function validateRequestRecord(record, plan = null) {
     const reset = record.rateLimit.rateLimitReset;
     if (reset !== null && !(typeof reset === 'string' && reset.length <= 40)) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_RATE_LIMIT_VALUE_INVALID');
   }
-  if (record.nextCursor !== null && !/^[0-9]{1,32}$/.test(String(record.nextCursor))) failClosed('PUBLIC_INTELLIGENCE_5K3_REQUEST_NEXT_CURSOR_INVALID');
+  assertPaginationCursor(record.nextCursor, 'PUBLIC_INTELLIGENCE_5K3_REQUEST_NEXT_CURSOR_INVALID');
   return record;
 }
 
@@ -396,8 +404,10 @@ export function validateManifestShape(manifest) {
   const cursors = manifest.providerCursorSummary;
   if (!PUBLIC_INTELLIGENCE_5K3_STOP_REASONS.includes(cursors.stopReason)) failClosed('PUBLIC_INTELLIGENCE_5K3_MANIFEST_STOP_REASON_INVALID');
   if (!isCount(cursors.cursorsUsed) || typeof cursors.nextCursorPresent !== 'boolean') failClosed('PUBLIC_INTELLIGENCE_5K3_MANIFEST_CURSORS_INVALID');
+  // Same provider-neutral rule as the request records: these are opaque bounded
+  // tokens copied from them, not provider syntax for this layer to interpret.
   for (const key of ['firstCursor', 'lastCursor']) {
-    if (cursors[key] !== null && !/^[0-9]{1,32}$/.test(String(cursors[key]))) failClosed('PUBLIC_INTELLIGENCE_5K3_MANIFEST_CURSORS_INVALID');
+    assertPaginationCursor(cursors[key], 'PUBLIC_INTELLIGENCE_5K3_MANIFEST_CURSORS_INVALID');
   }
   if (canonical(manifest.classification) !== canonical(PUBLIC_INTELLIGENCE_CLASSIFICATION)) {
     failClosed('PUBLIC_INTELLIGENCE_5K3_MANIFEST_CLASSIFICATION_OVERRIDE_REFUSED');

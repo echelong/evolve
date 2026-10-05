@@ -97,8 +97,17 @@ export {
   PUBLIC_INTELLIGENCE_5K3_STOP_REASONS, PUBLIC_INTELLIGENCE_5K3_STOP_REASON_ALIASES,
   PUBLIC_INTELLIGENCE_5K3_RUN_STATUS, PUBLIC_INTELLIGENCE_5K3_FAILURE_VALUES,
   PUBLIC_INTELLIGENCE_5K3_REQUEST_FAILURE_VALUES, PUBLIC_INTELLIGENCE_5K3_MANIFEST_SCHEMA,
+  PUBLIC_INTELLIGENCE_5K3_REQUEST_SCHEMA,
   governStopReason, validateManifestShape, deriveRunStatus, buildRequestRecord, buildRunManifest, checkAccounting,
+  validateRequestRecord, requestsFingerprint,
 } from './collection-manifest.mjs';
+
+// --- 5K.6.3 provider-neutral pagination cursor ------------------------------
+export * as PAGINATION_CURSOR_5K6_3 from './pagination-cursor.mjs';
+export {
+  PUBLIC_INTELLIGENCE_PAGINATION_CURSOR_MAX_LENGTH, PUBLIC_INTELLIGENCE_PAGINATION_CURSOR_CONTRACT,
+  isPaginationCursor, assertPaginationCursor,
+} from './pagination-cursor.mjs';
 
 // --- phase namespaces -------------------------------------------------------
 export * as INGESTION_5K1 from './index.mjs';
@@ -152,6 +161,7 @@ export const PROTECTED_MODULE_FRAGMENTS = Object.freeze([
   ['collection', 'run'].join('-'),
   ['collection', 'manifest'].join('-'),
   ['run', 'store'].join('-'),
+  ['pagination', 'cursor'].join('-'),
   ['corpus', 'membership'].join('-'),
   ['corpus', 'index'].join('-'),
   ['corpus', 'snapshot'].join('-'),
