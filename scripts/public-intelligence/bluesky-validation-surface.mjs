@@ -46,10 +46,20 @@ export * as BLUESKY_TRANSPORT_5K6 from './providers/bluesky-transport.mjs';
 export * as BLUESKY_REVISION_5K6 from './providers/bluesky-revision.mjs';
 export * as BLUESKY_ADAPTER_5K6 from './providers/bluesky.mjs';
 
+// --- 5K.6.1 governed provider capabilities -----------------------------------
+export * as PROVIDER_CAPABILITIES_5K6_1 from './provider-capabilities.mjs';
+export {
+  PUBLIC_INTELLIGENCE_5K6_1_PROVIDER_CAPABILITIES, PUBLIC_INTELLIGENCE_5K6_1_CAPABILITY_SCHEMA,
+  PUBLIC_INTELLIGENCE_5K6_1_CAPABILITY_PROVIDERS, PUBLIC_INTELLIGENCE_5K6_1_BLUESKY_TRANSPORT_CEILINGS,
+  providerCapabilitiesOf, planBoundCeilingsOf, transportBoundCeilingsOf,
+  validateProviderCapabilitiesRegistry, comparePlanAndTransportCeilings,
+} from './provider-capabilities.mjs';
+
 // --- 5K.3 governed registries, extended additively by 5K.6 ------------------
 export {
   PUBLIC_INTELLIGENCE_5K3_PROVIDERS, PUBLIC_INTELLIGENCE_5K3_QUERY_TYPES,
   PUBLIC_INTELLIGENCE_5K3_PROVIDER_DEFAULTS, PUBLIC_INTELLIGENCE_5K3_COLLECTION_MODES,
+  PUBLIC_INTELLIGENCE_5K3_BOUND_CEILINGS, planBoundCeilingsFor,
   validateCollectionPlan, rawProviderNamespaceOf,
 } from './collection-plan.mjs';
 
@@ -66,6 +76,8 @@ export { dedupIdentity5K1 } from './dedup.mjs';
 
 // --- 5K.2 Mastodon adapter, for cross-provider regression -------------------
 export { mapStatusToRawObservation } from './providers/mastodon-mapper.mjs';
+// --- 5K.2 Mastodon transport, so 5K.6.1 can test its bound layer directly ----
+export * as MASTODON_TRANSPORT_5K2 from './providers/mastodon-transport.mjs';
 
 // --- 5K.6 Bluesky run adapter, for bounded-run integration ------------------
 export { createBlueskyRunAdapter } from './providers/bluesky.mjs';
@@ -75,6 +87,7 @@ export {
   buildCollectionPlan, executeCollectionRun, replayRun, loadRunArtifacts,
   assertSafeRuntimeRoot, PUBLIC_INTELLIGENCE_5K3_DEFAULT_RUNTIME_ROOT, manifestFingerprintOf,
 } from './research-surface.mjs';
+export { collectionPlanFingerprint, assertProviderCapabilityCoverage } from './collection-plan.mjs';
 
 // --- phase namespaces -------------------------------------------------------
 export * as INGESTION_5K1 from './index.mjs';

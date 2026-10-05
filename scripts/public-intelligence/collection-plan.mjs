@@ -15,6 +15,9 @@ import {
   PROVIDER_HARD_CEILINGS, assertPublicHost, assertHashtag, ProviderAdapterError,
   PROVIDER_ERROR_CODES, providerFail,
 } from './providers/common.mjs';
+import {
+  planBoundCeilingsOf, PUBLIC_INTELLIGENCE_5K6_1_CAPABILITY_PROVIDERS,
+} from './provider-capabilities.mjs';
 
 export const PUBLIC_INTELLIGENCE_5K3_PHASE = 'PHASE_5K_3';
 export const PUBLIC_INTELLIGENCE_5K3_SCHEMA_VERSION = '5K.3.0';
@@ -35,7 +38,20 @@ export const PUBLIC_INTELLIGENCE_5K3_QUERY_TYPES = Object.freeze(['HASHTAG', 'TE
 /** OFFLINE_FIXTURE requires an injected transport; LIVE_PUBLIC_PROVIDER forbids one. */
 export const PUBLIC_INTELLIGENCE_5K3_COLLECTION_MODES = Object.freeze(['OFFLINE_FIXTURE', 'LIVE_PUBLIC_PROVIDER']);
 
-/** Plan bounds map 1:1 onto the 5K.2 hard ceilings. They can only be tightened. */
+/**
+ * The Mastodon-scoped plan bound ceilings, retained as the historical 5K.3 view.
+ *
+ * 5K.6.1 made plan validation PROVIDER-SCOPED: the ceilings a plan is checked
+ * against now come from the governed capability registry for the plan's own
+ * provider, because the Bluesky transport is stricter than the Mastodon one.
+ * This constant is unchanged and is still Mastodon's exact set, so any existing
+ * consumer of it - and the 5K.3 B6 assertion that pins these values - continues to
+ * hold. Its KEY SET is what defines the closed plan bound schema below, which is
+ * identical for every provider by design.
+ *
+ * It is NOT used to validate a plan. That would reintroduce exactly the
+ * provider-agnostic ceiling 5K.6.1 removes.
+ */
 export const PUBLIC_INTELLIGENCE_5K3_BOUND_CEILINGS = Object.freeze({
   maxPages: PROVIDER_HARD_CEILINGS.maxPages,
   maxRecords: PROVIDER_HARD_CEILINGS.maxRecords,
@@ -43,6 +59,36 @@ export const PUBLIC_INTELLIGENCE_5K3_BOUND_CEILINGS = Object.freeze({
   maxResponseBytes: PROVIDER_HARD_CEILINGS.maxResponseBytes,
   maxLookbackMs: PROVIDER_HARD_CEILINGS.lookbackMs,
 });
+
+/**
+ * The ceilings a plan must respect for the provider it selects.
+ *
+ * Fails closed for a provider with no capability entry. Every admitted provider is
+ * required to have one; see 5K.6.1 `assertProviderCapabilityCoverage`.
+ */
+export function planBoundCeilingsFor(provider) {
+  return planBoundCeilingsOf(provider);
+}
+
+/**
+ * Every admitted provider must have an explicit capability entry.
+ *
+ * This is the guard against a future provider being added to the 5K.3 allowlist
+ * without a matching entry here, which would otherwise fall back to someone
+ * else's ceilings. Called once at module load so the omission is a hard refusal at
+ * import time rather than a surprise at plan-validation time.
+ */
+export function assertProviderCapabilityCoverage() {
+  const admitted = [...PUBLIC_INTELLIGENCE_5K3_PROVIDERS].sort();
+  const governed = [...PUBLIC_INTELLIGENCE_5K6_1_CAPABILITY_PROVIDERS].sort();
+  const missing = admitted.filter(provider => !governed.includes(provider));
+  const extra = governed.filter(provider => !admitted.includes(provider));
+  if (missing.length > 0 || extra.length > 0) {
+    failClosed(`PUBLIC_INTELLIGENCE_5K6_1_PROVIDER_CAPABILITY_COVERAGE:${missing.concat(extra).join(',').slice(0, 64)}`);
+  }
+  return true;
+}
+assertProviderCapabilityCoverage();
 
 export const PUBLIC_INTELLIGENCE_5K3_PLAN_SCHEMA = Object.freeze({
   closed: true,
@@ -158,12 +204,17 @@ export function validateCollectionPlan(plan) {
   }
 
   assertClosed(plan.bounds, PUBLIC_INTELLIGENCE_5K3_PLAN_SCHEMA.boundFields, 'PUBLIC_INTELLIGENCE_5K3_PLAN_BOUNDS');
+  // 5K.6.1: the ceilings are the SELECTED PROVIDER's, not a generic set. A plan
+  // asking for more than its own transport allows is refused HERE, before any
+  // adapter or transport is reached, instead of later as a transport refusal. The
+  // provider has already been validated above, so this lookup cannot fall back.
+  const ceilings = planBoundCeilingsFor(plan.provider);
   for (const key of PUBLIC_INTELLIGENCE_5K3_PLAN_SCHEMA.boundFields) {
     const value = plan.bounds[key];
     // Number.isInteger rejects NaN, Infinity and fractions. >= 1 rejects the
     // "zero means unlimited" idiom. The ceiling rejects everything larger.
     if (!Number.isInteger(value) || value < 1) failClosed(`PUBLIC_INTELLIGENCE_5K3_PLAN_BOUND_INVALID:${key}`);
-    if (value > PUBLIC_INTELLIGENCE_5K3_BOUND_CEILINGS[key]) failClosed(`PUBLIC_INTELLIGENCE_5K3_PLAN_BOUND_EXCEEDS_CEILING:${key}`);
+    if (value > ceilings[key]) failClosed(`PUBLIC_INTELLIGENCE_5K3_PLAN_BOUND_EXCEEDS_CEILING:${key}`);
   }
 
   if (!isValidTimestamp(plan.createdAt)) failClosed('PUBLIC_INTELLIGENCE_5K3_PLAN_CREATED_AT_INVALID');

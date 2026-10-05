@@ -24,6 +24,7 @@
 // changes its handle or moves between AppViews. The DID is retained inside the
 // observation as `providerAuthorId` and inside `providerObservationId` (the AT
 // URI), where it belongs.
+import { PUBLIC_INTELLIGENCE_5K6_1_BLUESKY_TRANSPORT_CEILINGS } from '../provider-capabilities.mjs';
 
 /** Stable, explicit provider namespace. Never derived from a mutable handle. */
 export const BLUESKY_PROVIDER_NAMESPACE = 'bluesky:public-appview';
@@ -67,15 +68,14 @@ export const blueskyFail = (code, details) => { throw new BlueskyAdapterError(co
  * Bounds. No greater in spirit than the 5K.2 Mastodon ceilings, and explicitly
  * tightened: Bluesky search is a keyword endpoint, so a smaller record ceiling
  * is appropriate and nothing here can be disabled or made unlimited.
+ *
+ * Phase 5K.6.1 moved the DEFINITION of these ceilings into the governed
+ * `provider-capabilities.mjs` registry and this is a re-export of that single
+ * source, so the transport keeps enforcing exactly the ceiling it always did while
+ * the collection plan can read the same numbers without importing this module.
+ * Values are unchanged; only their definition site moved.
  */
-export const BLUESKY_HARD_CEILINGS = Object.freeze({
-  maxPages: 3,
-  maxRecords: 100,
-  maxResponseBytes: 2 * 1024 * 1024,
-  timeoutMs: 20_000,
-  lookbackMs: 7 * 24 * 60 * 60 * 1000,
-  maxRetries: 1,
-});
+export const BLUESKY_HARD_CEILINGS = PUBLIC_INTELLIGENCE_5K6_1_BLUESKY_TRANSPORT_CEILINGS;
 
 export const BLUESKY_DEFAULT_BOUNDS = Object.freeze({
   maxPages: 1,
