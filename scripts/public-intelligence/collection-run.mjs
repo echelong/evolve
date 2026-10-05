@@ -25,7 +25,7 @@ import { mapStatusToRawObservation } from './providers/mastodon-mapper.mjs';
 import { validateCollectionPlan, collectionPlanFingerprint, transportBoundsOf } from './collection-plan.mjs';
 import {
   PUBLIC_INTELLIGENCE_5K3_RUN_STATUS, PUBLIC_INTELLIGENCE_5K3_FAILURE_OF_ADAPTER_CODE, buildRequestRecord, buildRunManifest,
-  deriveRunId, deriveRunStatus,
+  deriveRunId, deriveRunStatus, governStopReason,
 } from './collection-manifest.mjs';
 import {
   createRunDirectory, runDirectoryExists, writePlanOnce, appendRequestRecord, writeManifestOnce, loadRunArtifacts,
@@ -214,7 +214,13 @@ export async function executeCollectionRun(planInput, options = {}) {
     else integrityFailures += 1;
   }
   if (integrityFailures) failureCounts.INTEGRITY_FAILURE = integrityFailures;
-  const stopReason = acquired?.stopReason ?? (transportError ? 'REQUEST_FAILED' : 'NOT_STARTED');
+  // The transport reports a provider-NATIVE stop reason; the manifest carries the
+  // GOVERNED one. `END_OF_RESULTS` (Bluesky's word for "the provider returned no
+  // further records") is the same state 5K.3 already governs as END_OF_TIMELINE,
+  // so it is translated here rather than admitted as a second representation.
+  // Everything else - including every failure reason - passes through untouched,
+  // and a reason the manifest does not govern is still refused downstream.
+  const stopReason = governStopReason(acquired?.stopReason ?? (transportError ? 'REQUEST_FAILED' : 'NOT_STARTED'));
 
   const finalize = (extraIntegrity) => {
     const failures = { ...failureCounts };

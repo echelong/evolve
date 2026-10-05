@@ -89,6 +89,17 @@ export {
 } from './research-surface.mjs';
 export { collectionPlanFingerprint, assertProviderCapabilityCoverage } from './collection-plan.mjs';
 
+// --- 5K.3 governed terminal vocabulary (read by the 5K.6.2 validator) ------
+// Additive re-exports only. 5K.6.2 needs to read the CLOSED stop-reason
+// vocabulary, the provider-native alias map and the accounting/status helpers
+// without ever naming a protected module path from outside this tree.
+export {
+  PUBLIC_INTELLIGENCE_5K3_STOP_REASONS, PUBLIC_INTELLIGENCE_5K3_STOP_REASON_ALIASES,
+  PUBLIC_INTELLIGENCE_5K3_RUN_STATUS, PUBLIC_INTELLIGENCE_5K3_FAILURE_VALUES,
+  PUBLIC_INTELLIGENCE_5K3_REQUEST_FAILURE_VALUES, PUBLIC_INTELLIGENCE_5K3_MANIFEST_SCHEMA,
+  governStopReason, validateManifestShape, deriveRunStatus, buildRequestRecord, buildRunManifest, checkAccounting,
+} from './collection-manifest.mjs';
+
 // --- phase namespaces -------------------------------------------------------
 export * as INGESTION_5K1 from './index.mjs';
 export * as PROVENANCE_5K1 from './provenance.mjs';

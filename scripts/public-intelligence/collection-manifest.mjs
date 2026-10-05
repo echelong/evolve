@@ -120,6 +120,44 @@ export const PUBLIC_INTELLIGENCE_5K3_STOP_REASONS = Object.freeze([
 ]);
 const PLANNED_STOP_REASONS = Object.freeze(['END_OF_TIMELINE', 'MAX_PAGES', 'MAX_RECORDS', 'LOOKBACK_REACHED']);
 
+/**
+ * PROVIDER-NATIVE STOP REASON -> THE GOVERNED 5K.3 STOP REASON THAT MEANS THE
+ * SAME THING. Additively closed, exactly like the adapter-code map above.
+ *
+ * A run's terminal stop reason is a cross-provider concept: "the provider
+ * returned no further records". 5K.3 already governs that state, ONCE, as
+ * `END_OF_TIMELINE` - it is one of the four PLANNED_STOP_REASONS, so a run that
+ * ends there with no failed request and no conflict is COMPLETED.
+ *
+ * Bluesky names the identical state `END_OF_RESULTS`. That word is provider
+ * vocabulary, not a second governed state: adding it to
+ * PUBLIC_INTELLIGENCE_5K3_STOP_REASONS would give natural exhaustion TWO
+ * representations in the same closed vocabulary and make "COMPLETED" depend on
+ * which provider ran. So the provider-native token is translated HERE, at the
+ * boundary, and manifests carry exactly one representation of the state.
+ *
+ * The map is deliberately ONE entry and deliberately applies ONLY to the
+ * provider-native success vocabulary. It grants nothing to a failure: an
+ * unusable cursor is still PAGINATION_CURSOR_UNUSABLE (PARTIAL), a failed
+ * request is still REQUEST_FAILED, and any reason that is neither governed nor
+ * listed here passes through untouched and is refused by validateManifestShape
+ * with MANIFEST_STOP_REASON_INVALID. Nothing is loosened to admit a run.
+ */
+export const PUBLIC_INTELLIGENCE_5K3_STOP_REASON_ALIASES = Object.freeze({
+  END_OF_RESULTS: 'END_OF_TIMELINE',
+});
+
+/**
+ * Translates one provider-native stop reason into the governed vocabulary.
+ * A reason that is already governed, or that is unknown, is returned AS IS:
+ * identity for Mastodon, and refusal downstream for anything invented.
+ */
+export function governStopReason(value) {
+  return Object.hasOwn(PUBLIC_INTELLIGENCE_5K3_STOP_REASON_ALIASES, value)
+    ? PUBLIC_INTELLIGENCE_5K3_STOP_REASON_ALIASES[value]
+    : value;
+}
+
 const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isCount = value => Number.isSafeInteger(value) && value >= 0;
 const FINGERPRINT = /^[0-9a-f]{64}$/;
