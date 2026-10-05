@@ -14,7 +14,7 @@ import { normalizeObservation5K1, normalizedFingerprint5K1 } from './normalize.m
 import { dedupIdentity5K1 } from './dedup.mjs';
 import { createMemoryStore, PUBLIC_INTELLIGENCE_5K1_RECORD_ENVELOPE } from './store.mjs';
 import { ingestPublicObservation } from './ingest.mjs';
-import { validateCollectionPlan, collectionPlanFingerprint } from './collection-plan.mjs';
+import { validateCollectionPlan, collectionPlanFingerprint, rawProviderNamespaceOf } from './collection-plan.mjs';
 import {
   validateManifestShape, validateRequestRecord, checkAccounting, deriveRunId, manifestFingerprintOf, requestsFingerprint,
 } from './collection-manifest.mjs';
@@ -75,7 +75,11 @@ export function verifyRunArtifacts(artifacts) {
     if (!raw) return;
     if (raw.collectionContext.collectionRunId !== manifest.runId) failures.push('RAW_RUN_ID_MISMATCH');
     if (raw.collectionContext.collectorMode !== plan.collectionMode) failures.push('RAW_COLLECTOR_MODE_MISMATCH');
-    if (raw.provider !== `${plan.provider}:${plan.instance}`) failures.push('RAW_PROVIDER_MISMATCH');
+    // The namespace comes from the governed provider registry. Mastodon's stays
+    // `${provider}:${instance}` verbatim; a provider with a host-free namespace
+    // (Bluesky) governs its own. Evidence whose namespace does not match its plan
+    // is still a hard failure.
+    if (raw.provider !== rawProviderNamespaceOf(plan)) failures.push('RAW_PROVIDER_MISMATCH');
   });
 
   // 6. stored normalized observations

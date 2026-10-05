@@ -213,11 +213,37 @@ test('B2 unknown or missing keys are rejected at every level', () => {
   refusal(() => validateCollectionPlan(missing), 'FIELD_MISSING:createdAt');
   refusal(() => validateCollectionPlan({ ...base, bounds: { maxPages: 1 } }), 'FIELD_MISSING');
 });
-test('B3 only the mastodon provider is accepted (no other provider is added)', () => {
-  for (const provider of ['x', 'twitter', 'reddit', 'bluesky', 'telegram', 'discord', 'rss', 'Mastodon', '', null]) {
+test('B3 only GOVERNED providers are accepted (no unregistered provider is added)', () => {
+  // 5K.3 originally shipped with exactly one provider, `mastodon`, and this
+  // test asserted that literal. Phase 5K.6 adds a SECOND provider, which makes
+  // that literal false for all time and would make every future provider phase a
+  // regression. The assertion is therefore SCOPED to its stated intent - "no
+  // other provider is added" - and expressed as a property of the governed
+  // registry rather than a hardcoded one-provider list. Mastodon stays in the
+  // registry, so no Mastodon validation is weakened, and the registry itself is
+  // still asserted to be small, sorted, duplicate-free and lower-case.
+  for (const provider of ['x', 'twitter', 'reddit', 'telegram', 'discord', 'rss', 'Mastodon', '', null]) {
     refusal(() => validateCollectionPlan({ ...mkPlan(), provider }), 'PROVIDER_INVALID');
   }
-  assert.deepEqual([...PLAN.PUBLIC_INTELLIGENCE_5K3_PROVIDERS], ['mastodon']);
+  assert.ok(PLAN.PUBLIC_INTELLIGENCE_5K3_PROVIDERS.includes('mastodon'), 'mastodon must remain governed');
+  const registry = [...PLAN.PUBLIC_INTELLIGENCE_5K3_PROVIDERS];
+  assert.equal(registry.length, new Set(registry).size, 'the registry has no duplicates');
+  assert.deepEqual(registry, [...registry].sort(), 'the registry is sorted');
+  for (const provider of registry) {
+    assert.equal(provider, provider.toLowerCase(), `${provider} is not canonical`);
+    // Each governed provider is accepted with a plan that satisfies ITS OWN
+    // governed query type and instance, so this cannot pass by accident.
+    const governed = PLAN.PUBLIC_INTELLIGENCE_5K3_PROVIDER_DEFAULTS[provider];
+    assert.ok(governed, `${provider} has no governed defaults`);
+    const built = PLAN.buildCollectionPlan({
+      provider,
+      instance: governed.instance ?? HOST,
+      ...(governed.queryType === 'HASHTAG' ? { hashtag: 'solana' } : { term: 'solana' }),
+      bounds: BOUNDS, collectionMode: 'OFFLINE_FIXTURE', createdAt: T0,
+    });
+    assert.equal(built.provider, provider);
+    assert.equal(built.query.type, governed.queryType);
+  }
 });
 test('B4 invalid query types and values are rejected', () => {
   for (const type of ['URL', 'USER', 'SEARCH', 'hashtag', '']) refusal(() => validateCollectionPlan({ ...mkPlan(), query: { type, value: 'solana' } }), 'QUERY_TYPE_INVALID');

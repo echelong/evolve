@@ -66,6 +66,28 @@ const K5_BASE = (() => {
   if (found !== K5_BASE_SHA) throw new Error(`PHASE_5K5_BASE_COMMIT_UNRESOLVED:${found ?? 'none'}`);
   return found;
 })();
+// Phase 5K.5's OWN commit.
+//
+// 5K.5 originally compared `K5_BASE..HEAD`. That is correct only while 5K.5 is the
+// newest commit: `HEAD` then names the 5K.5 commit itself, which is what both
+// L7 ("5K.5 touched an unrelated path") and O9 ("5K.5 adds no second provider")
+// actually mean. Once Phase 5K.6 lands, `HEAD` moves on and those two checks
+// silently re-scope themselves from "what did 5K.5 do" to "what has any phase
+// since 5K.4 done" - so they would fail on correct, unrelated future work, and
+// no 5K.6 import topology can avoid that (adding any Bluesky file necessarily
+// trips both). Pinning the phase's own commit restores the stated intent and is
+// strictly MORE precise, not weaker: it still forbids 5K.5 from adding a
+// provider or touching an unrelated path.
+const K5_HEAD_SUBJECT = 'Implement Phase 5K.5 temporal evidence semantics';
+const K5_HEAD_SHA = 'aaa5019c362621d967801ffccf65261d7011b50b';
+const K5_HEAD = (() => {
+  const lines = execFileSync('git', ['log', '--format=%H%x00%s'], { cwd: REPO_ROOT, encoding: 'utf8' })
+    .split('\n').filter(Boolean);
+  const found = lines.map(line => line.split('\u0000'))
+    .find(([, subject]) => subject === K5_HEAD_SUBJECT)?.[0];
+  if (found !== K5_HEAD_SHA) throw new Error(`PHASE_5K5_HEAD_COMMIT_UNRESOLVED:${found ?? 'none'}`);
+  return found;
+})();
 const TEMPORAL_MODULES = ['temporal-projection', 'observation-state', 'revision-chain', 'temporal-corpus', 'temporal-query', 'temporal-snapshot', 'temporal-verify'].map(name => `${PI}/${name}.mjs`);
 const require = createRequire(import.meta.url);
 const espree = require('espree');
@@ -1154,7 +1176,7 @@ test('L7 every 5K.0-5K.4 module is unmodified by 5K.5', () => {
   // phase touched must contain NOTHING that existed before it. Naming those
   // files here would re-create the exact import-boundary coupling this repair
   // removes, so the assertion is expressed as "every change is a NEW file".
-  const status = gitOut('diff', '--name-status', K5_BASE, 'HEAD').split('\n').filter(Boolean);
+  const status = gitOut('diff', '--name-status', K5_BASE, K5_HEAD).split('\n').filter(Boolean);
   const touched = status.map(line => line.slice(2));
   const notAdded = status.filter(line => !line.startsWith('A\t'));
   assert.equal(notAdded.join(' '), '',
@@ -1295,14 +1317,17 @@ test('O7 the phase document exists and covers every required section and disclai
 });
 test('O8 the validator made zero real network calls', () => assert.equal(tripwireCalls, 0));
 test('O9 5K.5 adds no second provider and no scraping surface', () => {
-  const touched = gitOut('diff', '--name-only', K5_BASE, 'HEAD').split('\n').filter(Boolean);
+  const touched = gitOut('diff', '--name-only', K5_BASE, K5_HEAD).split('\n').filter(Boolean);
   for (const provider of ['twitter', 'reddit', 'bluesky', 'telegram', 'discord', 'rss', 'scraper', 'x-api', 'nitter']) {
     assert.ok(!touched.some(f => f.toLowerCase().includes(provider)), `${provider} surface appeared`);
   }
   // A provider adapter is any tracked module the provider directory holds. 5K.5
-  // must leave that directory exactly as 5K.2 created it.
+  // must leave that directory exactly as 5K.2 created it. Both sides are read
+  // from the 5K.5 COMMIT rather than the working index: comparing a commit
+  // against `ls-files` measures "what has any later phase added", not "what did
+  // 5K.5 add", which is the property this test actually asserts.
   const adaptersBefore = gitOut('ls-tree', '-r', '--name-only', K5_BASE, '--', `${PI}/providers`).split('\n').filter(Boolean);
-  const adaptersAfter = gitOut('ls-files', `${PI}/providers`).split('\n').filter(Boolean);
+  const adaptersAfter = gitOut('ls-tree', '-r', '--name-only', K5_HEAD, '--', `${PI}/providers`).split('\n').filter(Boolean);
   assert.deepEqual(adaptersAfter, adaptersBefore, '5K.5 must not add or remove a provider adapter');
 });
 test('O10 5K.5 declares it is research and observation only', () => {

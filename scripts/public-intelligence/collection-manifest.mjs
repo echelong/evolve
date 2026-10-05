@@ -82,7 +82,17 @@ export const PUBLIC_INTELLIGENCE_5K3_REQUEST_FAILURE_VALUES = Object.freeze([
   'INVALID_PROVIDER_RESPONSE', 'OVERSIZED_RESPONSE',
 ]);
 
-/** 5K.2 adapter error code -> 5K.3 failure class. Anything else is an integrity failure. */
+/**
+ * Adapter error code -> 5K.3 failure class. Anything else is an integrity failure.
+ *
+ * The 5K.2 Mastodon codes are unchanged. Phase 5K.6 adds the Bluesky adapter's
+ * own codes ADDITIVELY, so a Bluesky transport failure is classified into the
+ * SAME structural failure vocabulary instead of degrading to
+ * INVALID_PROVIDER_RESPONSE. Without this the run would still be recorded, but
+ * its failure class would be wrong and the manifest accounting invariant would
+ * fail - a provider-specific vocabulary must not be able to distort run
+ * accounting.
+ */
 export const PUBLIC_INTELLIGENCE_5K3_FAILURE_OF_ADAPTER_CODE = Object.freeze({
   PROVIDER_RATE_LIMITED: 'RATE_LIMITED',
   PROVIDER_TIMEOUT: 'TIMEOUT',
@@ -93,6 +103,16 @@ export const PUBLIC_INTELLIGENCE_5K3_FAILURE_OF_ADAPTER_CODE = Object.freeze({
   PROVIDER_MALFORMED_RESPONSE: 'INVALID_PROVIDER_RESPONSE',
   PROVIDER_UNEXPECTED_CONTENT_TYPE: 'INVALID_PROVIDER_RESPONSE',
   PROVIDER_RESPONSE_TOO_LARGE: 'OVERSIZED_RESPONSE',
+  // --- 5K.6 Bluesky ---
+  BLUESKY_RATE_LIMITED: 'RATE_LIMITED',
+  BLUESKY_TIMEOUT: 'TIMEOUT',
+  BLUESKY_NETWORK_ERROR: 'NETWORK_ERROR',
+  BLUESKY_AUTH_REQUIRED: 'PROVIDER_AUTH_REQUIRED',
+  BLUESKY_CLIENT_ERROR_4XX: 'PROVIDER_4XX',
+  BLUESKY_SERVER_ERROR_5XX: 'PROVIDER_5XX',
+  BLUESKY_MALFORMED_RESPONSE: 'INVALID_PROVIDER_RESPONSE',
+  BLUESKY_UNEXPECTED_CONTENT_TYPE: 'INVALID_PROVIDER_RESPONSE',
+  BLUESKY_RESPONSE_TOO_LARGE: 'OVERSIZED_RESPONSE',
 });
 
 export const PUBLIC_INTELLIGENCE_5K3_STOP_REASONS = Object.freeze([

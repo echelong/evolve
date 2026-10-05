@@ -21,6 +21,7 @@
 import { PUBLIC_INTELLIGENCE_CLASSIFICATION, canonical, digest } from './definition.mjs';
 import { failClosed } from './observation.mjs';
 import { PUBLIC_INTELLIGENCE_5K4_SCHEMA_VERSION } from './corpus-membership.mjs';
+import { rawProviderNamespaceOf } from './collection-plan.mjs';
 
 export const PUBLIC_INTELLIGENCE_5K4_OBSERVATION_RECORD_TYPE = 'public_corpus_observation';
 export const PUBLIC_INTELLIGENCE_5K4_CONFLICT_RECORD_TYPE = 'public_corpus_conflict';
@@ -194,8 +195,14 @@ export function computeCoverage(memberships, index, runs) {
   for (const membership of memberships) {
     bump(statuses, membership.status);
     bump(queries, `${membership.query.type}:${membership.query.value}`);
-    // Keyed like the raw provider namespace (`mastodon:<instance>`) so run and observation counts unify.
-    const key = `${membership.provider}:${membership.instance}`;
+    // Keyed by the GOVERNED raw provider namespace, which is what every
+    // observation in this corpus also carries, so run and observation counts
+    // unify into one row per provider. For Mastodon this is exactly
+    // `mastodon:<instance>` as before. A provider whose namespace is host-free
+    // (Bluesky) would otherwise produce TWO rows - one from its runs and one from
+    // its evidence - and the run-level row would claim a namespace no observation
+    // ever carries.
+    const key = rawProviderNamespaceOf(membership);
     providers[key] ??= { runs: 0, appearances: 0, canonicalObservations: 0, conflictedIdentities: 0 };
     providers[key].runs += 1;
   }
