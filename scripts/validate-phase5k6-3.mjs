@@ -782,7 +782,10 @@ test('I11 this phase touches only the generic run layer and validators', () => {
     || /observation|provenance|normalize|dedup|ingest|revision|temporal-|corpus-/.test(entry));
   assert.deepEqual(forbidden, [], '5K.6.3 must not touch evidence or provider semantics');
   for (const entry of changed) {
-    assert.ok(entry.startsWith(`${PI}/`) || entry.startsWith('scripts/validate-'), entry);
+    // The documentation tree is allowed, exactly as 5K.6's own Q11 scope check
+    // allows it: a later phase is expected to land a phase document, and that
+    // document is not a change to any governed semantic surface.
+    assert.ok(entry.startsWith(`${PI}/`) || entry.startsWith('docs/') || entry.startsWith('scripts/validate-'), entry);
   }
 });
 

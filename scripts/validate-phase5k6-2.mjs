@@ -712,7 +712,10 @@ test('H6 the governed surface still re-exports only and adds no behaviour', () =
 test('H7 every file this phase touches lives inside the governed tree or is a validator', () => {
   const changed = gitOut('diff', '--name-only', BASE_COMMIT).split('\n').filter(Boolean);
   for (const entry of changed) {
-    assert.ok(entry.startsWith(`${PI}/`) || entry.startsWith('scripts/validate-'), entry);
+    // The documentation tree is allowed, exactly as 5K.6's own Q11 scope check
+    // allows it: a later phase is expected to land a phase document, and that
+    // document is not a change to any governed semantic surface.
+    assert.ok(entry.startsWith(`${PI}/`) || entry.startsWith('docs/') || entry.startsWith('scripts/validate-'), entry);
   }
 });
 test('H8 this validator is itself offline by construction and never runs a live smoke', () => {
