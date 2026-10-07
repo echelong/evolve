@@ -1,0 +1,1324 @@
+{
+  "schemaVersion": "5K.final.0",
+  "recordType": "phase5k_final_authority",
+  "status": "CLOSED",
+  "programLabel": "PHASE_5K_PUBLIC_SOCIAL_INTELLIGENCE",
+  "acceptedImplementationHead": "ed56ed17e366cffb59d088820b69a007890b538a",
+  "acceptanceScope": {
+    "recordIsAcceptanceOnly": true,
+    "addsPublicIntelligenceFunctionality": false,
+    "computesNewScientificResult": false,
+    "reinterpretsR4": false,
+    "createsSuccessorProgram": false,
+    "impliedSuccessorPhase": null
+  },
+  "classification": {
+    "developmentOnly": true,
+    "researchOnly": true,
+    "observerOnly": true,
+    "paperOnly": true,
+    "tradingAuthority": false,
+    "engineAuthority": false,
+    "arenaEligible": false,
+    "promotionEligible": false,
+    "profitabilityInferencePermitted": false,
+    "evidenceClass": "PUBLIC_SOCIAL_RESEARCH_EVIDENCE",
+    "programStatus": "CLOSED"
+  },
+  "phaseInventory": [
+    {
+      "phase": "5K.0",
+      "title": "Public social intelligence research governance",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k.mjs",
+      "document": "docs/PHASE5K-PUBLIC-SOCIAL-INTELLIGENCE.md",
+      "expectedPassed": 32,
+      "expectedTotal": 32
+    },
+    {
+      "phase": "5K.1",
+      "title": "Ingestion boundary, provenance and normalization",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k1.mjs",
+      "document": "docs/PHASE5K1-INGESTION-PROVENANCE.md",
+      "expectedPassed": 64,
+      "expectedTotal": 64
+    },
+    {
+      "phase": "5K.2",
+      "title": "First bounded public provider (Mastodon)",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k2.mjs",
+      "document": "docs/PHASE5K2-FIRST-PROVIDER.md",
+      "expectedPassed": 70,
+      "expectedTotal": 70
+    },
+    {
+      "phase": "5K.3",
+      "title": "Bounded collection runs",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k3.mjs",
+      "document": "docs/PHASE5K3-COLLECTION-RUNS.md",
+      "expectedPassed": 96,
+      "expectedTotal": 96
+    },
+    {
+      "phase": "5K.4",
+      "title": "Cross-run corpus construction",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k4.mjs",
+      "document": "docs/PHASE5K4-CROSS-RUN-CORPUS.md",
+      "expectedPassed": 116,
+      "expectedTotal": 116
+    },
+    {
+      "phase": "5K.5",
+      "title": "Temporal evidence semantics",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k5.mjs",
+      "document": "docs/PHASE5K5-TEMPORAL-REVISIONS.md",
+      "expectedPassed": 130,
+      "expectedTotal": 130
+    },
+    {
+      "phase": "5K.5.1",
+      "title": "Reproducible temporal revision evidence",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k5-1.mjs",
+      "document": "docs/PHASE5K5-TEMPORAL-REVISIONS.md",
+      "expectedPassed": 27,
+      "expectedTotal": 27
+    },
+    {
+      "phase": "5K.6",
+      "title": "Second bounded public provider (Bluesky)",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k6.mjs",
+      "document": "docs/PHASE5K6-BLUESKY-PROVIDER.md",
+      "expectedPassed": 166,
+      "expectedTotal": 166
+    },
+    {
+      "phase": "5K.6.1",
+      "title": "Provider-scoped collection bounds",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k6-1.mjs",
+      "document": "docs/PHASE5K6-BLUESKY-PROVIDER.md",
+      "expectedPassed": 57,
+      "expectedTotal": 57
+    },
+    {
+      "phase": "5K.6.2",
+      "title": "Terminal exhaustion compatibility",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k6-2.mjs",
+      "document": "docs/PHASE5K6-BLUESKY-PROVIDER.md",
+      "expectedPassed": 58,
+      "expectedTotal": 58
+    },
+    {
+      "phase": "5K.6.3",
+      "title": "Provider-neutral pagination cursors",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k6-3.mjs",
+      "document": "docs/PHASE5K6-BLUESKY-PROVIDER.md",
+      "expectedPassed": 71,
+      "expectedTotal": 71
+    },
+    {
+      "phase": "5K.7",
+      "title": "Cross-provider corroboration as coverage",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k7.mjs",
+      "document": "docs/PHASE5K7-CROSS-PROVIDER-CORROBORATION.md",
+      "expectedPassed": 153,
+      "expectedTotal": 153
+    },
+    {
+      "phase": "5K.8",
+      "title": "Content lineage and duplication semantics",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k8.mjs",
+      "document": "docs/PHASE5K8-CONTENT-LINEAGE.md",
+      "expectedPassed": 164,
+      "expectedTotal": 164
+    },
+    {
+      "phase": "5K.9",
+      "title": "Descriptive evidence features",
+      "status": "ACCEPTED",
+      "validator": "scripts/validate-phase5k9.mjs",
+      "document": "docs/PHASE5K9-DESCRIPTIVE-FEATURES.md",
+      "expectedPassed": 186,
+      "expectedTotal": 186
+    }
+  ],
+  "validatorExpectations": {
+    "execution": "ONE_NODE_PROCESS_PER_PHASE_VALIDATOR",
+    "successSignal": "REPORTED_EXACT_PASS_COUNT",
+    "exitCodeAloneIsInsufficient": true,
+    "expectedHistoricalAssertions": 1390,
+    "order": [
+      "5K.0",
+      "5K.1",
+      "5K.2",
+      "5K.3",
+      "5K.4",
+      "5K.5",
+      "5K.5.1",
+      "5K.6",
+      "5K.6.1",
+      "5K.6.2",
+      "5K.6.3",
+      "5K.7",
+      "5K.8",
+      "5K.9"
+    ],
+    "phases": [
+      {
+        "phase": "5K.0",
+        "validator": "scripts/validate-phase5k.mjs",
+        "expectedPassed": 32,
+        "expectedTotal": 32
+      },
+      {
+        "phase": "5K.1",
+        "validator": "scripts/validate-phase5k1.mjs",
+        "expectedPassed": 64,
+        "expectedTotal": 64
+      },
+      {
+        "phase": "5K.2",
+        "validator": "scripts/validate-phase5k2.mjs",
+        "expectedPassed": 70,
+        "expectedTotal": 70
+      },
+      {
+        "phase": "5K.3",
+        "validator": "scripts/validate-phase5k3.mjs",
+        "expectedPassed": 96,
+        "expectedTotal": 96
+      },
+      {
+        "phase": "5K.4",
+        "validator": "scripts/validate-phase5k4.mjs",
+        "expectedPassed": 116,
+        "expectedTotal": 116
+      },
+      {
+        "phase": "5K.5",
+        "validator": "scripts/validate-phase5k5.mjs",
+        "expectedPassed": 130,
+        "expectedTotal": 130
+      },
+      {
+        "phase": "5K.5.1",
+        "validator": "scripts/validate-phase5k5-1.mjs",
+        "expectedPassed": 27,
+        "expectedTotal": 27
+      },
+      {
+        "phase": "5K.6",
+        "validator": "scripts/validate-phase5k6.mjs",
+        "expectedPassed": 166,
+        "expectedTotal": 166
+      },
+      {
+        "phase": "5K.6.1",
+        "validator": "scripts/validate-phase5k6-1.mjs",
+        "expectedPassed": 57,
+        "expectedTotal": 57
+      },
+      {
+        "phase": "5K.6.2",
+        "validator": "scripts/validate-phase5k6-2.mjs",
+        "expectedPassed": 58,
+        "expectedTotal": 58
+      },
+      {
+        "phase": "5K.6.3",
+        "validator": "scripts/validate-phase5k6-3.mjs",
+        "expectedPassed": 71,
+        "expectedTotal": 71
+      },
+      {
+        "phase": "5K.7",
+        "validator": "scripts/validate-phase5k7.mjs",
+        "expectedPassed": 153,
+        "expectedTotal": 153
+      },
+      {
+        "phase": "5K.8",
+        "validator": "scripts/validate-phase5k8.mjs",
+        "expectedPassed": 164,
+        "expectedTotal": 164
+      },
+      {
+        "phase": "5K.9",
+        "validator": "scripts/validate-phase5k9.mjs",
+        "expectedPassed": 186,
+        "expectedTotal": 186
+      }
+    ]
+  },
+  "governedInventory": {
+    "source": "GIT_TREE_AT_ACCEPTED_COMMIT",
+    "selectionRules": [
+      "scripts/public-intelligence/**",
+      "scripts/validate-phase5k*.mjs",
+      "docs/PHASE5K*.md"
+    ],
+    "hashing": {
+      "canonicalization": "CANONICAL_JSON_SORTED_KEYS",
+      "digest": "SHA-256",
+      "memberFields": [
+        "path",
+        "gitMode",
+        "gitBlobObjectId",
+        "contentDigest"
+      ]
+    },
+    "fileCount": 85,
+    "governedTreeDigest": "113b7a9cb96a33fdc439bd875add5924c57f16d2b72e9e052ef753cb377b4502",
+    "files": [
+      {
+        "path": "docs/PHASE5K-PUBLIC-SOCIAL-INTELLIGENCE.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "d92b46785f9189123847fdcc4b3eeacfae21f786",
+        "contentDigest": "aa1d2e408381214ae44652a8c894bcbc8501d0b7221e6e03994e60e4736a93ef"
+      },
+      {
+        "path": "docs/PHASE5K1-INGESTION-PROVENANCE.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "a4caae2adf78b6263c0bcf5bd7e4ef5b5c895d47",
+        "contentDigest": "eb6b6021f9f4893f4378dc6bb4ce8014ff875c51025dc7e9895e59e3ab51f60c"
+      },
+      {
+        "path": "docs/PHASE5K2-FIRST-PROVIDER.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "9fdd9805bc26ea836c53a2ab18e516902633a0c9",
+        "contentDigest": "ef45f634b3a7e10b7880afe0659d86b6d9c9bf5d542716fb4e6d62809a874afd"
+      },
+      {
+        "path": "docs/PHASE5K3-COLLECTION-RUNS.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "0f1348f74e9e9449b760e867ebf586ef38ac6a9e",
+        "contentDigest": "50e21fe7238e9858ece51aff352ec6d0df22061fefe6a53a0cf15c22152da3b9"
+      },
+      {
+        "path": "docs/PHASE5K4-CROSS-RUN-CORPUS.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "3a908f2d572341e625ab620f3cc5878075ee568c",
+        "contentDigest": "4618db1f6a899a3195c6b6f817874ffa0e38323d5566f2efbcd69126be7d6287"
+      },
+      {
+        "path": "docs/PHASE5K5-TEMPORAL-REVISIONS.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "768c1a8eaa51035d7af5090bb0bf13c99b07bd01",
+        "contentDigest": "97bccc681645eb5086832ea10787c8dca99147a7cc57b18595d449f0811a8dad"
+      },
+      {
+        "path": "docs/PHASE5K6-BLUESKY-PROVIDER.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "6b125f01467c5d9e1ed5de3944adac126c81cd67",
+        "contentDigest": "25f4fdcd438a6eb506b508065326d8cd449c8d6d07d12eb8ef2fbaf28b7f0014"
+      },
+      {
+        "path": "docs/PHASE5K7-CROSS-PROVIDER-CORROBORATION.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "5dbc01839fc02c60ba3c971cabae2128b09bff09",
+        "contentDigest": "ea66643b011363539970a07be081a2670bc517896206964c14b29ca6afed93b1"
+      },
+      {
+        "path": "docs/PHASE5K8-CONTENT-LINEAGE.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c238be9c776bd0f2f60a6136088c6e811709196c",
+        "contentDigest": "bf1d432303e4f214111b9ba1e60082c2d476da5d1cad40bb6e5735a31826e721"
+      },
+      {
+        "path": "docs/PHASE5K9-DESCRIPTIVE-FEATURES.md",
+        "gitMode": "100644",
+        "gitBlobObjectId": "bd9a847a9e4af59b4c4faa9788b2fc735afbb7d2",
+        "contentDigest": "4f76075e6cafb58da04ef835a344125e38c876260d2e5ca94d57a15322c7bd65"
+      },
+      {
+        "path": "scripts/public-intelligence/bluesky-validation-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "878c43558297d7b10d910f8a45ed78398f7302d8",
+        "contentDigest": "3b67738dfc10ffcb67445a592f436308bda53e0dea44a890eef5a84e827cef88"
+      },
+      {
+        "path": "scripts/public-intelligence/collect.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "f30a77a7e658b00323eddd4dc24859a050998ada",
+        "contentDigest": "43d419748686d1a919e8004c1d944d4a16ae70d2c098fd2674c1a187fa8766af"
+      },
+      {
+        "path": "scripts/public-intelligence/collection-manifest.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "ea51faa6540a609f761467e794b446da9344462b",
+        "contentDigest": "9f153b2ad9beeff225fa21970ddd277bcb729317bc59b74b3a2276339b70cc09"
+      },
+      {
+        "path": "scripts/public-intelligence/collection-plan.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "3ab6cd146a226e80029d8f2841661a9b603b81fa",
+        "contentDigest": "bd29341a00d32dc1ad61a9c55712aab60cac4826cae0f6f0dcb44fe1fc1f3604"
+      },
+      {
+        "path": "scripts/public-intelligence/collection-run.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "904088717b8f723e7f415c628b3285b46c4f9739",
+        "contentDigest": "ee72849df1a10c4392e2ffe71a262534cc714f6501ce08703d078b68b5b7fa20"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-cli.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "202862624bf60ec0b7c13a07d7ecf7b9ed15a56c",
+        "contentDigest": "6bcd386d1c04f21017cb7fb5a3fc8a6a8e0c0b2510cd0a41d2ad2f81c7bd1a78"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-index.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "6242a7c6e2e7a9a96abcf8251b34345d22396615",
+        "contentDigest": "b8129ce9a6af021f698507dd83caa47b9e886a0eae632952b967deae64b201ea"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-membership.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "86bccd913570b32f82e26cd2b981b7482d29d3e7",
+        "contentDigest": "bd1c35429338f56f8d09aa39d84412c55f177f44c776f7eb4871ae51fe5aa063"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-query.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c90f3e127d4fe29e24d6e070d66663ca35323d39",
+        "contentDigest": "c2ce156b270c8fbead4fad20a71f76bef577fdb758319a2274365ca0ea6a4248"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-snapshot.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "2f0d188e1a7771cde5578e1159d2dd5536cac810",
+        "contentDigest": "8158398468364b5725ad5faa54c30628431c8353cdfcd787dce7b911cb55011a"
+      },
+      {
+        "path": "scripts/public-intelligence/corpus-verify.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "1fbea485b1f835cf4b9cd5d3b590bec52f9fafeb",
+        "contentDigest": "3487fd343297dfeb3591207d50e008666f19cdccd5252e0d9798bd6f268d914f"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-definition.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "504e66ff614e657d2c80d246fb3bc1ef668df498",
+        "contentDigest": "7fbeedf78f1177583daf09ff2c62e426b2e7e6d4694bc84807e43cac59701df7"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-index.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "065746d2e99477005c667898a6ea8a622faae276",
+        "contentDigest": "220573800884c3445891d36f7a51e9f185e6019737376bacb2f370d7fdd52845"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-query.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "2fc7bc13d0210d8e4842e509df7ae38fa626b556",
+        "contentDigest": "9ce6c2577f6bb9a26c15789ce0023ea894d0afeacd5e54d9ab51861dc422b82e"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-snapshot.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "ac450528a735f78e21cf48187bb9e3ee7d1388f1",
+        "contentDigest": "90362b854b38b0370f4f530d8927a507224f1f1f17f84adab22805d2980ccfce"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-validation-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "ef90b4bd1c45bfc82566186254ca4af4eaa112ae",
+        "contentDigest": "b507ba44815b3eb26bef1b4de6bbc08303c8a7dbd64e1e48b464ffb6f5eed141"
+      },
+      {
+        "path": "scripts/public-intelligence/corroboration-verify.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "1f76a52b380b9833d2b3007093a18bf0aba97042",
+        "contentDigest": "64c48592a98b17361ea730b3be907d542882899eea7e1f6397bb6808ce202e0f"
+      },
+      {
+        "path": "scripts/public-intelligence/dedup.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "4c57f6f54326044f7b309168f621755755e4a165",
+        "contentDigest": "89f14921ed732388df8372387d8239f952217224a607be4760b89139044e0379"
+      },
+      {
+        "path": "scripts/public-intelligence/definition.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "821b2ce0ef0541b7c7645117aad1e96f80c9efce",
+        "contentDigest": "a7c4d37dbaca45657e1253d6789318e66eb1be52f276ad5e04cea34545fd3356"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-definition.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "4b72e9c0eea9c253e265e9ef1f3b2c6234bb0da9",
+        "contentDigest": "fc2d9a0a8c30e488594de2062a1a0bee2bc6a44024311a054b83f3b34a806c1e"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-extract.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "d6120ee8c17b37cfa830680e546a0a2bb53dc7f8",
+        "contentDigest": "4ddf87f5c5311d54f08fe2c29c996cadc619adcfc938a83d26af755d367ae045"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-query.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "aaef1859e6175088cec7402192d74d625cfb39a9",
+        "contentDigest": "6ad3ba84ee85cf2560cba023cce7fe7a0632397e7647bbe0cb1f0f001afd2b7c"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-snapshot.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "9cc703a8a488cd339d2600b61947b80067b83d5f",
+        "contentDigest": "2ddbfdf751d4a077c6c68d5a7cf039a3008bcf8788503daede83942aaffd6200"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-validation-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "0ada2d0ecccc80bb7022c794516c1b690cbbbdc5",
+        "contentDigest": "289dffc62a9ea031b8ea5def609443794a5d56d2d1ca95179cefe73abb242c5c"
+      },
+      {
+        "path": "scripts/public-intelligence/feature-verify.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "0b5228411c076823d094f03989f957124fd7ae8e",
+        "contentDigest": "79b875bf2d12d68c881a4b184c73ab3f6c46674641b6fa9b3ad032a5df0c3254"
+      },
+      {
+        "path": "scripts/public-intelligence/fixtures.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "7609f6259b296f506789c90a69f71206df5aec5f",
+        "contentDigest": "6b075e0ab83efb1ec031e90a3bb2106ef88d75ad4d68961a3bc90bb73e8ef85d"
+      },
+      {
+        "path": "scripts/public-intelligence/index.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "1ab60a0410bcdd43966f5a5e9ab4ef0b5ec243c6",
+        "contentDigest": "cf0994734553fe5022d3cb4adc0761f68681dd8b548b816417d1f22bdf79d882"
+      },
+      {
+        "path": "scripts/public-intelligence/ingest.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "fbfb3a09414a15b71b169aee7d03ae830f8ef97c",
+        "contentDigest": "5eab8fce3c75d5f4bdc173ce43a76148fe99ede61a37ab6b40ba7babc3c6216e"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-definition.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c71915c1caa600f85f21c3f36ed34810f92208df",
+        "contentDigest": "c6ab0b4f61306d270a2ff94307f1c452ced1daf1b71a48a79b6d0317f42d4c99"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-index.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "393b9831edfdb3a62f458e898b2b9dd677c37e50",
+        "contentDigest": "85ee777fa64d4b34ad64c5ac27bafd50faffb54f13d2e12399677c87b8112dfb"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-query.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "5764798d770296c245f63663bab0e0c8da28474a",
+        "contentDigest": "c6dc4d2b837206aadb5e95a5dba9a2b05ab85e2364df5f68c8451dd938299b8a"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-snapshot.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "7e68029c27850421a61eff7c9054c7fc3b07bb33",
+        "contentDigest": "fd2dc4cda3275e39395da760abbeb26dbd99e321613f19681d59cc1c70087897"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-validation-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "d67f93c3dc07dea6c35bf88b6bd85e720d45bb86",
+        "contentDigest": "4234471fcb3c16fc1e49b7dba8576b8573789dcc9775e1467b924ad89785954a"
+      },
+      {
+        "path": "scripts/public-intelligence/lineage-verify.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "aa94b455ce14ea772b8425a452128792afc508bd",
+        "contentDigest": "81e934b46173e64ee9c40b72dae452418d521d3abad701c580b77ad8c5c90158"
+      },
+      {
+        "path": "scripts/public-intelligence/normalize.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "6cebccd63795c50cb91ae6dae889ad79ac95da24",
+        "contentDigest": "088938c80f645516a604faaae0654c700676e165b8207b2335b301decaa39926"
+      },
+      {
+        "path": "scripts/public-intelligence/observation-state.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "261f94f2b789d54923d761a467e7e45ef0589461",
+        "contentDigest": "f5f72046a4455890b62947095a0938ad6835156a05a05a3a728575ef7bce0240"
+      },
+      {
+        "path": "scripts/public-intelligence/observation.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "74dc1d307afbf85d817069f56e0228b7bc3d7075",
+        "contentDigest": "93455540e3f9dd59412f9fce02051b4e6aa0c2c643ff96a8d55bff75526bc557"
+      },
+      {
+        "path": "scripts/public-intelligence/pagination-cursor.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "22cf83c5eef41b4a901a7b73fafd468d5895a114",
+        "contentDigest": "b442ca726c931a00ce92402566bbf3cb3e8a17622c8056a25f647505ea04ca7a"
+      },
+      {
+        "path": "scripts/public-intelligence/provenance.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "02cfc06778e0ba1f1416cb1b0da4b416153b0488",
+        "contentDigest": "02ae956b85c5fcfd3214f0104c15cafb2953fd215d6feb953fae80dc246bde9e"
+      },
+      {
+        "path": "scripts/public-intelligence/provider-capabilities.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "a1ceea53381cd83720c6c8fd448910fb84b9e3e5",
+        "contentDigest": "b62c9a8f23aa319f31059059cb10004b99a539d43c6317d3ed63ed8132cb16c2"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/bluesky-common.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "9ed65538f0d79271d3cc3744b79696aef02fe0f5",
+        "contentDigest": "d3b9dbc04c7f6fbe2f979f3c29a07c0d191e72e77f147c051d56235dfe9c0582"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/bluesky-mapper.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "ed844f7a2734ccf37bf414afda7f700009ee15dd",
+        "contentDigest": "c369c0ff581f6b7287e3001bf599fd833035ca9d8b14190a4ff85203dd3b8825"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/bluesky-revision.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "42a5a52dd4242feadd09a26410f2e5f1fa461f7f",
+        "contentDigest": "f4a9298ab3feb8a70d00ad8d0f858309ba8c35bbb75f50d5ced3efada59c6be1"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/bluesky-transport.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c0bd203984e054050e1429a192d511c808402d06",
+        "contentDigest": "3e7bd7f7c79c82b56744e61b66eef4b6f9c3c07c77d07029ed3aa5b5f9d52052"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/bluesky.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "42a3d09f9dc3a270df816d7384d5ca071e52945c",
+        "contentDigest": "1c9765b1c621967f668d5513ae4938d16ef8ede5373f0e8b243c20d7db28c8c5"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/common.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "cee71342c45802ab6a5c8fa39c51879ba2cfc55f",
+        "contentDigest": "60055bc37cec0ad2de25783e67ac88dabbf57f2d0e431549c18f04790fcc256a"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/mastodon-mapper.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "fdeec129109db2be3c9c74de6e2360d750c0b676",
+        "contentDigest": "5136209121ecf7f54f0b23f6e77056b87c45d581175c73c27d52e22a06808e42"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/mastodon-transport.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "1dbf159132685329c01870ae927e5b1ed4a39085",
+        "contentDigest": "670c9ed848c865c9b527b44e05a5a2cf377e6796b69c011e59595658cd34df4a"
+      },
+      {
+        "path": "scripts/public-intelligence/providers/mastodon.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "7726449de171c6ccfc6ea7abdd997ffa62417a37",
+        "contentDigest": "e15d4a4ebd3075846da11feb15678562cce0900f88745d66392e4e9470fcb7aa"
+      },
+      {
+        "path": "scripts/public-intelligence/replay.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c07c835d86c338127400999c8df87aedf83e6e08",
+        "contentDigest": "abb0458398f79e66a74f9b18aea35bb3b958a41ca9d94e1d71e77799eaae4dbd"
+      },
+      {
+        "path": "scripts/public-intelligence/research-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "fe59042c1c3bd746221ae15bcb3e29c9c46d85eb",
+        "contentDigest": "ad38e18a1b8b510e5821ae6c7155f5977d32bc5d09619ae225dccabb0c30077c"
+      },
+      {
+        "path": "scripts/public-intelligence/revision-chain.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "04c7ff3e47a8602bb5adf28f589fc86ef9b6fa50",
+        "contentDigest": "a14f1c593b17ab4215e3e39811b0695d8e8aeaf2e923e37f8f0123ea9cf99073"
+      },
+      {
+        "path": "scripts/public-intelligence/run-store.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "992a453a3ea040bb5d8ce06040380d5328fdedd3",
+        "contentDigest": "d2c5613c708c74f57923440ba77b073301401571916f41f7a6737d6a8abde722"
+      },
+      {
+        "path": "scripts/public-intelligence/store.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "6b4c4383cf2ea3b104f04e98bdc9ca5ad027dc98",
+        "contentDigest": "a2cb431693326312fc98900aaedf9b336f388f995861949d6a60c5b193cc80a6"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-corpus.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "82d8239002c104544f52d7feec64a29116b269a5",
+        "contentDigest": "56b5d651adc187a982965e343131d292d70b1cf968732b356a99b9181c76d941"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-projection.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "fe8b5aaff4685a13a8427d4590705694ba8dd02d",
+        "contentDigest": "a98c81b0edf20ec4f54230aea91d2e020d34eb9bf1498cdfb1fada4e7723e66d"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-query.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "bbd979a82e8f61b6729a6e33b51698496dd3277e",
+        "contentDigest": "25436297179def067a4e7752b01163a747462ead9b0715884d6b68b2218c4f1f"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-smoke.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "ce00542bf8676a215d0b11c9c13c9524ed2e7e3c",
+        "contentDigest": "fe8a301839363b7395f38569cc8e2d51f279b17aba80938896ed8a24a29064b4"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-snapshot.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "bdd827e883d113a802ec265146b741ead1b4577e",
+        "contentDigest": "5fa182ecbff4bee67209271541a3396210716b803dd56a0840350500ca0b5e64"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-validation-surface.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "50f75f48ee6241899ed7c5ea8772f9a8ca8ce0fe",
+        "contentDigest": "42e8dfb21aa730ef233656d0cd76ef1d90bd09bce4101198bcccea2267d56848"
+      },
+      {
+        "path": "scripts/public-intelligence/temporal-verify.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "dbdfdac766316b73673a339b1f33e31947047559",
+        "contentDigest": "293f0b9031cb27a1c56e58528a3de2c170805b0162a0d2eac61d513818bb8603"
+      },
+      {
+        "path": "scripts/validate-phase5k.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "43adf841a21629b095e5ac0d434aa53c7c9734eb",
+        "contentDigest": "0ea5ad7d309c2fb14070a7ea32cc818ff8a9b002c9895ca738c5240f8b14ebff"
+      },
+      {
+        "path": "scripts/validate-phase5k1.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "7ba8708837f5270922e10443155fcde759caa746",
+        "contentDigest": "c5baaabd0883d8628fe71990f2f296e08388cec786a148af0282326c7abd12a2"
+      },
+      {
+        "path": "scripts/validate-phase5k2.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "bbf721c6fc08086f91fd33c9b42e4973a0f43637",
+        "contentDigest": "8e107b56d89817e1b87e87fe86ed018c0a58bd93559f70b392cac06bfc83f096"
+      },
+      {
+        "path": "scripts/validate-phase5k3.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c75ff2e19547560edc98c104771b90888e3b7a18",
+        "contentDigest": "48cda8b12cbe2912ac157fc72320b82d30796d8b2f21de6bad2974a796f61dbb"
+      },
+      {
+        "path": "scripts/validate-phase5k4.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "0875d3a20fc593c5bd8a1dccba5c12f9d67b72c4",
+        "contentDigest": "20a65dbd6f1e944111c1c95e82d81c77a9c0beed247466e06b77fb4b4c8f0b31"
+      },
+      {
+        "path": "scripts/validate-phase5k5-1.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "72841855d2a0f8fb323484952769f0f22e36480a",
+        "contentDigest": "fa60bba331bce0e518830b052d6023e5255c3338c1bbc72fa8e2407860e9c3e3"
+      },
+      {
+        "path": "scripts/validate-phase5k5.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "f6db5b9b8a7192f556211cb3df6de0c414f465e0",
+        "contentDigest": "d4e9ba2f2e53fa0910154413724d8653ab6dd395a237ef8a7679700b2bfc3edb"
+      },
+      {
+        "path": "scripts/validate-phase5k6-1.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "de7ddd8f9fea83d2ca37686da808903c9de712cb",
+        "contentDigest": "81a6c1ec6d2218ef82ad039aa77e749a9de898b003633c368972f031323b10ef"
+      },
+      {
+        "path": "scripts/validate-phase5k6-2.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "f5e53b4d293ee0e2192d90148f57dd95d44111f9",
+        "contentDigest": "9b4cd3c17d3299ea79cd7b79f0caf3ae98cca86a26924b23363218330e8f0d45"
+      },
+      {
+        "path": "scripts/validate-phase5k6-3.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "a94db70cffba65156acfe3944c12a051c122d1cc",
+        "contentDigest": "745394369434874aa4003769767c5abb9e0ee5e3efd4b3493d9e11598a190f3b"
+      },
+      {
+        "path": "scripts/validate-phase5k6.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "8bc3105ba2f4b18e3902c20bc56105e22541a178",
+        "contentDigest": "5f8a0b0f995560f29d1720aaf62944e4198fa7d6f4c2adab47bb84f85b9b5174"
+      },
+      {
+        "path": "scripts/validate-phase5k7.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "c7d9907b722e5c4cf2662db10661f9dfaff4a473",
+        "contentDigest": "31b788ff459b027a20655941469f8128be0b52b07ddbd94e7c85ef08a21b14b6"
+      },
+      {
+        "path": "scripts/validate-phase5k8.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "2db8d5c733c3a6470351a0031fb99912993f25c4",
+        "contentDigest": "e162baa65f89a60091b1aacebdcdef73c7d875c4ffbcc6e97fcd856752a97547"
+      },
+      {
+        "path": "scripts/validate-phase5k9.mjs",
+        "gitMode": "100644",
+        "gitBlobObjectId": "a6d4c9774bfc4a3f24fd0ae3fe44a8b92796f592",
+        "contentDigest": "3d044fd9df96ef5b8231751f65e8f27bfd2b68bacbc7645ec34cbc8d93cf0e8e"
+      }
+    ]
+  },
+  "providerBoundary": {
+    "providerFamilies": [
+      "bluesky",
+      "mastodon"
+    ],
+    "publicDataOnly": true,
+    "authenticationPermitted": false,
+    "unboundedCollectionPermitted": false,
+    "providerContactDuringAcceptance": false,
+    "hardCeilings": {
+      "maxPages": 5,
+      "maxRecords": 200,
+      "maxResponseBytes": 2097152,
+      "timeoutMs": 20000,
+      "lookbackMs": 604800000,
+      "maxRetries": 0
+    }
+  },
+  "semantics": {
+    "temporal": {
+      "classifications": [
+        "FIRST_OBSERVATION",
+        "SAME_CONTENT_SAME_STATE",
+        "SAME_CONTENT_UPDATED_STATE",
+        "PROVIDER_DECLARED_CONTENT_REVISION",
+        "UNVERIFIED_CONTENT_DIVERGENCE"
+      ],
+      "revisionEvidenceSources": [
+        "MASTODON_STATUS_EDITED_AT"
+      ]
+    },
+    "corroboration": {
+      "coverageStatus": {
+        "SINGLE_PROVIDER_FAMILY": "SINGLE_PROVIDER_FAMILY",
+        "MULTI_PROVIDER_FAMILY": "MULTI_PROVIDER_FAMILY"
+      },
+      "coverageStatusValues": [
+        "SINGLE_PROVIDER_FAMILY",
+        "MULTI_PROVIDER_FAMILY"
+      ],
+      "independence": {
+        "independenceUnit": "PROVIDER_FAMILY",
+        "familySeparatesCrossPlatformCoverage": true,
+        "namespaceSeparatesInstances": true,
+        "twoInstancesOfOneFamilyAreOneFamily": true,
+        "twoPostsOfOneFamilyAreOneFamily": true,
+        "sameTextCountsAsIndependence": false,
+        "sameTimeCountsAsIndependence": false,
+        "sameMintCountsAsIndependence": false,
+        "timeSeparationImpliesIndependence": false,
+        "aggregatedReferenceLayer": true,
+        "mergesUnderlyingEvidence": false
+      },
+      "coverageSemantics": {
+        "readOnly": true,
+        "derivedLayer": true,
+        "subjectIsExactMintOnly": true,
+        "crossProviderMergePerformed": false,
+        "underlyingEvidenceMergedAcrossProviders": false,
+        "claimsTruthEvaluated": false,
+        "providerAgreementInferred": false,
+        "independenceInferredFromTime": false,
+        "simultaneityInferred": false,
+        "absenceInterpreted": false,
+        "absenceFromOneProviderImpliesAbsence": false,
+        "scoreComputed": false,
+        "rankComputed": false,
+        "confidenceTierComputed": false,
+        "ordinalLevelAssigned": false,
+        "sentimentComputed": false,
+        "momentumComputed": false,
+        "popularityComputed": false,
+        "importanceComputed": false,
+        "predictionMade": false,
+        "recommendationMade": false,
+        "tradingInferenceMade": false,
+        "marketDataAccessed": false,
+        "clockRead": false,
+        "filesystemMtimeUsed": false,
+        "directoryOrderUsed": false,
+        "repeatedAcquisitionCountedAsNewUpstreamEvidence": false,
+        "engagementUsedAsEvidenceOfAnything": false,
+        "containsPostBodies": false,
+        "containsAuthorProfiles": false,
+        "containsCredentials": false
+      },
+      "marketLinkage": {
+        "priceDataAccessed": false,
+        "returnsAccessed": false,
+        "volatilityAccessed": false,
+        "r4OutcomeDataAccessed": false,
+        "tradingEngineReached": false,
+        "arenaReached": false,
+        "walletAccessed": false,
+        "signerAccessed": false,
+        "swapReached": false,
+        "rpcWriteReached": false,
+        "futureMovementAssociated": false
+      }
+    },
+    "lineage": {
+      "lineageClass": {
+        "DISTINCT_CONTENT": "DISTINCT_CONTENT",
+        "EXACT_RAW_TEXT_MATCH": "EXACT_RAW_TEXT_MATCH",
+        "CANONICAL_TEXT_MATCH": "CANONICAL_TEXT_MATCH",
+        "EXPLICIT_CROSS_POST_REFERENCE": "EXPLICIT_CROSS_POST_REFERENCE",
+        "UNRESOLVED": "UNRESOLVED"
+      },
+      "lineageClassValues": [
+        "DISTINCT_CONTENT",
+        "EXACT_RAW_TEXT_MATCH",
+        "CANONICAL_TEXT_MATCH",
+        "EXPLICIT_CROSS_POST_REFERENCE",
+        "UNRESOLVED"
+      ],
+      "textSemantics": {
+        "reusesCanonicalText5K1": true,
+        "newNormalizationIntroduced": false,
+        "rawTextPreservedCharacterForCharacter": true,
+        "lineEndingNormalizationOnly": true,
+        "aggressiveNormalizationApplied": false,
+        "lowercasingApplied": false,
+        "stemmingApplied": false,
+        "lemmatizationApplied": false,
+        "translationApplied": false,
+        "tokenizationApplied": false,
+        "stopWordRemovalApplied": false,
+        "semanticNormalizationApplied": false,
+        "arbitraryWordRemovalApplied": false,
+        "llmUsed": false,
+        "embeddingUsed": false,
+        "vectorSimilarityUsed": false,
+        "semanticSimilarityUsed": false,
+        "topicModelUsed": false,
+        "fuzzyNlpUsed": false,
+        "sentimentModelUsed": false,
+        "characterEditDistanceUsed": false,
+        "approximateMatchingUsed": false,
+        "rawTextFingerprintReusedFrom5K1": true,
+        "canonicalTextFingerprintReusedFrom5K1": true,
+        "alternateRawFingerprintCreated": false
+      },
+      "duplicationSemantics": {
+        "exactTextMatchEvaluated": true,
+        "exactTextMatchProvesCopying": false,
+        "exactTextMatchProvesSameAuthor": false,
+        "exactTextMatchProvesSameOrganization": false,
+        "exactTextMatchProvesSameClaimSource": false,
+        "originalityInferred": false,
+        "copyingInferred": false,
+        "plagiarismInferred": false,
+        "truthEvaluated": false,
+        "authorIndependenceInferred": false,
+        "crossProviderMergePerformed": false,
+        "underlyingEvidenceMergedAcrossProviders": false,
+        "sameTextCountsAsIndependence": false,
+        "runAppearanceCountedAsNewContentVersion": false,
+        "engagementChangeCountedAsNewContentVersion": false,
+        "engagementUsedAsEvidenceOfAnything": false
+      },
+      "identityResolution": {
+        "crossProviderHumanIdentityResolutionPerformed": false,
+        "authorIdentityComparedAcrossProviders": false,
+        "authorIdentifiersPersisted": false,
+        "sameHandleImpliesSamePerson": false,
+        "sameDisplayNameImpliesSamePerson": false,
+        "sameBioImpliesSamePerson": false,
+        "sameDomainImpliesSamePerson": false,
+        "sameAvatarImpliesSamePerson": false,
+        "sameTextImpliesSamePerson": false,
+        "mastodonAndBlueskyIdentitiesRemainSeparate": true
+      },
+      "marketLinkage": {
+        "priceDataAccessed": false,
+        "returnsAccessed": false,
+        "volatilityAccessed": false,
+        "r4OutcomeDataAccessed": false,
+        "tradingEngineReached": false,
+        "arenaReached": false,
+        "walletAccessed": false,
+        "signerAccessed": false,
+        "swapReached": false,
+        "rpcWriteReached": false,
+        "futureMovementAssociated": false,
+        "corroborationScoreComputed": false,
+        "tradeCandidateSelected": false
+      }
+    },
+    "features": {
+      "featureSemantics": {
+        "readOnly": true,
+        "derivedLayer": true,
+        "descriptiveOnly": true,
+        "measurableFromAuthenticatedEvidence": true,
+        "weightingApplied": false,
+        "normalizationApplied": false,
+        "standardizationApplied": false,
+        "zScoreComputed": false,
+        "percentileInterpretedAsRank": false,
+        "compositeComputed": false,
+        "scoreComputed": false,
+        "rankComputed": false,
+        "orderingByFeatureValue": false,
+        "defaultOrderingIsLexical": true,
+        "confidenceTierAssigned": false,
+        "ordinalLevelAssigned": false,
+        "sentimentComputed": false,
+        "momentumComputed": false,
+        "viralityComputed": false,
+        "popularityComputed": false,
+        "trendLabelled": false,
+        "importanceComputed": false,
+        "truthProbabilityComputed": false,
+        "predictionMade": false,
+        "recommendationMade": false,
+        "profitabilityInferenceMade": false,
+        "tradingInferenceMade": false,
+        "causesProviderContact": false,
+        "readsLiveNetworkData": false
+      },
+      "timeSemantics": {
+        "timestampsCopiedFromAuthenticatedEvidence": true,
+        "currentTimeUsed": false,
+        "filesystemMtimeUsed": false,
+        "directoryOrderUsed": false,
+        "windowComputedAsLastMinusFirst": true,
+        "rateInterpretedAsMomentum": false,
+        "simultaneityInferred": false,
+        "causalityInferred": false,
+        "emptyBucketImputed": false
+      },
+      "engagementSemantics": {
+        "countersAreProviderDefined": true,
+        "summariesSeparatedByProviderFamily": true,
+        "summariesSeparatedFieldByField": true,
+        "aggregatedAcrossProviderFamilies": false,
+        "aggregatedAcrossCounterTypes": false,
+        "absentCounterFilledWithZero": false,
+        "absentCounterTreatedAsEmptyString": false,
+        "carryForwardApplied": false,
+        "interpolationApplied": false,
+        "increaseIsPositiveEvidence": false,
+        "decreaseIsNegativeEvidence": false,
+        "regressionRemainsValidObservation": true,
+        "absoluteChangeComputed": false,
+        "momentumComputed": false,
+        "growthComputed": false,
+        "velocityComputed": false,
+        "popularityComputed": false,
+        "ratioComputed": false,
+        "scoreComputed": false
+      },
+      "marketLinkage": {
+        "priceAccessed": false,
+        "returnsAccessed": false,
+        "volatilityAccessed": false,
+        "marketOutcomesAccessed": false,
+        "r4ResultAccessed": false,
+        "r4OutcomeArtifactsAccessed": false,
+        "tradingEngineReached": false,
+        "arenaReached": false,
+        "walletAccessed": false,
+        "signerAccessed": false,
+        "swapReached": false,
+        "rpcWriteReached": false,
+        "solanaRpcLookupPerformed": false,
+        "marketApiContacted": false,
+        "priceCorrelationComputed": false,
+        "returnLinkageComputed": false,
+        "mintIsIdentityOnly": true
+      },
+      "lineageCoverageStatusValues": [
+        "NO_LINEAGE",
+        "SINGLE_LINEAGE",
+        "MULTIPLE_LINEAGES"
+      ]
+    },
+    "governance": {
+      "classification": {
+        "developmentOnly": true,
+        "researchOnly": true,
+        "observerOnly": true,
+        "paperOnly": true,
+        "tradingAuthority": false,
+        "engineAuthority": false,
+        "arenaEligible": false,
+        "promotionEligible": false,
+        "profitabilityInferencePermitted": false
+      },
+      "r4Boundary": {
+        "phase": "PHASE_5K_0",
+        "r4Status": "CLOSED",
+        "relationship": "POST_R4",
+        "evidenceClass": "PUBLIC_SOCIAL_RESEARCH_EVIDENCE",
+        "r4EvidenceIsDistinct": true,
+        "mayAlterR4Membership": false,
+        "mayAlterR4Outcomes": false,
+        "mayAlterR4Analysis": false,
+        "mayAlterR4Interpretation": false,
+        "isHiddenR4SensitivityAnalysis": false,
+        "retroactivelyChangesR4Reading": false,
+        "r4ResearchOnly": true,
+        "r4PaperOnly": true,
+        "r4ObserverOnly": true,
+        "r4TradingAuthority": false,
+        "r4ProfitabilityInferencePermitted": false,
+        "r4PositiveAssociationIsPermissionToAct": false,
+        "r4CanonicalResult": {
+          "availabilityDenominator": 3516,
+          "resolvedReferences": 2341,
+          "distinctResolvedMints": 90,
+          "kendallTauB": 0.40163549403930066,
+          "bootstrapCi95": [
+            0.2762661417066577,
+            0.4971652649589867
+          ],
+          "bootstrapReplicates": 10000
+        }
+      },
+      "scope": {
+        "publicDataOnly": true,
+        "authenticationPermitted": false,
+        "authenticationBypassPermitted": false,
+        "privateAccountAccessPermitted": false,
+        "restrictedContentScrapingPermitted": false,
+        "privateMessageIngestionPermitted": false,
+        "identityEnrichmentPermitted": false,
+        "deanonymizationPermitted": false,
+        "contactDiscoveryPermitted": false,
+        "privatePersonProfilingPermitted": false,
+        "prohibited": [
+          "PRIVATE_ACCOUNT_ACCESS",
+          "AUTHENTICATION_BYPASS",
+          "RESTRICTED_CONTENT_SCRAPING",
+          "PRIVATE_MESSAGE_INGESTION",
+          "IDENTITY_ENRICHMENT",
+          "DEANONYMIZATION",
+          "CONTACT_DISCOVERY",
+          "PRIVATE_PERSON_PROFILING",
+          "PRIVATE_KEY_USE",
+          "TRANSACTION_SUBMISSION"
+        ]
+      },
+      "collectionBounds": {
+        "unboundedCollectionPermitted": false,
+        "requiredBoundFields": [
+          "maxDurationMs",
+          "maxResultsPerQuery",
+          "maxPagesPerQuery",
+          "maxStorageBytes",
+          "maxRequestsPerRun",
+          "providerCooldownMs",
+          "rateLimitHandling"
+        ]
+      },
+      "personalData": {
+        "forbiddenFields": [
+          "email",
+          "phone",
+          "privateMessage",
+          "directMessage",
+          "ipAddress",
+          "realName",
+          "legalName",
+          "homeAddress",
+          "geoLocation",
+          "birthDate",
+          "deviceId",
+          "sessionCookie",
+          "accessToken",
+          "refreshToken",
+          "apiKey",
+          "bearerToken",
+          "followerList",
+          "followingList",
+          "contactList",
+          "profileImageUrl"
+        ]
+      },
+      "providerFamilies": [
+        "bluesky",
+        "mastodon"
+      ],
+      "providerHardCeilings": {
+        "maxPages": 5,
+        "maxRecords": 200,
+        "maxResponseBytes": 2097152,
+        "timeoutMs": 20000,
+        "lookbackMs": 604800000,
+        "maxRetries": 0
+      }
+    }
+  },
+  "providedCapabilities": [
+    "authenticated public observation evidence",
+    "provider-scoped provenance",
+    "bounded collection",
+    "offline replay",
+    "cross-run corpus construction",
+    "temporal content and state semantics",
+    "provider-declared revision evidence",
+    "Mastodon and Bluesky support",
+    "provider-family coverage accounting",
+    "cross-provider content lineage",
+    "deterministic descriptive evidence features",
+    "explicit missingness",
+    "tamper verification",
+    "deterministic snapshots",
+    "read-only research query surfaces"
+  ],
+  "nonClaims": [
+    "More observations != more truth.",
+    "More providers != more confidence.",
+    "More engagement != importance.",
+    "More lineages != stronger truth.",
+    "More revisions != suspicion.",
+    "Multi-provider presence != consensus.",
+    "Identical cross-provider content != proof of copying.",
+    "Distinct content != independent human authorship.",
+    "Temporal ordering != causality.",
+    "Descriptive feature != predictive feature.",
+    "Exact mint identity != investment relevance.",
+    "No Phase 5K output is a trading signal."
+  ],
+  "boundaryFlags": {
+    "researchOnly": true,
+    "observerOnly": true,
+    "paperOnly": true,
+    "developmentOnly": true,
+    "tradingAuthority": false,
+    "engineAuthority": false,
+    "arenaEligible": false,
+    "promotionEligible": false,
+    "priceDataPermitted": false,
+    "marketOutcomeLinkagePermitted": false,
+    "profitabilityInferencePermitted": false,
+    "predictionPermitted": false,
+    "recommendationPermitted": false,
+    "rankingPermitted": false,
+    "assetScoringPermitted": false,
+    "walletAuthority": false,
+    "signerAuthority": false,
+    "swapAuthority": false,
+    "rpcWriteAuthority": false,
+    "crossProviderIdentityResolutionPermitted": false,
+    "providerContactPermittedDuringAcceptance": false,
+    "liveNetworkDependencyInDerivedLayers": false,
+    "personalDataSurfaceExpansionPermitted": false,
+    "r4MutationPermitted": false,
+    "evolveStorageWritePermitted": false,
+    "runtimeCapturePermittedInClosure": false,
+    "authorityIsDeterministic": true,
+    "authorityIsSelfVerifying": true
+  },
+  "deferredCapabilities": {
+    "status": "DEFERRED",
+    "reason": "OUT_OF_SCOPE_FOR_PHASE_5K",
+    "requiresSeparateGovernedProgram": true,
+    "requiresGovernanceDecision": true,
+    "successorProgramDeclared": false,
+    "impliedSuccessorPhase": null,
+    "capabilities": [
+      {
+        "id": "MARKET_PRICE_LINKAGE",
+        "capability": "Linking public observations to price data"
+      },
+      {
+        "id": "RETURN_CORRELATION",
+        "capability": "Correlating social evidence with subsequent returns"
+      },
+      {
+        "id": "VOLATILITY_LINKAGE",
+        "capability": "Linking social evidence to volatility measures"
+      },
+      {
+        "id": "PREDICTIVE_MODELLING",
+        "capability": "Any predictive model over social evidence"
+      },
+      {
+        "id": "PROFITABILITY_RESEARCH",
+        "capability": "Any profitability or alpha inference"
+      },
+      {
+        "id": "RANKING",
+        "capability": "Ranking subjects, authors, posts or content by any measure"
+      },
+      {
+        "id": "RECOMMENDATION",
+        "capability": "Recommending any subject or action"
+      },
+      {
+        "id": "TRADE_CANDIDATE_SELECTION",
+        "capability": "Selecting trade candidates from public evidence"
+      },
+      {
+        "id": "EXECUTION",
+        "capability": "Any execution, order submission or transaction construction"
+      },
+      {
+        "id": "WALLET_OR_SIGNING",
+        "capability": "Any wallet, signer or key custody capability"
+      },
+      {
+        "id": "ARENA_INTEGRATION",
+        "capability": "Any Arena eligibility or exposure"
+      },
+      {
+        "id": "ENGINE_PROMOTION",
+        "capability": "Any engine promotion or fitness influence"
+      }
+    ]
+  },
+  "closureSurface": {
+    "files": [
+      "scripts/public-intelligence/final-acceptance-definition.mjs",
+      "scripts/public-intelligence/final-acceptance-surface.mjs",
+      "scripts/public-intelligence/final-acceptance.mjs",
+      "scripts/validate-phase5k-final.mjs",
+      "docs/PHASE5K-FINAL-ACCEPTANCE.md",
+      "docs/PHASE5K-FINAL-AUTHORITY.json"
+    ],
+    "modifiesAcceptedImplementation": false,
+    "addsProviders": false,
+    "addsNetworkCapability": false,
+    "addsMarketAuthority": false,
+    "addsScientificClaim": false
+  },
+  "authorityFingerprint": "65724d625dc2f444c5867d0cb4a3430ade895e6b4fcb36d6eec627028a0f1d3f"
+}
