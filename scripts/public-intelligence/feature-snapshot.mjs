@@ -114,6 +114,19 @@ export const featureSnapshotFingerprintOf = manifest => {
   return digest(body);
 };
 
+/**
+ * THE DERIVATION OF THE LINEAGE SOURCE FINGERPRINT.
+ *
+ * A lineage snapshot's governed aggregate digests are the whole of what this
+ * phase derives from it, so the source fingerprint is a pure function of them.
+ * It is defined here, once, so the verifier can re-derive the exact same value
+ * from a PERSISTED lineage snapshot manifest rather than trusting the declared
+ * number or re-implementing the derivation.
+ */
+export function lineageSourceFingerprintOf({ sourceLineageSnapshotId, lineageDigest, contentVersionDigest }) {
+  return digest({ kind: 'public_feature_lineage_source', sourceLineageSnapshotId, lineageDigest, contentVersionDigest });
+}
+
 /** The flattened authenticated envelopes of a run set, for availability facts. */
 export function envelopesOf(authenticated) {
   const envelopes = [];
@@ -135,8 +148,7 @@ export function assembleFeatureContent(authenticated, policyInput = PUBLIC_INTEL
   const lineage = assembleLineageContent(authenticated, policy, revisionEvidence);
   const runManifestFingerprints = lineage.memberships.map(member => member.runManifestFingerprint);
   const sourceLineageSnapshotId = deriveLineageSnapshotId(policy, runManifestFingerprints);
-  const sourceLineageSnapshotFingerprint = digest({
-    kind: 'public_feature_lineage_source',
+  const sourceLineageSnapshotFingerprint = lineageSourceFingerprintOf({
     sourceLineageSnapshotId,
     lineageDigest: lineage.lineageDigest,
     contentVersionDigest: lineage.contentVersionDigest,

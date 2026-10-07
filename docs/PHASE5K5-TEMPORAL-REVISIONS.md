@@ -190,6 +190,35 @@ record (`public_provider_revision_evidence`) bound to the **unchanged** 5K.1
   `UNVERIFIED_CONTENT_DIVERGENCE` - the correct conservative outcome for evidence that predates the
   field.
 
+### Revision evidence is persisted with the snapshot (5K.5.1)
+
+A sidecar is not decoration: `providerRevisionTimestamp` on every derived record, the
+`PROVIDER_DECLARED_CONTENT_REVISION` classification and the revision-chain link all exist *only*
+because a sidecar was supplied when the index was built. A snapshot that stored a declared revision
+but did not store the sidecar it came from was therefore not reproducible - its verifier rebuilt
+without the proof and produced `UNVERIFIED_CONTENT_DIVERGENCE` where the snapshot said
+`PROVIDER_DECLARED_CONTENT_REVISION`, and a conflicted identity's unproven link could not pass the
+revision-chain proof rules at all.
+
+5K.5.1 closes that gap additively, using the same pattern 5K.7-5K.9 already use:
+
+* the sidecar is persisted beside the derived records as `source-revision-evidence.ndjson`;
+* the manifest binds it with `revisionEvidenceCount` and `revisionEvidenceDigest`, a SHA-256 over
+  the canonical, validated, raw-fingerprint-sorted evidence array, so the digest is a pure function
+  of the evidence **set** and not of the order a caller collected it in;
+* the file is governed, write-once, mode `0444`, and written even when empty - a corpus with no
+  declared revision records its *absence* of evidence as an authenticated empty sidecar rather than
+  losing the distinction between "no proof was supplied" and "the proof was lost";
+* the verifier rebuilds from the sidecar **stored with the snapshot**, never from an empty default
+  and never by re-deriving proof from the snapshot's own output;
+* a conflicted identity is verified as a conflict - structure only, since demanding a declaration on
+  its unproven link would demand the very proof whose absence defines the outcome - while a fully
+  proven chain is still held to every proof-order rule.
+
+The sidecar carries a provider, an observation id, a raw fingerprint, one declared timestamp and a
+fingerprint; it duplicates no post body, no URL, no author identity and no credential, and it adds
+no new authority of any kind.
+
 ## Unverified Divergence
 
 Same upstream identity, different content fingerprint, **no valid provider proof** is a
@@ -314,6 +343,14 @@ content event.
   `temporal-snapshot-1`. Richer semantics never invalidate a historical artifact.
 * Building the same temporal corpus twice is write-once and reports `ALREADY_EXISTS_IDENTICAL`.
 * No 5K.0-5K.4 module, validator or document is modified by 5K.5.
+* The 5K.5.1 revision-evidence binding is **optional on read**. A snapshot written before 5K.5.1 has
+  neither the binding fields nor the sidecar file, and keeps verifying exactly as it always did
+  whenever nothing it stores depends on revision evidence. When its stored records DO carry a
+  provider-declared revision timestamp, the missing sidecar is a specific, named verification
+  failure (`REVISION_EVIDENCE_REQUIRED_BUT_ABSENT`) - never a silent empty default and never a
+  reconstruction. A binding that is present is all-or-nothing, and deleting a bound sidecar is
+  `REVISION_EVIDENCE_ARTIFACT_MISSING`. No unaffected historical fixture is invalidated by any of
+  this; the schema stays closed, and an unknown field is still a hard refusal.
 
 ## Non-Goals
 

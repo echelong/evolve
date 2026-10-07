@@ -18,6 +18,32 @@
 // 5K.5 exists; richer semantics being available is not a reason to reject
 // history.
 //
+// 5K.5.1 - REPRODUCIBLE TEMPORAL REVISION EVIDENCE.
+//
+// A provider-declared revision exists ONLY because a revision-evidence sidecar
+// was supplied when the index was built: `providerRevisionTimestamp` on every
+// derived record, the PROVIDER_DECLARED_CONTENT_REVISION classification and the
+// revision-chain link all come from that sidecar and from nothing else. A
+// snapshot that records such a corpus but does not record the sidecar is
+// therefore not reproducible: its verifier rebuilds without the proof and gets
+// UNVERIFIED_CONTENT_DIVERGENCE where the snapshot says revision.
+//
+// The repair is additive and is exactly the pattern 5K.7-5K.9 already use: the
+// sidecar is persisted beside the derived records as
+// `source-revision-evidence.ndjson`, and the manifest binds it with
+// `revisionEvidenceCount` + `revisionEvidenceDigest` (a fingerprint over the
+// canonical, validated, fingerprint-sorted evidence array).
+//
+//   - the two binding fields are OPTIONAL on read, so a snapshot written before
+//     5K.5.1 - which has neither the fields nor the file - still verifies
+//     whenever nothing it stores depends on revision evidence;
+//   - a snapshot whose stored records DO depend on revision evidence and which
+//     declares no binding fails closed in the verifier rather than being
+//     silently reconstructed;
+//   - the file is governed, write-once, mode 0444, and empty (`0` bytes) when a
+//     corpus carries no declared revision - absence of evidence is recorded as
+//     an empty sidecar, never as a missing one.
+//
 // Corpus storage never touches a run directory and never writes under .evolve.
 import {
   chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync,
@@ -34,6 +60,7 @@ import {
   PUBLIC_INTELLIGENCE_5K5_TEMPORAL_POLICY_VERSION,
 } from './temporal-projection.mjs';
 import { buildTemporalCorpus, computeTemporalAccounting, checkTemporalAccounting } from './temporal-corpus.mjs';
+import { canonicalRevisionEvidence } from './revision-chain.mjs';
 
 export const PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_RECORD_TYPE = 'public_temporal_snapshot';
 export const PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_POLICY_VERSION = 'temporal-snapshot-1';
@@ -42,6 +69,9 @@ export const PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_FILES = Object.freeze({
   observations: 'observation-records.ndjson',
   states: 'observation-states.ndjson',
   revisions: 'revisions.ndjson',
+  // 5K.5.1: the governed source definition of every provider-declared revision
+  // the derived records carry. Same filename 5K.7/5K.8/5K.9 already persist.
+  revisionEvidence: 'source-revision-evidence.ndjson',
   snapshot: 'temporal-snapshot.json',
 });
 const SNAPSHOT_ID = /^tsnap-[0-9a-f]{32}$/;
@@ -60,6 +90,11 @@ export const PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_SCHEMA = Object.freeze({
     'accounting', 'contentDigest', 'observationDigest', 'stateDigest', 'revisionDigest',
     'classification', 'snapshotFingerprint',
   ]),
+  // ADDITIVE FROM 5K.5.1, and deliberately OPTIONAL. A snapshot written before
+  // 5K.5.1 carries neither field and must remain readable; a snapshot written
+  // after 5K.5.1 carries BOTH, or it is refused as incomplete. Nothing outside
+  // this enumerated set is ever accepted, so the schema stays closed.
+  optionalFields: Object.freeze(['revisionEvidenceCount', 'revisionEvidenceDigest']),
   countFields: Object.freeze([
     'membershipCount', 'upstreamIdentityCount', 'contentVersionCount', 'observationRecordCount',
     'observationStateSnapshotCount', 'providerDeclaredRevisionCount', 'unverifiedDivergenceCount',
@@ -111,10 +146,14 @@ export function authenticateRuns(root, runIds, policyInput = PUBLIC_INTELLIGENCE
 /** Pure assembly of the reproducible temporal content from authenticated runs. */
 export function assembleTemporalContent(authenticated, policyInput = PUBLIC_INTELLIGENCE_5K4_DEFAULT_POLICY, revisionEvidence = []) {
   const policy = validateCorpusPolicy(policyInput);
+  // The source of every declared revision is canonicalized BEFORE it is used,
+  // so the persisted sidecar and its digest depend on the evidence SET and not
+  // on the order a caller collected it in.
+  const evidence = Object.freeze(canonicalRevisionEvidence(revisionEvidence));
   const memberships = authenticated.map(auth => buildMembershipRecord(auth, policy))
     .sort((a, b) => (a.runId < b.runId ? -1 : 1));
   const runs = authenticated.map(auth => ({ manifest: auth.artifacts.manifest, observations: auth.artifacts.observations }));
-  const index = buildTemporalCorpus(runs, { revisionEvidence });
+  const index = buildTemporalCorpus(runs, { revisionEvidence: evidence });
   const accounting = { ...computeTemporalAccounting(index), runCount: memberships.length };
   const content = {
     policy,
@@ -124,6 +163,11 @@ export function assembleTemporalContent(authenticated, policyInput = PUBLIC_INTE
     states: index.states,
     revisions: index.revisions,
     accounting,
+    // The reproducible source definition, carried with the derived records so
+    // the snapshot can persist it and a verifier can replay it exactly.
+    revisionEvidence: evidence,
+    revisionEvidenceCount: evidence.length,
+    revisionEvidenceDigest: digest(evidence),
     contentDigest: digest(index.contentRecords),
     observationDigest: digest(index.observationRecords),
     stateDigest: digest(index.states),
@@ -170,6 +214,10 @@ export function buildSnapshotManifest(content, createdAt) {
     observationDigest: content.observationDigest,
     stateDigest: content.stateDigest,
     revisionDigest: content.revisionDigest,
+    // 5K.5.1: the binding to the persisted revision-evidence sidecar. Always
+    // emitted by THIS code, optional on read for snapshots written before it.
+    revisionEvidenceCount: content.revisionEvidenceCount,
+    revisionEvidenceDigest: content.revisionEvidenceDigest,
     classification: PUBLIC_INTELLIGENCE_CLASSIFICATION,
   };
   const manifest = plain({ ...body, snapshotFingerprint: digest(body) });
@@ -183,8 +231,20 @@ export function buildSnapshotManifest(content, createdAt) {
 export function validateSnapshotManifest(manifest) {
   const S = PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_SCHEMA;
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_NOT_AN_OBJECT');
-  for (const key of Object.keys(manifest)) if (!S.fields.includes(key)) failClosed(`PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_UNKNOWN_FIELD:${String(key).slice(0, 40)}`);
+  for (const key of Object.keys(manifest)) {
+    if (!S.fields.includes(key) && !S.optionalFields.includes(key)) failClosed(`PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_UNKNOWN_FIELD:${String(key).slice(0, 40)}`);
+  }
   for (const key of S.fields) if (!Object.hasOwn(manifest, key)) failClosed(`PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_FIELD_MISSING:${key}`);
+  // The additive revision-evidence binding is ALL-OR-NOTHING: a snapshot either
+  // carries both fields (5K.5.1+) or neither (written before 5K.5.1).
+  const binding = S.optionalFields.filter(key => Object.hasOwn(manifest, key));
+  if (binding.length !== 0 && binding.length !== S.optionalFields.length) failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_REVISION_BINDING_INCOMPLETE');
+  if (binding.length === S.optionalFields.length) {
+    if (!FINGERPRINT.test(manifest.revisionEvidenceDigest)) failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_REVISION_EVIDENCE_DIGEST_INVALID');
+    if (!Number.isSafeInteger(manifest.revisionEvidenceCount) || manifest.revisionEvidenceCount < 0) {
+      failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_REVISION_EVIDENCE_COUNT_INVALID');
+    }
+  }
   if (manifest.schemaVersion !== PUBLIC_INTELLIGENCE_5K5_SCHEMA_VERSION
     || manifest.recordType !== PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_RECORD_TYPE
     || manifest.phase !== PUBLIC_INTELLIGENCE_5K5_PHASE) failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_TYPE_INVALID');
@@ -238,6 +298,12 @@ export function loadTemporalArtifacts(directory) {
     observationRecords: readNdjson(F.observations),
     states: readNdjson(F.states),
     revisions: readNdjson(F.revisions),
+    revisionEvidence: readNdjson(F.revisionEvidence),
+    // Which GOVERNED files are absent. A pre-5K.5.1 snapshot legitimately has no
+    // sidecar, so absence is reported here and judged by the verifier against
+    // what the manifest declares and what the stored records require - it is
+    // never inferred from a load that quietly returned nothing.
+    missingFiles: existsSync(directory) ? Object.values(F).filter(name => !existsSync(path.join(directory, name))).sort() : Object.values(F).slice().sort(),
     extraFiles: extra,
     loadProblems: problems,
   };
@@ -261,7 +327,8 @@ export function buildAndStoreTemporalSnapshot({ root, runIds, policy = PUBLIC_IN
       && canonical(stored.contentRecords) === canonical(content.contentRecords)
       && canonical(stored.observationRecords) === canonical(content.observationRecords)
       && canonical(stored.states) === canonical(content.states)
-      && canonical(stored.revisions) === canonical(content.revisions);
+      && canonical(stored.revisions) === canonical(content.revisions)
+      && canonical(stored.revisionEvidence) === canonical(content.revisionEvidence);
     if (!same) failClosed('PUBLIC_INTELLIGENCE_5K5_SNAPSHOT_EXISTS_DIFFERENT');
     return Object.freeze({ outcome: 'ALREADY_EXISTS_IDENTICAL', temporalSnapshotId: manifest.temporalSnapshotId, directory: final, manifest: stored.manifest });
   }
@@ -275,6 +342,10 @@ export function buildAndStoreTemporalSnapshot({ root, runIds, policy = PUBLIC_IN
   write(F.observations, lines(content.observationRecords));
   write(F.states, lines(content.states));
   write(F.revisions, lines(content.revisions));
+  // Always written, even when empty: a corpus with no declared revision records
+  // its ABSENCE of evidence as an empty sidecar rather than a missing one, so a
+  // verifier can distinguish "no proof was supplied" from "the proof was lost".
+  write(F.revisionEvidence, lines(content.revisionEvidence));
   write(F.snapshot, `${canonical(manifest)}\n`);
   for (const name of Object.values(F)) chmodSync(path.join(building, name), 0o444);
   renameSync(building, final); // atomic; fails if `final` appeared meanwhile

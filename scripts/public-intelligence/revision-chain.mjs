@@ -163,6 +163,34 @@ export function validateRevisionEvidence(record) {
 }
 
 /**
+ * CANONICAL EVIDENCE ORDER (5K.5.1).
+ *
+ * The persisted sidecar and its digest must be a pure function of the evidence
+ * SET, never of the order a caller happened to collect it in. Sorting by the raw
+ * fingerprint each record is bound to - the same key the index uses - makes the
+ * stored file and its digest identical for identical evidence, so a snapshot's
+ * reproducibility cannot depend on caller order.
+ *
+ * The records themselves are validated here, so no unvalidated record can reach
+ * a persisted artifact even if a caller assembled the array by hand.
+ */
+export function canonicalRevisionEvidence(records) {
+  if (!Array.isArray(records)) failClosed('PUBLIC_INTELLIGENCE_5K5_REV_EVIDENCE_LIST_REQUIRED');
+  const validated = records.map(record => {
+    validateRevisionEvidence(record);
+    return record;
+  });
+  validated.sort((a, b) => (a.rawObservationFingerprint < b.rawObservationFingerprint ? -1
+    : a.rawObservationFingerprint > b.rawObservationFingerprint ? 1 : 0));
+  for (let index = 1; index < validated.length; index += 1) {
+    if (validated[index].rawObservationFingerprint === validated[index - 1].rawObservationFingerprint) {
+      failClosed('PUBLIC_INTELLIGENCE_5K5_REV_EVIDENCE_DUPLICATE_BINDING');
+    }
+  }
+  return validated;
+}
+
+/**
  * Indexes revision evidence by the raw fingerprint it is bound to.
  *
  * A sidecar bound to a raw fingerprint that no authenticated observation
@@ -296,6 +324,41 @@ export function verifyRevisionChain(records) {
     if (previous.providerRevisionTimestamp !== null && record.providerRevisionTimestamp < previous.providerRevisionTimestamp) {
       push(`REVISION_TIMESTAMP_OUT_OF_ORDER:${record.versionIndex}`);
     }
+  });
+  return Object.freeze({ ok: failures.length === 0, failures: Object.freeze(failures) });
+}
+
+/**
+ * THE STRUCTURE A CONFLICTED CHAIN MUST STILL SATISFY (5K.5.1).
+ *
+ * An identity whose content changed without a provider declaration that is
+ * strictly later than the fetch it supersedes is a conflict, and its unproven
+ * link IS that conflict: the content record reports it as
+ * UNVERIFIED_CONTENT_DIVERGENCE and `conflicted: true`, and no winner is ever
+ * selected. `verifyRevisionChain` demands a declaration on every non-first
+ * version, so running it over a conflict would demand the very proof whose
+ * absence defines the outcome - and would report a faithfully built, faithfully
+ * stored conflict as corrupt.
+ *
+ * What a conflict is still required to satisfy is its STRUCTURE, because that is
+ * what the corpus guarantees by construction regardless of the proof:
+ *
+ *   - indexes are contiguous from 0;
+ *   - each version supersedes exactly its predecessor's content fingerprint.
+ *
+ * Proof-order rules are deliberately NOT asserted here. Where they cannot be
+ * satisfied, that is the conflict itself, and where they could be, the identity is
+ * a revision chain and must be verified with `verifyRevisionChain`. Every version
+ * is retained either way; nothing is discarded, merged or repaired.
+ */
+export function verifyConflictedChainStructure(records) {
+  const failures = [];
+  const ordered = [...records].sort((a, b) => a.versionIndex - b.versionIndex);
+  ordered.forEach((record, position) => {
+    if (record.versionIndex !== position) failures.push(`CONFLICT_INDEX_NOT_CONTIGUOUS:${record.versionIndex}`);
+    if (position === 0) return;
+    const previous = ordered[position - 1];
+    if (record.supersedesContentFingerprint !== previous.contentFingerprint) failures.push(`CONFLICT_CHAIN_BREAK:${record.versionIndex}`);
   });
   return Object.freeze({ ok: failures.length === 0, failures: Object.freeze(failures) });
 }

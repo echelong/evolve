@@ -326,9 +326,18 @@ the same feature policy produces the same feature content.
 
 1. validates the stored manifest against the closed schema and its own
    fingerprint, and re-derives the deterministic snapshot id;
-2. verifies every SOURCE snapshot that is present on disk — the 5K.5 temporal,
-   5K.7 corroboration and 5K.8 lineage snapshots — each against its own runs;
-3. re-authenticates every member run from the run directories;
+2. REQUIRES every source authority the manifest DECLARES — the verified run
+   corpus, the 5K.5 temporal snapshot, the 5K.7 corroboration snapshot and the
+   5K.8 lineage snapshot — to be present on disk and to verify green under its
+   own verifier. This is deliberately not "verify whichever sources happen to
+   exist": a declared-but-absent source is a hard failure, and each declared
+   source fingerprint is re-derived from the verified artifact's own governed
+   digests, so a green-but-different source cannot stand in for the one that was
+   declared. `sourceTemporalSnapshotFingerprint` is therefore only resolved by a
+   persisted temporal snapshot that verifies — which is possible only because
+   5K.5.1 persists the revision-evidence sidecar with it;
+3. re-authenticates every member run from the run directories (the verified
+   corpus source);
 4. rebuilds the 5K.5/5K.7/5K.8 derivation and recomputes every feature from
    scratch, using the revision evidence the snapshot recorded;
 5. compares source ids and fingerprints, every stored record against the rebuild

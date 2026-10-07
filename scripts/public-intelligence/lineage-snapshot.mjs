@@ -116,6 +116,31 @@ export const lineageSnapshotFingerprintOf = manifest => {
   return digest(body);
 };
 
+/**
+ * THE DERIVATION OF A TEMPORAL SOURCE FINGERPRINT.
+ *
+ * A temporal snapshot's four content digests are the WHOLE of what a
+ * corroboration or lineage view derives from it, so the source fingerprint is a
+ * pure function of them. It is defined here, once, so a downstream verifier can
+ * re-derive the exact same value from a PERSISTED temporal snapshot manifest
+ * instead of re-implementing the derivation and risking a second definition.
+ */
+export function temporalSourceFingerprintOf({ contentDigest, observationDigest, stateDigest, revisionDigest }) {
+  return digest({ kind: 'public_lineage_temporal_source', contentDigest, observationDigest, stateDigest, revisionDigest });
+}
+
+/**
+ * THE DERIVATION OF A CORROBORATION SOURCE FINGERPRINT.
+ *
+ * The same reasoning, over a corroboration snapshot's governed view digests and
+ * its own snapshot identity.
+ */
+export function corroborationSourceFingerprintOf({ sourceCorroborationSnapshotId, coverageDigest, recordsDigest, observationCoverageDigest }) {
+  return digest({
+    kind: 'public_lineage_corroboration_source', sourceCorroborationSnapshotId, coverageDigest, recordsDigest, observationCoverageDigest,
+  });
+}
+
 /** The flattened authenticated envelopes of a run set, for text fingerprints. */
 function envelopesOf(authenticated) {
   const envelopes = [];
@@ -137,21 +162,14 @@ export function assembleLineageContent(authenticated, policyInput = PUBLIC_INTEL
   const temporal = assembleTemporalContent(authenticated, policy, revisionEvidence);
   const runManifestFingerprints = temporal.memberships.map(member => member.runManifestFingerprint);
   const sourceTemporalSnapshotId = deriveTemporalSnapshotId(policy, runManifestFingerprints);
-  const sourceTemporalFingerprint = digest({
-    kind: 'public_lineage_temporal_source',
-    contentDigest: temporal.contentDigest,
-    observationDigest: temporal.observationDigest,
-    stateDigest: temporal.stateDigest,
-    revisionDigest: temporal.revisionDigest,
-  });
+  const sourceTemporalFingerprint = temporalSourceFingerprintOf(temporal);
 
   const corroboration = buildCorroborationIndex(
     { contentRecords: temporal.contentRecords, observationRecords: temporal.observationRecords },
     { sourceSnapshotIds: [sourceTemporalSnapshotId] },
   );
   const sourceCorroborationSnapshotId = deriveCorroborationSnapshotId(policy, runManifestFingerprints);
-  const sourceCorroborationSnapshotFingerprint = digest({
-    kind: 'public_lineage_corroboration_source',
+  const sourceCorroborationSnapshotFingerprint = corroborationSourceFingerprintOf({
     sourceCorroborationSnapshotId,
     coverageDigest: digest(corroboration.aggregate),
     recordsDigest: digest(corroboration.coverageRecords),

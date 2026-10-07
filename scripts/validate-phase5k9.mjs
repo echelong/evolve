@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import {
-  chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -234,18 +234,24 @@ async function buildWorkspace() {
   const runIds = [alpha1.runId, beta.runId, bluesky.runId, alpha2.runId];
   const content = SNAP.rebuildFeatureSnapshot({ root, runIds, policy: POLICY, revisionEvidence });
   const snapshot = SNAP.buildAndStoreFeatureSnapshot({ root, runIds, policy: POLICY, revisionEvidence, createdAt: T5 });
-  // Every governed SOURCE snapshot that can be stored, so the 5K.9 verifier can
-  // verify each one present on disk.
+  // EVERY governed source authority the 5K.9 manifest declares is stored here, so
+  // the verifier can REQUIRE each one to be present and green rather than
+  // verifying whichever sources happen to exist.
   //
-  // No 5K.5 temporal snapshot is stored here, deliberately. The 5K.5 snapshot
-  // persists no revision-evidence sidecar of its own and its verifier rebuilds
-  // from the run set alone, so a corpus carrying a provider-declared revision or
-  // an unverified divergence - this fixture has both - can never be reproduced by
-  // it (verifyRevisionChain requires a provider revision timestamp on every
-  // non-first version). The 5K.7 and 5K.8 sources are both stored and both verify.
+  // The 5K.5 temporal snapshot is one of those authorities, and this fixture
+  // carries BOTH a provider-declared revision (observation 1006) and an
+  // unverified divergence (observation 1010). The pre-5K.5.1 snapshot could
+  // reproduce neither: it persisted no revision-evidence sidecar of its own and
+  // its verifier rebuilt from the run set alone, so this fixture deliberately
+  // stored no temporal snapshot at all. 5K.5.1 persists the sidecar with the
+  // snapshot and verifies it offline, so the source is stored here and asserted
+  // green immediately - a failure would abort the whole workspace.
+  const temporal = SURFACE.buildAndStoreTemporalSnapshot({ root, runIds, policy: POLICY, revisionEvidence, createdAt: T5 });
+  assert.equal(SURFACE.verifyTemporalSnapshot(root, temporal.temporalSnapshotId).ok, true,
+    'the declared temporal source verifies offline, with its revision and its divergence');
   SURFACE.buildAndStoreCorroborationSnapshot({ root, runIds, policy: POLICY, revisionEvidence, createdAt: T5 });
   SURFACE.buildAndStoreLineageSnapshot({ root, runIds, policy: POLICY, revisionEvidence, createdAt: T5 });
-  return { root, runIds, revisionEvidence, content, snapshot };
+  return { root, runIds, revisionEvidence, content, snapshot, temporal };
 }
 
 const WORKSPACE = await buildWorkspace();
@@ -1127,10 +1133,73 @@ function tampered(file, mutate, expectedFragment) {
 const F = SNAP.PUBLIC_INTELLIGENCE_5K9_SNAPSHOT_FILES;
 const mutateRecord = (mint, apply) => records => records.map(record => (record.mint === mint ? apply({ ...record }) : record));
 
-test('P1 the untouched snapshot verifies, including every source snapshot on disk', () => {
+test('P1 the untouched snapshot verifies, including every declared source authority', () => {
   const verification = VERIFY.verifyFeatureSnapshot(WORKSPACE.root, WORKSPACE.snapshot.snapshotId);
   assert.deepEqual(verification.failures, []);
   assert.equal(verification.ok, true);
+});
+test('P1a the declared temporal source is stored and verifies on its own', () => {
+  const directory = SURFACE.temporalCorporaDirectoryOf(WORKSPACE.root, MANIFEST.sourceTemporalSnapshotId);
+  assert.ok(statSync(directory).isDirectory(), 'the declared temporal source is persisted');
+  const verification = SURFACE.verifyTemporalSnapshot(WORKSPACE.root, MANIFEST.sourceTemporalSnapshotId);
+  assert.equal(verification.ok, true, verification.failures.join(','));
+  const stored = SURFACE.loadTemporalArtifacts(directory);
+  assert.equal(stored.revisionEvidence.length, WORKSPACE.revisionEvidence.length,
+    'the revision-evidence sidecar travels with the temporal source');
+  assert.equal(stored.manifest.providerDeclaredRevisionCount, 1);
+  assert.equal(stored.manifest.unverifiedDivergenceCount, 1);
+});
+test('P1b a missing declared temporal source fails closed by name', () => {
+  const directory = SURFACE.temporalCorporaDirectoryOf(WORKSPACE.root, MANIFEST.sourceTemporalSnapshotId);
+  const parked = `${directory}.parked`;
+  renameSync(directory, parked);
+  let verification;
+  try { verification = VERIFY.verifyFeatureSnapshot(WORKSPACE.root, WORKSPACE.snapshot.snapshotId); }
+  finally { renameSync(parked, directory); }
+  assert.equal(verification.ok, false);
+  assert.ok(verification.failures.some(failure => failure.includes('TEMPORAL_SOURCE_SNAPSHOT_MISSING')), verification.failures.join(','));
+});
+test('P1c a tampered declared temporal source is never accepted as verified', () => {
+  const directory = SURFACE.temporalCorporaDirectoryOf(WORKSPACE.root, MANIFEST.sourceTemporalSnapshotId);
+  const target = path.join(directory, 'observation-records.ndjson');
+  const original = readFileSync(target, 'utf8');
+  const first = JSON.parse(original.split('\n').filter(Boolean)[0]);
+  // A syntactically valid, well-fingerprinted EXTRA observation record: the
+  // source's own verifier must refuse it, and the feature verifier must report
+  // that its declared authority is not green.
+  chmodSync(target, 0o644);
+  writeFileSync(target, `${original.trimEnd()}\n${canonical({ ...first, observationRecordFingerprint: 'a'.repeat(64) })}\n`);
+  chmodSync(target, 0o444);
+  let verification;
+  try { verification = VERIFY.verifyFeatureSnapshot(WORKSPACE.root, WORKSPACE.snapshot.snapshotId); }
+  finally {
+    chmodSync(target, 0o644);
+    writeFileSync(target, original);
+    chmodSync(target, 0o444);
+  }
+  assert.equal(verification.ok, false);
+  assert.ok(verification.failures.some(failure => failure.includes('TEMPORAL_SOURCE_SNAPSHOT_NOT_VERIFIED')), verification.failures.join(','));
+});
+test('P1d the declared corroboration and lineage sources are required as well', () => {
+  const corroboration = SURFACE.corroborationCorporaDirectoryOf(WORKSPACE.root, MANIFEST.sourceCorroborationSnapshotId);
+  const parkedCorroboration = `${corroboration}.parked`;
+  renameSync(corroboration, parkedCorroboration);
+  let withoutCorroboration;
+  try { withoutCorroboration = VERIFY.verifyFeatureSnapshot(WORKSPACE.root, WORKSPACE.snapshot.snapshotId); }
+  finally { renameSync(parkedCorroboration, corroboration); }
+  assert.ok(withoutCorroboration.failures.some(failure => failure.includes('CORROBORATION_SOURCE_SNAPSHOT_MISSING')),
+    withoutCorroboration.failures.join(','));
+  const lineage = SURFACE.lineageCorporaDirectoryOf(WORKSPACE.root, MANIFEST.sourceLineageSnapshotId);
+  const parkedLineage = `${lineage}.parked`;
+  renameSync(lineage, parkedLineage);
+  let withoutLineage;
+  try { withoutLineage = VERIFY.verifyFeatureSnapshot(WORKSPACE.root, WORKSPACE.snapshot.snapshotId); }
+  finally { renameSync(parkedLineage, lineage); }
+  assert.ok(withoutLineage.failures.some(failure => failure.includes('LINEAGE_SOURCE_SNAPSHOT_MISSING')),
+    withoutLineage.failures.join(','));
+});
+test('P1e a declared source fingerprint that does not resolve is refused', () => {
+  tampered(F.snapshot, () => `${canonical({ ...MANIFEST, sourceTemporalSnapshotFingerprint: 'a'.repeat(64) })}\n`, 'SOURCE_TEMPORAL_FINGERPRINT_UNRESOLVED');
 });
 test('P2 changing a mint is detected', () => {
   // A record re-keyed to another mint is no longer the record for its own mint,
@@ -1449,6 +1518,7 @@ test('T17 5K.6.2 stays 58/58', () => phaseCount('scripts/validate-phase5k6-2.mjs
 test('T18 5K.6.3 stays 71/71', () => phaseCount('scripts/validate-phase5k6-3.mjs', 'Phase 5K.6.3: 71/71 passed'));
 test('T19 5K.7 stays 153/153', () => phaseCount('scripts/validate-phase5k7.mjs', 'Phase 5K.7: 153/153 passed'));
 test('T20 5K.8 stays 164/164', () => phaseCount('scripts/validate-phase5k8.mjs', 'Phase 5K.8: 164/164 passed'));
+test('T21 5K.5.1 stays 27/27', () => phaseCount('scripts/validate-phase5k5-1.mjs', 'Phase 5K.5.1: 27/27 passed'));
 
 // ---------------------------------------------------------------------------
 async function main() {
