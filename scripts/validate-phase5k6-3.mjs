@@ -79,6 +79,25 @@ const test = (name, fn) => tests.push([name, fn]);
 const temporary = [];
 const tempRoot = () => { const root = mkdtempSync(path.join(tmpdir(), 'evolve-5k6-3-')); temporary.push(root); return root; };
 const gitOut = (...args) => execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' });
+// 5K.6.3's OWN commit.
+//
+// I11 is a PHASE-SCOPED claim: "this phase touches only the generic run layer and
+// validators". It was expressed as `BASE_COMMIT..working tree`, which names THIS
+// phase's change only while 5K.6.3 is the newest commit: the moment any LATER phase
+// legitimately touches a temporal or revision module, that range silently
+// re-scopes itself from "what 5K.6.3 did" to "what has any phase since 5K.6.2
+// done". Pinning the phase's own commit restores the stated intent and is strictly
+// MORE precise, not weaker - 5K.6.3 is still forbidden from touching evidence or
+// provider semantics, exactly as before.
+const K6_3_HEAD_SUBJECT = 'Fix provider-neutral pagination cursors';
+const K6_3_HEAD_SHA = 'ed3541f24e398c726bc741eb7108a7ed9406dec3';
+const K6_3_HEAD = (() => {
+  const lines = gitOut('log', '--format=%H%x00%s').split('\n').filter(Boolean);
+  const found = lines.map(line => line.split('\u0000'))
+    .find(([, subject]) => subject === K6_3_HEAD_SUBJECT)?.[0];
+  if (found !== K6_3_HEAD_SHA) throw new Error(`PHASE_5K6_3_HEAD_COMMIT_UNRESOLVED:${found ?? 'none'}`);
+  return found;
+})();
 const refusal = (fn, fragment) => {
   let thrown = null;
   try { fn(); } catch (error) { thrown = error; }
@@ -777,7 +796,7 @@ test('I11 this phase touches only the generic run layer and validators', () => {
   // The defect lives in the generic request schema. Evidence, mapper, transport
   // and revision semantics are all out of scope and must be untouched.
   const providerDir = ['scripts', 'public-intelligence', 'providers'].join('/');
-  const changed = gitOut('diff', '--name-only', BASE_COMMIT).split('\n').filter(Boolean);
+  const changed = gitOut('diff', '--name-only', `${BASE_COMMIT}..${K6_3_HEAD}`).split('\n').filter(Boolean);
   const forbidden = changed.filter(entry => entry.includes(providerDir)
     || /observation|provenance|normalize|dedup|ingest|revision|temporal-|corpus-/.test(entry));
   assert.deepEqual(forbidden, [], '5K.6.3 must not touch evidence or provider semantics');

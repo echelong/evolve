@@ -75,6 +75,27 @@ const test = (name, fn) => tests.push([name, fn]);
 const temporary = [];
 const tempRoot = () => { const root = mkdtempSync(path.join(tmpdir(), 'evolve-5k6-2-')); temporary.push(root); return root; };
 const gitOut = (...args) => execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' });
+// 5K.6.2's OWN commit.
+//
+// G7 and H7 are PHASE-SCOPED claims: "this phase changes no evidence, revision or
+// transport semantics module" and "every file this phase touches lives inside the
+// governed tree or is a validator". They were expressed as
+// `BASE_COMMIT..working tree`, which names THIS phase's change only while 5K.6.2 is
+// the newest commit: the moment any LATER phase legitimately touches a temporal or
+// revision module, that range silently re-scopes itself from "what 5K.6.2 did" to
+// "what has any phase since 5K.6.1 done", and reports unrelated correct work as
+// this phase's. Pinning the phase's own commit restores the stated intent and is
+// strictly MORE precise, not weaker - 5K.6.2 is still forbidden from touching any
+// of those modules, exactly as before.
+const K6_2_HEAD_SUBJECT = 'Fix Bluesky terminal exhaustion handling';
+const K6_2_HEAD_SHA = '98664b3006e7010501041a58d76c8da55ce039c1';
+const K6_2_HEAD = (() => {
+  const lines = gitOut('log', '--format=%H%x00%s').split('\n').filter(Boolean);
+  const found = lines.map(line => line.split('\u0000'))
+    .find(([, subject]) => subject === K6_2_HEAD_SUBJECT)?.[0];
+  if (found !== K6_2_HEAD_SHA) throw new Error(`PHASE_5K6_2_HEAD_COMMIT_UNRESOLVED:${found ?? 'none'}`);
+  return found;
+})();
 const refusal = (fn, fragment) => {
   let thrown = null;
   try { fn(); } catch (error) { thrown = error; }
@@ -621,7 +642,7 @@ test('G7 this phase changes no evidence, mapper, transport or revision semantics
   // the fix must actually live in the shared run/manifest layer. The provider
   // directory fragment is assembled so naming it is not an import.
   const providerDir = ['scripts', 'public-intelligence', 'providers'].join('/');
-  const changed = gitOut('diff', '--name-only', BASE_COMMIT).split('\n').filter(Boolean);
+  const changed = gitOut('diff', '--name-only', `${BASE_COMMIT}..${K6_2_HEAD}`).split('\n').filter(Boolean);
   const forbidden = changed.filter(entry => entry.includes(providerDir)
     || /observation|provenance|normalize|dedup|ingest|revision|temporal-|corpus-/.test(entry));
   assert.deepEqual(forbidden, [], '5K.6.2 must not touch evidence, provider or revision semantics');
@@ -710,7 +731,7 @@ test('H6 the governed surface still re-exports only and adds no behaviour', () =
   assert.ok(!/process\.env|Date\.now|setTimeout|setInterval/.test(source), 'the surface reads no clock or environment');
 });
 test('H7 every file this phase touches lives inside the governed tree or is a validator', () => {
-  const changed = gitOut('diff', '--name-only', BASE_COMMIT).split('\n').filter(Boolean);
+  const changed = gitOut('diff', '--name-only', `${BASE_COMMIT}..${K6_2_HEAD}`).split('\n').filter(Boolean);
   for (const entry of changed) {
     // The documentation tree is allowed, exactly as 5K.6's own Q11 scope check
     // allows it: a later phase is expected to land a phase document, and that
